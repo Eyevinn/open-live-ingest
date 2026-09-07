@@ -1,0 +1,17 @@
+[package]
+name = "open-live-gateway-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop app for streaming a local capture device into Open Live"
+
+[dependencies]
+open-live-gateway = { path = "../gateway" }
+open-live-gateway-types = { path = "../types" }
+eframe.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

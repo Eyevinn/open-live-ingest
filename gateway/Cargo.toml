@@ -22,3 +22,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 hostname.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

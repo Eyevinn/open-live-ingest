@@ -2,6 +2,7 @@
 //! Live registration loop.
 
 use crate::strom::client::SrtUplink;
+use open_live_gateway_types::config::InputConfig;
 use open_live_gateway_types::status::{GatewayStatus, InputState, InputStatus, UplinkStats};
 use open_live_gateway_types::GatewayConfig;
 use std::collections::BTreeMap;
@@ -52,6 +53,33 @@ impl SharedState {
             strom_reachable: AtomicBool::new(false),
             inputs: Mutex::new(inputs),
         }
+    }
+
+    /// Adds an input created at runtime, as the desktop app does when an operator
+    /// starts a device. A no-op if it is already present, so restarting one input
+    /// does not discard its accumulated status.
+    pub fn add_input(&self, input: &InputConfig, gateway_id: &str) {
+        let mut inputs = self.inputs.lock().expect("state poisoned");
+        inputs
+            .entry(input.id.clone())
+            .or_insert_with(|| InputStatus {
+                id: input.id.clone(),
+                state: InputState::Idle,
+                flow_id: crate::strom::flow::flow_id(gateway_id, &input.id),
+                gst_state: None,
+                source_id: None,
+                listener_address: input.uplink.cloud_uri(),
+                restarts: 0,
+                last_error: None,
+                uplink: None,
+                stalled_polls: 0,
+            });
+    }
+
+    /// Removes an input that is no longer running, so the UI and the registration
+    /// loop stop reporting it.
+    pub fn remove_input(&self, input_id: &str) {
+        self.inputs.lock().expect("state poisoned").remove(input_id);
     }
 
     pub fn gateway_id(&self) -> &str {
@@ -204,6 +232,7 @@ mod tests {
                 },
                 enabled: true,
             }],
+            app: Default::default(),
             open_live: Default::default(),
             control: Default::default(),
             log: Default::default(),

@@ -34,6 +34,29 @@ api_key = "change-me"
 register = true
 state_path = "/var/lib/open-live-gateway/state.json"
 
+# Defaults the desktop app applies to a device an operator starts. Unused by the
+# headless daemon, which declares its inputs below.
+[app]
+video_resolution = "1280x720"
+video_framerate = "25/1"
+
+  [app.video]
+  codec = "h264"
+  bitrate_kbps = 6000
+  encoder_preference = "auto"
+  quality_preset = "ultrafast"
+  tune = "zerolatency"
+  rate_control = "cbr"
+  keyframe_interval = 25
+
+  # The app allocates a port per input from this range, so an operator never has to
+  # pick one. Ports claimed by [[inputs]] below are skipped.
+  [app.uplink]
+  mode = "caller"
+  host = "strom.example.com"
+  port_range = "9000-9100"
+  latency_ms = 200
+
 [control]
 # Loopback by default. A non-loopback bind requires `token` and is rejected at startup
 # without one.

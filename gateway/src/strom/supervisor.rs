@@ -63,7 +63,10 @@ pub fn spawn_supervisors(state: Arc<SharedState>, cfg: &GatewayConfig) -> Result
     Ok(())
 }
 
-async fn supervise(
+/// Supervises one input forever. The headless daemon spawns one per configured
+/// input; the desktop app spawns one when an operator starts a device and aborts it
+/// when they stop it.
+pub async fn supervise(
     state: Arc<SharedState>,
     client: StromClient,
     input: InputConfig,

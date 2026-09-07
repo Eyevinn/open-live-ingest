@@ -5,12 +5,7 @@
 //! the Open Live API so operators can assign it to a mixer input. The gateway owns no
 //! media pipeline of its own. See docs/DESIGN.md.
 
-mod config;
-mod control;
-mod identity;
-mod openlive;
-mod state;
-mod strom;
+use open_live_gateway::{config, control, identity, openlive, state, strom};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -46,6 +41,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("loading config from {}", cli.config.display()))?;
 
     config::init_tracing(&cfg.log.level);
+
+    // Only the headless daemon needs inputs up front; the desktop app creates them
+    // when an operator picks a device.
+    if cfg.inputs.is_empty() {
+        anyhow::bail!("no inputs configured — the headless daemon needs at least one [[inputs]]");
+    }
 
     if cli.check {
         info!("configuration is valid: {} input(s)", cfg.inputs.len());

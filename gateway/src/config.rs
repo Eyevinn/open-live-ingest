@@ -53,10 +53,6 @@ pub fn load(path: &Path, log_level_override: Option<&str>) -> Result<GatewayConf
 
 /// Rejects configurations that would fail confusingly at runtime.
 fn validate(cfg: &GatewayConfig) -> Result<()> {
-    if cfg.inputs.is_empty() {
-        bail!("no inputs configured");
-    }
-
     if cfg.strom.url.trim().is_empty() {
         bail!("strom.url is unset — the gateway needs a local Strom instance to drive");
     }
@@ -347,13 +343,12 @@ id = \"cam1\"
         );
     }
 
+    /// The desktop app creates its inputs at runtime, so an empty list is valid for
+    /// the shared validation. The headless binary applies its own stricter check.
     #[test]
-    fn empty_input_list_is_rejected() {
+    fn an_empty_input_list_is_allowed_by_shared_validation() {
         let mut cfg = config_from(BASE);
         cfg.inputs.clear();
-        assert!(
-            validate(&cfg).is_err(),
-            "a gateway with no inputs must be rejected"
-        );
+        validate(&cfg).expect("an empty input list is for the app to fill at runtime");
     }
 }

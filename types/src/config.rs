@@ -26,6 +26,10 @@ pub struct GatewayConfig {
     /// port, so one camera failing cannot disturb another.
     #[serde(default)]
     pub inputs: Vec<InputConfig>,
+    /// Settings the desktop app uses for inputs an operator starts at runtime.
+    /// Not needed by the headless daemon, which declares its inputs above.
+    #[serde(default)]
+    pub app: AppConfig,
     #[serde(default)]
     pub open_live: OpenLiveConfig,
     #[serde(default)]
@@ -42,6 +46,103 @@ pub struct GatewayIdentity {
     pub id: Option<String>,
     /// Human-readable name, used as a prefix for registered Open Live source names.
     pub name: String,
+}
+
+/// Defaults applied to an input the operator starts from the desktop app, where
+/// there is no config entry to read them from.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppConfig {
+    #[serde(default)]
+    pub video: VideoConfig,
+    /// Capture format requested from the device.
+    #[serde(default = "default_resolution")]
+    pub video_resolution: String,
+    #[serde(default = "default_framerate")]
+    pub video_framerate: String,
+    #[serde(default)]
+    pub uplink: UplinkTemplate,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            video: VideoConfig::default(),
+            video_resolution: default_resolution(),
+            video_framerate: default_framerate(),
+            uplink: UplinkTemplate::default(),
+        }
+    }
+}
+
+/// An uplink with no port yet: the app allocates one per input from `port_range`,
+/// because an operator picking a camera cannot be asked to choose a UDP port.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UplinkTemplate {
+    #[serde(default = "default_uplink_mode")]
+    pub mode: UplinkMode,
+    #[serde(default = "default_uplink_host")]
+    pub host: String,
+    #[serde(default)]
+    pub public_host: Option<String>,
+    /// Inclusive `first-last` range to allocate SRT ports from, e.g. "9000-9100".
+    #[serde(default = "default_port_range")]
+    pub port_range: String,
+    #[serde(default = "default_srt_latency")]
+    pub latency_ms: u32,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+    #[serde(default)]
+    pub pbkeylen: Option<u32>,
+}
+
+impl Default for UplinkTemplate {
+    fn default() -> Self {
+        Self {
+            mode: default_uplink_mode(),
+            host: default_uplink_host(),
+            public_host: None,
+            port_range: default_port_range(),
+            latency_ms: DEFAULT_SRT_LATENCY_MS,
+            passphrase: None,
+            pbkeylen: None,
+        }
+    }
+}
+
+impl UplinkTemplate {
+    /// The inclusive port range to allocate from.
+    pub fn ports(&self) -> Result<std::ops::RangeInclusive<u16>, String> {
+        let (first, last) = self
+            .port_range
+            .split_once('-')
+            .ok_or_else(|| format!("port_range must be \"first-last\", got {}", self.port_range))?;
+        let first: u16 = first
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid first port in {}", self.port_range))?;
+        let last: u16 = last
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid last port in {}", self.port_range))?;
+        if first == 0 || last < first {
+            return Err(format!("empty port range {}", self.port_range));
+        }
+        Ok(first..=last)
+    }
+
+    /// Fills in a concrete uplink for one input.
+    pub fn materialize(&self, port: u16) -> UplinkConfig {
+        UplinkConfig {
+            mode: self.mode,
+            host: self.host.clone(),
+            public_host: self.public_host.clone(),
+            port,
+            latency_ms: self.latency_ms,
+            passphrase: self.passphrase.clone(),
+            pbkeylen: self.pbkeylen,
+            stream_id: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +512,14 @@ fn default_uplink_mode() -> UplinkMode {
 
 fn default_auth_mode() -> String {
     "direct".to_string()
+}
+
+fn default_uplink_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_port_range() -> String {
+    "9000-9100".to_string()
 }
 
 fn default_srt_latency() -> u32 {

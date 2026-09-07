@@ -121,7 +121,6 @@ impl OpenLiveClient {
         res.json().await.context("decoding patched source")
     }
 
-    #[allow(dead_code)] // used for immediate status pushes on state change (phase 2)
     pub async fn set_status(&self, id: &str, status: &str) -> Result<()> {
         let res = self
             .auth_req(

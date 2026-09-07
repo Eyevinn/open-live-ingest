@@ -131,6 +131,32 @@ Consequences to design around:
 - **The passphrase is owned by the gateway.** Open Live encrypts it at rest and masks it on read,
   so the gateway never reads it back — it puts the same value on both URIs.
 
+## 5a. Two front ends
+
+The same core serves two deployment models, and they differ in who owns an input's lifetime.
+
+The **headless daemon** takes its inputs from the config file and runs unattended under systemd.
+Inputs outlive the process, so everything above — idempotent registration, derived flow ids, drift
+reconciliation — exists to converge on a declared state no matter what happened before.
+
+The **desktop app** inverts that: an input exists because an operator picked a device, and closing
+the window ends it. That makes the lifecycle simpler rather than harder. The app owns each flow
+outright and deletes it on the way out, so there is nothing to reconcile against next time, and no
+control API is needed because the UI reads `SharedState` in-process.
+
+Two things it still has to handle, because a window can be closed the hard way:
+
+- **Orphans from a crash.** Derived flow ids mean a fresh start can find and delete its own
+  leftovers with no stored state to consult.
+- **Ports.** An operator picking a camera cannot be asked to choose a UDP port, so one is allocated
+  per input from `[app.uplink] port_range`, skipping ports that config-declared inputs claimed.
+
+Input ids are derived from the device id, so picking the same camera after a restart addresses the
+same flow and the same Open Live source instead of accumulating a duplicate per session.
+
+The app is explicitly **not** a venue appliance: no unattended recovery, nothing under systemd. A
+venue box that must come back by itself after a power cut runs the headless binary.
+
 ## 6. Control plane
 
 **Flow supervision.** One task per input, reconciling desired state against what Strom reports:

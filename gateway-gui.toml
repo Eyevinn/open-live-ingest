@@ -1,0 +1,37 @@
+# Desktop app config. No [[inputs]] — devices are chosen in the window.
+
+[gateway]
+id = "dev-gateway"
+name = "Dev"
+
+[strom]
+url = "http://127.0.0.1:8080"
+
+[open_live]
+url = "http://127.0.0.1:3000"
+auth_mode = "direct"
+register = true
+state_path = "./.dev/gui-state.json"
+
+[log]
+level = "info"
+
+# Defaults applied to whatever device the operator starts.
+[app]
+video_resolution = "1280x720"
+video_framerate = "25/1"
+
+  [app.video]
+  codec = "h264"
+  bitrate_kbps = 4000
+  encoder_preference = "auto"
+  quality_preset = "ultrafast"
+  tune = "zerolatency"
+  rate_control = "cbr"
+  keyframe_interval = 25
+
+  [app.uplink]
+  mode = "caller"
+  host = "127.0.0.1"
+  port_range = "9200-9300"
+  latency_ms = 200

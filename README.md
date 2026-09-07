@@ -22,10 +22,30 @@ the flow provisioned, up to date with the config, and running.
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design: why media never transits Open Live, why
 the SRT caller direction matters, what is deliberately left to Strom, and what is deferred.
 
+## Two front ends
+
+Both share the same core — flow templating, supervision, Open Live registration:
+
+| | `open-live-gateway` | `open-live-gateway-gui` |
+|---|---|---|
+| Inputs | declared in the config file | picked from a device list in the window |
+| Lifetime | unattended under systemd, survives reboots | streams while the window is open |
+| Cleanup | flows persist and are reconciled | flows are removed when you stop a device or close the app |
+| For | a venue box that must come back on its own | running a camera into Open Live from a laptop |
+
+The app allocates an SRT port per input from `[app.uplink] port_range`, so an operator never has to
+choose one, and it derives a stable input id per device — picking the same camera again addresses
+the same flow and the same Open Live source rather than accumulating duplicates.
+
+```bash
+cargo run -p open-live-gateway-gui -- --config ./gateway.toml
+```
+
 ## Status
 
-Early. Design, flow templating, supervision, and Open Live registration are in place. Not yet
-exercised against a live Strom.
+Early. Flow templating, supervision, Open Live registration (including OSC token exchange), stall
+detection and recovery, and both front ends are in place. Verified end to end against a live Strom
+and a live Open Live: a test pattern reached a production's program output as decodable video.
 
 ## Requirements
 

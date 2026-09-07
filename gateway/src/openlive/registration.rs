@@ -18,6 +18,51 @@ use tracing::{info, warn};
 /// How often the loop reconciles source status against live pipeline state.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Builds the Open Live client from config, if registration is configured at all.
+pub fn client_from(cfg: &GatewayConfig) -> Result<OpenLiveClient> {
+    let url = cfg
+        .open_live
+        .url
+        .clone()
+        .context("open_live.url is unset")?;
+    OpenLiveClient::new(
+        &url,
+        &cfg.open_live.auth_mode,
+        cfg.open_live.api_key.as_deref().filter(|k| !k.is_empty()),
+    )
+}
+
+/// Reconciles a single input forever. Spawned per input, so the desktop app can start
+/// and stop one without disturbing the others.
+pub async fn reconcile_forever(
+    state: Arc<SharedState>,
+    client: OpenLiveClient,
+    input: InputConfig,
+    gateway_name: String,
+    state_path: PathBuf,
+) {
+    let mut ticker = tokio::time::interval(RECONCILE_INTERVAL);
+    loop {
+        ticker.tick().await;
+        if let Err(err) = reconcile(&state, &client, &input, &gateway_name, &state_path).await {
+            warn!(input = %input.id, %err, "source reconciliation failed");
+        }
+    }
+}
+
+/// Marks an input's source inactive, so a stopped feed does not sit in Studio looking
+/// available. Best-effort: a failure here must not block shutdown.
+pub async fn mark_inactive(client: &OpenLiveClient, state_path: &Path, input_id: &str) {
+    let Ok(persisted) = identity::load(state_path) else {
+        return;
+    };
+    if let Some(source_id) = persisted.source_ids.get(input_id) {
+        if let Err(err) = client.set_status(source_id, "inactive").await {
+            warn!(input = %input_id, %err, "could not mark the source inactive on the way out");
+        }
+    }
+}
+
 pub fn spawn_registration(state: Arc<SharedState>, cfg: &GatewayConfig) -> Result<()> {
     let url = cfg
         .open_live

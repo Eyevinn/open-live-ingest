@@ -62,6 +62,18 @@ pub struct SrtUplink {
     pub negotiated_latency_ms: Option<u64>,
 }
 
+/// A capture device Strom can see on this host.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CaptureDevice {
+    /// Strom's device id — what `builtin.local_input.video_device` expects. Not a
+    /// `/dev/video*` path.
+    pub id: String,
+    #[serde(alias = "name")]
+    pub display_name: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
 pub struct StromClient {
     http: reqwest::Client,
     base_url: String,
@@ -152,6 +164,25 @@ impl StromClient {
     }
 
     #[allow(dead_code)] // used by POST /api/v1/inputs/{id}/stop in phase 2
+    /// Deletes a flow. Used when an input is stopped, so neither Strom nor Studio
+    /// accumulates leftovers from a session that has ended.
+    pub async fn delete_flow(&self, id: &str) -> Result<()> {
+        let res = self
+            .auth(
+                self.http
+                    .delete(format!("{}/api/flows/{id}", self.base_url)),
+            )
+            .send()
+            .await
+            .context("DELETE flow")?;
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        error_for_status(res, "DELETE flow")?;
+        Ok(())
+    }
+
     pub async fn stop_flow(&self, id: &str) -> Result<FlowState> {
         let res = self
             .auth(
@@ -217,6 +248,37 @@ impl StromClient {
             packets_sent_dropped: caller.get("packets_sent_dropped").and_then(Value::as_u64),
             negotiated_latency_ms: caller.get("negotiated_latency_ms").and_then(Value::as_u64),
         }))
+    }
+
+    /// Lists capture devices in a category (`video_source` or `audio_source`).
+    ///
+    /// Strom owns discovery, so the app asks it rather than enumerating hardware
+    /// itself — and the ids it returns are exactly what the capture block wants.
+    pub async fn devices(&self, category: &str) -> Result<Vec<CaptureDevice>> {
+        let res = self
+            .auth(self.http.get(format!(
+                "{}/api/discovery/devices?category={category}",
+                self.base_url
+            )))
+            .send()
+            .await
+            .context("GET devices")?;
+
+        let res = error_for_status(res, "GET devices")?;
+        let body: Value = res.json().await.context("decoding devices")?;
+
+        // Accept either a bare array or an object wrapping one, so a shape change
+        // upstream degrades to an empty list rather than an error.
+        let items = if body.is_array() {
+            body
+        } else {
+            ["devices", "items", "sources"]
+                .iter()
+                .find_map(|k| body.get(*k).cloned())
+                .unwrap_or(Value::Array(vec![]))
+        };
+
+        Ok(serde_json::from_value(items).unwrap_or_default())
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
