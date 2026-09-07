@@ -128,8 +128,16 @@ fn validate(cfg: &GatewayConfig) -> Result<()> {
         if cfg.open_live.url.is_none() {
             bail!("open_live.register is on but open_live.url is unset");
         }
-        if cfg.open_live.api_key.is_none() {
-            bail!("open_live.register is on but open_live.api_key is unset");
+        // Only osc mode needs a credential: a self-hosted Open Live with API_KEY
+        // unset leaves /api/v1 open, which is the normal local development case.
+        if cfg.open_live.auth_mode == "osc"
+            && cfg
+                .open_live
+                .api_key
+                .as_deref()
+                .is_none_or(|k| k.trim().is_empty())
+        {
+            bail!("open_live.auth_mode is \"osc\" but open_live.api_key (the OSC PAT) is unset");
         }
         if !matches!(cfg.open_live.auth_mode.as_str(), "direct" | "osc") {
             bail!(
@@ -258,7 +266,7 @@ id = \"cam1\"
     }
 
     #[test]
-    fn registration_requires_url_and_api_key() {
+    fn registration_requires_a_url() {
         let mut cfg = config_from(BASE);
         cfg.open_live.register = true;
         assert!(
@@ -267,13 +275,24 @@ id = \"cam1\"
         );
 
         cfg.open_live.url = Some("https://open-live.example.com".to_string());
+        validate(&cfg).expect("direct mode needs no key");
+    }
+
+    /// A local Open Live with API_KEY unset needs no credential, but OSC's proxy
+    /// always does, and failing at startup beats every request 401ing.
+    #[test]
+    fn osc_mode_requires_a_pat() {
+        let mut cfg = config_from(BASE);
+        cfg.open_live.register = true;
+        cfg.open_live.url = Some("https://open-live.example.com".to_string());
+        cfg.open_live.auth_mode = "osc".to_string();
         assert!(
             validate(&cfg).is_err(),
-            "registration without an API key must be rejected"
+            "osc mode without a PAT must be rejected"
         );
 
-        cfg.open_live.api_key = Some("key".to_string());
-        validate(&cfg).expect("registration with URL and key should validate");
+        cfg.open_live.api_key = Some("pat".to_string());
+        validate(&cfg).expect("osc mode with a PAT should validate");
     }
 
     /// The cloud cannot dial a venue whose address it does not know, and failing at

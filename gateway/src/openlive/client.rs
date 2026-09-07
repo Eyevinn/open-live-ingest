@@ -51,7 +51,7 @@ pub struct OpenLiveClient {
 }
 
 impl OpenLiveClient {
-    pub fn new(base_url: &str, auth_mode: &str, api_key: &str) -> Result<Self> {
+    pub fn new(base_url: &str, auth_mode: &str, api_key: Option<&str>) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -67,7 +67,10 @@ impl OpenLiveClient {
     /// Attaches the bearer token. In OSC mode this may perform a token exchange, so
     /// it is awaited per request rather than cached on the client.
     async fn auth_req(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        Ok(req.bearer_auth(self.auth.bearer(&self.http).await?))
+        Ok(match self.auth.bearer(&self.http).await? {
+            Some(token) => req.bearer_auth(token),
+            None => req,
+        })
     }
 
     /// Lists all sources.

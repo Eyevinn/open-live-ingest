@@ -67,6 +67,9 @@ and the SRT passphrase — install it mode 0600.
 | `OLG_OPEN_LIVE_URL` | `open_live.url` |
 | `OLG_OPEN_LIVE_API_KEY` | `open_live.api_key` |
 | `OLG_OPEN_LIVE_AUTH_MODE` | `open_live.auth_mode` (`direct` or `osc`) |
+
+In `direct` mode the key is optional: a self-hosted Open Live with `API_KEY` unset leaves
+`/api/v1` open, which is the usual local development setup. `osc` mode always needs the PAT.
 | `OLG_CONTROL_BIND` | `control.bind` |
 | `OLG_CONTROL_TOKEN` | `control.token` |
 | `OLG_LOG_LEVEL` | `log.level` |

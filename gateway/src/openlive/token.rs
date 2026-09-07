@@ -41,8 +41,9 @@ pub struct Auth {
 }
 
 enum Inner {
-    /// Static bearer token.
-    Direct(String),
+    /// Static bearer token, or none at all — a self-hosted Open Live with `API_KEY`
+    /// unset leaves `/api/v1` open, which is the normal local development case.
+    Direct(Option<String>),
     /// OSC PAT exchanged for a short-lived SAT.
     Osc {
         pat: String,
@@ -51,11 +52,13 @@ enum Inner {
 }
 
 impl Auth {
-    pub fn new(mode: &str, key: &str) -> Result<Self> {
+    pub fn new(mode: &str, key: Option<&str>) -> Result<Self> {
         let inner = match mode {
-            "direct" => Inner::Direct(key.to_string()),
+            "direct" => Inner::Direct(key.map(str::to_string)),
             "osc" => Inner::Osc {
-                pat: key.to_string(),
+                // Validation rejects osc mode without a key, so this is unreachable
+                // in practice; an empty PAT simply fails the exchange.
+                pat: key.unwrap_or_default().to_string(),
                 cache: Mutex::new(None),
             },
             other => {
@@ -65,21 +68,21 @@ impl Auth {
         Ok(Self { inner })
     }
 
-    /// The bearer token to present on the next request.
-    pub async fn bearer(&self, http: &reqwest::Client) -> Result<String> {
+    /// The bearer token to present on the next request, if any.
+    pub async fn bearer(&self, http: &reqwest::Client) -> Result<Option<String>> {
         match &self.inner {
             Inner::Direct(key) => Ok(key.clone()),
             Inner::Osc { pat, cache } => {
                 let mut guard = cache.lock().await;
                 if let Some(cached) = guard.as_ref() {
                     if !is_expiring(cached) {
-                        return Ok(cached.token.clone());
+                        return Ok(Some(cached.token.clone()));
                     }
                 }
                 let fresh = exchange(http, pat).await?;
                 let token = fresh.token.clone();
                 *guard = Some(fresh);
-                Ok(token)
+                Ok(Some(token))
             }
         }
     }
@@ -124,21 +127,32 @@ async fn exchange(http: &reqwest::Client, pat: &str) -> Result<CachedToken> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn direct_mode_returns_the_key_unchanged() {
-        let auth = Auth::new("direct", "static-key").unwrap();
+    fn bearer_of(auth: &Auth) -> Option<String> {
         let http = reqwest::Client::new();
-        let token = tokio::runtime::Builder::new_current_thread()
+        tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
             .block_on(auth.bearer(&http))
-            .unwrap();
-        assert_eq!(token, "static-key");
+            .unwrap()
+    }
+
+    #[test]
+    fn direct_mode_returns_the_key_unchanged() {
+        let auth = Auth::new("direct", Some("static-key")).unwrap();
+        assert_eq!(bearer_of(&auth).as_deref(), Some("static-key"));
+    }
+
+    /// A self-hosted Open Live with API_KEY unset leaves /api/v1 open, so requiring a
+    /// key would block the normal local development setup.
+    #[test]
+    fn direct_mode_without_a_key_sends_no_token() {
+        let auth = Auth::new("direct", None).unwrap();
+        assert_eq!(bearer_of(&auth), None);
     }
 
     #[test]
     fn an_unknown_mode_is_rejected_rather_than_silently_defaulted() {
-        assert!(Auth::new("oauth", "key").is_err());
+        assert!(Auth::new("oauth", Some("key")).is_err());
     }
 
     /// A token inside the refresh buffer must be treated as expiring, or a request

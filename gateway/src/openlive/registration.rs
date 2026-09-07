@@ -24,13 +24,11 @@ pub fn spawn_registration(state: Arc<SharedState>, cfg: &GatewayConfig) -> Resul
         .url
         .clone()
         .context("open_live.url is unset")?;
-    let api_key = cfg
-        .open_live
-        .api_key
-        .clone()
-        .context("open_live.api_key is unset")?;
-
-    let client = OpenLiveClient::new(&url, &cfg.open_live.auth_mode, &api_key)?;
+    let client = OpenLiveClient::new(
+        &url,
+        &cfg.open_live.auth_mode,
+        cfg.open_live.api_key.as_deref().filter(|k| !k.is_empty()),
+    )?;
     let inputs = cfg.inputs.clone();
     let gateway_name = cfg.gateway.name.clone();
     let state_path = PathBuf::from(&cfg.open_live.state_path);
