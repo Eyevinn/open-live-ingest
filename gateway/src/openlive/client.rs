@@ -64,33 +64,35 @@ impl OpenLiveClient {
         })
     }
 
-    /// The bearer token for the next request. In OSC mode this may perform a token
-    /// exchange, so it is awaited per request rather than cached on the client.
-    async fn bearer(&self) -> Result<String> {
-        self.auth.bearer(&self.http).await
+    /// Attaches the bearer token. In OSC mode this may perform a token exchange, so
+    /// it is awaited per request rather than cached on the client.
+    async fn auth_req(&self, req: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+        Ok(req.bearer_auth(self.auth.bearer(&self.http).await?))
     }
 
-    pub async fn get_source(&self, id: &str) -> Result<Option<SourceResponse>> {
+    /// Lists all sources.
+    ///
+    /// Deliberately used instead of `GET /api/v1/sources/{id}`: a 200 with a JSON
+    /// array proves the API is up and serving, so our id being absent from it is real
+    /// evidence the source was deleted. A 404 on a single resource proves nothing —
+    /// a restarting Open Live 404s every route, and acting on that would recreate the
+    /// source on every tick.
+    pub async fn list_sources(&self) -> Result<Vec<SourceResponse>> {
         let res = self
-            .http
-            .get(format!("{}/api/v1/sources/{id}", self.base_url))
-            .bearer_auth(self.bearer().await?)
+            .auth_req(self.http.get(format!("{}/api/v1/sources", self.base_url)))
+            .await?
             .send()
             .await
-            .context("GET source")?;
+            .context("GET sources")?;
 
-        if res.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        let res = error_for_status(res, "GET source")?;
-        Ok(Some(res.json().await.context("decoding source")?))
+        let res = error_for_status(res, "GET sources")?;
+        res.json().await.context("decoding sources")
     }
 
     pub async fn create_source(&self, payload: &SourcePayload) -> Result<SourceResponse> {
         let res = self
-            .http
-            .post(format!("{}/api/v1/sources", self.base_url))
-            .bearer_auth(self.bearer().await?)
+            .auth_req(self.http.post(format!("{}/api/v1/sources", self.base_url)))
+            .await?
             .json(payload)
             .send()
             .await
@@ -102,9 +104,11 @@ impl OpenLiveClient {
 
     pub async fn patch_source(&self, id: &str, payload: &SourcePayload) -> Result<SourceResponse> {
         let res = self
-            .http
-            .patch(format!("{}/api/v1/sources/{id}", self.base_url))
-            .bearer_auth(self.bearer().await?)
+            .auth_req(
+                self.http
+                    .patch(format!("{}/api/v1/sources/{id}", self.base_url)),
+            )
+            .await?
             .json(payload)
             .send()
             .await
@@ -117,9 +121,11 @@ impl OpenLiveClient {
     #[allow(dead_code)] // used for immediate status pushes on state change (phase 2)
     pub async fn set_status(&self, id: &str, status: &str) -> Result<()> {
         let res = self
-            .http
-            .patch(format!("{}/api/v1/sources/{id}", self.base_url))
-            .bearer_auth(self.bearer().await?)
+            .auth_req(
+                self.http
+                    .patch(format!("{}/api/v1/sources/{id}", self.base_url)),
+            )
+            .await?
             .json(&serde_json::json!({ "status": status }))
             .send()
             .await

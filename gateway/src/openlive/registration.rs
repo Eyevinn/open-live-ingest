@@ -6,7 +6,7 @@
 //! in Studio's source list.
 
 use crate::identity;
-use crate::openlive::client::{OpenLiveClient, SourcePayload};
+use crate::openlive::client::{OpenLiveClient, SourcePayload, SourceResponse};
 use crate::state::SharedState;
 use anyhow::{Context, Result};
 use open_live_gateway_types::config::{GatewayConfig, InputConfig};
@@ -77,7 +77,7 @@ async fn reconcile(
         .find(|status| status.id == input.id)
         .map(|status| status.state);
 
-    let payload = SourcePayload {
+    let desired = SourcePayload {
         name: input.source_name(gateway_name),
         address: input.uplink.listener_uri(),
         stream_type: "srt".to_string(),
@@ -89,33 +89,169 @@ async fn reconcile(
         live_camera: Some(true),
     };
 
+    // One list call, for two reasons: a 200 with an array proves the API is serving
+    // (so an absent id is real evidence of deletion, not a restarting instance), and
+    // it gives the stored source to compare against.
+    let sources = client.list_sources().await?;
+
     let mut persisted = identity::load(state_path)?;
     let known_id = persisted.source_ids.get(&input.id).cloned();
+    let existing = known_id
+        .as_deref()
+        .and_then(|id| sources.iter().find(|s| s.id == id));
 
-    let source = match known_id {
-        // A source id we remember may have been deleted in Studio since; fall through
-        // to creating a fresh one rather than failing forever on a dead id.
-        Some(id) => match client.get_source(&id).await? {
-            Some(_) => client.patch_source(&id, &payload).await?,
-            None => {
-                info!(input = %input.id, %id, "remembered source is gone, recreating");
-                client.create_source(&payload).await?
+    let source_id = match existing {
+        Some(stored) => {
+            // Only write when something actually differs. Open Live stores sources in
+            // CouchDB, which keeps a revision per write, so a needless PATCH every
+            // reconcile would add thousands of revisions a day per source.
+            if drifted(stored, &desired) {
+                info!(input = %input.id, source_id = %stored.id, "source differs, updating");
+                client.patch_source(&stored.id, &desired).await?.id
+            } else {
+                stored.id.clone()
             }
-        },
+        }
         None => {
-            let created = client.create_source(&payload).await?;
+            if let Some(id) = known_id.as_deref() {
+                info!(
+                    input = %input.id, %id,
+                    "remembered source is absent from a healthy source list, recreating"
+                );
+            }
+            let created = client.create_source(&desired).await?;
             info!(input = %input.id, source_id = %created.id, "registered source with Open Live");
-            created
+            created.id
         }
     };
 
-    if persisted.source_ids.get(&input.id) != Some(&source.id) {
+    if persisted.source_ids.get(&input.id) != Some(&source_id) {
         persisted
             .source_ids
-            .insert(input.id.clone(), source.id.clone());
+            .insert(input.id.clone(), source_id.clone());
         identity::store(state_path, &persisted)?;
     }
-    state.set_source_id(&input.id, &source.id);
+    state.set_source_id(&input.id, &source_id);
 
     Ok(())
+}
+
+/// Whether the stored source needs updating to match what the gateway wants.
+///
+/// Addresses are compared with the SRT passphrase masked, because Open Live masks it
+/// on read: comparing raw would report drift on every tick for any source configured
+/// with a passphrase, and PATCH it forever.
+fn drifted(stored: &SourceResponse, desired: &SourcePayload) -> bool {
+    stored.name != desired.name
+        || stored.stream_type != desired.stream_type
+        || stored.status != desired.status
+        || stored.latency != Some(desired.latency)
+        || mask_passphrase(&stored.address) != mask_passphrase(&desired.address)
+}
+
+/// Replaces an SRT passphrase value with the same mask Open Live applies on read.
+fn mask_passphrase(address: &str) -> String {
+    let Some(at) = address.to_lowercase().find("passphrase=") else {
+        return address.to_string();
+    };
+    let value_start = at + "passphrase=".len();
+    let value_end = address[value_start..]
+        .find('&')
+        .map(|i| value_start + i)
+        .unwrap_or(address.len());
+    format!("{}***{}", &address[..value_start], &address[value_end..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored(address: &str, status: &str) -> SourceResponse {
+        SourceResponse {
+            id: "src-1".to_string(),
+            name: "Dev — cam1".to_string(),
+            address: address.to_string(),
+            stream_type: "srt".to_string(),
+            status: status.to_string(),
+            latency: Some(200),
+        }
+    }
+
+    fn desired(address: &str, status: &str) -> SourcePayload {
+        SourcePayload {
+            name: "Dev — cam1".to_string(),
+            address: address.to_string(),
+            stream_type: "srt".to_string(),
+            status: status.to_string(),
+            latency: 200,
+            live_camera: Some(true),
+        }
+    }
+
+    #[test]
+    fn an_identical_source_does_not_drift() {
+        let address = "srt://:9000?mode=listener";
+        assert!(!drifted(
+            &stored(address, "active"),
+            &desired(address, "active")
+        ));
+    }
+
+    #[test]
+    fn a_status_change_drifts() {
+        let address = "srt://:9000?mode=listener";
+        assert!(drifted(
+            &stored(address, "inactive"),
+            &desired(address, "active")
+        ));
+    }
+
+    #[test]
+    fn a_port_change_drifts() {
+        assert!(drifted(
+            &stored("srt://:9000?mode=listener", "active"),
+            &desired("srt://:9001?mode=listener", "active")
+        ));
+    }
+
+    #[test]
+    fn a_latency_change_drifts() {
+        let address = "srt://:9000?mode=listener";
+        let mut want = desired(address, "active");
+        want.latency = 400;
+        assert!(drifted(&stored(address, "active"), &want));
+    }
+
+    /// Open Live masks the passphrase on read. Comparing raw values would report
+    /// drift forever and PATCH the source on every single tick.
+    #[test]
+    fn a_masked_passphrase_does_not_drift() {
+        assert!(!drifted(
+            &stored("srt://:9000?mode=listener&passphrase=***", "active"),
+            &desired("srt://:9000?mode=listener&passphrase=s3cret", "active")
+        ));
+    }
+
+    #[test]
+    fn a_passphrase_change_is_invisible_but_the_rest_is_not() {
+        // Masking makes a changed passphrase undetectable — an accepted limitation,
+        // since the alternative is rewriting the source forever. A port change
+        // alongside it must still be caught.
+        assert!(drifted(
+            &stored("srt://:9000?mode=listener&passphrase=***", "active"),
+            &desired("srt://:9002?mode=listener&passphrase=other", "active")
+        ));
+    }
+
+    #[test]
+    fn masking_handles_a_passphrase_followed_by_other_params() {
+        assert_eq!(
+            mask_passphrase("srt://:9000?passphrase=abc&pbkeylen=16"),
+            "srt://:9000?passphrase=***&pbkeylen=16"
+        );
+        assert_eq!(
+            mask_passphrase("srt://:9000?mode=listener"),
+            "srt://:9000?mode=listener"
+        );
+    }
 }
