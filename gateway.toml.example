@@ -21,6 +21,13 @@ url = "http://127.0.0.1:8080"
 
 [open_live]
 url = "https://open-live.example.com"
+# How api_key is used:
+#   direct (default) — sent as the bearer token as-is, for a self-hosted Open Live
+#                      protected by a static API_KEY.
+#   osc              — api_key is an OSC Personal Access Token, exchanged for a
+#                      short-lived Service Access Token. Required for an
+#                      OSC-hosted instance, whose proxy rejects a PAT directly.
+auth_mode = "direct"
 # Also settable as OLG_OPEN_LIVE_API_KEY so a deployment tool need not template this file.
 api_key = "change-me"
 # Create and update the Open Live source documents for these inputs automatically.

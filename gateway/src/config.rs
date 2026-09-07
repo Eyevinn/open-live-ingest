@@ -11,6 +11,7 @@ use std::path::Path;
 /// the values a deployment tool needs to inject without templating a whole file.
 const ENV_OPEN_LIVE_URL: &str = "OLG_OPEN_LIVE_URL";
 const ENV_OPEN_LIVE_API_KEY: &str = "OLG_OPEN_LIVE_API_KEY";
+const ENV_OPEN_LIVE_AUTH_MODE: &str = "OLG_OPEN_LIVE_AUTH_MODE";
 const ENV_CONTROL_BIND: &str = "OLG_CONTROL_BIND";
 const ENV_CONTROL_TOKEN: &str = "OLG_CONTROL_TOKEN";
 const ENV_STROM_URL: &str = "OLG_STROM_URL";
@@ -25,6 +26,9 @@ pub fn load(path: &Path, log_level_override: Option<&str>) -> Result<GatewayConf
     }
     if let Ok(key) = std::env::var(ENV_OPEN_LIVE_API_KEY) {
         cfg.open_live.api_key = Some(key);
+    }
+    if let Ok(mode) = std::env::var(ENV_OPEN_LIVE_AUTH_MODE) {
+        cfg.open_live.auth_mode = mode;
     }
     if let Ok(bind) = std::env::var(ENV_CONTROL_BIND) {
         cfg.control.bind = bind;
@@ -109,6 +113,12 @@ fn validate(cfg: &GatewayConfig) -> Result<()> {
         }
         if cfg.open_live.api_key.is_none() {
             bail!("open_live.register is on but open_live.api_key is unset");
+        }
+        if !matches!(cfg.open_live.auth_mode.as_str(), "direct" | "osc") {
+            bail!(
+                "open_live.auth_mode must be \"direct\" or \"osc\", got {:?}",
+                cfg.open_live.auth_mode
+            );
         }
     }
 

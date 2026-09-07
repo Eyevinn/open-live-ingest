@@ -6,5 +6,6 @@
 
 pub mod client;
 pub mod registration;
+pub mod token;
 
 pub use registration::spawn_registration;

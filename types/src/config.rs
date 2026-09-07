@@ -185,12 +185,21 @@ pub struct UplinkConfig {
     pub stream_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenLiveConfig {
     /// Base URL of the Open Live API, e.g. `https://open-live.example.com`.
     #[serde(default)]
     pub url: Option<String>,
-    /// Bearer token for `/api/v1`. Redacted from all log output.
+    /// How `api_key` is used:
+    ///
+    /// - `direct` (default) — sent as the bearer token as-is, for a self-hosted
+    ///   Open Live protected by a static `API_KEY`.
+    /// - `osc` — treated as an OSC Personal Access Token and exchanged for a
+    ///   short-lived Service Access Token. Required for an OSC-hosted instance,
+    ///   whose reverse proxy rejects a PAT presented directly.
+    #[serde(default = "default_auth_mode")]
+    pub auth_mode: String,
+    /// Bearer token or OSC PAT, depending on `auth_mode`. Redacted from all logs.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Create and update source documents automatically. Turn off when an operator
@@ -215,6 +224,18 @@ pub struct ControlConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogConfig {
     pub level: String,
+}
+
+impl Default for OpenLiveConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            auth_mode: default_auth_mode(),
+            api_key: None,
+            register: true,
+            state_path: default_state_path(),
+        }
+    }
 }
 
 impl Default for VideoConfig {
@@ -311,6 +332,10 @@ fn default_channels() -> u32 {
 
 fn default_sample_rate() -> u32 {
     48000
+}
+
+fn default_auth_mode() -> String {
+    "direct".to_string()
 }
 
 fn default_srt_latency() -> u32 {

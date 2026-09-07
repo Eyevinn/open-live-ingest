@@ -3,6 +3,7 @@
 //! Only the calls the gateway needs. The API key is a bearer token and must never
 //! reach the logs — construct errors from status codes, not from request dumps.
 
+use crate::openlive::token::Auth;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -46,11 +47,11 @@ pub struct SourceResponse {
 pub struct OpenLiveClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    auth: Auth,
 }
 
 impl OpenLiveClient {
-    pub fn new(base_url: &str, api_key: &str) -> Result<Self> {
+    pub fn new(base_url: &str, auth_mode: &str, api_key: &str) -> Result<Self> {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -59,15 +60,21 @@ impl OpenLiveClient {
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
+            auth: Auth::new(auth_mode, api_key)?,
         })
+    }
+
+    /// The bearer token for the next request. In OSC mode this may perform a token
+    /// exchange, so it is awaited per request rather than cached on the client.
+    async fn bearer(&self) -> Result<String> {
+        self.auth.bearer(&self.http).await
     }
 
     pub async fn get_source(&self, id: &str) -> Result<Option<SourceResponse>> {
         let res = self
             .http
             .get(format!("{}/api/v1/sources/{id}", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.bearer().await?)
             .send()
             .await
             .context("GET source")?;
@@ -83,7 +90,7 @@ impl OpenLiveClient {
         let res = self
             .http
             .post(format!("{}/api/v1/sources", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.bearer().await?)
             .json(payload)
             .send()
             .await
@@ -97,7 +104,7 @@ impl OpenLiveClient {
         let res = self
             .http
             .patch(format!("{}/api/v1/sources/{id}", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.bearer().await?)
             .json(payload)
             .send()
             .await
@@ -112,7 +119,7 @@ impl OpenLiveClient {
         let res = self
             .http
             .patch(format!("{}/api/v1/sources/{id}", self.base_url))
-            .bearer_auth(&self.api_key)
+            .bearer_auth(self.bearer().await?)
             .json(&serde_json::json!({ "status": status }))
             .send()
             .await
