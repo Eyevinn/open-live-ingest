@@ -22,6 +22,8 @@ use tracing::{info, warn};
 /// What the UI asks the controller to do.
 pub enum Cmd {
     Rescan,
+    /// Adopt edited settings: rebuild the clients, re-resolve the cloud host, rescan.
+    Reconfigure(Box<GatewayConfig>),
     Start(CaptureDevice),
     Stop(String),
     /// Stop everything and acknowledge, so the window can close cleanly.
@@ -115,6 +117,7 @@ impl Controller {
         while let Some(cmd) = rx.recv().await {
             match cmd {
                 Cmd::Rescan => self.rescan().await,
+                Cmd::Reconfigure(cfg) => self.reconfigure(*cfg).await,
                 Cmd::Start(device) => {
                     if let Err(err) = self.start(device).await {
                         self.fail(err);
@@ -134,6 +137,47 @@ impl Controller {
                 }
             }
         }
+    }
+
+    /// Adopts edited settings.
+    ///
+    /// Connection settings can only change while nothing is streaming — the UI
+    /// enforces that — so there is no need to migrate a running input onto new
+    /// clients, which would mean interrupting a live feed to apply a setting.
+    async fn reconfigure(&mut self, cfg: GatewayConfig) {
+        match StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref()) {
+            Ok(client) => self.strom = client,
+            Err(err) => {
+                self.fail(err);
+                return;
+            }
+        }
+
+        self.open_live = if cfg.open_live.register {
+            match registration::client_from(&cfg) {
+                Ok(c) => Some(c),
+                Err(err) => {
+                    warn!(%err, "Open Live registration unavailable with these settings");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        self.state_path = PathBuf::from(&cfg.open_live.state_path);
+        self.cloud_host = cfg.app.uplink.host.clone().filter(|h| !h.trim().is_empty());
+        self.cfg = cfg;
+
+        {
+            let mut ui = self.ui.lock().expect("ui poisoned");
+            ui.cloud_host = self.cloud_host.clone();
+            ui.last_error = None;
+        }
+
+        info!("settings applied");
+        self.resolve_cloud_host().await;
+        self.rescan().await;
     }
 
     /// Asks Open Live where its Strom is, unless the config already says.

@@ -1,8 +1,10 @@
 //! The window. Reads shared state, sends commands, holds no logic of its own.
 
 use crate::controller::{Cmd, Ui};
+use crate::settings::Form;
 use eframe::egui;
 use open_live_gateway::state::SharedState;
+use open_live_gateway_types::config::UplinkMode;
 use open_live_gateway_types::status::InputState;
 use open_live_gateway_types::GatewayConfig;
 use std::sync::Arc;
@@ -10,6 +12,10 @@ use tokio::sync::{mpsc, oneshot};
 
 pub struct App {
     cfg: GatewayConfig,
+    config_path: std::path::PathBuf,
+    form: Form,
+    settings_open: bool,
+    saved_note: Option<String>,
     state: Arc<SharedState>,
     ui: Ui,
     tx: mpsc::UnboundedSender<Cmd>,
@@ -20,12 +26,21 @@ pub struct App {
 impl App {
     pub fn new(
         cfg: GatewayConfig,
+        config_path: std::path::PathBuf,
         state: Arc<SharedState>,
         ui: Ui,
         tx: mpsc::UnboundedSender<Cmd>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
+        let form = Form::from_config(&cfg);
+        // Nothing to connect to yet means a first run: open the form rather than
+        // showing an empty device list with no hint about why.
+        let settings_open = cfg.open_live.url.is_none();
         Self {
+            form,
+            settings_open,
+            saved_note: None,
+            config_path,
             cfg,
             state,
             ui,
@@ -140,6 +155,20 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(root, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let streaming = !active.is_empty();
+                let header = if self.settings_open {
+                    "Settings \u{25BE}"
+                } else {
+                    "Settings \u{25B8}"
+                };
+                if ui.selectable_label(self.settings_open, header).clicked() {
+                    self.settings_open = !self.settings_open;
+                }
+                if self.settings_open {
+                    self.settings_form(ui, streaming);
+                    ui.add_space(10.0);
+                }
+
                 ui.horizontal(|ui| {
                     ui.heading("Capture devices");
                     if ui.add_enabled(!busy, egui::Button::new("Rescan")).clicked() {
@@ -233,6 +262,177 @@ impl eframe::App for App {
             let _ = self.runtime.block_on(async {
                 tokio::time::timeout(std::time::Duration::from_secs(15), ack_rx).await
             });
+        }
+    }
+}
+
+impl App {
+    fn settings_form(&mut self, ui: &mut egui::Ui, streaming: bool) {
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            if streaming {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 170, 60),
+                    "Stop every feed before changing these — a live input keeps the \
+                     connection it was started with.",
+                );
+                ui.add_space(4.0);
+            }
+            ui.add_enabled_ui(!streaming, |ui| {
+                egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.gateway_name)
+                            .hint_text("shown on the sources in Studio"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Open Live URL");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.open_live_url)
+                            .hint_text("https://open-live.example.com"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Credential");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.open_live_key)
+                            .password(true)
+                            .hint_text("OSC personal access token, or an API key"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Credential kind");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.form.auth_mode,
+                            "osc".to_string(),
+                            "OSC token",
+                        );
+                        ui.selectable_value(
+                            &mut self.form.auth_mode,
+                            "direct".to_string(),
+                            "API key",
+                        );
+                    });
+                    ui.end_row();
+
+                    ui.label("Register sources");
+                    ui.checkbox(&mut self.form.register, "show these feeds in Studio");
+                    ui.end_row();
+
+                    ui.label("Local Strom");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.strom_url)
+                            .hint_text("http://127.0.0.1:8080"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Cloud Strom host");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.cloud_host)
+                            .hint_text("leave blank to ask Open Live"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Uplink");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.form.uplink_mode,
+                            UplinkMode::Caller,
+                            "we dial out",
+                        );
+                        ui.selectable_value(
+                            &mut self.form.uplink_mode,
+                            UplinkMode::Listener,
+                            "cloud dials us",
+                        );
+                        ui.selectable_value(
+                            &mut self.form.uplink_mode,
+                            UplinkMode::Rendezvous,
+                            "both dial",
+                        );
+                    });
+                    ui.end_row();
+
+                    if matches!(
+                        self.form.uplink_mode,
+                        UplinkMode::Listener | UplinkMode::Rendezvous
+                    ) {
+                        ui.label("Our public address");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.form.public_host)
+                                .hint_text("this machine, as the cloud sees it"),
+                        );
+                        ui.end_row();
+                    }
+
+                    ui.label("SRT ports");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.port_range)
+                            .hint_text("9000-9100"),
+                    );
+                    ui.end_row();
+
+                    ui.label("SRT latency (ms)");
+                    ui.add(egui::TextEdit::singleline(&mut self.form.latency_ms));
+                    ui.end_row();
+
+                    ui.label("Capture format");
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.form.resolution)
+                                .desired_width(90.0)
+                                .hint_text("1280x720"),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.form.framerate)
+                                .desired_width(60.0)
+                                .hint_text("25/1"),
+                        );
+                    });
+                    ui.end_row();
+
+                    ui.label("Bitrate (kbps)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.form.bitrate_kbps).desired_width(80.0),
+                    );
+                    ui.end_row();
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        self.save_settings();
+                    }
+                    if ui.button("Revert").clicked() {
+                        self.form = Form::from_config(&self.cfg);
+                        self.saved_note = None;
+                    }
+                    if let Some(note) = &self.saved_note {
+                        ui.weak(note);
+                    }
+                });
+                ui.weak(format!("Stored in {}", self.config_path.display()));
+            });
+        });
+    }
+
+    fn save_settings(&mut self) {
+        match self.form.to_config(&self.cfg) {
+            Ok(cfg) => match open_live_gateway::config::save(&self.config_path, &cfg) {
+                Ok(()) => {
+                    self.cfg = cfg.clone();
+                    self.saved_note = Some("saved".to_string());
+                    let _ = self.tx.send(Cmd::Reconfigure(Box::new(cfg)));
+                    self.ui.lock().expect("ui poisoned").last_error = None;
+                }
+                Err(err) => {
+                    self.ui.lock().expect("ui poisoned").last_error = Some(format!("{err:#}"));
+                }
+            },
+            Err(msg) => {
+                self.ui.lock().expect("ui poisoned").last_error = Some(msg);
+            }
         }
     }
 }

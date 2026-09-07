@@ -52,8 +52,14 @@ api_key = "…"
 ```
 
 ```bash
-cargo run -p open-live-gateway-gui -- --config ./gateway.toml
+cargo run -p open-live-gateway-gui
 ```
+
+**No config file needed.** The app opens its settings form on first run, writes the file when you
+press Save (mode 0600 — it holds your credential), and stores it in a per-user location:
+`~/Library/Application Support/open-live-gateway/gateway.toml` on macOS, `$XDG_CONFIG_HOME` or
+`~/.config` on Linux. Pass `--config` to keep it somewhere else. Nothing needs a text editor; the
+headless daemon reads the same format if you would rather write one.
 
 ## Status
 

@@ -9,6 +9,7 @@
 //! binary and its config file instead.
 
 mod controller;
+mod settings;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -22,10 +23,10 @@ use tokio::sync::mpsc;
 #[derive(Debug, Parser)]
 #[command(name = "open-live-gateway-gui", version)]
 struct Cli {
-    /// Path to the configuration file. Only the Strom and Open Live sections and the
-    /// [app] defaults are used; inputs are chosen in the window.
-    #[arg(short, long, env = "OLG_CONFIG", default_value = "gateway.toml")]
-    config: PathBuf,
+    /// Path to the settings file. Defaults to a per-user location and is created on
+    /// first save — the window is the only editor you need.
+    #[arg(short, long, env = "OLG_CONFIG")]
+    config: Option<PathBuf>,
 
     #[arg(long, env = "OLG_LOG_LEVEL")]
     log_level: Option<String>,
@@ -33,8 +34,12 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = config::load(&cli.config, cli.log_level.as_deref())
-        .with_context(|| format!("loading config from {}", cli.config.display()))?;
+    let config_path = cli.config.unwrap_or_else(config::default_path);
+    let mut cfg = config::load_or_default(&config_path)
+        .with_context(|| format!("loading settings from {}", config_path.display()))?;
+    if let Some(level) = cli.log_level {
+        cfg.log.level = level;
+    }
     config::init_tracing(&cfg.log.level);
 
     let gateway_id = identity::resolve_gateway_id(&cfg);
@@ -63,7 +68,14 @@ fn main() -> Result<()> {
     )?;
     runtime.spawn(controller.run(rx));
 
-    let app = ui::App::new(cfg, state, ui_state, tx, runtime.handle().clone());
+    let app = ui::App::new(
+        cfg,
+        config_path,
+        state,
+        ui_state,
+        tx,
+        runtime.handle().clone(),
+    );
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

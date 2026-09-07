@@ -161,6 +161,14 @@ the Open Live address and its credential — the local Strom defaults to loopbac
 the same machine. What still cannot be discovered is the SRT port, since nothing allocates them
 (§9), and the uplink direction, which depends on which side can publish a port.
 
+**The app owns its own settings.** It writes the same config format the daemon reads, from a form
+in the window, so nothing about it requires a text editor — an operator setting up a venue box
+should not have to learn TOML. Consequences worth designing for: the file holds the Open Live
+credential, so it is written mode 0600 via a temporary file and a rename; an invalid config is
+refused before it reaches disk, since saving one would leave the app unable to start next time; and
+connection settings are only editable while nothing is streaming, because a running input keeps the
+clients it was started with and migrating it would mean interrupting a live feed to apply a setting.
+
 The app is explicitly **not** a venue appliance: no unattended recovery, nothing under systemd. A
 venue box that must come back by itself after a power cut runs the headless binary.
 

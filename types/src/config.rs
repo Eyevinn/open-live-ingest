@@ -17,8 +17,9 @@ pub const DEFAULT_SRT_LATENCY_MS: u32 = 200;
 /// Default video bitrate in kbps for a 1080p25 contribution feed.
 pub const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 6000;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GatewayConfig {
+    #[serde(default)]
     pub gateway: GatewayIdentity,
     /// The local Strom instance this gateway drives. Defaults to loopback, since on a
     /// venue box Strom runs beside the gateway.
@@ -40,7 +41,8 @@ pub struct GatewayConfig {
     pub log: LogConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct GatewayIdentity {
     /// Stable identity for this box. Defaults to the hostname when unset. Also seeds
     /// the deterministic flow ids, so changing it orphans the flows already created.
