@@ -133,7 +133,9 @@ already running recovers without the agent.
 
 What the agent is actually for, then: **provisioning** — the flow does not exist until something
 creates it, and auto-restart only helps flows that already do; **config drift** — a changed bitrate,
-port, or passphrase gets pushed on the next reconcile; **recovery of a flow that fails while
+port, or passphrase is written on the next reconcile, and the flow is restarted so it
+actually takes effect, since Strom's flow update rewrites stored data only and a
+running pipeline keeps the properties it was built with; **recovery of a flow that fails while
 running**, which boot-time auto-restart does not cover; and **fleet-scale templating**, so a venue
 box is described by a config file rather than built by hand in Strom's editor.
 

@@ -119,9 +119,26 @@ async fn reconcile(
                 state.set_state(&input.id, InputState::Provisioning);
                 let body = flow::preserving_strom_state(desired, &fetched.raw);
                 client.update_flow(flow_id, &body).await?;
+
+                // Updating a flow only rewrites Strom's stored copy — a running
+                // pipeline keeps the properties it was built with, so a changed
+                // bitrate or uplink URI would never take effect. Restarting is the
+                // only way to apply it, and it briefly interrupts the feed, so it
+                // happens only for a real shape change and is logged as such.
+                if fetched.state.running {
+                    warn!(
+                        input = %input.id, flow_id,
+                        "restarting flow to apply the new configuration, interrupting the feed briefly"
+                    );
+                    client.stop_flow(flow_id).await?;
+                }
+                state.set_gst_state(&input.id, None);
+                // Fall through to the start path below.
+                false
+            } else {
+                state.set_gst_state(&input.id, fetched.state.gst_state.as_deref());
+                fetched.state.running
             }
-            state.set_gst_state(&input.id, fetched.state.gst_state.as_deref());
-            fetched.state.running
         }
         None => {
             state.set_state(&input.id, InputState::Provisioning);
