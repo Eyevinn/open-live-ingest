@@ -1,0 +1,5 @@
+# Pinned deliberately. Floating on `stable` means a Rust release can turn CI red on
+# changes nobody made. Bump on purpose, with any lint fallout fixed in the same commit.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

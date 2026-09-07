@@ -1,0 +1,29 @@
+[Unit]
+Description=Open Live Gateway
+Documentation=https://github.com/Eyevinn/open-live-gateway
+# Strom holds the capture hardware and runs the pipeline; the gateway only drives it
+# over HTTP. Ordering after it avoids a burst of failed reconciles at boot, though the
+# supervisor's backoff handles the case where Strom comes up late anyway.
+After=network-online.target strom.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/open-live-gateway --config /etc/open-live-gateway/gateway.toml
+Restart=always
+RestartSec=5s
+
+User=open-live-gateway
+Group=open-live-gateway
+StateDirectory=open-live-gateway
+
+# No device access and no privileges needed: this is an HTTP client.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/open-live-gateway
+
+[Install]
+WantedBy=multi-user.target

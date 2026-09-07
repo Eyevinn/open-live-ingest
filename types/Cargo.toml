@@ -1,0 +1,10 @@
+[package]
+name = "open-live-gateway-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared configuration and status types for the Open Live Gateway"
+
+[dependencies]
+serde.workspace = true
