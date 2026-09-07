@@ -79,6 +79,9 @@ pub struct InputStatus {
     pub last_error: Option<String>,
     /// SRT uplink telemetry, read from Strom's srt-stats. None until first polled.
     pub uplink: Option<UplinkStats>,
+    /// Consecutive polls where the uplink delivered nothing. Drives both the
+    /// hysteresis on the reported status and the decision to restart the flow.
+    pub stalled_polls: u32,
 }
 
 /// Uplink health, derived from Strom's SRT statistics.

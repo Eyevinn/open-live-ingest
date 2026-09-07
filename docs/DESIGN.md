@@ -165,10 +165,28 @@ cloud flow from reaching playing at all, so Open Live never publishes the WHEP e
 whole show fails to come up — one dead input is not degraded gracefully, it takes everything with
 it. `active` therefore has to mean "safe to assign".
 
-Delivery is judged from Strom's `/api/flows/{id}/srt-stats`, by `bytes_sent` advancing between
-polls. Strom's own `connected` flag is not usable for this: when the far end vanishes, `srtsink`
-keeps a stale caller entry reporting `connected: true` while it retries, and every metric
-alongside it goes null. That field is the only health channel the current Open Live API offers, so
+Delivery is judged from Strom's `/api/flows/{id}/srt-stats`, by `bytes_sent` *changing* between
+polls. Strom's own `connected` flag is not usable for this, and neither is a bare increase:
+
+- When the far end vanishes, `srtsink` keeps a stale caller entry reporting `connected: true`
+  while it retries, with every metric beside it null.
+- Worse, an SRT socket can sit at `connected: true` with a frozen `bytes_sent` and a decaying
+  `send_rate` indefinitely — a dead feed that never heals itself. Seen in practice after the far
+  end went away and came back. Rebuilding the flow clears it, so a stalled uplink is restarted
+  rather than left dead.
+- A flow restart resets the counter, so *change* rather than growth is the test; requiring growth
+  would treat a healthy new connection as stalled until it passed the previous total.
+
+Three consecutive dead polls are required before acting. That hysteresis is not timidity: each
+status flip rewrites the Open Live source, and CouchDB keeps a revision per write, so a flapping
+verdict pollutes the document's history as well as misleading the operator.
+
+**A restart is not free.** Dropping the SRT connection makes a cloud production consuming the feed
+see its input disappear, and Strom's own troubleshooting notes record where that leads: the
+receiving `tsdemux` tears down its program, pushes EOS, `h264parse` posts a fatal error, and the
+production's `whepserversink` never opens its port — answering 502 to every player for the rest of
+that flow's life. The gateway restarts only a feed that is already dead, where there is nothing
+left to protect, but the interaction is worth knowing before adding any other restart trigger. That field is the only health channel the current Open Live API offers, so
 richer telemetry is exposed locally instead, until Open Live grows somewhere to put it (§8).
 
 **Local control API** (axum, loopback by default; a non-loopback bind requires a token, enforced at

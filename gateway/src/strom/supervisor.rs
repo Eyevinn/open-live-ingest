@@ -29,6 +29,13 @@ use tracing::{info, warn};
 /// How often each input's flow is reconciled against Strom.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Consecutive polls delivering nothing before the uplink is called stalled.
+///
+/// Hysteresis, not caution for its own sake: a single quiet poll flips the reported
+/// status, and every flip rewrites the Open Live source — which CouchDB stores as a
+/// new revision. Three polls is ~30 s of genuinely dead feed.
+const STALL_TOLERANCE: u32 = 3;
+
 /// Backoff bounds after a failed reconcile.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -199,12 +206,37 @@ async fn classify_uplink(
         return Ok(());
     };
 
-    let delivering = state.record_uplink(&input.id, &uplink);
+    let sample = state.record_uplink(&input.id, &uplink);
 
-    if delivering {
+    if sample.delivering {
         state.set_state(&input.id, InputState::Running);
-    } else {
-        state.set_state(&input.id, InputState::Stalled);
+        return Ok(());
     }
+
+    if sample.consecutive_stalls < STALL_TOLERANCE {
+        // Within tolerance: hold the previous verdict rather than flapping the
+        // Open Live source status on one quiet poll.
+        return Ok(());
+    }
+
+    state.set_state(&input.id, InputState::Stalled);
+
+    // An SRT socket can sit at connected=true and deliver nothing indefinitely — seen
+    // in practice after the far end went away and came back — and it does not heal on
+    // its own. Rebuilding the flow does clear it, so a stalled uplink is restarted
+    // rather than left dead.
+    //
+    // Restarting drops the SRT connection, which a cloud production consuming this
+    // feed will see as its input disappearing. That is a real cost, but the feed is
+    // already dead by the time we get here, so it cannot make matters worse.
+    warn!(
+        input = %input.id, flow_id, stalls = sample.consecutive_stalls,
+        "uplink has delivered nothing for {} polls, restarting the flow to rebuild the SRT socket",
+        sample.consecutive_stalls
+    );
+    state.record_error(&input.id, "uplink stalled, restarting flow");
+    client.stop_flow(flow_id).await?;
+    state.clear_uplink(&input.id);
+    // The next reconcile sees a stopped flow and starts it.
     Ok(())
 }
