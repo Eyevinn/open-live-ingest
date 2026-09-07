@@ -140,11 +140,15 @@ fn capture_stage(capture: &CaptureConfig) -> Result<CaptureStage> {
         } => {
             let audio = audio_device.as_deref().is_some_and(|d| !d.is_empty());
             let mut properties = json!({
-                "video_device": video_device,
                 "video_resolution": video_resolution,
                 "video_framerate": video_framerate,
                 "stream_mode": if audio { "audio_video" } else { "video" },
             });
+            // Omitted rather than sent empty: Strom falls back to autovideosrc and
+            // picks the OS default device, which is what a single-camera box wants.
+            if let Some(device) = video_device.as_deref().filter(|d| !d.is_empty()) {
+                properties["video_device"] = json!(device);
+            }
             if let Some(device) = audio_device.as_deref().filter(|d| !d.is_empty()) {
                 properties["audio_device"] = json!(device);
                 properties["audio_channels"] = json!(audio_channels);
@@ -291,7 +295,7 @@ mod tests {
     #[test]
     fn local_input_without_an_audio_device_is_video_only() {
         let capture = CaptureConfig::Local {
-            video_device: "/dev/video0".to_string(),
+            video_device: Some("usb-camera-0".to_string()),
             video_resolution: "1920x1080".to_string(),
             video_framerate: "25/1".to_string(),
             audio_device: None,
@@ -309,7 +313,33 @@ mod tests {
 
         assert_eq!(capture_block["block_definition_id"], "builtin.local_input");
         assert_eq!(capture_block["properties"]["stream_mode"], "video");
+        assert_eq!(capture_block["properties"]["video_device"], "usb-camera-0");
         assert!(capture_block["properties"].get("audio_device").is_none());
+    }
+
+    /// With no device id configured, the property must be absent rather than empty
+    /// so Strom's autovideosrc fallback picks the OS default camera.
+    #[test]
+    fn local_input_without_a_device_id_omits_the_property() {
+        let capture = CaptureConfig::Local {
+            video_device: None,
+            video_resolution: "1280x720".to_string(),
+            video_framerate: "25/1".to_string(),
+            audio_device: None,
+            audio_channels: 2,
+            audio_rate: 48000,
+        };
+        let flow = build("venue-a", "Venue A", &input(capture)).unwrap();
+        let properties = flow["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "capture")
+            .unwrap()["properties"]
+            .clone();
+
+        assert!(properties.get("video_device").is_none());
+        assert_eq!(properties["video_resolution"], "1280x720");
     }
 
     /// The uplink block must receive the caller URI. Sending it the listener form

@@ -95,16 +95,25 @@ pub enum CaptureConfig {
         #[serde(default = "default_true")]
         audio: bool,
     },
-    /// `builtin.local_input` — USB/UVC capture via V4L2.
+    /// `builtin.local_input` — any device the OS exposes as a video/audio source:
+    /// USB webcams, USB capture dongles, HDMI/SDI grabbers, virtual sources.
     Local {
-        #[serde(default = "default_video_device")]
-        video_device: String,
+        /// Strom device id, as listed by
+        /// `GET /api/discovery/devices?category=video_source` on the target Strom.
+        /// **Not** a `/dev/video*` path. Leave unset to let Strom pick the OS
+        /// default via `autovideosrc`, which is usually what you want with a
+        /// single camera attached.
+        #[serde(default)]
+        video_device: Option<String>,
         /// `WxH`, e.g. `1920x1080`.
         #[serde(default = "default_resolution")]
         video_resolution: String,
         #[serde(default = "default_framerate")]
         video_framerate: String,
-        /// ALSA device carrying this capture card's audio, e.g. `hw:1,0`.
+        /// Strom device id from
+        /// `GET /api/discovery/devices?category=audio_source`. Leave unset for
+        /// video-only capture — a USB camera's microphone is a separate device, and
+        /// its independent clock will drift against the video anyway.
         #[serde(default)]
         audio_device: Option<String>,
         #[serde(default = "default_channels")]
@@ -275,10 +284,6 @@ fn default_true() -> bool {
 
 fn default_auto() -> String {
     "auto".to_string()
-}
-
-fn default_video_device() -> String {
-    "/dev/video0".to_string()
 }
 
 fn default_resolution() -> String {

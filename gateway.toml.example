@@ -86,17 +86,23 @@ enabled = true
   # passphrase = "change-me"
   # pbkeylen = 16
 
-# A second input on the same box. Note the distinct SRT port.
+# A second input on the same box, from a USB camera or capture dongle. Note the
+# distinct SRT port.
+#
+# video_device is a Strom device id from
+# `GET /api/discovery/devices?category=video_source` — not a /dev/video* path.
+# Omit it to let Strom pick the OS default camera via autovideosrc, which is what
+# you want with a single device attached. audio_device works the same way; leave it
+# out for video-only capture.
+#
 # [[inputs]]
 # id = "cam2"
 # enabled = true
 #
 #   [inputs.capture]
 #   kind = "local"
-#   video_device = "/dev/video0"
-#   video_resolution = "1920x1080"
+#   video_resolution = "1280x720"
 #   video_framerate = "25/1"
-#   audio_device = "hw:1,0"
 #
 #   [inputs.uplink]
 #   host = "strom.example.com"
