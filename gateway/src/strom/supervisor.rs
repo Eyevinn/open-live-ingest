@@ -4,9 +4,11 @@
 //! The reconcile is idempotent and safe to run forever: create the flow if absent,
 //! update it if the config changed, start it if it is not running.
 //!
-//! Strom does not auto-start flows on boot, so this loop is what brings a venue back
-//! on air after a power cut. It is also why the loop keeps running rather than
-//! reconciling once at startup.
+//! Boot recovery is not this loop's job: Strom sets `auto_restart` on a flow when it
+//! is started and restarts every flagged flow at startup, so a box whose flow was
+//! already running comes back on its own. The loop exists to provision the flow in
+//! the first place, to push config changes, and to recover a flow that fails while
+//! running — which boot-time auto-restart does not cover.
 //!
 //! Transient SRT drops are deliberately not handled here: `builtin.mpegtssrt_output`
 //! has `auto_reconnect` on by default, so the block re-dials the cloud on its own.

@@ -2,3 +2,4 @@
 gateway.toml
 *.log
 .DS_Store
+/.dev/

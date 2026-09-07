@@ -16,8 +16,8 @@ the feed with the Open Live API so it appears as an assignable source in
 ```
 
 The gateway owns no media pipeline. Strom does the media; this is the control agent that means a
-venue box needs no manual work in Strom's editor and comes back on air by itself after a power cut
-— Strom does not auto-start flows on boot.
+venue box is described by a config file rather than built by hand in Strom's editor, and that keeps
+the flow provisioned, up to date with the config, and running.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design: why media never transits Open Live, why
 the SRT caller direction matters, what is deliberately left to Strom, and what is deferred.

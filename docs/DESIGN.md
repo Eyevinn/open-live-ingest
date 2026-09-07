@@ -124,10 +124,18 @@ Consequences to design around:
 
 **Flow supervision.** One task per input, reconciling desired state against what Strom reports:
 create the flow if absent, update it if the config changed, start it if it is not running. The
-reconcile is idempotent and runs on a timer rather than once at startup, because **Strom does not
-auto-start flows on boot** — there is no `auto_start` in its code, only in a stale doc example. That
-loop is what brings a venue back on air after a power cut, and it is the clearest single
-justification for the agent existing at all.
+reconcile is idempotent and runs on a timer rather than once at startup.
+
+Note what this does *not* have to solve: Strom restarts flows itself on boot. `auto_restart` is set
+on a flow when it is started and cleared when it is manually stopped, and at startup Strom starts
+every flagged flow unless run with `--no-auto-restart`. So a power cut on a box whose flow was
+already running recovers without the agent.
+
+What the agent is actually for, then: **provisioning** — the flow does not exist until something
+creates it, and auto-restart only helps flows that already do; **config drift** — a changed bitrate,
+port, or passphrase gets pushed on the next reconcile; **recovery of a flow that fails while
+running**, which boot-time auto-restart does not cover; and **fleet-scale templating**, so a venue
+box is described by a config file rather than built by hand in Strom's editor.
 
 Failures back off (1 s → 30 s). An unreachable Strom moves the input to `Unknown`, not `Failed`:
 the agent losing contact is not evidence that the feed stopped.
