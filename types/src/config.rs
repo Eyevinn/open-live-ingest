@@ -314,10 +314,15 @@ impl UplinkConfig {
                     self.port, self.latency_ms
                 )
             }
-            // Both dial; the venue still needs the cloud's address.
+            // Both dial. Neither of these params is optional. `localport` pins the
+            // port we send from, because rendezvous only works if each peer sends
+            // from the port the other dials. `localaddress` is needed because
+            // GStreamer otherwise tries to *bind* the URI host — the far end's
+            // address — and fails with "Cannot bind to <host>: unable to
+            // create/configure SRT socket".
             UplinkMode::Rendezvous => format!(
-                "srt://{}:{}?mode=rendezvous&latency={}",
-                self.host, self.port, self.latency_ms
+                "srt://{}:{}?mode=rendezvous&latency={}&localport={}&localaddress=0.0.0.0",
+                self.host, self.port, self.latency_ms, self.port
             ),
         };
         self.append_crypto(&mut uri);
@@ -343,9 +348,13 @@ impl UplinkConfig {
                 self.public_host.as_deref().unwrap_or_default(),
                 self.port
             ),
+            // The cloud needs the same treatment: without localaddress it would try
+            // to bind the venue's public address, which it cannot, and its input
+            // block would fail to start — taking the production down with it.
             UplinkMode::Rendezvous => format!(
-                "srt://{}:{}?mode=rendezvous",
+                "srt://{}:{}?mode=rendezvous&localport={}&localaddress=0.0.0.0",
                 self.public_host.as_deref().unwrap_or_default(),
+                self.port,
                 self.port
             ),
         };
@@ -449,16 +458,19 @@ mod tests {
         assert_eq!(cfg.cloud_uri(), "srt://venue.example.com:9000?mode=caller");
     }
 
+    /// Both ends dial, and both must pin their local port and bind address: rendezvous only works if
+    /// each peer sends from the port the other dials, and libsrt otherwise binds an
+    /// ephemeral port the far end can never reach.
     #[test]
-    fn rendezvous_mode_has_both_ends_dial_each_other() {
+    fn rendezvous_mode_has_both_ends_dial_each_other_from_a_pinned_port() {
         let cfg = uplink(UplinkMode::Rendezvous);
         assert_eq!(
             cfg.venue_uri(),
-            "srt://strom.example.com:9000?mode=rendezvous&latency=200"
+            "srt://strom.example.com:9000?mode=rendezvous&latency=200&localport=9000&localaddress=0.0.0.0"
         );
         assert_eq!(
             cfg.cloud_uri(),
-            "srt://venue.example.com:9000?mode=rendezvous"
+            "srt://venue.example.com:9000?mode=rendezvous&localport=9000&localaddress=0.0.0.0"
         );
     }
 
