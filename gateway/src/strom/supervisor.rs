@@ -108,32 +108,41 @@ async fn reconcile(
     let existing = client.get_flow(flow_id).await?;
     state.set_strom_reachable(true);
 
-    let current = match existing {
-        Some(current) => {
-            // The flow exists from an earlier boot or an earlier config. Push the
-            // desired shape unconditionally rather than diffing block trees — Strom
-            // is the one that knows whether anything actually changed, and an update
-            // to an identical flow is cheap.
-            state.set_state(&input.id, InputState::Provisioning);
-            client.update_flow(flow_id, desired).await?;
-            current
+    let running = match existing {
+        Some(fetched) => {
+            // Only write when the shape actually differs. An unconditional update
+            // would rewrite the flow every tick, and each rewrite drops the fields
+            // Strom owns — auto_restart among them, which is what recovers the feed
+            // after a reboot.
+            if flow::differs(&fetched.raw, desired) {
+                info!(input = %input.id, flow_id, "flow differs from config, updating");
+                state.set_state(&input.id, InputState::Provisioning);
+                let body = flow::preserving_strom_state(desired, &fetched.raw);
+                client.update_flow(flow_id, &body).await?;
+            }
+            state.set_gst_state(&input.id, fetched.state.gst_state.as_deref());
+            fetched.state.running
         }
         None => {
             state.set_state(&input.id, InputState::Provisioning);
             match client.create_flow(desired).await? {
                 FlowCreateOutcome::Created(created) => {
                     info!(input = %input.id, flow_id, "created flow in Strom");
-                    created
+                    created.running
                 }
-                // Raced with another writer between the GET and the POST.
-                FlowCreateOutcome::AlreadyExists => client.update_flow(flow_id, desired).await?,
+                // Raced with another writer between the GET and the POST. Re-read
+                // rather than blind-updating, for the same reason as above.
+                FlowCreateOutcome::AlreadyExists => client
+                    .get_flow(flow_id)
+                    .await?
+                    .map(|f| f.state.running)
+                    .unwrap_or(false),
             }
         }
     };
 
-    if current.running {
+    if running {
         state.set_state(&input.id, InputState::Running);
-        state.set_gst_state(&input.id, current.gst_state.as_deref());
         return Ok(());
     }
 

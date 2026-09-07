@@ -122,8 +122,19 @@ pub enum CaptureConfig {
         audio_rate: u32,
     },
     /// Test pattern and tone, built from raw `videotestsrc`/`audiotestsrc` elements.
-    /// Useful for commissioning an SRT link before the cameras arrive.
-    Test,
+    /// Useful for commissioning an SRT link before the cameras arrive — so it
+    /// defaults to broadcast format rather than the elements' own 320x240 defaults,
+    /// which would exercise nothing like a real feed.
+    Test {
+        #[serde(default = "default_resolution")]
+        video_resolution: String,
+        #[serde(default = "default_framerate")]
+        video_framerate: String,
+        #[serde(default = "default_sample_rate")]
+        audio_rate: u32,
+        #[serde(default = "default_channels")]
+        audio_channels: u32,
+    },
 }
 
 /// Maps to `builtin.videoenc`. Strom already selects the encoder element itself,

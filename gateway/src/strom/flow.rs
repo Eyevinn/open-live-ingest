@@ -32,6 +32,8 @@ const BLOCK_ENCODER: &str = "encoder";
 const BLOCK_UPLINK: &str = "uplink";
 const ELEMENT_TEST_VIDEO: &str = "testvideo";
 const ELEMENT_TEST_AUDIO: &str = "testaudio";
+const ELEMENT_TEST_VIDEO_CAPS: &str = "testvideocaps";
+const ELEMENT_TEST_AUDIO_CAPS: &str = "testaudiocaps";
 
 /// Deterministic flow id for an input on this gateway.
 pub fn flow_id(gateway_id: &str, input_id: &str) -> String {
@@ -40,6 +42,93 @@ pub fn flow_id(gateway_id: &str, input_id: &str) -> String {
         format!("{gateway_id}/{input_id}").as_bytes(),
     )
     .to_string()
+}
+
+/// Whether the flow Strom holds differs from the one the gateway wants.
+///
+/// Compares only what the gateway owns — block ids, definitions and properties,
+/// element ids, types and properties, and the link set — and deliberately ignores
+/// everything Strom owns or derives: `running`, `gst_state`, `properties`, editor
+/// positions (Strom runs auto-layout and rewrites them), and any extra block fields
+/// such as `computed_external_pads`. Without this the agent would rewrite the flow on
+/// every tick, and each rewrite drops the fields Strom set.
+pub fn differs(existing: &Value, desired: &Value) -> bool {
+    if existing.get("name") != desired.get("name") {
+        return true;
+    }
+    shape_of(existing) != shape_of(desired)
+}
+
+/// The gateway-owned shape of a flow, in a form that compares cleanly.
+fn shape_of(flow: &Value) -> (Vec<Value>, Vec<Value>, Vec<String>) {
+    let mut blocks: Vec<Value> = flow
+        .get("blocks")
+        .and_then(Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .map(|b| {
+                    json!({
+                        "id": b.get("id"),
+                        "block_definition_id": b.get("block_definition_id"),
+                        "properties": b.get("properties"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    blocks.sort_by_key(|b| b["id"].as_str().unwrap_or_default().to_string());
+
+    let mut elements: Vec<Value> = flow
+        .get("elements")
+        .and_then(Value::as_array)
+        .map(|elements| {
+            elements
+                .iter()
+                .map(|e| {
+                    json!({
+                        "id": e.get("id"),
+                        "element_type": e.get("element_type"),
+                        "properties": e.get("properties"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    elements.sort_by_key(|e| e["id"].as_str().unwrap_or_default().to_string());
+
+    let mut links: Vec<String> = flow
+        .get("links")
+        .and_then(Value::as_array)
+        .map(|links| {
+            links
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}->{}",
+                        l.get("from").and_then(Value::as_str).unwrap_or_default(),
+                        l.get("to").and_then(Value::as_str).unwrap_or_default()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    links.sort();
+
+    (blocks, elements, links)
+}
+
+/// Copies Strom-owned lifecycle state from the stored flow onto an update body, so
+/// updating a flow does not stop it auto-restarting after a reboot or make Strom
+/// report a live flow as stopped.
+pub fn preserving_strom_state(desired: &Value, existing: &Value) -> Value {
+    let mut body = desired.clone();
+    for field in ["properties", "running", "gst_state"] {
+        if let Some(value) = existing.get(field) {
+            body[field] = value.clone();
+        }
+    }
+    body
 }
 
 /// Builds the complete flow JSON for one input.
@@ -170,8 +259,17 @@ fn capture_stage(capture: &CaptureConfig) -> Result<CaptureStage> {
         }
 
         // Raw elements rather than a block: Strom has no test-source block, and a
-        // commissioning feed does not need one.
-        CaptureConfig::Test => {
+        // commissioning feed does not need one. The capsfilters are not optional —
+        // without them videotestsrc negotiates 320x240 and audiotestsrc 44.1 kHz
+        // mono, which tells you nothing about a real 1080p25 uplink.
+        CaptureConfig::Test {
+            video_resolution,
+            video_framerate,
+            audio_rate,
+            audio_channels,
+        } => {
+            let (width, height) = parse_resolution(video_resolution)?;
+
             elements.push(json!({
                 "id": ELEMENT_TEST_VIDEO,
                 "element_type": "videotestsrc",
@@ -179,13 +277,54 @@ fn capture_stage(capture: &CaptureConfig) -> Result<CaptureStage> {
                 "position": [0.0, 0.0],
             }));
             elements.push(json!({
+                "id": ELEMENT_TEST_VIDEO_CAPS,
+                "element_type": "capsfilter",
+                "properties": {
+                    "caps": format!(
+                        "video/x-raw,width={width},height={height},framerate={video_framerate}"
+                    ),
+                },
+                "position": [120.0, 0.0],
+            }));
+            elements.push(json!({
                 "id": ELEMENT_TEST_AUDIO,
                 "element_type": "audiotestsrc",
                 "properties": { "is-live": true, "wave": "sine", "freq": 1000.0 },
                 "position": [0.0, 150.0],
             }));
-            links.push(link(ELEMENT_TEST_VIDEO, "src", BLOCK_ENCODER, "video_in"));
-            links.push(link(ELEMENT_TEST_AUDIO, "src", BLOCK_UPLINK, "audio_in_0"));
+            elements.push(json!({
+                "id": ELEMENT_TEST_AUDIO_CAPS,
+                "element_type": "capsfilter",
+                "properties": {
+                    "caps": format!("audio/x-raw,rate={audio_rate},channels={audio_channels}"),
+                },
+                "position": [120.0, 150.0],
+            }));
+
+            links.push(link(
+                ELEMENT_TEST_VIDEO,
+                "src",
+                ELEMENT_TEST_VIDEO_CAPS,
+                "sink",
+            ));
+            links.push(link(
+                ELEMENT_TEST_VIDEO_CAPS,
+                "src",
+                BLOCK_ENCODER,
+                "video_in",
+            ));
+            links.push(link(
+                ELEMENT_TEST_AUDIO,
+                "src",
+                ELEMENT_TEST_AUDIO_CAPS,
+                "sink",
+            ));
+            links.push(link(
+                ELEMENT_TEST_AUDIO_CAPS,
+                "src",
+                BLOCK_UPLINK,
+                "audio_in_0",
+            ));
             true
         }
     };
@@ -195,6 +334,14 @@ fn capture_stage(capture: &CaptureConfig) -> Result<CaptureStage> {
     }
 
     Ok((blocks, elements, links, has_audio))
+}
+
+/// Splits a `WxH` resolution string.
+fn parse_resolution(resolution: &str) -> Result<(u32, u32)> {
+    let (w, h) = resolution
+        .split_once(['x', 'X'])
+        .ok_or_else(|| anyhow::anyhow!("resolution must be WxH, got {resolution}"))?;
+    Ok((w.trim().parse()?, h.trim().parse()?))
 }
 
 fn link(from_id: &str, from_pad: &str, to_id: &str, to_pad: &str) -> Value {
@@ -224,6 +371,15 @@ mod tests {
                 stream_id: None,
             },
             enabled: true,
+        }
+    }
+
+    fn test_capture() -> CaptureConfig {
+        CaptureConfig::Test {
+            video_resolution: "1920x1080".to_string(),
+            video_framerate: "25/1".to_string(),
+            audio_rate: 48000,
+            audio_channels: 2,
         }
     }
 
@@ -378,14 +534,160 @@ mod tests {
 
     #[test]
     fn test_capture_builds_raw_elements_instead_of_a_capture_block() {
-        let flow = build("venue-a", "Venue A", &input(CaptureConfig::Test)).unwrap();
+        let flow = build("venue-a", "Venue A", &input(test_capture())).unwrap();
 
-        assert_eq!(flow["elements"].as_array().unwrap().len(), 2);
+        assert_eq!(flow["elements"].as_array().unwrap().len(), 4);
         assert!(!flow["blocks"]
             .as_array()
             .unwrap()
             .iter()
             .any(|b| b["id"] == "capture"));
-        assert!(links_of(&flow).contains(&("testvideo:src".into(), "encoder:video_in".into())));
+        assert!(links_of(&flow).contains(&("testvideocaps:src".into(), "encoder:video_in".into())));
+    }
+
+    /// Without capsfilters the test sources negotiate 320x240 and 44.1 kHz mono,
+    /// which exercises nothing like the real uplink it is meant to commission.
+    #[test]
+    fn test_capture_pins_broadcast_caps() {
+        let flow = build("venue-a", "Venue A", &input(test_capture())).unwrap();
+        let caps: Vec<String> = flow["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["element_type"] == "capsfilter")
+            .map(|e| e["properties"]["caps"].as_str().unwrap().to_string())
+            .collect();
+
+        assert!(caps
+            .iter()
+            .any(|c| c == "video/x-raw,width=1920,height=1080,framerate=25/1"));
+        assert!(caps
+            .iter()
+            .any(|c| c == "audio/x-raw,rate=48000,channels=2"));
+    }
+
+    #[test]
+    fn a_malformed_test_resolution_is_rejected() {
+        let capture = CaptureConfig::Test {
+            video_resolution: "1080p".to_string(),
+            video_framerate: "25/1".to_string(),
+            audio_rate: 48000,
+            audio_channels: 2,
+        };
+        assert!(build("venue-a", "Venue A", &input(capture)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+    use open_live_gateway_types::config::{CaptureConfig, UplinkConfig, VideoConfig};
+
+    fn input() -> InputConfig {
+        InputConfig {
+            id: "cam1".to_string(),
+            name: None,
+            capture: CaptureConfig::Test {
+                video_resolution: "1920x1080".to_string(),
+                video_framerate: "25/1".to_string(),
+                audio_rate: 48000,
+                audio_channels: 2,
+            },
+            video: VideoConfig::default(),
+            uplink: UplinkConfig {
+                host: "strom.example.com".to_string(),
+                port: 9000,
+                latency_ms: 200,
+                passphrase: None,
+                pbkeylen: None,
+                stream_id: None,
+            },
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_flow_does_not_drift() {
+        let flow = build("venue-a", "Venue A", &input()).unwrap();
+        assert!(!differs(&flow, &flow));
+    }
+
+    /// Strom echoes back its own lifecycle state, runs auto-layout over editor
+    /// positions, and adds computed pads. None of that is drift — treating it as
+    /// drift would make the agent rewrite the flow on every single tick.
+    #[test]
+    fn strom_owned_fields_are_not_drift() {
+        let desired = build("venue-a", "Venue A", &input()).unwrap();
+        let mut stored = desired.clone();
+
+        stored["running"] = json!(true);
+        stored["gst_state"] = json!("Playing");
+        stored["properties"] =
+            json!({ "auto_restart": true, "started_at": "2026-09-07T12:00:00Z" });
+        for block in stored["blocks"].as_array_mut().unwrap() {
+            block["position"] = json!({ "x": 1234.0, "y": 567.0 });
+            block["computed_external_pads"] = json!({ "inputs": [], "outputs": [] });
+        }
+        stored["blocks"].as_array_mut().unwrap().reverse();
+
+        assert!(!differs(&stored, &desired));
+    }
+
+    #[test]
+    fn a_changed_bitrate_is_drift() {
+        let desired = build("venue-a", "Venue A", &input()).unwrap();
+        let mut stored = desired.clone();
+        stored["blocks"][0]["properties"]["bitrate"] = json!(2000);
+
+        assert!(differs(&stored, &desired));
+    }
+
+    #[test]
+    fn a_changed_uplink_uri_is_drift() {
+        let desired = build("venue-a", "Venue A", &input()).unwrap();
+        let mut stored = desired.clone();
+        for block in stored["blocks"].as_array_mut().unwrap() {
+            if block["id"] == "uplink" {
+                block["properties"]["srt_uri"] = json!("srt://other.example.com:9000?mode=caller");
+            }
+        }
+
+        assert!(differs(&stored, &desired));
+    }
+
+    #[test]
+    fn a_missing_link_is_drift() {
+        let desired = build("venue-a", "Venue A", &input()).unwrap();
+        let mut stored = desired.clone();
+        stored["links"].as_array_mut().unwrap().pop();
+
+        assert!(differs(&stored, &desired));
+    }
+
+    /// The whole point of the fix: an update must carry Strom's lifecycle fields
+    /// back, or the flow stops auto-restarting and Strom reports it as stopped.
+    #[test]
+    fn an_update_body_preserves_strom_state() {
+        let desired = build("venue-a", "Venue A", &input()).unwrap();
+        let mut stored = desired.clone();
+        stored["properties"] =
+            json!({ "auto_restart": true, "started_at": "2026-09-07T12:00:00Z" });
+        stored["running"] = json!(true);
+        stored["gst_state"] = json!("Playing");
+
+        let body = preserving_strom_state(&desired, &stored);
+
+        assert_eq!(body["properties"]["auto_restart"], true);
+        assert_eq!(body["running"], true);
+        assert_eq!(body["gst_state"], "Playing");
+        // And still carries the gateway's own desired shape.
+        assert_eq!(body["links"], desired["links"]);
+    }
+
+    #[test]
+    fn preserving_state_from_a_flow_without_properties_is_harmless() {
+        let desired = build("venue-a", "Venue A", &input()).unwrap();
+        let body = preserving_strom_state(&desired, &json!({}));
+        assert_eq!(body, desired);
     }
 }

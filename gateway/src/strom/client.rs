@@ -35,6 +35,17 @@ struct FlowResponse {
     flow: FlowState,
 }
 
+/// A flow as Strom holds it: the fields the agent acts on, plus the raw JSON.
+///
+/// The raw form matters because Strom owns fields the gateway must not overwrite —
+/// `properties.auto_restart`, `properties.started_at`, `running`, `gst_state` — so an
+/// update has to carry them back rather than let them default away.
+#[derive(Debug)]
+pub struct FetchedFlow {
+    pub state: FlowState,
+    pub raw: Value,
+}
+
 pub struct StromClient {
     http: reqwest::Client,
     base_url: String,
@@ -55,7 +66,7 @@ impl StromClient {
         })
     }
 
-    pub async fn get_flow(&self, id: &str) -> Result<Option<FlowState>> {
+    pub async fn get_flow(&self, id: &str) -> Result<Option<FetchedFlow>> {
         let res = self
             .auth(self.http.get(format!("{}/api/flows/{id}", self.base_url)))
             .send()
@@ -66,8 +77,13 @@ impl StromClient {
             return Ok(None);
         }
         let res = error_for_status(res, "GET flow")?;
-        let body: FlowResponse = res.json().await.context("decoding flow")?;
-        Ok(Some(body.flow))
+        let body: Value = res.json().await.context("decoding flow")?;
+        let raw = body
+            .get("flow")
+            .cloned()
+            .context("flow response has no `flow` field")?;
+        let state: FlowState = serde_json::from_value(raw.clone()).context("decoding flow")?;
+        Ok(Some(FetchedFlow { state, raw }))
     }
 
     /// Creates a flow under the id carried in `flow`.

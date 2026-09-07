@@ -49,7 +49,14 @@ enabled = true
 
   # builtin.decklink_input. Preferred where available: video and audio share the
   # card's clock. Use kind = "local" for USB/UVC capture, or "test" for a test
-  # pattern while commissioning the link.
+  # pattern and tone while commissioning a link before cameras arrive:
+  #
+  #   [inputs.capture]
+  #   kind = "test"
+  #   video_resolution = "1920x1080"   # defaults shown; the test sources would
+  #   video_framerate = "25/1"         # otherwise negotiate 320x240 / 44.1k mono,
+  #   audio_rate = 48000               # which exercises nothing like a real feed
+  #   audio_channels = 2
   [inputs.capture]
   kind = "decklink"
   device_number = 0
