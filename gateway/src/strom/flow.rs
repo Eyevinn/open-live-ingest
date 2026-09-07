@@ -157,7 +157,7 @@ pub fn build(gateway_id: &str, gateway_name: &str, input: &InputConfig) -> Resul
         "block_definition_id": "builtin.mpegtssrt_output",
         "name": "SRT Uplink",
         "properties": {
-            "srt_uri": input.uplink.caller_uri(),
+            "srt_uri": input.uplink.venue_uri(),
             "latency": input.uplink.latency_ms,
             "num_video_tracks": 1u32,
             "num_audio_tracks": if has_audio { 1u32 } else { 0u32 },
@@ -363,7 +363,9 @@ mod tests {
             capture,
             video: VideoConfig::default(),
             uplink: UplinkConfig {
+                mode: open_live_gateway_types::config::UplinkMode::Caller,
                 host: "strom.example.com".to_string(),
+                public_host: None,
                 port: 9000,
                 latency_ms: 200,
                 passphrase: None,
@@ -595,7 +597,9 @@ mod drift_tests {
             },
             video: VideoConfig::default(),
             uplink: UplinkConfig {
+                mode: open_live_gateway_types::config::UplinkMode::Caller,
                 host: "strom.example.com".to_string(),
+                public_host: None,
                 port: 9000,
                 latency_ms: 200,
                 passphrase: None,

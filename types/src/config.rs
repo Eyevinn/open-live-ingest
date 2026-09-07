@@ -159,15 +159,44 @@ pub struct VideoConfig {
     pub keyframe_interval: u32,
 }
 
+/// Which end of the SRT link dials the other.
+///
+/// This is a deployment question, not a preference: whichever end is the caller needs
+/// no inbound UDP, and whichever end listens does. Both directions are legitimate and
+/// the right one depends on which side is reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UplinkMode {
+    /// The venue dials the cloud. Needs a published UDP port on the *cloud* host, and
+    /// nothing inbound at the venue.
+    Caller,
+    /// The cloud dials the venue. Needs a published UDP port at the *venue* — a public
+    /// address or a port forward — and nothing inbound in the cloud. This matches the
+    /// convention Open Live's own seeded sources use, where the address on the source
+    /// is what the cloud Strom dials.
+    Listener,
+    /// Both ends dial each other, punching through NAT. Needs each side to know the
+    /// other's address but no port forward, so it is worth trying when neither end
+    /// can publish a port.
+    Rendezvous,
+}
+
 /// SRT uplink to the cloud Strom instance, mapped to `builtin.mpegtssrt_output`.
 ///
-/// Note the two-URI split: `host`/`port` form the *caller* URI the local Strom dials,
-/// while the address registered with Open Live is the matching *listener* form
-/// (`srt://:PORT?mode=listener`) that the cloud Strom binds.
+/// One link is described by two URIs that mirror each other: the one this gateway puts
+/// on the venue Strom's output block, and the one it registers on the Open Live source
+/// for the cloud Strom's input block. `mode` decides which side dials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UplinkConfig {
-    /// Public hostname of the cloud Strom instance.
+    /// Which end dials. Default `caller` (the venue dials out).
+    #[serde(default = "default_uplink_mode")]
+    pub mode: UplinkMode,
+    /// Public hostname of the cloud Strom instance. Used when the venue dials.
     pub host: String,
+    /// This gateway's address as the cloud sees it — a public hostname or IP. Required
+    /// for `listener` and `rendezvous`, where the cloud has to dial the venue.
+    #[serde(default)]
+    pub public_host: Option<String>,
     /// UDP port the cloud Strom binds for this input. Must be unique across every
     /// gateway pointing at the same Strom, and open on the cloud firewall.
     pub port: u16,
@@ -270,12 +299,27 @@ impl Default for LogConfig {
 }
 
 impl UplinkConfig {
-    /// The caller URI the local Strom's `builtin.mpegtssrt_output` dials out to.
-    pub fn caller_uri(&self) -> String {
-        let mut uri = format!(
-            "srt://{}:{}?mode=caller&latency={}",
-            self.host, self.port, self.latency_ms
-        );
+    /// The URI for the venue Strom's `builtin.mpegtssrt_output`.
+    pub fn venue_uri(&self) -> String {
+        let mut uri = match self.mode {
+            // Dial the cloud.
+            UplinkMode::Caller => format!(
+                "srt://{}:{}?mode=caller&latency={}",
+                self.host, self.port, self.latency_ms
+            ),
+            // Bind and wait for the cloud to dial in.
+            UplinkMode::Listener => {
+                format!(
+                    "srt://:{}?mode=listener&latency={}",
+                    self.port, self.latency_ms
+                )
+            }
+            // Both dial; the venue still needs the cloud's address.
+            UplinkMode::Rendezvous => format!(
+                "srt://{}:{}?mode=rendezvous&latency={}",
+                self.host, self.port, self.latency_ms
+            ),
+        };
         self.append_crypto(&mut uri);
         if let Some(stream_id) = self.stream_id.as_deref().filter(|s| !s.is_empty()) {
             uri.push_str(&format!("&streamid={stream_id}"));
@@ -283,10 +327,28 @@ impl UplinkConfig {
         uri
     }
 
-    /// The listener form registered with Open Live, which the cloud Strom binds.
-    /// Open Live's source validation explicitly permits this hostless form.
-    pub fn listener_uri(&self) -> String {
-        let mut uri = format!("srt://:{}?mode=listener", self.port);
+    /// The address registered on the Open Live source, which becomes the `srt_uri` of
+    /// the cloud Strom's `builtin.mpegtssrt_input`. The mirror image of `venue_uri`.
+    ///
+    /// Note that `srtsrc` defaults to caller mode, so an address with no explicit
+    /// `mode=` makes the cloud dial out — which is what Open Live's own seeded demo
+    /// sources rely on.
+    pub fn cloud_uri(&self) -> String {
+        let mut uri = match self.mode {
+            // The venue dials, so the cloud binds.
+            UplinkMode::Caller => format!("srt://:{}?mode=listener", self.port),
+            // The cloud dials the venue.
+            UplinkMode::Listener => format!(
+                "srt://{}:{}?mode=caller",
+                self.public_host.as_deref().unwrap_or_default(),
+                self.port
+            ),
+            UplinkMode::Rendezvous => format!(
+                "srt://{}:{}?mode=rendezvous",
+                self.public_host.as_deref().unwrap_or_default(),
+                self.port
+            ),
+        };
         self.append_crypto(&mut uri);
         uri
     }
@@ -334,6 +396,10 @@ fn default_sample_rate() -> u32 {
     48000
 }
 
+fn default_uplink_mode() -> UplinkMode {
+    UplinkMode::Caller
+}
+
 fn default_auth_mode() -> String {
     "direct".to_string()
 }
@@ -350,9 +416,11 @@ fn default_state_path() -> String {
 mod tests {
     use super::*;
 
-    fn uplink() -> UplinkConfig {
+    fn uplink(mode: UplinkMode) -> UplinkConfig {
         UplinkConfig {
+            mode,
             host: "strom.example.com".to_string(),
+            public_host: Some("venue.example.com".to_string()),
             port: 9000,
             latency_ms: 200,
             passphrase: None,
@@ -361,50 +429,86 @@ mod tests {
         }
     }
 
+    /// Venue dials out: nothing inbound at the venue, cloud must publish the port.
     #[test]
-    fn caller_uri_dials_the_cloud_host() {
+    fn caller_mode_has_the_venue_dial_and_the_cloud_bind() {
+        let cfg = uplink(UplinkMode::Caller);
         assert_eq!(
-            uplink().caller_uri(),
+            cfg.venue_uri(),
             "srt://strom.example.com:9000?mode=caller&latency=200"
+        );
+        assert_eq!(cfg.cloud_uri(), "srt://:9000?mode=listener");
+    }
+
+    /// Cloud dials in: nothing inbound in the cloud, venue must publish the port.
+    /// This is the direction Open Live's own seeded demo sources use.
+    #[test]
+    fn listener_mode_has_the_cloud_dial_and_the_venue_bind() {
+        let cfg = uplink(UplinkMode::Listener);
+        assert_eq!(cfg.venue_uri(), "srt://:9000?mode=listener&latency=200");
+        assert_eq!(cfg.cloud_uri(), "srt://venue.example.com:9000?mode=caller");
+    }
+
+    #[test]
+    fn rendezvous_mode_has_both_ends_dial_each_other() {
+        let cfg = uplink(UplinkMode::Rendezvous);
+        assert_eq!(
+            cfg.venue_uri(),
+            "srt://strom.example.com:9000?mode=rendezvous&latency=200"
+        );
+        assert_eq!(
+            cfg.cloud_uri(),
+            "srt://venue.example.com:9000?mode=rendezvous"
         );
     }
 
-    /// The listener form is what the cloud Strom binds, so it must stay hostless —
-    /// Open Live's source validation permits `srt://:PORT` specifically.
+    /// The venue's own address must never appear in the caller-mode cloud address:
+    /// there the cloud only binds a port.
     #[test]
-    fn listener_uri_is_hostless_and_never_leaks_the_cloud_host() {
-        let uri = uplink().listener_uri();
-        assert_eq!(uri, "srt://:9000?mode=listener");
+    fn caller_mode_cloud_uri_stays_hostless() {
+        let uri = uplink(UplinkMode::Caller).cloud_uri();
+        assert!(!uri.contains("venue.example.com"));
         assert!(!uri.contains("strom.example.com"));
     }
 
     #[test]
     fn both_uris_carry_the_passphrase_so_the_ends_agree() {
-        let mut cfg = uplink();
+        let mut cfg = uplink(UplinkMode::Caller);
         cfg.passphrase = Some("s3cret".to_string());
         cfg.pbkeylen = Some(16);
 
-        assert!(cfg.caller_uri().contains("passphrase=s3cret&pbkeylen=16"));
-        assert!(cfg.listener_uri().contains("passphrase=s3cret&pbkeylen=16"));
+        assert!(cfg.venue_uri().contains("passphrase=s3cret&pbkeylen=16"));
+        assert!(cfg.cloud_uri().contains("passphrase=s3cret&pbkeylen=16"));
     }
 
     #[test]
     fn an_empty_passphrase_is_not_sent() {
-        let mut cfg = uplink();
+        let mut cfg = uplink(UplinkMode::Caller);
         cfg.passphrase = Some(String::new());
 
-        assert!(!cfg.caller_uri().contains("passphrase"));
-        assert!(!cfg.listener_uri().contains("passphrase"));
+        assert!(!cfg.venue_uri().contains("passphrase"));
+        assert!(!cfg.cloud_uri().contains("passphrase"));
     }
 
-    /// `streamid` is a caller-side selector; on the listener it would be meaningless
-    /// and Open Live would store a misleading address.
+    /// `streamid` is a caller-side selector, so it belongs on whichever URI dials.
     #[test]
-    fn stream_id_applies_to_the_caller_only() {
-        let mut cfg = uplink();
+    fn stream_id_applies_to_the_venue_uri_only() {
+        let mut cfg = uplink(UplinkMode::Caller);
         cfg.stream_id = Some("cam1".to_string());
 
-        assert!(cfg.caller_uri().contains("streamid=cam1"));
-        assert!(!cfg.listener_uri().contains("streamid"));
+        assert!(cfg.venue_uri().contains("streamid=cam1"));
+        assert!(!cfg.cloud_uri().contains("streamid"));
+    }
+
+    #[test]
+    fn uplink_mode_defaults_to_caller() {
+        let cfg: UplinkConfig = toml::from_str(
+            r#"
+host = "strom.example.com"
+port = 9000
+"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.mode, UplinkMode::Caller);
     }
 }

@@ -725,6 +725,7 @@ name = "open-live-gateway-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "toml",
 ]
 
 [[package]]

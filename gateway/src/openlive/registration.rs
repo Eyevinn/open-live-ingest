@@ -79,7 +79,7 @@ async fn reconcile(
 
     let desired = SourcePayload {
         name: input.source_name(gateway_name),
-        address: input.uplink.listener_uri(),
+        address: input.uplink.cloud_uri(),
         stream_type: "srt".to_string(),
         // `active` means "safe to assign to a production", which requires the
         // uplink to be delivering — not merely that the local flow is running. A

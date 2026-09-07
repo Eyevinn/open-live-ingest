@@ -30,7 +30,7 @@ impl SharedState {
                         flow_id: crate::strom::flow::flow_id(&gateway_id, &input.id),
                         gst_state: None,
                         source_id: None,
-                        listener_address: input.uplink.listener_uri(),
+                        listener_address: input.uplink.cloud_uri(),
                         restarts: 0,
                         last_error: None,
                         uplink: None,

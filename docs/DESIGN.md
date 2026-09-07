@@ -95,30 +95,41 @@ linking its crates, so those names live here as string literals — a rename ups
 runtime error from Strom, not a compile error. `GET /api/blocks` on the target Strom is the
 authority; the block reference in Strom's docs may lag it.
 
-## 5. Uplink addressing — the two-URI problem
+## 5. Uplink addressing — which end dials
 
-One link, two URIs, and conflating them is the easiest way to lose an afternoon:
+One link, two URIs that mirror each other, and conflating them is the easiest way to lose an
+afternoon. What the pair looks like depends on `uplink.mode`, and that choice is a deployment
+constraint rather than a preference: **whichever end listens is the end that needs an inbound UDP
+port.**
 
-| Side | URI | Meaning |
-|---|---|---|
-| Venue (local Strom's uplink block) | `srt://strom.example.com:9000?mode=caller` | Local Strom dials out |
-| Cloud (stored on the Open Live source) | `srt://:9000?mode=listener` | Cloud Strom binds UDP 9000 and waits |
+| Mode | Venue output block | Registered on the Open Live source | Needs an inbound port |
+|---|---|---|---|
+| `caller` (default) | `srt://cloud:9000?mode=caller` | `srt://:9000?mode=listener` | the cloud |
+| `listener` | `srt://:9000?mode=listener` | `srt://venue:9000?mode=caller` | the venue |
+| `rendezvous` | `srt://cloud:9000?mode=rendezvous` | `srt://venue:9000?mode=rendezvous` | neither |
 
-The gateway config holds the public cloud host and port, puts the caller form on the uplink block,
-and *derives* the listener form it registers with Open Live. Open Live's source validation
-explicitly permits the hostless listener form, so this works against the API as it stands.
+A subtlety that decides how an address is read: **`srtsrc` defaults to caller mode.** So a source
+address carrying no `mode=` makes the cloud Strom *dial out* — which is exactly what Open Live's
+own seeded demo sources (`srt://127.0.0.1:5010`) rely on, dialling something inside the cloud host
+itself. Reading such an address as "listen on 5010" is wrong, and that reading is what makes
+`caller` look like the obvious default when it is only one of three.
 
 Consequences to design around:
 
-- **The caller direction is deliberate.** The venue needs no inbound firewall rule and no static IP.
-- **Ports must be unique per input across every gateway** pointing at one cloud Strom, and must be
-  opened on the cloud firewall — Strom's media-plane ports are per-flow, not part of its control
-  port. The gateway enforces local uniqueness only; fleet-wide is the operator's problem today (§8).
-- **SRT `latency` should be 3–4× the measured RTT.** The gateway writes its configured value into
+- **`caller` keeps the venue free of inbound rules and static IPs**, which is what makes a NAT'd
+  venue deployable — but it moves the requirement to the cloud, and a cloud Strom behind an
+  HTTP-only reverse proxy cannot satisfy it. That is not hypothetical: it is what an OSC-hosted
+  Strom looks like.
+- **`listener` matches the convention Open Live's seeded sources use** and asks nothing of the
+  cloud, at the cost of a public address or port forward at the venue. For a fixed installation
+  that is normal; for a laptop on a corporate network it is not.
+- **Ports must be unique** per input across every gateway pointing at one Strom, on whichever side
+  is listening, and open on that side's firewall.
+- **SRT `latency` should be 3–4x the measured RTT.** The gateway writes its configured value into
   the source's `latency` field so the cloud receiver matches; Open Live takes the maximum across a
   production's sources when generating the flow.
-- **The passphrase is owned by the gateway.** Open Live encrypts it at rest and masks it on read, so
-  the gateway never tries to read it back — it sets the same value on both URIs.
+- **The passphrase is owned by the gateway.** Open Live encrypts it at rest and masks it on read,
+  so the gateway never reads it back — it puts the same value on both URIs.
 
 ## 6. Control plane
 

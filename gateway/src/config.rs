@@ -2,6 +2,7 @@
 //! (precedence CLI > env > file), followed by validation.
 
 use anyhow::{bail, Context, Result};
+use open_live_gateway_types::config::UplinkMode;
 use open_live_gateway_types::GatewayConfig;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -83,6 +84,22 @@ fn validate(cfg: &GatewayConfig) -> Result<()> {
         }
         if input.uplink.host.trim().is_empty() {
             bail!("input {} has no uplink host", input.id);
+        }
+        if matches!(
+            input.uplink.mode,
+            UplinkMode::Listener | UplinkMode::Rendezvous
+        ) && input
+            .uplink
+            .public_host
+            .as_deref()
+            .is_none_or(|h| h.trim().is_empty())
+        {
+            bail!(
+                "input {} uses uplink mode {:?}, where the cloud dials the venue, so \
+                 uplink.public_host must be set to this gateway's address as the cloud sees it",
+                input.id,
+                input.uplink.mode
+            );
         }
         if let Some(len) = input.uplink.pbkeylen {
             if !matches!(len, 16 | 24 | 32) {
@@ -257,6 +274,32 @@ id = \"cam1\"
 
         cfg.open_live.api_key = Some("key".to_string());
         validate(&cfg).expect("registration with URL and key should validate");
+    }
+
+    /// The cloud cannot dial a venue whose address it does not know, and failing at
+    /// startup beats a production that silently never receives anything.
+    #[test]
+    fn cloud_dialling_modes_require_a_public_host() {
+        for mode in [UplinkMode::Listener, UplinkMode::Rendezvous] {
+            let mut cfg = config_from(BASE);
+            cfg.inputs[0].uplink.mode = mode;
+            cfg.inputs[0].uplink.public_host = None;
+            assert!(
+                validate(&cfg).is_err(),
+                "{mode:?} without a public_host must be rejected"
+            );
+
+            cfg.inputs[0].uplink.public_host = Some("venue.example.com".to_string());
+            validate(&cfg).expect("with a public_host it should validate");
+        }
+    }
+
+    #[test]
+    fn caller_mode_needs_no_public_host() {
+        let mut cfg = config_from(BASE);
+        cfg.inputs[0].uplink.mode = UplinkMode::Caller;
+        cfg.inputs[0].uplink.public_host = None;
+        validate(&cfg).expect("caller mode should validate without a public_host");
     }
 
     #[test]
