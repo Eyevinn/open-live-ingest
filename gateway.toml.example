@@ -13,7 +13,9 @@
 id = "venue-a-gateway"
 name = "Venue A"
 
-# The local Strom instance.
+# The local Strom instance — the one on this box that captures and encodes. Optional:
+# it defaults to http://127.0.0.1:8080, since Strom runs beside the gateway. This is
+# not the cloud Strom, and not something Open Live knows about.
 [strom]
 url = "http://127.0.0.1:8080"
 # Set when Strom runs with STROM_API_KEY. Omit for a Strom without auth.
@@ -53,7 +55,9 @@ video_framerate = "25/1"
   # pick one. Ports claimed by [[inputs]] below are skipped.
   [app.uplink]
   mode = "caller"
-  host = "strom.example.com"
+  # Hostname of the CLOUD Strom to send to. Omit it and the app asks Open Live
+  # (GET /api/v1/server-info), so a venue box needs only the Open Live address.
+  # host = "strom.example.com"
   port_range = "9000-9100"
   latency_ms = 200
 

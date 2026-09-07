@@ -37,6 +37,20 @@ The app allocates an SRT port per input from `[app.uplink] port_range`, so an op
 choose one, and it derives a stable input id per device — picking the same camera again addresses
 the same flow and the same Open Live source rather than accumulating duplicates.
 
+For a venue box whose Open Live lives in the cloud, that is nearly the whole config: the local
+Strom defaults to `http://127.0.0.1:8080` (it runs beside the gateway), and the *cloud* Strom host
+is discovered from Open Live's `server-info`.
+
+```toml
+[gateway]
+name = "Venue A"
+
+[open_live]
+url = "https://open-live.example.com"
+auth_mode = "osc"        # OSC-hosted; api_key is then an OSC PAT
+api_key = "…"
+```
+
 ```bash
 cargo run -p open-live-gateway-gui -- --config ./gateway.toml
 ```

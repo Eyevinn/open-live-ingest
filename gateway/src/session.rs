@@ -56,7 +56,12 @@ pub fn allocate_port(template: &UplinkTemplate, taken: &BTreeSet<u16>) -> Result
 }
 
 /// Builds the input for a chosen capture device.
-pub fn input_for_device(app: &AppConfig, device: &CaptureDevice, port: u16) -> InputConfig {
+pub fn input_for_device(
+    app: &AppConfig,
+    device: &CaptureDevice,
+    port: u16,
+    cloud_host: &str,
+) -> InputConfig {
     InputConfig {
         id: input_id_for_device(&device.id),
         name: Some(device.display_name.clone()),
@@ -72,7 +77,7 @@ pub fn input_for_device(app: &AppConfig, device: &CaptureDevice, port: u16) -> I
             audio_rate: 48000,
         },
         video: app.video.clone(),
-        uplink: app.uplink.materialize(port),
+        uplink: app.uplink.materialize(port, cloud_host),
         enabled: true,
     }
 }
@@ -255,10 +260,16 @@ mod tests {
     #[test]
     fn a_device_becomes_a_local_capture_input_named_after_it() {
         let app = AppConfig::default();
-        let input = input_for_device(&app, &device("dev-abc", "FaceTime HD Camera"), 9000);
+        let input = input_for_device(
+            &app,
+            &device("dev-abc", "FaceTime HD Camera"),
+            9000,
+            "cloud.example.com",
+        );
 
         assert_eq!(input.name.as_deref(), Some("FaceTime HD Camera"));
         assert_eq!(input.uplink.port, 9000);
+        assert_eq!(input.uplink.host, "cloud.example.com");
         match input.capture {
             CaptureConfig::Local {
                 video_device,

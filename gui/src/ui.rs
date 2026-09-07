@@ -81,12 +81,13 @@ impl eframe::App for App {
             .request_repaint_after(std::time::Duration::from_millis(500));
 
         let snapshot = self.state.snapshot();
-        let (devices, active, strom_ok, last_error, busy) = {
+        let (devices, active, strom_ok, cloud_host, last_error, busy) = {
             let ui = self.ui.lock().expect("ui poisoned");
             (
                 ui.devices.clone(),
                 ui.active.clone(),
                 ui.strom_reachable,
+                ui.cloud_host.clone(),
                 ui.last_error.clone(),
                 ui.busy,
             )
@@ -106,6 +107,22 @@ impl eframe::App for App {
                 match self.cfg.open_live.url.as_deref() {
                     Some(url) if registering => ui.monospace(url),
                     _ => ui.weak("not registering — feeds will not appear in Studio"),
+                };
+            });
+            ui.horizontal(|ui| {
+                let configured = self
+                    .cfg
+                    .app
+                    .uplink
+                    .host
+                    .clone()
+                    .filter(|h| !h.trim().is_empty());
+                let target = configured.or(cloud_host);
+                dot(ui, target.is_some());
+                ui.label("Sending to");
+                match target {
+                    Some(host) => ui.monospace(host),
+                    None => ui.weak("unknown — Open Live has not reported its Strom host"),
                 };
             });
             ui.add_space(6.0);

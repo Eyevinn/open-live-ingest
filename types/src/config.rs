@@ -20,7 +20,9 @@ pub const DEFAULT_VIDEO_BITRATE_KBPS: u32 = 6000;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     pub gateway: GatewayIdentity,
-    /// The local Strom instance this gateway drives.
+    /// The local Strom instance this gateway drives. Defaults to loopback, since on a
+    /// venue box Strom runs beside the gateway.
+    #[serde(default)]
     pub strom: StromConfig,
     /// One entry per capture input. Each becomes its own Strom flow with its own SRT
     /// port, so one camera failing cannot disturb another.
@@ -80,8 +82,10 @@ impl Default for AppConfig {
 pub struct UplinkTemplate {
     #[serde(default = "default_uplink_mode")]
     pub mode: UplinkMode,
-    #[serde(default = "default_uplink_host")]
-    pub host: String,
+    /// Hostname of the cloud Strom to dial. Leave unset and it is discovered from
+    /// Open Live's `server-info`, so a venue box needs only the Open Live address.
+    #[serde(default)]
+    pub host: Option<String>,
     #[serde(default)]
     pub public_host: Option<String>,
     /// Inclusive `first-last` range to allocate SRT ports from, e.g. "9000-9100".
@@ -99,7 +103,7 @@ impl Default for UplinkTemplate {
     fn default() -> Self {
         Self {
             mode: default_uplink_mode(),
-            host: default_uplink_host(),
+            host: None,
             public_host: None,
             port_range: default_port_range(),
             latency_ms: DEFAULT_SRT_LATENCY_MS,
@@ -131,10 +135,13 @@ impl UplinkTemplate {
     }
 
     /// Fills in a concrete uplink for one input.
-    pub fn materialize(&self, port: u16) -> UplinkConfig {
+    ///
+    /// `host` is passed in rather than read from the template because it may have
+    /// been discovered from Open Live at startup.
+    pub fn materialize(&self, port: u16, host: &str) -> UplinkConfig {
         UplinkConfig {
             mode: self.mode,
-            host: self.host.clone(),
+            host: host.to_string(),
             public_host: self.public_host.clone(),
             port,
             latency_ms: self.latency_ms,
@@ -146,8 +153,11 @@ impl UplinkTemplate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StromConfig {
-    /// Base URL of the local Strom instance, e.g. `http://127.0.0.1:8080`.
+    /// Base URL of the *local* Strom instance — the one on this machine that captures
+    /// and encodes. Not the cloud Strom, and not something Open Live knows about.
+    #[serde(default = "default_strom_url")]
     pub url: String,
     /// Strom API key, sent as a bearer token. Unset when Strom runs without auth.
     #[serde(default)]
@@ -244,19 +254,26 @@ pub enum CaptureConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoConfig {
     /// `h264`, `h265`, `av1`, `vp9`. H.264 is the interoperable default.
+    #[serde(default = "default_codec")]
     pub codec: String,
     /// Bitrate in kbps.
+    #[serde(default = "default_bitrate")]
     pub bitrate_kbps: u32,
     /// `auto`, `hardware`, or `software`.
+    #[serde(default = "default_auto")]
     pub encoder_preference: String,
     /// `ultrafast`, `fast`, `medium`, `slow`, `veryslow`.
+    #[serde(default = "default_quality_preset")]
     pub quality_preset: String,
     /// `zerolatency` for contribution.
+    #[serde(default = "default_tune")]
     pub tune: String,
     /// `cbr`, `vbr`, or `cqp`. CBR for contribution over a committed link.
+    #[serde(default = "default_rate_control")]
     pub rate_control: String,
     /// Keyframe interval in frames. 1–2 seconds' worth so a reconnecting receiver
     /// locks on quickly.
+    #[serde(default = "default_keyframe_interval")]
     pub keyframe_interval: u32,
 }
 
@@ -368,16 +385,27 @@ impl Default for OpenLiveConfig {
     }
 }
 
-impl Default for VideoConfig {
+impl Default for StromConfig {
     fn default() -> Self {
         Self {
-            codec: "h264".to_string(),
-            bitrate_kbps: DEFAULT_VIDEO_BITRATE_KBPS,
+            url: default_strom_url(),
+            api_key: None,
+        }
+    }
+}
+
+impl Default for VideoConfig {
+    fn default() -> Self {
+        // Built from the same functions serde uses, so a partial [video] table and an
+        // omitted one cannot drift apart.
+        Self {
+            codec: default_codec(),
+            bitrate_kbps: default_bitrate(),
             encoder_preference: default_auto(),
-            quality_preset: "ultrafast".to_string(),
-            tune: "zerolatency".to_string(),
-            rate_control: "cbr".to_string(),
-            keyframe_interval: 25,
+            quality_preset: default_quality_preset(),
+            tune: default_tune(),
+            rate_control: default_rate_control(),
+            keyframe_interval: default_keyframe_interval(),
         }
     }
 }
@@ -514,8 +542,32 @@ fn default_auth_mode() -> String {
     "direct".to_string()
 }
 
-fn default_uplink_host() -> String {
-    "127.0.0.1".to_string()
+fn default_codec() -> String {
+    "h264".to_string()
+}
+
+fn default_bitrate() -> u32 {
+    DEFAULT_VIDEO_BITRATE_KBPS
+}
+
+fn default_quality_preset() -> String {
+    "ultrafast".to_string()
+}
+
+fn default_tune() -> String {
+    "zerolatency".to_string()
+}
+
+fn default_rate_control() -> String {
+    "cbr".to_string()
+}
+
+fn default_keyframe_interval() -> u32 {
+    25
+}
+
+fn default_strom_url() -> String {
+    "http://127.0.0.1:8080".to_string()
 }
 
 fn default_port_range() -> String {
@@ -631,5 +683,56 @@ port = 9000
         )
         .expect("parses");
         assert_eq!(cfg.mode, UplinkMode::Caller);
+    }
+}
+
+#[cfg(test)]
+mod partial_table_tests {
+    use super::*;
+
+    /// Naming one field must not force an operator to restate the rest — and the
+    /// values filled in must match `Default`, or an omitted table and a partial one
+    /// would behave differently.
+    #[test]
+    fn a_partial_video_table_keeps_the_defaults_for_everything_else() {
+        let cfg: VideoConfig = toml::from_str("bitrate_kbps = 9000").expect("parses");
+        let defaults = VideoConfig::default();
+
+        assert_eq!(cfg.bitrate_kbps, 9000);
+        assert_eq!(cfg.codec, defaults.codec);
+        assert_eq!(cfg.encoder_preference, defaults.encoder_preference);
+        assert_eq!(cfg.quality_preset, defaults.quality_preset);
+        assert_eq!(cfg.tune, defaults.tune);
+        assert_eq!(cfg.rate_control, defaults.rate_control);
+        assert_eq!(cfg.keyframe_interval, defaults.keyframe_interval);
+    }
+
+    #[test]
+    fn an_empty_video_table_equals_the_defaults() {
+        let cfg: VideoConfig = toml::from_str("").expect("parses");
+        assert_eq!(cfg.bitrate_kbps, VideoConfig::default().bitrate_kbps);
+        assert_eq!(cfg.codec, VideoConfig::default().codec);
+    }
+
+    /// The whole point of discovery: a config naming only Open Live must load.
+    #[test]
+    fn a_config_with_only_open_live_loads() {
+        let cfg: GatewayConfig = toml::from_str(
+            r#"
+[gateway]
+name = "Venue A"
+
+[open_live]
+url = "https://open-live.example.com"
+"#,
+        )
+        .expect("parses");
+
+        assert_eq!(cfg.strom.url, "http://127.0.0.1:8080");
+        assert!(
+            cfg.app.uplink.host.is_none(),
+            "the cloud host is discovered"
+        );
+        assert!(cfg.inputs.is_empty());
     }
 }

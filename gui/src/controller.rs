@@ -35,6 +35,8 @@ pub struct UiState {
     /// input id -> the device it came from and its registered address.
     pub active: BTreeMap<String, ActiveView>,
     pub strom_reachable: bool,
+    /// Where feeds are sent, once known.
+    pub cloud_host: Option<String>,
     pub last_error: Option<String>,
     pub busy: bool,
 }
@@ -61,6 +63,9 @@ pub struct Controller {
     strom: StromClient,
     open_live: Option<OpenLiveClient>,
     state_path: PathBuf,
+    /// The cloud Strom's hostname: configured, or discovered from Open Live at
+    /// startup so a venue box needs only the Open Live address.
+    cloud_host: Option<String>,
     active: HashMap<String, ActiveInput>,
     tasks: HashMap<String, Tasks>,
 }
@@ -87,6 +92,7 @@ impl Controller {
             None
         };
         let state_path = PathBuf::from(&cfg.open_live.state_path);
+        let cfg_host = cfg.app.uplink.host.clone().filter(|h| !h.trim().is_empty());
 
         Ok(Self {
             cfg,
@@ -96,12 +102,14 @@ impl Controller {
             strom,
             open_live,
             state_path,
+            cloud_host: cfg_host,
             active: HashMap::new(),
             tasks: HashMap::new(),
         })
     }
 
     pub async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+        self.resolve_cloud_host().await;
         self.rescan().await;
 
         while let Some(cmd) = rx.recv().await {
@@ -125,6 +133,27 @@ impl Controller {
                     return;
                 }
             }
+        }
+    }
+
+    /// Asks Open Live where its Strom is, unless the config already says.
+    async fn resolve_cloud_host(&mut self) {
+        if self.cloud_host.is_some() {
+            return;
+        }
+        let Some(client) = &self.open_live else {
+            return;
+        };
+        match client.cloud_strom_host().await {
+            Ok(Some(host)) => {
+                info!(%host, "discovered the cloud Strom host from Open Live");
+                self.cloud_host = Some(host.clone());
+                self.ui.lock().expect("ui poisoned").cloud_host = Some(host);
+            }
+            Ok(None) => {
+                warn!("Open Live does not expose server-info; set [app.uplink] host in the config")
+            }
+            Err(err) => warn!(%err, "could not ask Open Live for its Strom host"),
         }
     }
 
@@ -159,7 +188,15 @@ impl Controller {
         taken.extend(self.active.values().map(|a| a.input.uplink.port));
         let port = session::allocate_port(&self.cfg.app.uplink, &taken)?;
 
-        let input = session::input_for_device(&self.cfg.app, &device, port);
+        // Without a far end there is nowhere to send, and guessing would produce a
+        // feed that silently goes nowhere.
+        let cloud_host = self.cloud_host.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no cloud Strom host: Open Live did not report one, so set [app.uplink] host"
+            )
+        })?;
+
+        let input = session::input_for_device(&self.cfg.app, &device, port, &cloud_host);
         let active = session::start_input(
             &self.strom,
             &self.gateway_id,

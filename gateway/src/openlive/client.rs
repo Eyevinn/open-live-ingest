@@ -73,6 +73,34 @@ impl OpenLiveClient {
         })
     }
 
+    /// The hostname of the Strom instance Open Live drives — the uplink's far end.
+    ///
+    /// Lets a venue box be configured with nothing but the Open Live address. Older
+    /// deployments lack the route, so a 404 is not an error: the caller falls back to
+    /// a configured host.
+    pub async fn cloud_strom_host(&self) -> Result<Option<String>> {
+        let res = self
+            .auth_req(
+                self.http
+                    .get(format!("{}/api/v1/server-info", self.base_url)),
+            )
+            .await?
+            .send()
+            .await
+            .context("GET server-info")?;
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let res = error_for_status(res, "GET server-info")?;
+        let body: serde_json::Value = res.json().await.context("decoding server-info")?;
+        Ok(body
+            .get("stromHost")
+            .and_then(|v| v.as_str())
+            .filter(|h| !h.is_empty())
+            .map(str::to_string))
+    }
+
     /// Lists all sources.
     ///
     /// Deliberately used instead of `GET /api/v1/sources/{id}`: a 200 with a JSON

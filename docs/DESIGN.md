@@ -154,6 +154,13 @@ Two things it still has to handle, because a window can be closed the hard way:
 Input ids are derived from the device id, so picking the same camera after a restart addresses the
 same flow and the same Open Live source instead of accumulating a duplicate per session.
 
+**Two Stroms, one of them Open Live's business.** The venue box runs its own Strom to capture and
+encode; the cloud runs the Strom that Open Live drives. Only the second is discoverable: Open Live
+reports its hostname from `GET /api/v1/server-info`, so the app can be configured with nothing but
+the Open Live address and its credential — the local Strom defaults to loopback because it lives on
+the same machine. What still cannot be discovered is the SRT port, since nothing allocates them
+(§9), and the uplink direction, which depends on which side can publish a port.
+
 The app is explicitly **not** a venue appliance: no unattended recovery, nothing under systemd. A
 venue box that must come back by itself after a power cut runs the headless binary.
 
