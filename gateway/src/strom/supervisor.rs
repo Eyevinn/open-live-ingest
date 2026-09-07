@@ -159,7 +159,10 @@ async fn reconcile(
     };
 
     if running {
-        state.set_state(&input.id, InputState::Running);
+        // The flow being up says nothing about whether the far end is taking the
+        // stream. Only a delivering uplink makes this input safe to assign to a
+        // production, so the state distinguishes the two.
+        classify_uplink(state, client, input, flow_id).await?;
         return Ok(());
     }
 
@@ -169,7 +172,8 @@ async fn reconcile(
 
     if started.running {
         info!(input = %input.id, flow_id, "flow running");
-        state.set_state(&input.id, InputState::Running);
+        state.clear_uplink(&input.id);
+        state.set_state(&input.id, InputState::Stalled);
     } else {
         // Start returned without the pipeline reaching a running state — surface it
         // and let the next tick try again.
@@ -177,5 +181,30 @@ async fn reconcile(
         state.record_error(&input.id, "Strom reported the flow not running after start");
     }
 
+    Ok(())
+}
+
+/// Sets `Running` or `Stalled` from the uplink's SRT statistics.
+async fn classify_uplink(
+    state: &SharedState,
+    client: &StromClient,
+    input: &InputConfig,
+    flow_id: &str,
+) -> Result<()> {
+    let Some(uplink) = client.srt_uplink(flow_id).await? else {
+        // No SRT connection reported at all: the pipeline is up but the uplink has
+        // not established, so nothing is reaching the far end.
+        state.clear_uplink(&input.id);
+        state.set_state(&input.id, InputState::Stalled);
+        return Ok(());
+    };
+
+    let delivering = state.record_uplink(&input.id, &uplink);
+
+    if delivering {
+        state.set_state(&input.id, InputState::Running);
+    } else {
+        state.set_state(&input.id, InputState::Stalled);
+    }
     Ok(())
 }

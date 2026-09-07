@@ -19,8 +19,13 @@ pub enum InputState {
     Provisioning,
     /// Flow created, start requested, not yet reported running.
     Starting,
-    /// Strom reports the flow running.
+    /// Strom reports the flow running and the SRT uplink is delivering bytes.
     Running,
+    /// The flow is running but the uplink is delivering nothing — the far end is not
+    /// accepting the stream. Never reported to Open Live as `active`: assigning a
+    /// source that cannot deliver stops the cloud production from reaching playing,
+    /// which takes the whole show down rather than just losing one input.
+    Stalled,
     /// Strom is unreachable, so the flow's true state is unknown. The feed may well
     /// still be on air — Strom keeps running when the agent dies.
     Unknown,
@@ -36,6 +41,15 @@ impl InputState {
     /// invite an operator to drop a production that is still on air.
     pub fn is_active(self) -> bool {
         matches!(self, InputState::Running | InputState::Unknown)
+    }
+
+    /// Whether the operator can safely assign this input to a production.
+    ///
+    /// Stricter than [`is_active`]: it requires the uplink to be proven delivering,
+    /// because a source whose feed never arrives prevents the cloud flow from
+    /// reaching playing at all.
+    pub fn is_deliverable(self) -> bool {
+        matches!(self, InputState::Running)
     }
 }
 
@@ -63,4 +77,20 @@ pub struct InputStatus {
     pub listener_address: String,
     pub restarts: u32,
     pub last_error: Option<String>,
+    /// SRT uplink telemetry, read from Strom's srt-stats. None until first polled.
+    pub uplink: Option<UplinkStats>,
+}
+
+/// Uplink health, derived from Strom's SRT statistics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UplinkStats {
+    /// True only when `bytes_sent` advanced since the previous poll. Strom's own
+    /// `connected` flag stays true against a vanished peer, so it is not used.
+    pub delivering: bool,
+    pub bytes_sent: u64,
+    pub rtt_ms: Option<f64>,
+    pub send_rate_mbps: Option<f64>,
+    pub packets_retransmitted: Option<u64>,
+    pub packets_sent_dropped: Option<u64>,
+    pub negotiated_latency_ms: Option<u64>,
 }

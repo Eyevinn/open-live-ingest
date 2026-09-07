@@ -46,6 +46,22 @@ pub struct FetchedFlow {
     pub raw: Value,
 }
 
+/// The uplink's SRT connection as Strom reports it.
+///
+/// `connected` is deliberately not exposed: when the far end disappears, srtsink
+/// keeps a stale caller entry with `connected: true` while it retries. What actually
+/// distinguishes a delivering uplink is `bytes_sent` advancing, corroborated by a
+/// non-null `rtt_ms` — every metric goes null once the socket is broken.
+#[derive(Debug, Clone, Default)]
+pub struct SrtUplink {
+    pub bytes_sent: u64,
+    pub rtt_ms: Option<f64>,
+    pub send_rate_mbps: Option<f64>,
+    pub packets_retransmitted: Option<u64>,
+    pub packets_sent_dropped: Option<u64>,
+    pub negotiated_latency_ms: Option<u64>,
+}
+
 pub struct StromClient {
     http: reqwest::Client,
     base_url: String,
@@ -149,6 +165,58 @@ impl StromClient {
         let res = error_for_status(res, "POST flow stop")?;
         let body: FlowResponse = res.json().await.context("decoding stopped flow")?;
         Ok(body.flow)
+    }
+
+    /// Reads the flow's SRT statistics, picking out the sink in caller mode — the
+    /// gateway's uplink. Returns None when the flow reports no such connection.
+    pub async fn srt_uplink(&self, id: &str) -> Result<Option<SrtUplink>> {
+        let res = self
+            .auth(
+                self.http
+                    .get(format!("{}/api/flows/{id}/srt-stats", self.base_url)),
+            )
+            .send()
+            .await
+            .context("GET srt-stats")?;
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let res = error_for_status(res, "GET srt-stats")?;
+        let body: Value = res.json().await.context("decoding srt-stats")?;
+
+        let connections = match body
+            .pointer("/stats/connections")
+            .and_then(Value::as_object)
+        {
+            Some(connections) => connections,
+            None => return Ok(None),
+        };
+
+        let uplink = connections.values().find(|c| {
+            c.get("role").and_then(Value::as_str) == Some("sink")
+                && c.get("mode").and_then(Value::as_str) == Some("caller")
+        });
+
+        let Some(caller) = uplink
+            .and_then(|c| c.get("callers"))
+            .and_then(Value::as_array)
+            .and_then(|callers| callers.first())
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(SrtUplink {
+            bytes_sent: caller
+                .get("bytes_sent")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            rtt_ms: caller.get("rtt_ms").and_then(Value::as_f64),
+            send_rate_mbps: caller.get("send_rate_mbps").and_then(Value::as_f64),
+            packets_retransmitted: caller.get("packets_retransmitted").and_then(Value::as_u64),
+            packets_sent_dropped: caller.get("packets_sent_dropped").and_then(Value::as_u64),
+            negotiated_latency_ms: caller.get("negotiated_latency_ms").and_then(Value::as_u64),
+        }))
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

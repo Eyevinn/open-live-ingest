@@ -147,8 +147,17 @@ patched if a field drifted, or created if absent. Persisting it is what stops ev
 leaving another orphaned source in Studio's list. A remembered id that has since been deleted in
 Studio falls through to creating a fresh one rather than failing forever.
 
-**Status reconciliation.** The source `status` (`active`/`inactive`) is reconciled against flow
-state every ~10 s. That field is the only health channel the current Open Live API offers, so
+**Status reconciliation.** The source `status` (`active`/`inactive`) is reconciled every ~10 s
+against whether the uplink is *delivering*, not merely whether the local flow runs. The
+distinction is not cosmetic: a source assigned to a production whose feed never arrives stops the
+cloud flow from reaching playing at all, so Open Live never publishes the WHEP endpoints and the
+whole show fails to come up — one dead input is not degraded gracefully, it takes everything with
+it. `active` therefore has to mean "safe to assign".
+
+Delivery is judged from Strom's `/api/flows/{id}/srt-stats`, by `bytes_sent` advancing between
+polls. Strom's own `connected` flag is not usable for this: when the far end vanishes, `srtsink`
+keeps a stale caller entry reporting `connected: true` while it retries, and every metric
+alongside it goes null. That field is the only health channel the current Open Live API offers, so
 richer telemetry is exposed locally instead, until Open Live grows somewhere to put it (§8).
 
 **Local control API** (axum, loopback by default; a non-loopback bind requires a token, enforced at

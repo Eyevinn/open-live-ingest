@@ -1,7 +1,8 @@
 //! Runtime state shared between the flow supervisors, the control API, and the Open
 //! Live registration loop.
 
-use open_live_gateway_types::status::{GatewayStatus, InputState, InputStatus};
+use crate::strom::client::SrtUplink;
+use open_live_gateway_types::status::{GatewayStatus, InputState, InputStatus, UplinkStats};
 use open_live_gateway_types::GatewayConfig;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +33,7 @@ impl SharedState {
                         listener_address: input.uplink.listener_uri(),
                         restarts: 0,
                         last_error: None,
+                        uplink: None,
                     },
                 )
             })
@@ -85,6 +87,37 @@ impl SharedState {
         self.mutate(input_id, |status| {
             status.source_id = Some(source_id.to_string());
         });
+    }
+
+    /// Records an uplink sample and reports whether it is delivering, which is true
+    /// only when `bytes_sent` advanced since the previous sample.
+    pub fn record_uplink(&self, input_id: &str, sample: &SrtUplink) -> bool {
+        let mut inputs = self.inputs.lock().expect("state poisoned");
+        let Some(status) = inputs.get_mut(input_id) else {
+            return false;
+        };
+
+        let delivering = match status.uplink.as_ref().map(|u| u.bytes_sent) {
+            Some(before) => sample.bytes_sent > before,
+            // The first sample cannot prove movement; require a second one rather
+            // than declaring an unproven uplink healthy.
+            None => false,
+        };
+
+        status.uplink = Some(UplinkStats {
+            delivering,
+            bytes_sent: sample.bytes_sent,
+            rtt_ms: sample.rtt_ms,
+            send_rate_mbps: sample.send_rate_mbps,
+            packets_retransmitted: sample.packets_retransmitted,
+            packets_sent_dropped: sample.packets_sent_dropped,
+            negotiated_latency_ms: sample.negotiated_latency_ms,
+        });
+        delivering
+    }
+
+    pub fn clear_uplink(&self, input_id: &str) {
+        self.mutate(input_id, |status| status.uplink = None);
     }
 
     pub fn record_error(&self, input_id: &str, err: &str) {

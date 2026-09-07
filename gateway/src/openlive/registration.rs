@@ -81,8 +81,12 @@ async fn reconcile(
         name: input.source_name(gateway_name),
         address: input.uplink.listener_uri(),
         stream_type: "srt".to_string(),
+        // `active` means "safe to assign to a production", which requires the
+        // uplink to be delivering — not merely that the local flow is running. A
+        // source whose feed never arrives stops the cloud flow from reaching
+        // playing, so an over-optimistic status here takes down a whole show.
         status: match input_state {
-            Some(s) if s.is_active() => "active".to_string(),
+            Some(s) if s.is_deliverable() => "active".to_string(),
             _ => "inactive".to_string(),
         },
         latency: input.uplink.latency_ms,
