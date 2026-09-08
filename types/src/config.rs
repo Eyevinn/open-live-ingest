@@ -54,28 +54,20 @@ pub struct GatewayIdentity {
 
 /// Defaults applied to an input the operator starts from the desktop app, where
 /// there is no config entry to read them from.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AppConfig {
     #[serde(default)]
     pub video: VideoConfig,
-    /// Capture format requested from the device.
-    #[serde(default = "default_resolution")]
-    pub video_resolution: String,
-    #[serde(default = "default_framerate")]
-    pub video_framerate: String,
+    /// Capture format to request from the device, or nothing to take what it offers.
+    /// See the note on `CaptureConfig::Local` — asking for a format a device does not
+    /// advertise fails negotiation rather than being converted.
+    #[serde(default)]
+    pub video_resolution: Option<String>,
+    #[serde(default)]
+    pub video_framerate: Option<String>,
     #[serde(default)]
     pub uplink: UplinkTemplate,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            video: VideoConfig::default(),
-            video_resolution: default_resolution(),
-            video_framerate: default_framerate(),
-            uplink: UplinkTemplate::default(),
-        }
-    }
 }
 
 /// An uplink with no port yet: the app allocates one per input from `port_range`,
@@ -218,11 +210,16 @@ pub enum CaptureConfig {
         /// single camera attached.
         #[serde(default)]
         video_device: Option<String>,
-        /// `WxH`, e.g. `1920x1080`.
-        #[serde(default = "default_resolution")]
-        video_resolution: String,
-        #[serde(default = "default_framerate")]
-        video_framerate: String,
+        /// `WxH`, e.g. `1920x1080`. Leave unset to take whatever the device offers.
+        ///
+        /// Not a request the pipeline can satisfy by conversion: `local_input`
+        /// normalises through `videoconvert`, which changes pixel format but cannot
+        /// scale or re-time. Asking for a format the device does not offer fails
+        /// negotiation outright, so the safe default is to ask for nothing.
+        #[serde(default)]
+        video_resolution: Option<String>,
+        #[serde(default)]
+        video_framerate: Option<String>,
         /// Strom device id from
         /// `GET /api/discovery/devices?category=audio_source`. Leave unset for
         /// video-only capture — a USB camera's microphone is a separate device, and

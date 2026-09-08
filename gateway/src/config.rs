@@ -118,7 +118,7 @@ fn with_env_overrides(mut cfg: GatewayConfig) -> GatewayConfig {
 }
 
 /// Rejects configurations that would fail confusingly at runtime.
-fn validate(cfg: &GatewayConfig) -> Result<()> {
+pub fn validate(cfg: &GatewayConfig) -> Result<()> {
     if cfg.strom.url.trim().is_empty() {
         bail!("strom.url is unset — the gateway needs a local Strom instance to drive");
     }

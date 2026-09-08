@@ -23,6 +23,29 @@ use open_live_gateway_types::config::{
 };
 use std::collections::BTreeSet;
 
+/// Devices that exist but produce nothing unless some other application is running.
+///
+/// Streaming one of these registers a source in Studio that sits permanently waiting
+/// for a picture, which looks like a fault. Included only when explicitly asked for.
+const VIRTUAL_HINTS: &[&str] = &[
+    "virtual",
+    "obs",
+    "loopback",
+    "dummy",
+    "null",
+    "screen capture",
+    "desktop",
+];
+
+/// Whether a device looks like a virtual one rather than real capture hardware.
+///
+/// A name heuristic, because the platform providers do not distinguish them: on macOS
+/// a virtual camera and a built-in one both arrive from `avfprovider`.
+pub fn is_probably_virtual(device: &CaptureDevice) -> bool {
+    let name = device.display_name.to_lowercase();
+    VIRTUAL_HINTS.iter().any(|hint| name.contains(hint))
+}
+
 /// Turns a device id into an input id that is stable for that device.
 ///
 /// Stability matters: restarting the app and picking the same camera addresses the
@@ -200,6 +223,32 @@ mod tests {
 
     /// Picking the same camera after a restart must address the same flow and source,
     /// or Studio's source list fills up with duplicates of one device.
+    #[test]
+    fn virtual_devices_are_recognised_by_name() {
+        assert!(is_probably_virtual(&device("d1", "OBS Virtual Camera")));
+        assert!(is_probably_virtual(&device("d2", "Screen Capture")));
+        assert!(is_probably_virtual(&device("d3", "v4l2loopback")));
+    }
+
+    /// Real hardware must never be filtered out — a venue whose camera vanished from
+    /// the list because of a name heuristic is a worse outcome than a stray virtual
+    /// device appearing.
+    #[test]
+    fn real_capture_hardware_is_not_filtered() {
+        for name in [
+            "FaceTime HD Camera",
+            "DeckLink Mini Recorder 4K",
+            "Magewell USB Capture SDI",
+            "Luddes Camera",
+            "Logitech BRIO",
+        ] {
+            assert!(
+                !is_probably_virtual(&device("d", name)),
+                "{name} must not be treated as virtual"
+            );
+        }
+    }
+
     #[test]
     fn input_ids_are_stable_per_device() {
         let a = input_id_for_device("dev-d24eb9fb6733c220");

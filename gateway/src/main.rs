@@ -1,76 +1,122 @@
-//! Open Live Gateway — control agent for a venue-side Strom instance.
+//! Open Live Gateway.
 //!
-//! Templates and supervises a Strom flow that captures SDI, encodes it, and pushes it
-//! over SRT to a cloud-hosted Strom driven by Open Live; and registers the feed with
-//! the Open Live API so operators can assign it to a mixer input. The gateway owns no
-//! media pipeline of its own. See docs/DESIGN.md.
-
-use open_live_gateway::{config, control, identity, openlive, state, strom};
+//! Streams the capture devices on this machine into Open Live. Run it and it asks for
+//! whatever it needs, checks the answers, remembers them, then registers every device
+//! it finds and starts sending. Built to be driven over SSH: prompts on a plain
+//! terminal, no window, no full-screen UI.
+//!
+//! Strom does the media — capture, encode, mux, SRT — and this drives it. See
+//! docs/DESIGN.md.
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
+use open_live_gateway::{config, identity, prompt, runner};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
-#[command(name = "open-live-gateway", version)]
+#[command(name = "open-live-gateway", version, about)]
 struct Cli {
-    /// Path to the configuration file.
-    #[arg(
-        short,
-        long,
-        env = "OLG_CONFIG",
-        default_value = "/etc/open-live-gateway/gateway.toml"
-    )]
-    config: PathBuf,
+    /// Settings file. Defaults to a per-user location and is written on first setup.
+    #[arg(short, long, env = "OLG_CONFIG", global = true)]
+    config: Option<PathBuf>,
 
-    /// Log level override (`trace`, `debug`, `info`, `warn`, `error`).
-    #[arg(long, env = "OLG_LOG_LEVEL")]
+    /// Log level (`trace`, `debug`, `info`, `warn`, `error`).
+    #[arg(long, env = "OLG_LOG_LEVEL", global = true)]
     log_level: Option<String>,
 
-    /// Validate the configuration and exit without starting anything.
-    #[arg(long)]
-    check: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Register every capture device with Open Live and stream it. Stays running:
+    /// Ctrl-C stops and removes the feeds, while a closed SSH session does not.
+    Up {
+        /// Include virtual devices, which are skipped by default because they
+        /// produce nothing unless another application is running.
+        #[arg(long)]
+        all: bool,
+
+        /// Only these devices, by number from the printed list, e.g. `--devices 1,3`.
+        #[arg(long)]
+        devices: Option<String>,
+
+        /// Ask for every setting again, even the ones already stored.
+        #[arg(long)]
+        reconfigure: bool,
+    },
+    /// Stop a running gateway and remove its flows and Open Live sources.
+    Down,
+    /// Report what is running, from Strom and Open Live directly.
+    Status,
+    /// Ask for settings and store them without starting anything.
+    Setup,
+    /// Check the settings file and exit.
+    Check,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = config::load(&cli.config, cli.log_level.as_deref())
-        .with_context(|| format!("loading config from {}", cli.config.display()))?;
+    let config_path = cli.config.clone().unwrap_or_else(config::default_path);
 
+    let mut cfg = config::load_or_default(&config_path)
+        .with_context(|| format!("loading settings from {}", config_path.display()))?;
+    if let Some(level) = &cli.log_level {
+        cfg.log.level = level.clone();
+    }
     config::init_tracing(&cfg.log.level);
 
-    // Only the headless daemon needs inputs up front; the desktop app creates them
-    // when an operator picks a device.
-    if cfg.inputs.is_empty() {
-        anyhow::bail!("no inputs configured — the headless daemon needs at least one [[inputs]]");
-    }
+    let command = cli.command.unwrap_or(Command::Up {
+        all: false,
+        devices: None,
+        reconfigure: false,
+    });
 
-    if cli.check {
-        info!("configuration is valid: {} input(s)", cfg.inputs.len());
-        return Ok(());
-    }
-
-    let gateway_id = identity::resolve_gateway_id(&cfg);
-    info!(gateway_id = %gateway_id, inputs = cfg.inputs.len(), "starting Open Live Gateway");
-
-    let state = Arc::new(state::SharedState::new(gateway_id, &cfg));
-
-    // Flows first: the feed must come up even if Open Live cannot be reached. See
-    // the invariant in docs/DESIGN.md §1.
-    strom::spawn_supervisors(Arc::clone(&state), &cfg)?;
-
-    if cfg.open_live.register {
-        match openlive::spawn_registration(Arc::clone(&state), &cfg) {
-            Ok(()) => info!("Open Live registration loop started"),
-            // Registration is best-effort by design and must never abort startup.
-            Err(err) => warn!(%err, "Open Live registration unavailable, continuing without it"),
+    match command {
+        Command::Check => {
+            config::validate(&cfg)?;
+            println!(
+                "Settings at {} are valid ({} declared input(s)).",
+                config_path.display(),
+                cfg.inputs.len()
+            );
+            Ok(())
         }
-    } else {
-        info!("Open Live registration disabled by config");
-    }
 
-    control::serve(Arc::clone(&state), &cfg.control).await
+        Command::Setup => {
+            if prompt::configure(&mut cfg, true).await? {
+                config::save(&config_path, &cfg)?;
+                println!("\nSaved to {}.", config_path.display());
+            }
+            Ok(())
+        }
+
+        Command::Up {
+            all,
+            devices,
+            reconfigure,
+        } => {
+            if prompt::configure(&mut cfg, reconfigure).await? {
+                config::save(&config_path, &cfg)?;
+                println!("\nSaved to {}.\n", config_path.display());
+            }
+            config::validate(&cfg)?;
+            let gateway_id = identity::resolve_gateway_id(&cfg);
+            runner::up(cfg, gateway_id, all, devices).await
+        }
+
+        Command::Down => {
+            config::validate(&cfg)?;
+            let gateway_id = identity::resolve_gateway_id(&cfg);
+            runner::down(cfg, gateway_id).await
+        }
+
+        Command::Status => {
+            config::validate(&cfg)?;
+            let gateway_id = identity::resolve_gateway_id(&cfg);
+            runner::status(cfg, gateway_id).await
+        }
+    }
 }

@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use open_live_gateway_types::GatewayConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -13,6 +13,20 @@ pub struct PersistedState {
     /// Local input id -> Open Live source id (`src-<uuid>`).
     #[serde(default)]
     pub source_ids: HashMap<String, String>,
+    /// What the last `up` started, keyed by input id.
+    ///
+    /// Recorded independently of registration on purpose: `status` and `down` have to
+    /// work when registration is off, and after a hard kill left flows behind. Tying
+    /// the record to a registered source made both blind in exactly those cases.
+    #[serde(default)]
+    pub started: BTreeMap<String, StartedInput>,
+}
+
+/// Enough about a started input to report on it and to tear it down.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartedInput {
+    pub device_name: String,
+    pub port: u16,
 }
 
 pub fn resolve_gateway_id(cfg: &GatewayConfig) -> String {
@@ -32,6 +46,27 @@ pub fn load(path: &Path) -> Result<PersistedState> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(PersistedState::default()),
         Err(err) => Err(err).context("reading gateway state file"),
     }
+}
+
+/// Records that an input was started, so `status` and `down` can find it later.
+pub fn record_started(path: &Path, input_id: &str, device_name: &str, port: u16) -> Result<()> {
+    let mut state = load(path)?;
+    state.started.insert(
+        input_id.to_string(),
+        StartedInput {
+            device_name: device_name.to_string(),
+            port,
+        },
+    );
+    store(path, &state)
+}
+
+/// Forgets a torn-down input.
+pub fn forget_started(path: &Path, input_id: &str) -> Result<()> {
+    let mut state = load(path)?;
+    state.started.remove(input_id);
+    state.source_ids.remove(input_id);
+    store(path, &state)
 }
 
 pub fn store(path: &Path, state: &PersistedState) -> Result<()> {

@@ -74,6 +74,17 @@ pub struct CaptureDevice {
     pub provider: Option<String>,
 }
 
+/// What a probe of the local Strom found.
+pub enum Reachability {
+    Ok {
+        video_sources: usize,
+    },
+    /// Reached it, but it wants a credential — so ask for one rather than reporting
+    /// an unreachable server, which would send someone looking at the network.
+    NeedsCredential,
+    Unreachable(String),
+}
+
 pub struct StromClient {
     http: reqwest::Client,
     base_url: String,
@@ -248,6 +259,53 @@ impl StromClient {
             packets_sent_dropped: caller.get("packets_sent_dropped").and_then(Value::as_u64),
             negotiated_latency_ms: caller.get("negotiated_latency_ms").and_then(Value::as_u64),
         }))
+    }
+
+    /// Checks whether the local Strom is reachable and whether it wants a credential.
+    ///
+    /// The distinction matters at setup time: "needs a key" and "cannot be reached"
+    /// lead an operator to completely different places.
+    pub async fn probe(&self) -> Reachability {
+        let res = self
+            .auth(self.http.get(format!(
+                "{}/api/discovery/devices?category=video_source",
+                self.base_url
+            )))
+            .send()
+            .await;
+
+        let res = match res {
+            Ok(res) => res,
+            Err(err) => return Reachability::Unreachable(err.to_string()),
+        };
+
+        match res.status() {
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+                Reachability::NeedsCredential
+            }
+            status if !status.is_success() => Reachability::Unreachable(format!("HTTP {status}")),
+            _ => {
+                let count = res
+                    .json::<Value>()
+                    .await
+                    .ok()
+                    .map(|body| {
+                        let items = if body.is_array() {
+                            body
+                        } else {
+                            ["devices", "items", "sources"]
+                                .iter()
+                                .find_map(|k| body.get(*k).cloned())
+                                .unwrap_or(Value::Array(vec![]))
+                        };
+                        items.as_array().map(|a| a.len()).unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                Reachability::Ok {
+                    video_sources: count,
+                }
+            }
+        }
     }
 
     /// Lists capture devices in a category (`video_source` or `audio_source`).

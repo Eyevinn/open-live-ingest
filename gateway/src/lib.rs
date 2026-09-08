@@ -11,6 +11,8 @@ pub mod config;
 pub mod control;
 pub mod identity;
 pub mod openlive;
+pub mod prompt;
+pub mod runner;
 pub mod session;
 pub mod state;
 pub mod strom;

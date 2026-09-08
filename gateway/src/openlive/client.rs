@@ -149,6 +149,26 @@ impl OpenLiveClient {
         res.json().await.context("decoding patched source")
     }
 
+    /// Removes a source. Used by `down`, so a torn-down venue does not leave stale
+    /// entries in Studio's source list.
+    pub async fn delete_source(&self, id: &str) -> Result<()> {
+        let res = self
+            .auth_req(
+                self.http
+                    .delete(format!("{}/api/v1/sources/{id}", self.base_url)),
+            )
+            .await?
+            .send()
+            .await
+            .context("DELETE source")?;
+
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        error_for_status(res, "DELETE source")?;
+        Ok(())
+    }
+
     pub async fn set_status(&self, id: &str, status: &str) -> Result<()> {
         let res = self
             .auth_req(

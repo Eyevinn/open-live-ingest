@@ -229,10 +229,18 @@ fn capture_stage(capture: &CaptureConfig) -> Result<CaptureStage> {
         } => {
             let audio = audio_device.as_deref().is_some_and(|d| !d.is_empty());
             let mut properties = json!({
-                "video_resolution": video_resolution,
-                "video_framerate": video_framerate,
                 "stream_mode": if audio { "audio_video" } else { "video" },
             });
+            // Only constrain the capture format when asked to. `videoconvert` cannot
+            // scale or re-time, so requesting a format the device does not advertise
+            // fails negotiation instead of being converted — and many capture devices
+            // offer exactly one.
+            if let Some(res) = video_resolution.as_deref().filter(|r| !r.is_empty()) {
+                properties["video_resolution"] = json!(res);
+            }
+            if let Some(rate) = video_framerate.as_deref().filter(|r| !r.is_empty()) {
+                properties["video_framerate"] = json!(rate);
+            }
             // Omitted rather than sent empty: Strom falls back to autovideosrc and
             // picks the OS default device, which is what a single-camera box wants.
             if let Some(device) = video_device.as_deref().filter(|d| !d.is_empty()) {
@@ -454,8 +462,8 @@ mod tests {
     fn local_input_without_an_audio_device_is_video_only() {
         let capture = CaptureConfig::Local {
             video_device: Some("usb-camera-0".to_string()),
-            video_resolution: "1920x1080".to_string(),
-            video_framerate: "25/1".to_string(),
+            video_resolution: Some("1920x1080".to_string()),
+            video_framerate: Some("25/1".to_string()),
             audio_device: None,
             audio_channels: 2,
             audio_rate: 48000,
@@ -481,8 +489,8 @@ mod tests {
     fn local_input_without_a_device_id_omits_the_property() {
         let capture = CaptureConfig::Local {
             video_device: None,
-            video_resolution: "1280x720".to_string(),
-            video_framerate: "25/1".to_string(),
+            video_resolution: Some("1280x720".to_string()),
+            video_framerate: Some("25/1".to_string()),
             audio_device: None,
             audio_channels: 2,
             audio_rate: 48000,
@@ -693,5 +701,82 @@ mod drift_tests {
         let desired = build("venue-a", "Venue A", &input()).unwrap();
         let body = preserving_strom_state(&desired, &json!({}));
         assert_eq!(body, desired);
+    }
+}
+
+#[cfg(test)]
+mod capture_format_tests {
+    use super::*;
+    use open_live_gateway_types::config::{UplinkConfig, UplinkMode, VideoConfig};
+
+    fn local(resolution: Option<&str>, framerate: Option<&str>) -> InputConfig {
+        InputConfig {
+            id: "cam1".to_string(),
+            name: None,
+            capture: CaptureConfig::Local {
+                video_device: Some("dev-1".to_string()),
+                video_resolution: resolution.map(str::to_string),
+                video_framerate: framerate.map(str::to_string),
+                audio_device: None,
+                audio_channels: 2,
+                audio_rate: 48000,
+            },
+            video: VideoConfig::default(),
+            uplink: UplinkConfig {
+                mode: UplinkMode::Caller,
+                host: "cloud.example.com".to_string(),
+                public_host: None,
+                port: 9000,
+                latency_ms: 200,
+                passphrase: None,
+                pbkeylen: None,
+                stream_id: None,
+            },
+            enabled: true,
+        }
+    }
+
+    fn capture_properties(input: &InputConfig) -> Value {
+        let flow = build("gw", "GW", input).unwrap();
+        flow["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "capture")
+            .unwrap()["properties"]
+            .clone()
+    }
+
+    /// The default has to be "whatever the device offers". `videoconvert` cannot
+    /// scale or re-time, so a requested format the device does not advertise fails
+    /// negotiation outright — and devices with exactly one fixed format are common
+    /// (a virtual camera offering only 1920x1080@60, for instance).
+    #[test]
+    fn no_requested_format_means_no_constraint_in_the_flow() {
+        let props = capture_properties(&local(None, None));
+        assert!(props.get("video_resolution").is_none());
+        assert!(props.get("video_framerate").is_none());
+    }
+
+    #[test]
+    fn a_requested_format_is_passed_through() {
+        let props = capture_properties(&local(Some("1280x720"), Some("25/1")));
+        assert_eq!(props["video_resolution"], "1280x720");
+        assert_eq!(props["video_framerate"], "25/1");
+    }
+
+    /// An empty string is not a format; it would constrain negotiation to nothing.
+    #[test]
+    fn blank_strings_are_treated_as_unset() {
+        let props = capture_properties(&local(Some(""), Some("")));
+        assert!(props.get("video_resolution").is_none());
+        assert!(props.get("video_framerate").is_none());
+    }
+
+    #[test]
+    fn resolution_and_framerate_are_independent() {
+        let props = capture_properties(&local(Some("1920x1080"), None));
+        assert_eq!(props["video_resolution"], "1920x1080");
+        assert!(props.get("video_framerate").is_none());
     }
 }

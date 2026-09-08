@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["types", "gateway", "gui"]
+members = ["types", "gateway"]
 default-members = ["gateway"]
 
 [workspace.package]
@@ -24,7 +24,11 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4"
-eframe = "0.36"
+# No-echo terminal input for credential prompts. Deliberately tiny: this must work on
+# a dumb terminal over SSH.
+rpassword = "7"
+# Signal 0 liveness checks and SIGTERM for `down`.
+libc = "0.2"
 # v5 for deterministic flow ids derived from gateway id + input id, so a reboot
 # addresses the same Strom flow without consulting local state.
 uuid = { version = "1", features = ["serde", "v5"] }

@@ -131,46 +131,43 @@ Consequences to design around:
 - **The passphrase is owned by the gateway.** Open Live encrypts it at rest and masks it on read,
   so the gateway never reads it back — it puts the same value on both URIs.
 
-## 5a. Two front ends
+## 5a. The command line
 
-The same core serves two deployment models, and they differ in who owns an input's lifetime.
+There is one front end and it is a terminal, because the machine is reached over SSH. Plain
+prompts, no window and no full-screen UI: it has to work on whatever terminal a venue laptop has,
+inside tmux, over a link that may drop.
 
-The **headless daemon** takes its inputs from the config file and runs unattended under systemd.
-Inputs outlive the process, so everything above — idempotent registration, derived flow ids, drift
-reconciliation — exists to converge on a declared state no matter what happened before.
+**Setup is running it.** Anything missing is asked for, checked immediately, and written to the
+config file. Checking each answer as it is given is the whole point — a wrong credential caught at
+the prompt costs a retype, while the same mistake surfacing later looks like a feed that silently
+goes nowhere. Two things follow from that: the Open Live credential kind is *inferred* from the
+address rather than asked about, since nobody can answer "osc or direct" from those words; and the
+local Strom's key is asked for only when Strom actually answers 401, because "wants a credential"
+and "cannot be reached" send an operator to completely different places.
 
-The **desktop app** inverts that: an input exists because an operator picked a device, and closing
-the window ends it. That makes the lifecycle simpler rather than harder. The app owns each flow
-outright and deletes it on the way out, so there is nothing to reconcile against next time, and no
-control API is needed because the UI reads `SharedState` in-process.
+**`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
+**SIGHUP does not** — a closed SSH session, or a link dropping mid-show, must not take a venue off
+air. That asymmetry is deliberate: a deliberate stop stops, an accident does not.
 
-Two things it still has to handle, because a window can be closed the hard way:
+**`down` and `status` are stateless.** Neither asks a running `up` what exists; they work it out
+from what was recorded and from derived flow ids, so they behave identically whether `up` is
+running, finished, or was killed outright. `down` signals a running instance first, then sweeps
+whatever it did not manage to remove.
 
-- **Orphans from a crash.** Derived flow ids mean a fresh start can find and delete its own
-  leftovers with no stored state to consult.
-- **Ports.** An operator picking a camera cannot be asked to choose a UDP port, so one is allocated
-  per input from `[app.uplink] port_range`, skipping ports that config-declared inputs claimed.
+What `up` started is recorded independently of Open Live registration. Tying that record to a
+registered source made both commands blind exactly when they were needed most: with registration
+off, and after a hard kill left flows behind.
 
-Input ids are derived from the device id, so picking the same camera after a restart addresses the
-same flow and the same Open Live source instead of accumulating a duplicate per session.
+**Capture format is not requested by default.** `builtin.local_input` normalises through
+`videoconvert`, which changes pixel format but cannot scale or re-time, so asking for a resolution
+or framerate a device does not advertise fails negotiation rather than being converted — and
+devices with a single fixed format are common. Each device therefore delivers what it offers, and
+the encoder takes it; a format may still be set as an override.
 
-**Two Stroms, one of them Open Live's business.** The venue box runs its own Strom to capture and
-encode; the cloud runs the Strom that Open Live drives. Only the second is discoverable: Open Live
-reports its hostname from `GET /api/v1/server-info`, so the app can be configured with nothing but
-the Open Live address and its credential — the local Strom defaults to loopback because it lives on
-the same machine. What still cannot be discovered is the SRT port, since nothing allocates them
-(§9), and the uplink direction, which depends on which side can publish a port.
-
-**The app owns its own settings.** It writes the same config format the daemon reads, from a form
-in the window, so nothing about it requires a text editor — an operator setting up a venue box
-should not have to learn TOML. Consequences worth designing for: the file holds the Open Live
-credential, so it is written mode 0600 via a temporary file and a rename; an invalid config is
-refused before it reaches disk, since saving one would leave the app unable to start next time; and
-connection settings are only editable while nothing is streaming, because a running input keeps the
-clients it was started with and migrating it would mean interrupting a live feed to apply a setting.
-
-The app is explicitly **not** a venue appliance: no unattended recovery, nothing under systemd. A
-venue box that must come back by itself after a power cut runs the headless binary.
+Virtual devices are skipped unless asked for. Streaming one registers a source that sits
+permanently waiting for a picture, which reads as a fault. And because one command starts every
+device, the total uplink bitrate is printed before anything begins: N devices means N encoders and
+N times the bitrate, which is easy to overlook.
 
 ## 6. Control plane
 

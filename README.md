@@ -22,50 +22,47 @@ the flow provisioned, up to date with the config, and running.
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design: why media never transits Open Live, why
 the SRT caller direction matters, what is deliberately left to Strom, and what is deferred.
 
-## Two front ends
+## Running it
 
-Both share the same core — flow templating, supervision, Open Live registration:
-
-| | `open-live-gateway` | `open-live-gateway-gui` |
-|---|---|---|
-| Inputs | declared in the config file | picked from a device list in the window |
-| Lifetime | unattended under systemd, survives reboots | streams while the window is open |
-| Cleanup | flows persist and are reconciled | flows are removed when you stop a device or close the app |
-| For | a venue box that must come back on its own | running a camera into Open Live from a laptop |
-
-The app allocates an SRT port per input from `[app.uplink] port_range`, so an operator never has to
-choose one, and it derives a stable input id per device — picking the same camera again addresses
-the same flow and the same Open Live source rather than accumulating duplicates.
-
-For a venue box whose Open Live lives in the cloud, that is nearly the whole config: the local
-Strom defaults to `http://127.0.0.1:8080` (it runs beside the gateway), and the *cloud* Strom host
-is discovered from Open Live's `server-info`.
-
-```toml
-[gateway]
-name = "Venue A"
-
-[open_live]
-url = "https://open-live.example.com"
-auth_mode = "osc"        # OSC-hosted; api_key is then an OSC PAT
-api_key = "…"
-```
+Run it and it asks for what it needs, checks each answer, remembers it, then registers every
+capture device with Open Live and starts streaming:
 
 ```bash
-cargo run -p open-live-gateway-gui
+open-live-gateway              # same as `up`
+open-live-gateway status       # what is running, from Strom and Open Live directly
+open-live-gateway down         # stop and remove the flows and sources
+open-live-gateway setup        # ask for settings without starting anything
+open-live-gateway up --all             # include virtual devices, skipped by default
+open-live-gateway up --devices 1,3     # only these, by number from the printed list
+open-live-gateway up --reconfigure     # ask for every setting again
 ```
 
-**No config file needed.** The app opens its settings form on first run, writes the file when you
-press Save (mode 0600 — it holds your credential), and stores it in a per-user location:
-`~/Library/Application Support/open-live-gateway/gateway.toml` on macOS, `$XDG_CONFIG_HOME` or
-`~/.config` on Linux. Pass `--config` to keep it somewhere else. Nothing needs a text editor; the
-headless daemon reads the same format if you would rather write one.
+Built for SSH: plain prompts on any terminal, no window and no full-screen UI. `up` stays in the
+foreground and owns what it started — Ctrl-C stops and removes the feeds — but it **ignores
+SIGHUP**, so a closed session or a dropped link does not take a venue off air. `status` and `down`
+work from a second session, and from the recorded state rather than by talking to the running
+process, so they behave the same after a `kill -9`.
+
+Three credentials exist in this system and it only ever asks for one:
+
+| Credential | Who needs it | Asked for |
+|---|---|---|
+| Open Live: an OSC personal access token, or Open Live's own `API_KEY` | the gateway, to register sources | **yes** — inferred from the URL, so you are not asked to choose |
+| The local Strom's `STROM_API_KEY` | the gateway, only if that Strom runs with auth | only when Strom actually refuses without one |
+| The cloud Strom's token | Open Live holds it itself | never — the gateway speaks only SRT to the cloud Strom |
+
+Settings live in a per-user file (`~/Library/Application Support/open-live-gateway/gateway.toml` on
+macOS, `$XDG_CONFIG_HOME` or `~/.config` on Linux), written mode 0600 because it holds that
+credential. Pass `--config` to put it elsewhere. Nothing needs a text editor, though the file is
+the same format if you would rather write one — and a declared `[[inputs]]` list still works for a
+box that should stream something other than "every device".
 
 ## Status
 
 Early. Flow templating, supervision, Open Live registration (including OSC token exchange), stall
-detection and recovery, and both front ends are in place. Verified end to end against a live Strom
-and a live Open Live: a test pattern reached a production's program output as decodable video.
+detection and recovery, interactive setup, and `up`/`down`/`status` are in place. Verified end to
+end against a live Strom and a live Open Live: a test pattern reached a production's program output
+as decodable video.
 
 ## Requirements
 
