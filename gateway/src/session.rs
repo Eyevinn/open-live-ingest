@@ -156,6 +156,64 @@ pub async fn stop_input(client: &StromClient, active: &ActiveInput) -> Result<()
     client.delete_flow(&active.flow_id).await
 }
 
+/// The capture device a flow opens, if it has a local-input block.
+pub fn flow_capture_device(flow: &serde_json::Value) -> Option<String> {
+    flow.get("blocks")?
+        .as_array()?
+        .iter()
+        .find(|b| {
+            b.get("block_definition_id").and_then(|v| v.as_str()) == Some("builtin.local_input")
+        })?
+        .get("properties")?
+        .get("video_device")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Removes any flow already holding one of the devices we are about to open.
+///
+/// Derived flow ids only find our own leftovers *under the current gateway id*, so a
+/// renamed gateway — or a flow from an earlier experiment — stays invisible to
+/// `reap_orphans` and keeps the camera open. Two pipelines on one device contend for
+/// frames, which presents as stutter rather than as an error, so this matches on the
+/// device itself.
+pub async fn clear_conflicting_flows(
+    client: &StromClient,
+    device_ids: &[String],
+    keep: &[String],
+) -> Vec<String> {
+    let Ok(flows) = client.list_flows().await else {
+        return Vec::new();
+    };
+
+    let mut cleared = Vec::new();
+    for flow in flows {
+        let Some(id) = flow.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if keep.iter().any(|k| k == id) {
+            continue;
+        }
+        let Some(device) = flow_capture_device(&flow) else {
+            continue;
+        };
+        if !device_ids.iter().any(|d| d == &device) {
+            continue;
+        }
+
+        let name = flow
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(id)
+            .to_string();
+        client.stop_flow(id).await.ok();
+        if client.delete_flow(id).await.is_ok() {
+            cleared.push(name);
+        }
+    }
+    cleared
+}
+
 /// Deletes any flow this gateway would have created for the given input ids.
 ///
 /// Called at startup to clear orphans from a run that ended without cleanup. Derived
@@ -212,6 +270,7 @@ pub fn register_in_state(state: &SharedState, input: &InputConfig, gateway_id: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn device(id: &str, name: &str) -> CaptureDevice {
         CaptureDevice {
@@ -223,6 +282,40 @@ mod tests {
 
     /// Picking the same camera after a restart must address the same flow and source,
     /// or Studio's source list fills up with duplicates of one device.
+    #[test]
+    fn a_flows_capture_device_is_read_from_its_local_input_block() {
+        let flow = json!({
+            "id": "f1",
+            "blocks": [
+                {"id": "capture", "block_definition_id": "builtin.local_input",
+                 "properties": {"video_device": "dev-abc"}},
+                {"id": "encoder", "block_definition_id": "builtin.videoenc", "properties": {}}
+            ]
+        });
+        assert_eq!(flow_capture_device(&flow).as_deref(), Some("dev-abc"));
+    }
+
+    /// A flow with no local input — a test pattern, an SRT relay, someone else's
+    /// work — must not be mistaken for one holding a camera.
+    #[test]
+    fn a_flow_without_a_local_input_has_no_capture_device() {
+        let flow = json!({
+            "id": "f1",
+            "blocks": [{"id": "e", "block_definition_id": "builtin.videoenc", "properties": {}}]
+        });
+        assert!(flow_capture_device(&flow).is_none());
+
+        let flow = json!({
+            "id": "f2",
+            "blocks": [{"id": "c", "block_definition_id": "builtin.local_input",
+                        "properties": {}}]
+        });
+        assert!(
+            flow_capture_device(&flow).is_none(),
+            "no device set is not a device"
+        );
+    }
+
     #[test]
     fn virtual_devices_are_recognised_by_name() {
         assert!(is_probably_virtual(&device("d1", "OBS Virtual Camera")));

@@ -186,6 +186,18 @@ pub async fn up(
         info!(reaped, "removed flows left over from an earlier run");
     }
 
+    // Derived ids only find our own leftovers under the current gateway id. A flow
+    // from an earlier experiment, or from before the gateway was renamed, would keep
+    // the camera open and contend for frames with the one we are about to start.
+    let device_ids: Vec<String> = devices.iter().map(|d| d.id.clone()).collect();
+    let ours: Vec<String> = input_ids
+        .iter()
+        .map(|id| flow::flow_id(&gateway_id, id))
+        .collect();
+    for name in session::clear_conflicting_flows(&strom, &device_ids, &ours).await {
+        println!("  removed {name:?}, which was already using one of these devices");
+    }
+
     let mut taken: BTreeSet<u16> = session::ports_in_config(&cfg);
     let mut active: BTreeMap<String, ActiveInput> = BTreeMap::new();
 
