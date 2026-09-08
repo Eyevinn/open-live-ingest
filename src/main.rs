@@ -5,12 +5,20 @@
 //! it finds and starts sending. Built to be driven over SSH: prompts on a plain
 //! terminal, no window, no full-screen UI.
 //!
-//! Strom does the media — capture, encode, mux, SRT — and this drives it. See
-//! docs/DESIGN.md.
+//! Strom does the media: capture, encode, mux, SRT. This drives it over HTTP and
+//! registers the result with Open Live. See docs/DESIGN.md for the reasoning.
+
+mod config;
+mod devices;
+mod flow;
+mod local_strom;
+mod openlive;
+mod run;
+mod setup;
+mod strom;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use open_live_gateway::{config, identity, prompt, runner};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -38,9 +46,14 @@ enum Command {
         #[arg(long)]
         all: bool,
 
-        /// Only these devices, by id or name, e.g. `--devices "FaceTime,DeckLink"`.
+        /// Only these devices, by id or name fragment, e.g. `--devices "FaceTime,DeckLink"`.
         #[arg(long)]
         devices: Option<String>,
+
+        /// Stream a test pattern and tone instead of any device, to commission the
+        /// link before the cameras arrive.
+        #[arg(long)]
+        test: bool,
 
         /// Ask for every setting again, even the ones already stored.
         #[arg(long)]
@@ -61,10 +74,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config_path = cli.config.clone().unwrap_or_else(config::default_path);
-
-    let mut cfg = config::load_or_default(&config_path)
-        .with_context(|| format!("loading settings from {}", config_path.display()))?;
+    let path = cli.config.clone().unwrap_or_else(config::default_path);
+    let mut cfg = config::load_or_default(&path)
+        .with_context(|| format!("loading settings from {}", path.display()))?;
     if let Some(level) = &cli.log_level {
         cfg.log.level = level.clone();
     }
@@ -73,57 +85,46 @@ async fn main() -> Result<()> {
     let command = cli.command.unwrap_or(Command::Up {
         all: false,
         devices: None,
+        test: false,
         reconfigure: false,
     });
 
     match command {
         Command::Check => {
             config::validate(&cfg)?;
-            println!(
-                "Settings at {} are valid ({} declared input(s)).",
-                config_path.display(),
-                cfg.inputs.len()
-            );
+            println!("Settings at {} are valid.", path.display());
             Ok(())
         }
-
         Command::Setup => {
-            if prompt::configure(&mut cfg, true).await? {
-                config::save(&config_path, &cfg)?;
-                println!("\nSaved to {}.", config_path.display());
+            if setup::configure(&mut cfg, true).await? {
+                config::save(&path, &cfg)?;
+                println!("\nSaved to {}.", path.display());
             }
             Ok(())
         }
-
         Command::Up {
             all,
             devices,
+            test,
             reconfigure,
         } => {
-            if prompt::configure(&mut cfg, reconfigure).await? {
-                config::save(&config_path, &cfg)?;
-                println!("\nSaved to {}.\n", config_path.display());
+            if setup::configure(&mut cfg, reconfigure).await? {
+                config::save(&path, &cfg)?;
+                println!("\nSaved to {}.\n", path.display());
             }
             config::validate(&cfg)?;
-            let gateway_id = identity::resolve_gateway_id(&cfg);
-            runner::up(cfg, gateway_id, all, devices).await
+            run::up(cfg, all, devices, test).await
         }
-
         Command::Down => {
             config::validate(&cfg)?;
-            let gateway_id = identity::resolve_gateway_id(&cfg);
-            runner::down(cfg, gateway_id).await
+            run::down(cfg).await
         }
-
-        Command::Devices => {
-            config::validate(&cfg)?;
-            runner::devices(cfg).await
-        }
-
         Command::Status => {
             config::validate(&cfg)?;
-            let gateway_id = identity::resolve_gateway_id(&cfg);
-            runner::status(cfg, gateway_id).await
+            run::status(cfg).await
         }
+        // Listing devices needs only Strom, so an unfinished Open Live setup must not
+        // stand in the way.
+        Command::Devices => run::devices(cfg).await,
     }
 }
