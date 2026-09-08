@@ -248,7 +248,11 @@ pub async fn up(
     }
 
     print_summary(&devices, &active);
-    write_pidfile(&cfg)?;
+    // Only a convenience for `down`, which falls back to sweeping by name. Losing it
+    // must not abort a run whose feeds are already up.
+    if let Err(err) = write_pidfile(&cfg) {
+        warn!(%err, "could not write the pidfile; `down` will sweep by name instead");
+    }
     // Recorded so a `down` after a hard kill can stop the Strom we started, which
     // would otherwise keep holding the capture devices.
     if let Some(pid) = local_strom.managed_pid() {
@@ -651,9 +655,11 @@ pub async fn status(cfg: GatewayConfig, gateway_id: String) -> Result<()> {
 fn write_pidfile(cfg: &GatewayConfig) -> Result<()> {
     let path = pidfile(cfg);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(&path, std::process::id().to_string()).context("writing the pidfile")
+    std::fs::write(&path, std::process::id().to_string())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 fn read_pidfile(cfg: &GatewayConfig) -> Option<u32> {

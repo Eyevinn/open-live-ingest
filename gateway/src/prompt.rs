@@ -105,8 +105,16 @@ pub fn infer_auth_mode(url: &str) -> &'static str {
 
 /// Whether anything still has to be asked for.
 fn needs_setup(cfg: &GatewayConfig) -> bool {
-    cfg.gateway.name.trim().is_empty()
-        || cfg.open_live.url.is_none()
+    if cfg.gateway.name.trim().is_empty() {
+        return true;
+    }
+    // With registration off there is nothing to register, so no address or credential
+    // is needed. Demanding them made a non-interactive run refuse over settings it
+    // was never going to use.
+    if !cfg.open_live.register {
+        return false;
+    }
+    cfg.open_live.url.is_none()
         || (cfg.open_live.auth_mode == "osc" && cfg.open_live.api_key.is_none())
 }
 
@@ -326,6 +334,18 @@ mod tests {
         cfg.gateway.name = "Venue".to_string();
         cfg.open_live.url = Some("http://127.0.0.1:3000".to_string());
         cfg.open_live.auth_mode = "direct".to_string();
+        assert!(!needs_setup(&cfg));
+    }
+
+    /// Registration off means no Open Live settings are needed at all — a gateway
+    /// streaming to a Strom without registering is a legitimate setup.
+    #[test]
+    fn registration_off_needs_nothing_from_open_live() {
+        let mut cfg = GatewayConfig::default();
+        cfg.gateway.name = "Nuc1".to_string();
+        cfg.open_live.register = false;
+        cfg.open_live.url = None;
+        cfg.open_live.api_key = None;
         assert!(!needs_setup(&cfg));
     }
 

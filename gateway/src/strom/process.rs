@@ -35,6 +35,37 @@ pub struct Managed {
     log_path: PathBuf,
 }
 
+impl Drop for Managed {
+    fn drop(&mut self) {
+        let pid = self.child.id();
+        info!(pid, "stopping the Strom we started");
+        stop_pid(pid);
+
+        // Wait for it to go, then insist. Strom holds capture devices and sockets;
+        // leaving one behind means the next run adopts a half-dead engine, or a
+        // camera stays streaming with nothing supervising it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Ok(None) => {
+                    warn!(pid, "Strom did not stop in time, killing it");
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    return;
+                }
+                Err(err) => {
+                    warn!(pid, %err, "could not wait for Strom");
+                    return;
+                }
+            }
+        }
+    }
+}
+
 impl LocalStrom {
     /// The pid of a Strom we started, for recording so a later `down` can clean up
     /// after a hard kill.
@@ -46,38 +77,12 @@ impl LocalStrom {
     }
 
     /// Stops a Strom we started; leaves an adopted one running.
+    ///
+    /// Only sugar over dropping it: the stopping lives in `Drop`, so an error on any
+    /// path cannot leak a Strom. It leaked in practice — a failed run left one
+    /// running, holding the camera and streaming, with nothing left to stop it.
     pub fn shutdown(self) {
-        match self {
-            LocalStrom::Adopted => {}
-            LocalStrom::Managed(mut m) => {
-                let pid = m.child.id();
-                info!(pid, "stopping the Strom we started");
-                stop_pid(pid);
-
-                // Wait for it to go, then insist. Strom holds capture devices and
-                // sockets; leaving one behind makes the next run adopt a half-dead
-                // engine.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                loop {
-                    match m.child.try_wait() {
-                        Ok(Some(_)) => return,
-                        Ok(None) if Instant::now() < deadline => {
-                            std::thread::sleep(Duration::from_millis(200));
-                        }
-                        Ok(None) => {
-                            warn!(pid, "Strom did not stop in time, killing it");
-                            let _ = m.child.kill();
-                            let _ = m.child.wait();
-                            return;
-                        }
-                        Err(err) => {
-                            warn!(pid, %err, "could not wait for Strom");
-                            return;
-                        }
-                    }
-                }
-            }
-        }
+        drop(self);
     }
 
     /// Where a managed Strom's output went, for error reporting.
