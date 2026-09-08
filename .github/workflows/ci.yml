@@ -9,15 +9,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # The gateway has no system dependencies — it drives Strom over HTTP rather than
-  # linking GStreamer — so one job covers everything.
+  # No system dependencies: the gateway drives Strom over HTTP rather than linking
+  # GStreamer, so one job covers everything. The toolchain comes from
+  # rust-toolchain.toml, so CI tests the version the repo pins.
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo check --workspace
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

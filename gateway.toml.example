@@ -1,150 +1,79 @@
-# Open Live Gateway configuration.
+# Open Live Gateway settings.
 #
-# Install to /etc/open-live-gateway/gateway.toml, mode 0600 — it holds the Open Live
-# API key, the Strom API key, and the SRT passphrase. Environment variables override
-# the file, and CLI flags override the environment.
-#
-# The gateway drives a Strom instance on this same box. Strom does the capture,
-# encoding, and SRT uplink; this config describes the flow the gateway asks it to run.
+# Normally written by `open-live-gateway setup`, which asks for each value and checks
+# it. Written mode 0600: it holds the Open Live credential and any SRT passphrase.
+# The file lives per user (~/.config/open-live-gateway/gateway.toml on Linux,
+# ~/Library/Application Support/open-live-gateway/gateway.toml on macOS), or wherever
+# --config points. Environment variables override the file: OLG_OPEN_LIVE_URL,
+# OLG_OPEN_LIVE_API_KEY, OLG_OPEN_LIVE_AUTH_MODE, OLG_STROM_URL, OLG_STROM_API_KEY.
 
 [gateway]
-# Stable identity for this box. Defaults to the hostname when omitted. It also seeds
-# the deterministic Strom flow ids, so changing it orphans the flows already created.
-id = "venue-a-gateway"
+# Prefix of every source name in Open Live, so two venues' cameras can be told apart.
 name = "Venue A"
+# Stable identity for this machine. Seeds the flow ids, so `down` and `status` find
+# the flows again with nothing stored. Defaults to the hostname.
+# id = "venue-a"
 
-# The local Strom instance — the one on this box that captures and encodes. Optional:
-# it defaults to http://127.0.0.1:8080, since Strom runs beside the gateway. This is
-# not the cloud Strom, and not something Open Live knows about.
+# The Strom on this machine, which does the capturing and encoding. Not the cloud
+# Strom, and not something Open Live knows about.
 [strom]
 url = "http://127.0.0.1:8080"
-# Set when Strom runs with STROM_API_KEY. Omit for a Strom without auth.
+# Set when Strom runs with STROM_API_KEY.
 # api_key = "change-me"
+# Start a headless Strom when nothing is listening at url, and stop it again on the
+# way out. A Strom already running is always adopted, never replaced or stopped.
+manage = true
+# The Strom executable: a name on PATH, or a path.
+binary = "strom"
+# Where a managed Strom keeps its flows. Defaults beside these settings.
+# data_dir = "/var/lib/strom"
 
 [open_live]
 url = "https://open-live.example.com"
-# How api_key is used:
-#   direct (default) — sent as the bearer token as-is, for a self-hosted Open Live
-#                      protected by a static API_KEY.
-#   osc              — api_key is an OSC Personal Access Token, exchanged for a
-#                      short-lived Service Access Token. Required for an
-#                      OSC-hosted instance, whose proxy rejects a PAT directly.
+# direct: api_key is sent as the bearer token as-is, for a self-hosted Open Live with
+#         a static API_KEY, or none at all.
+# osc:    api_key is an OSC personal access token, exchanged for a short-lived
+#         service token. Needed for an OSC-hosted instance, whose proxy rejects a
+#         PAT presented directly. Setup infers this from the address.
 auth_mode = "direct"
-# Also settable as OLG_OPEN_LIVE_API_KEY so a deployment tool need not template this file.
-api_key = "change-me"
-# Create and update the Open Live source documents for these inputs automatically.
+# api_key = "change-me"
+# Register one source per input. Off for a box that only streams to a Strom.
 register = true
-state_path = "/var/lib/open-live-gateway/state.json"
 
-# Defaults the desktop app applies to a device an operator starts. Unused by the
-# headless daemon, which declares its inputs below.
-[app]
-video_resolution = "1280x720"
-video_framerate = "25/1"
+# builtin.mpegtssrt_output. One port per input is allocated from port_range, lowest
+# first in device-name order, so the same devices land on the same ports each run.
+[uplink]
+# caller:   this machine dials the cloud. Nothing inbound here; the cloud publishes
+#           the ports.
+# listener: the cloud dials this machine. Needs public_host and inbound UDP here.
+mode = "caller"
+# The cloud Strom to send to. Leave unset to ask Open Live (GET /api/v1/server-info).
+# host = "strom.example.com"
+# public_host = "venue.example.com"
+port_range = "9000-9100"
+# Rule of thumb: 3-4x the measured RTT.
+latency_ms = 200
+# 10 to 79 characters; letters, digits, and - _ . ~ ! *
+# passphrase = "change-me-please"
+# pbkeylen = 16
 
-  [app.video]
-  codec = "h264"
-  bitrate_kbps = 6000
-  encoder_preference = "auto"
-  quality_preset = "ultrafast"
-  tune = "zerolatency"
-  rate_control = "cbr"
-  keyframe_interval = 25
+# builtin.videoenc. Strom picks the encoder element itself, hardware first, so this
+# expresses intent rather than an element name.
+[video]
+codec = "h264"                  # h264 | h265 | av1 | vp9
+bitrate_kbps = 6000
+encoder_preference = "auto"     # auto | hardware | software
+quality_preset = "ultrafast"    # ultrafast | fast | medium | slow | veryslow
+tune = "zerolatency"
+rate_control = "cbr"            # cbr | vbr | cqp
+keyframe_interval = 25          # frames; one or two seconds' worth
 
-  # The app allocates a port per input from this range, so an operator never has to
-  # pick one. Ports claimed by [[inputs]] below are skipped.
-  [app.uplink]
-  mode = "caller"
-  # Hostname of the CLOUD Strom to send to. Omit it and the app asks Open Live
-  # (GET /api/v1/server-info), so a venue box needs only the Open Live address.
-  # host = "strom.example.com"
-  port_range = "9000-9100"
-  latency_ms = 200
-
-[control]
-# Loopback by default. A non-loopback bind requires `token` and is rejected at startup
-# without one.
-bind = "127.0.0.1:9001"
-# token = "change-me"
+# Capture format to request from each device. Blank takes whatever the device
+# offers, which suits most devices: builtin.local_input cannot scale or re-time, so
+# asking for a format a device does not advertise fails negotiation.
+[capture]
+# video_resolution = "1280x720"
+# video_framerate = "25/1"
 
 [log]
 level = "info"
-
-# ---------------------------------------------------------------------------
-# One [[inputs]] block per capture input. Each becomes its own Strom flow with its
-# own SRT port, so one camera failing cannot disturb another.
-# ---------------------------------------------------------------------------
-
-[[inputs]]
-id = "cam1"
-# Registered name in Open Live. Defaults to "<gateway name> — <input id>".
-name = "Venue A — Camera 1"
-enabled = true
-
-  # builtin.decklink_input. Preferred where available: video and audio share the
-  # card's clock. Use kind = "local" for USB/UVC capture, or "test" for a test
-  # pattern and tone while commissioning a link before cameras arrive:
-  #
-  #   [inputs.capture]
-  #   kind = "test"
-  #   video_resolution = "1920x1080"   # defaults shown; the test sources would
-  #   video_framerate = "25/1"         # otherwise negotiate 320x240 / 44.1k mono,
-  #   audio_rate = 48000               # which exercises nothing like a real feed
-  #   audio_channels = 2
-  [inputs.capture]
-  kind = "decklink"
-  device_number = 0
-  connection = "sdi"      # auto | sdi | hdmi | optical | component | composite | svideo
-  mode = "auto"           # auto, or an explicit mode such as 1080p25
-  video_format = "auto"
-  drop_no_signal_frames = true
-  audio = true
-
-  # builtin.videoenc. Strom picks the encoder element itself, hardware first across
-  # NVENC, QSV, VA-API, VideoToolbox, AMF, and V4L2 — so express intent here, not an
-  # element name.
-  [inputs.video]
-  codec = "h264"                    # h264 | h265 | av1 | vp9
-  bitrate_kbps = 6000
-  encoder_preference = "auto"       # auto | hardware | software
-  quality_preset = "ultrafast"      # ultrafast | fast | medium | slow | veryslow
-  tune = "zerolatency"
-  rate_control = "cbr"              # cbr | vbr | cqp
-  keyframe_interval = 25            # frames; 1-2 seconds' worth
-
-  # builtin.mpegtssrt_output. The venue is always the SRT caller, so it needs no
-  # inbound firewall rule and no static IP.
-  #
-  # `host`/`port` form the caller URI the local Strom dials. The address registered
-  # with Open Live is the matching listener form (srt://:PORT?mode=listener) that the
-  # cloud Strom binds — the port must be unique across every gateway pointing at that
-  # Strom, and open on the cloud firewall.
-  [inputs.uplink]
-  host = "strom.example.com"
-  port = 9000
-  # Rule of thumb: 3-4x the measured RTT.
-  latency_ms = 200
-  # passphrase = "change-me"
-  # pbkeylen = 16
-
-# A second input on the same box, from a USB camera or capture dongle. Note the
-# distinct SRT port.
-#
-# video_device is a Strom device id from
-# `GET /api/discovery/devices?category=video_source` — not a /dev/video* path.
-# Omit it to let Strom pick the OS default camera via autovideosrc, which is what
-# you want with a single device attached. audio_device works the same way; leave it
-# out for video-only capture.
-#
-# [[inputs]]
-# id = "cam2"
-# enabled = true
-#
-#   [inputs.capture]
-#   kind = "local"
-#   video_resolution = "1280x720"
-#   video_framerate = "25/1"
-#
-#   [inputs.uplink]
-#   host = "strom.example.com"
-#   port = 9001

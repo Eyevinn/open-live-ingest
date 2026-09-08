@@ -1,5 +1,6 @@
 /target
 gateway.toml
+gateway-*.toml
 *.log
 .DS_Store
 /.dev/
