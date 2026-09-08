@@ -45,11 +45,11 @@ pub fn load_or_default(path: &Path) -> Result<GatewayConfig> {
     match std::fs::read_to_string(path) {
         Ok(raw) => {
             let cfg: GatewayConfig = toml::from_str(&raw).context("parsing config TOML")?;
-            Ok(with_env_overrides(cfg))
+            Ok(with_writable_state_path(with_env_overrides(cfg)))
         }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(with_env_overrides(GatewayConfig::default()))
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(with_writable_state_path(
+            with_env_overrides(GatewayConfig::default()),
+        )),
         Err(err) => Err(err).context("reading config file"),
     }
 }
@@ -83,12 +83,39 @@ pub fn save(path: &Path, cfg: &GatewayConfig) -> Result<()> {
 pub fn load(path: &Path, log_level_override: Option<&str>) -> Result<GatewayConfig> {
     let raw = std::fs::read_to_string(path).context("reading config file")?;
     let cfg: GatewayConfig = toml::from_str(&raw).context("parsing config TOML")?;
-    let mut cfg = with_env_overrides(cfg);
+    let mut cfg = with_writable_state_path(with_env_overrides(cfg));
     if let Some(level) = log_level_override {
         cfg.log.level = level.to_string();
     }
     validate(&cfg)?;
     Ok(cfg)
+}
+
+/// Moves the state file somewhere writable if the configured location is not.
+///
+/// A config written by an older version can name a directory this user cannot
+/// create — `/var/lib/open-live-gateway` was the default once — and the failure used
+/// to surface halfway through a run that was already streaming, leaving no record of
+/// what it had started. Warn and relocate instead: an unusable path must not cost a
+/// venue its teardown.
+fn with_writable_state_path(mut cfg: GatewayConfig) -> GatewayConfig {
+    let configured = PathBuf::from(&cfg.open_live.state_path);
+    let usable = match configured.parent() {
+        Some(parent) => std::fs::create_dir_all(parent).is_ok(),
+        None => false,
+    };
+    if usable {
+        return cfg;
+    }
+
+    let fallback = open_live_gateway_types::config::user_dir().join("state.json");
+    tracing::warn!(
+        configured = %configured.display(),
+        using = %fallback.display(),
+        "the configured state path is not writable; using a per-user one instead"
+    );
+    cfg.open_live.state_path = fallback.to_string_lossy().into_owned();
+    cfg
 }
 
 /// Applies the environment overrides a deployment tool may set.

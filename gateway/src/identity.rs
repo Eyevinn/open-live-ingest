@@ -90,7 +90,8 @@ pub fn forget_strom_pid(path: &Path) -> Result<()> {
 
 pub fn store(path: &Path, state: &PersistedState) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("creating state directory")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating the state directory {}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(state)?;
     // Write-then-rename so a power cut cannot leave a truncated state file behind,

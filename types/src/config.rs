@@ -598,8 +598,33 @@ fn default_srt_latency() -> u32 {
     DEFAULT_SRT_LATENCY_MS
 }
 
+/// Where per-user files live: settings, recorded state, a managed Strom's data.
+///
+/// Per-user because this is run by an operator, not by root. The previous default
+/// put state under `/var/lib`, which a normal user cannot create — and the failure
+/// aborted a run that was already streaming. A packaged service can still point at
+/// `/var/lib` explicitly.
+pub fn user_dir() -> std::path::PathBuf {
+    let base = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| {
+            std::path::PathBuf::from(h)
+                .join("Library")
+                .join("Application Support")
+        })
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+            })
+    };
+
+    base.unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("open-live-gateway")
+}
+
 fn default_state_path() -> String {
-    "/var/lib/open-live-gateway/state.json".to_string()
+    user_dir().join("state.json").to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -754,5 +779,30 @@ url = "https://open-live.example.com"
             "the cloud host is discovered"
         );
         assert!(cfg.inputs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    /// State must default somewhere an operator can actually write. It used to
+    /// default under /var/lib, where creating it fails for a normal user — and that
+    /// failure aborted a run whose feeds were already live.
+    #[test]
+    fn the_default_state_path_is_under_the_users_own_directory() {
+        let path = default_state_path();
+        assert!(
+            !path.starts_with("/var/"),
+            "state must not default to a root-owned location, got {path}"
+        );
+        assert!(path.ends_with("state.json"), "got {path}");
+        assert!(path.contains("open-live-gateway"), "got {path}");
+    }
+
+    #[test]
+    fn settings_and_state_share_one_directory() {
+        let dir = user_dir();
+        assert!(default_state_path().starts_with(&*dir.to_string_lossy()));
     }
 }
