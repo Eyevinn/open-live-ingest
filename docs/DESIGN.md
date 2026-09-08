@@ -149,6 +149,15 @@ and "cannot be reached" send an operator to completely different places.
 **SIGHUP does not** — a closed SSH session, or a link dropping mid-show, must not take a venue off
 air. That asymmetry is deliberate: a deliberate stop stops, an accident does not.
 
+**The gateway never starts Strom.** It drives an engine that is already there — a venue box runs
+Strom as a service, with its own installer, data directory and restart behaviour, and owning that
+lifecycle from here would mean owning its logs, crashes and versions too. What the gateway does owe
+an operator is a useful failure: `up` checks Strom before doing anything and, when it is absent,
+says so along with the command to start it, rather than surfacing a connection error five levels
+deep. `down` deliberately does *not* refuse in that case — if Strom has gone, its flows are already
+stopped and the Open Live sources still need removing, so refusing would leave them stranded in
+Studio. `status` degrades the same way, reporting per input rather than failing.
+
 **`down` and `status` are stateless.** Neither asks a running `up` what exists; they work it out
 from what was recorded and from derived flow ids, so they behave identically whether `up` is
 running, finished, or was killed outright. `down` signals a running instance first, then sweeps

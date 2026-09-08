@@ -13,7 +13,7 @@ use crate::openlive::client::OpenLiveClient;
 use crate::openlive::registration;
 use crate::session::{self, ActiveInput};
 use crate::state::SharedState;
-use crate::strom::client::{CaptureDevice, StromClient};
+use crate::strom::client::{CaptureDevice, Reachability, StromClient};
 use crate::strom::{flow, supervisor};
 use anyhow::{bail, Context, Result};
 use open_live_gateway_types::config::GatewayConfig;
@@ -26,6 +26,41 @@ use tracing::{info, warn};
 /// Where the pid of a running `up` is kept, beside the source-id state.
 fn pidfile(cfg: &GatewayConfig) -> PathBuf {
     PathBuf::from(&cfg.open_live.state_path).with_extension("pid")
+}
+
+/// Checks Strom before doing anything, so an unreachable engine produces advice
+/// rather than a stack of transport errors.
+///
+/// This is the most likely first-run failure: the gateway drives Strom but never
+/// starts it, and "Connection refused" five levels deep tells an operator nothing
+/// about what to do next.
+async fn preflight(strom: &StromClient, cfg: &GatewayConfig) -> Result<()> {
+    match strom.probe().await {
+        Reachability::Ok { .. } => Ok(()),
+        Reachability::NeedsCredential => bail!(
+            "Strom at {url} needs a credential.\n\n\
+             It is running with STROM_API_KEY set. Run `open-live-gateway setup` and \
+             enter that key when it asks.",
+            url = cfg.strom.url
+        ),
+        Reachability::Unreachable(err) => bail!(
+            "cannot reach Strom at {url} ({err}).\n\n\
+             Strom does the capturing and encoding; this gateway only drives it, and does \
+             not start it. Start it first, for example:\n    \
+             strom --headless --port {port}\n\n\
+             If it runs elsewhere, run `open-live-gateway setup` to point at it.",
+            url = cfg.strom.url,
+            err = err,
+            port = port_of(&cfg.strom.url).unwrap_or(8080),
+        ),
+    }
+}
+
+/// The port in a Strom URL, for use in the advice above.
+fn port_of(url: &str) -> Option<u16> {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host = after_scheme.split('/').next()?;
+    host.rsplit_once(':')?.1.parse().ok()
 }
 
 /// Devices to bring up, after filtering and selection.
@@ -77,6 +112,8 @@ pub async fn up(
     selection: Option<String>,
 ) -> Result<()> {
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
+    preflight(&strom, &cfg).await?;
+
     let devices = choose_devices(
         strom
             .devices("video_source")
@@ -350,6 +387,17 @@ pub async fn down(cfg: GatewayConfig, gateway_id: String) -> Result<()> {
     }
 
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
+    // Deliberately not a hard failure here: if Strom has gone away its flows are
+    // already stopped, and the Open Live sources still need removing. Refusing would
+    // leave them in Studio with no way to clear them.
+    let strom_reachable = matches!(strom.probe().await, Reachability::Ok { .. });
+    if !strom_reachable {
+        println!(
+            "Strom at {} is not reachable; removing the Open Live sources and leaving \
+             its flows alone.",
+            cfg.strom.url
+        );
+    }
     let state_path = PathBuf::from(&cfg.open_live.state_path);
     let persisted = identity::load(&state_path).unwrap_or_default();
     let input_ids = recorded_inputs(&persisted);
@@ -373,7 +421,7 @@ pub async fn down(cfg: GatewayConfig, gateway_id: String) -> Result<()> {
 
     for input_id in input_ids {
         let flow_id = flow::flow_id(&gateway_id, &input_id);
-        if matches!(strom.get_flow(&flow_id).await, Ok(Some(_))) {
+        if strom_reachable && matches!(strom.get_flow(&flow_id).await, Ok(Some(_))) {
             strom.stop_flow(&flow_id).await.ok();
             if let Err(err) = strom.delete_flow(&flow_id).await {
                 warn!(input = %input_id, %err, "could not remove the flow");
@@ -516,6 +564,14 @@ mod tests {
             device("d2", "FaceTime HD Camera"),
             device("d3", "DeckLink Mini Recorder"),
         ]
+    }
+
+    #[test]
+    fn a_port_is_read_from_a_strom_url_for_the_advice() {
+        assert_eq!(port_of("http://127.0.0.1:8080"), Some(8080));
+        assert_eq!(port_of("https://strom.example.com:9443/"), Some(9443));
+        // No port means Strom's default, which the caller substitutes.
+        assert_eq!(port_of("http://strom.example.com"), None);
     }
 
     #[test]

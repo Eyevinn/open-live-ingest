@@ -51,6 +51,18 @@ Three credentials exist in this system and it only ever asks for one:
 | The local Strom's `STROM_API_KEY` | the gateway, only if that Strom runs with auth | only when Strom actually refuses without one |
 | The cloud Strom's token | Open Live holds it itself | never — the gateway speaks only SRT to the cloud Strom |
 
+It does **not** start Strom. Strom does the capturing and encoding and normally runs as a service
+on the same box; the gateway drives it over HTTP. If it is not running, `up` says so and gives you
+the command:
+
+```
+Error: cannot reach Strom at http://127.0.0.1:8080 (…).
+
+Strom does the capturing and encoding; this gateway only drives it, and does not start it.
+Start it first, for example:
+    strom --headless --port 8080
+```
+
 Settings live in a per-user file (`~/Library/Application Support/open-live-gateway/gateway.toml` on
 macOS, `$XDG_CONFIG_HOME` or `~/.config` on Linux), written mode 0600 because it holds that
 credential. Pass `--config` to put it elsewhere. Nothing needs a text editor, though the file is
