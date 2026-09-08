@@ -78,16 +78,31 @@ pub fn allocate_port(template: &UplinkTemplate, taken: &BTreeSet<u16>) -> Result
         })
 }
 
+/// The name a device's source carries in Open Live.
+///
+/// Prefixed with the gateway's name so an operator can tell two venues' cameras
+/// apart in Studio — "FaceTime HD Camera" on its own says nothing about which
+/// machine it came from — and so cleanup can recognise its own sources.
+pub fn source_name_for_device(gateway_name: &str, device: &CaptureDevice) -> String {
+    format!("{} — {}", gateway_name.trim(), device.display_name)
+}
+
+/// The prefix every source from this gateway carries.
+pub fn source_name_prefix(gateway_name: &str) -> String {
+    format!("{} — ", gateway_name.trim())
+}
+
 /// Builds the input for a chosen capture device.
 pub fn input_for_device(
     app: &AppConfig,
     device: &CaptureDevice,
     port: u16,
     cloud_host: &str,
+    gateway_name: &str,
 ) -> InputConfig {
     InputConfig {
         id: input_id_for_device(&device.id),
-        name: Some(device.display_name.clone()),
+        name: Some(source_name_for_device(gateway_name, device)),
         capture: CaptureConfig::Local {
             video_device: Some(device.id.clone()),
             video_resolution: app.video_resolution.clone(),
@@ -316,6 +331,22 @@ mod tests {
         );
     }
 
+    /// Two venues streaming the same model of camera must be distinguishable in
+    /// Studio, and cleanup has to be able to recognise its own sources.
+    #[test]
+    fn source_names_carry_the_gateway_name() {
+        let name = source_name_for_device("Venue A", &device("d", "FaceTime HD Camera"));
+        assert_eq!(name, "Venue A — FaceTime HD Camera");
+        assert!(name.starts_with(&source_name_prefix("Venue A")));
+        assert!(!name.starts_with(&source_name_prefix("Venue B")));
+    }
+
+    #[test]
+    fn a_padded_gateway_name_still_produces_a_matching_prefix() {
+        let name = source_name_for_device("  Venue A  ", &device("d", "Cam"));
+        assert!(name.starts_with(&source_name_prefix("Venue A")));
+    }
+
     #[test]
     fn virtual_devices_are_recognised_by_name() {
         assert!(is_probably_virtual(&device("d1", "OBS Virtual Camera")));
@@ -407,9 +438,10 @@ mod tests {
             &device("dev-abc", "FaceTime HD Camera"),
             9000,
             "cloud.example.com",
+            "Venue A",
         );
 
-        assert_eq!(input.name.as_deref(), Some("FaceTime HD Camera"));
+        assert_eq!(input.name.as_deref(), Some("Venue A — FaceTime HD Camera"));
         assert_eq!(input.uplink.port, 9000);
         assert_eq!(input.uplink.host, "cloud.example.com");
         match input.capture {
