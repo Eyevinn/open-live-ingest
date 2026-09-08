@@ -269,7 +269,14 @@ pub async fn up(
         let _ = task.await;
     }
 
-    teardown(&strom, open_live.as_ref(), &state_path, &active).await;
+    teardown(
+        &strom,
+        open_live.as_ref(),
+        &state_path,
+        &active,
+        &cfg.gateway.name,
+    )
+    .await;
     let managed = local_strom.managed_pid().is_some();
     local_strom.shutdown();
     if managed {
@@ -408,6 +415,7 @@ async fn teardown(
     open_live: Option<&OpenLiveClient>,
     state_path: &Path,
     active: &BTreeMap<String, ActiveInput>,
+    gateway_name: &str,
 ) {
     for (input_id, input) in active {
         if let Some(client) = open_live {
@@ -420,19 +428,44 @@ async fn teardown(
         }
         identity::forget_started(state_path, input_id).ok();
     }
+
+    // A final pass by name, because removing by recorded id only works when an id
+    // was recorded. Anything of ours still present goes now — one input failing to
+    // be cleaned up must not leave the rest in Studio.
+    if let Some(client) = open_live {
+        sweep_stray_sources(client, gateway_name).await;
+    }
 }
 
 /// Removes an input's Open Live source and forgets its id.
 async fn delete_source(client: &OpenLiveClient, state_path: &Path, input_id: &str) {
-    let Ok(mut persisted) = identity::load(state_path) else {
-        return;
-    };
-    if let Some(source_id) = persisted.source_ids.remove(input_id) {
-        if let Err(err) = client.delete_source(&source_id).await {
-            warn!(input = %input_id, %err, "could not remove the Open Live source");
+    let mut persisted = match identity::load(state_path) {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(input = %input_id, %err, "could not read the state file to find the source");
             return;
         }
-        let _ = identity::store(state_path, &persisted);
+    };
+
+    // Silence used to be ambiguous here: no recorded id looked exactly like a
+    // successful removal, which is how a source left behind went unnoticed.
+    let Some(source_id) = persisted.source_ids.remove(input_id) else {
+        warn!(
+            input = %input_id,
+            "no Open Live source id recorded for this input, so nothing to remove by id"
+        );
+        return;
+    };
+
+    match client.delete_source(&source_id).await {
+        Ok(()) => {
+            println!("  {input_id} — source removed from Open Live");
+            let _ = identity::store(state_path, &persisted);
+        }
+        Err(err) => warn!(
+            input = %input_id, source = %source_id, %err,
+            "could not remove the Open Live source"
+        ),
     }
 }
 
