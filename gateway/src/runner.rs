@@ -22,6 +22,7 @@ use open_live_gateway_types::status::InputState;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 /// Where the pid of a running `up` is kept, beside the source-id state.
@@ -200,30 +201,35 @@ pub async fn up(
 
     let mut taken: BTreeSet<u16> = session::ports_in_config(&cfg);
     let mut active: BTreeMap<String, ActiveInput> = BTreeMap::new();
+    // Held so they can be stopped *before* teardown. Both loops keep reconciling
+    // every few seconds, and a registration tick that runs after a source is deleted
+    // simply creates it again — which looks like a source that refuses to go away.
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
 
     for device in &devices {
         let port = session::allocate_port(&cfg.app.uplink, &taken)?;
         taken.insert(port);
 
-        let input = session::input_for_device(&cfg.app, device, port, &cloud_host);
+        let input =
+            session::input_for_device(&cfg.app, device, port, &cloud_host, &cfg.gateway.name);
         match session::start_input(&strom, &gateway_id, &cfg.gateway.name, &input).await {
             Ok(started) => {
                 state.add_input(&input, &gateway_id);
-                tokio::spawn(supervisor::supervise(
+                tasks.push(tokio::spawn(supervisor::supervise(
                     Arc::clone(&state),
                     StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?,
                     input.clone(),
                     gateway_id.clone(),
                     cfg.gateway.name.clone(),
-                ));
+                )));
                 if let Some(_client) = &open_live {
-                    tokio::spawn(registration::reconcile_forever(
+                    tasks.push(tokio::spawn(registration::reconcile_forever(
                         Arc::clone(&state),
                         registration::client_from(&cfg)?,
                         input.clone(),
                         cfg.gateway.name.clone(),
                         state_path.clone(),
-                    ));
+                    )));
                 }
                 if let Err(err) =
                     identity::record_started(&state_path, &input.id, &device.display_name, port)
@@ -252,6 +258,17 @@ pub async fn up(
     let outcome = wait_for_stop(Arc::clone(&state)).await;
 
     println!("\nStopping.");
+
+    // Stop reconciling before removing anything. Otherwise a supervisor restarts a
+    // flow we just deleted, or a registration tick recreates a source we just
+    // removed, and the teardown races loops that are still trying to converge.
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
+
     teardown(&strom, open_live.as_ref(), &state_path, &active).await;
     let managed = local_strom.managed_pid().is_some();
     local_strom.shutdown();
@@ -485,8 +502,32 @@ pub async fn down(cfg: GatewayConfig, gateway_id: String) -> Result<()> {
         println!("  {input_id} — torn down");
     }
 
+    if let Some(client) = &open_live {
+        sweep_stray_sources(client, &cfg.gateway.name).await;
+    }
+
     stop_managed_strom(&state_path);
     Ok(())
+}
+
+/// Removes any Open Live source this gateway created that is still there.
+///
+/// The state file only knows what the last run recorded, so a source left by a run
+/// that died — or by one whose registration loop recreated it during teardown — would
+/// otherwise sit in Studio with nothing able to clear it. Matched on the gateway's
+/// own name prefix, so it never touches sources belonging to another gateway or
+/// created by hand.
+async fn sweep_stray_sources(client: &OpenLiveClient, gateway_name: &str) {
+    let prefix = session::source_name_prefix(gateway_name);
+    let Ok(sources) = client.list_sources().await else {
+        return;
+    };
+    for source in sources.iter().filter(|s| s.name.starts_with(&prefix)) {
+        match client.delete_source(&source.id).await {
+            Ok(()) => println!("  removed stray source {:?}", source.name),
+            Err(err) => warn!(source = %source.name, %err, "could not remove stray source"),
+        }
+    }
 }
 
 /// Stops a Strom recorded as started by us, for the case where `up` was killed hard
