@@ -125,6 +125,26 @@ impl StromClient {
         Ok(Some(FetchedFlow { state, raw }))
     }
 
+    /// Every flow Strom holds, as raw JSON.
+    ///
+    /// Used to find flows that already hold a capture device we are about to open.
+    /// Two pipelines on one camera contend for frames, which shows up as stutter.
+    pub async fn list_flows(&self) -> Result<Vec<Value>> {
+        let res = self
+            .auth(self.http.get(format!("{}/api/flows", self.base_url)))
+            .send()
+            .await
+            .context("GET flows")?;
+
+        let res = error_for_status(res, "GET flows")?;
+        let body: Value = res.json().await.context("decoding flows")?;
+        Ok(body
+            .get("flows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
+    }
+
     /// Creates a flow under the id carried in `flow`.
     ///
     /// Strom answers 409 when that id already exists, which for a deterministic id is

@@ -1,0 +1,52 @@
+inputs = []
+
+[gateway]
+id = "ludde-mac"
+name = "Ludde Mac"
+
+[strom]
+url = "http://127.0.0.1:8080"
+manage = true
+binary = "./.dev/bin/strom"
+data_dir = "./.dev/managed-strom"
+
+# Performance settings, aimed at smooth output rather than lowest latency.
+[app]
+# Match the production PGM format exactly (1280x720 @ 25/1). The biggest lever:
+# with nothing requested the camera picks its own rate — typically 30, dropping
+# lower in poor light — while the cloud mixer composites at 25, so it drops or
+# repeats frames unevenly. That reads as stutter. The FaceTime camera advertises
+# 1280x720 at [15/1, 30/1], so 25 negotiates natively.
+video_resolution = "1280x720"
+video_framerate = "25/1"
+
+[app.video]
+codec = "h264"
+# Generous for 720p25, so motion is not starved of bits.
+bitrate_kbps = 6000
+encoder_preference = "auto"
+quality_preset = "fast"
+tune = "zerolatency"
+rate_control = "cbr"
+keyframe_interval = 25
+
+[app.uplink]
+mode = "caller"
+port_range = "47110-47129"
+# Raised from 200. Sweden to Frankfurt is roughly 30 ms, so 200 was already ~6x
+# RTT — this trades delay, which does not matter here, for tolerance of jitter
+# and loss on office wifi, which does.
+latency_ms = 500
+
+[open_live]
+url = "https://ludde-openliveludde2.eyevinn-open-live.auto.prod-se.osaas.io"
+auth_mode = "osc"
+api_key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE3ODg4NTQ5ODUsInRlbmFudElkIjoibHVkZGUiLCJ1c2VySWQiOiI2NmU3MzVmMzRkMGZhMDE5ODBlZGI3ZmYiLCJwYXRJZCI6IjZlYzZjYzBmLTE0MGQtNGVmYi05ZTg0LTFjZjA1NDhjOWFlMCIsImV4cCI6MTc5NjYzMDk4NSwiaXNzIjoidG9rZW4ub3NhYXMuZXlldmlubi5zZSJ9.qxkbn7tIen2blVGzKd_13rLDTgfVAUQmUnZ4IoSbSN4"
+register = true
+state_path = "./.dev/cloud-state.json"
+
+[control]
+bind = "127.0.0.1:9001"
+
+[log]
+level = "warn"
