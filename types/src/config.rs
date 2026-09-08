@@ -153,6 +153,20 @@ pub struct StromConfig {
     /// and encodes. Not the cloud Strom, and not something Open Live knows about.
     #[serde(default = "default_strom_url")]
     pub url: String,
+    /// Start a headless Strom when nothing is listening at `url`, and stop it again
+    /// on the way out.
+    ///
+    /// An already-running Strom is always adopted rather than replaced, and never
+    /// stopped — it may be a service this box depends on, or someone else's.
+    #[serde(default = "default_true")]
+    pub manage: bool,
+    /// The Strom executable: a name to find on `PATH`, or an absolute path.
+    #[serde(default = "default_strom_binary")]
+    pub binary: String,
+    /// Where a managed Strom keeps its flows and blocks. Defaults beside our own
+    /// settings, so a gateway-managed Strom does not disturb an existing install.
+    #[serde(default)]
+    pub data_dir: Option<String>,
     /// Strom API key, sent as a bearer token. Unset when Strom runs without auth.
     #[serde(default)]
     pub api_key: Option<String>,
@@ -388,6 +402,9 @@ impl Default for StromConfig {
     fn default() -> Self {
         Self {
             url: default_strom_url(),
+            manage: true,
+            binary: default_strom_binary(),
+            data_dir: None,
             api_key: None,
         }
     }
@@ -563,6 +580,10 @@ fn default_rate_control() -> String {
 
 fn default_keyframe_interval() -> u32 {
     25
+}
+
+fn default_strom_binary() -> String {
+    "strom".to_string()
 }
 
 fn default_strom_url() -> String {

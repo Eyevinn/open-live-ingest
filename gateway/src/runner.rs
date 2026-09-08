@@ -14,6 +14,7 @@ use crate::openlive::registration;
 use crate::session::{self, ActiveInput};
 use crate::state::SharedState;
 use crate::strom::client::{CaptureDevice, Reachability, StromClient};
+use crate::strom::process;
 use crate::strom::{flow, supervisor};
 use anyhow::{bail, Context, Result};
 use open_live_gateway_types::config::GatewayConfig;
@@ -26,41 +27,6 @@ use tracing::{info, warn};
 /// Where the pid of a running `up` is kept, beside the source-id state.
 fn pidfile(cfg: &GatewayConfig) -> PathBuf {
     PathBuf::from(&cfg.open_live.state_path).with_extension("pid")
-}
-
-/// Checks Strom before doing anything, so an unreachable engine produces advice
-/// rather than a stack of transport errors.
-///
-/// This is the most likely first-run failure: the gateway drives Strom but never
-/// starts it, and "Connection refused" five levels deep tells an operator nothing
-/// about what to do next.
-async fn preflight(strom: &StromClient, cfg: &GatewayConfig) -> Result<()> {
-    match strom.probe().await {
-        Reachability::Ok { .. } => Ok(()),
-        Reachability::NeedsCredential => bail!(
-            "Strom at {url} needs a credential.\n\n\
-             It is running with STROM_API_KEY set. Run `open-live-gateway setup` and \
-             enter that key when it asks.",
-            url = cfg.strom.url
-        ),
-        Reachability::Unreachable(err) => bail!(
-            "cannot reach Strom at {url} ({err}).\n\n\
-             Strom does the capturing and encoding; this gateway only drives it, and does \
-             not start it. Start it first, for example:\n    \
-             strom --headless --port {port}\n\n\
-             If it runs elsewhere, run `open-live-gateway setup` to point at it.",
-            url = cfg.strom.url,
-            err = err,
-            port = port_of(&cfg.strom.url).unwrap_or(8080),
-        ),
-    }
-}
-
-/// The port in a Strom URL, for use in the advice above.
-fn port_of(url: &str) -> Option<u16> {
-    let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let host = after_scheme.split('/').next()?;
-    host.rsplit_once(':')?.1.parse().ok()
 }
 
 /// Devices to bring up, after filtering and selection.
@@ -83,25 +49,85 @@ fn choose_devices(
         return Ok(devices);
     };
 
-    // 1-based, matching what `status` and the startup listing print.
+    // Matched by id or by name, never by position. A device list changes between
+    // runs — a camera reconnecting is enough — so `--devices 2` can silently mean a
+    // different camera today than it did yesterday.
     let mut chosen = Vec::new();
-    for part in selection.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
+    for wanted in selection.split(',') {
+        let wanted = wanted.trim();
+        if wanted.is_empty() {
             continue;
         }
-        let index: usize = part
-            .parse()
-            .with_context(|| format!("--devices takes numbers from the list, got {part:?}"))?;
-        let device = devices
-            .get(index.checked_sub(1).context("device numbers start at 1")?)
-            .with_context(|| format!("there is no device {index}"))?;
-        chosen.push(device.clone());
+        let needle = wanted.to_lowercase();
+
+        let matches: Vec<&CaptureDevice> = devices
+            .iter()
+            .filter(|d| {
+                d.id.eq_ignore_ascii_case(wanted) || d.display_name.to_lowercase().contains(&needle)
+            })
+            .collect();
+
+        match matches.as_slice() {
+            [device] => chosen.push((*device).clone()),
+            [] => {
+                bail!("no device matches {wanted:?}. Run `open-live-gateway devices` to see them.")
+            }
+            // Refuse rather than guess: starting the wrong camera is worse than
+            // asking again with a longer name.
+            several => bail!(
+                "{wanted:?} matches {} devices ({}). Use a longer name or an id.",
+                several.len(),
+                several
+                    .iter()
+                    .map(|d| d.display_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     }
     if chosen.is_empty() {
         bail!("--devices selected nothing");
     }
     Ok(chosen)
+}
+
+/// Lists what Strom can see, so an operator can pick before starting anything.
+pub async fn devices(cfg: GatewayConfig) -> Result<()> {
+    let local_strom = process::ensure_running(&cfg).await?;
+    let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
+    let all = strom
+        .devices("video_source")
+        .await
+        .context("asking Strom what capture devices it can see")?;
+
+    let mut all = all;
+    all.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+
+    if all.is_empty() {
+        println!("Strom reports no video sources on this machine.");
+    } else {
+        println!("{:<30} ID", "DEVICE");
+        for device in &all {
+            let note = if session::is_probably_virtual(device) {
+                "virtual — skipped unless --all"
+            } else {
+                ""
+            };
+            println!(
+                "{:<30} {:<24} {}",
+                truncate(&device.display_name, 30),
+                truncate(&device.id, 24),
+                note
+            );
+        }
+        println!();
+        println!("`up` starts all of these except the virtual ones.");
+        println!("Pick some with `up --devices \"FaceTime\"` or by id.");
+    }
+
+    // Started only to ask; do not leave it behind.
+    local_strom.shutdown();
+    Ok(())
 }
 
 /// Brings every chosen device up and supervises it until stopped.
@@ -111,8 +137,10 @@ pub async fn up(
     include_virtual: bool,
     selection: Option<String>,
 ) -> Result<()> {
+    // Strom is not assumed to be running: adopt one if it is, start a headless one if
+    // not. Only a Strom started here is stopped again at the end.
+    let local_strom = process::ensure_running(&cfg).await?;
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
-    preflight(&strom, &cfg).await?;
 
     let devices = choose_devices(
         strom
@@ -203,11 +231,22 @@ pub async fn up(
 
     print_summary(&devices, &active);
     write_pidfile(&cfg)?;
+    // Recorded so a `down` after a hard kill can stop the Strom we started, which
+    // would otherwise keep holding the capture devices.
+    if let Some(pid) = local_strom.managed_pid() {
+        identity::record_strom_pid(&state_path, pid).ok();
+    }
 
     let outcome = wait_for_stop(Arc::clone(&state)).await;
 
     println!("\nStopping.");
     teardown(&strom, open_live.as_ref(), &state_path, &active).await;
+    let managed = local_strom.managed_pid().is_some();
+    local_strom.shutdown();
+    if managed {
+        println!("  strom — stopped");
+        identity::forget_strom_pid(&state_path).ok();
+    }
     remove_pidfile(&cfg);
     outcome
 }
@@ -433,7 +472,25 @@ pub async fn down(cfg: GatewayConfig, gateway_id: String) -> Result<()> {
         identity::forget_started(&state_path, &input_id).ok();
         println!("  {input_id} — torn down");
     }
+
+    stop_managed_strom(&state_path);
     Ok(())
+}
+
+/// Stops a Strom recorded as started by us, for the case where `up` was killed hard
+/// and left it running. An adopted Strom is never recorded, so never stopped.
+fn stop_managed_strom(state_path: &Path) {
+    let Ok(persisted) = identity::load(state_path) else {
+        return;
+    };
+    let Some(pid) = persisted.strom_pid else {
+        return;
+    };
+    if process_alive(pid) {
+        println!("  strom (pid {pid}) — stopping the one we started");
+        signal_stop(pid);
+    }
+    identity::forget_strom_pid(state_path).ok();
 }
 
 /// Every input the last run recorded, whether or not it reached Open Live.
@@ -567,14 +624,6 @@ mod tests {
     }
 
     #[test]
-    fn a_port_is_read_from_a_strom_url_for_the_advice() {
-        assert_eq!(port_of("http://127.0.0.1:8080"), Some(8080));
-        assert_eq!(port_of("https://strom.example.com:9443/"), Some(9443));
-        // No port means Strom's default, which the caller substitutes.
-        assert_eq!(port_of("http://strom.example.com"), None);
-    }
-
-    #[test]
     fn virtual_devices_are_skipped_by_default() {
         let chosen = choose_devices(devices(), false, None).unwrap();
         let names: Vec<&str> = chosen.iter().map(|d| d.display_name.as_str()).collect();
@@ -590,26 +639,49 @@ mod tests {
     /// Numbers must match the printed list, which is sorted — otherwise `--devices 1`
     /// picks something other than the first row an operator can see.
     #[test]
-    fn selection_indexes_the_sorted_filtered_list() {
-        let chosen = choose_devices(devices(), false, Some("1")).unwrap();
-        assert_eq!(chosen[0].display_name, "DeckLink Mini Recorder");
-
-        let chosen = choose_devices(devices(), false, Some("2")).unwrap();
+    fn a_device_can_be_selected_by_name_fragment() {
+        let chosen = choose_devices(devices(), false, Some("facetime")).unwrap();
+        assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].display_name, "FaceTime HD Camera");
     }
 
     #[test]
-    fn selection_accepts_several_numbers() {
-        let chosen = choose_devices(devices(), true, Some("1,3")).unwrap();
-        assert_eq!(chosen.len(), 2);
+    fn a_device_can_be_selected_by_id() {
+        let chosen = choose_devices(devices(), true, Some("d1")).unwrap();
+        assert_eq!(chosen[0].display_name, "OBS Virtual Camera");
     }
 
     #[test]
-    fn a_bad_selection_is_an_error_rather_than_a_silent_skip() {
-        assert!(choose_devices(devices(), false, Some("9")).is_err());
-        assert!(choose_devices(devices(), false, Some("x")).is_err());
-        assert!(choose_devices(devices(), false, Some("0")).is_err());
-        assert!(choose_devices(devices(), false, Some(",")).is_err());
+    fn several_devices_can_be_named_at_once() {
+        let chosen = choose_devices(devices(), true, Some("facetime,obs")).unwrap();
+        assert_eq!(chosen.len(), 2);
+    }
+
+    /// Selection must not depend on position: a device list changes between runs,
+    /// and a number that meant one camera yesterday can mean another today.
+    #[test]
+    fn positions_are_not_accepted_as_selectors() {
+        assert!(
+            choose_devices(devices(), false, Some("1")).is_err(),
+            "a bare number must not select by position"
+        );
+    }
+
+    /// Starting the wrong camera is worse than asking again, so an ambiguous name
+    /// is refused rather than resolved by picking the first match.
+    #[test]
+    fn an_ambiguous_name_is_refused() {
+        let mut list = devices();
+        list.push(device("d4", "Camera Link Pro"));
+        let err = choose_devices(list, true, Some("camera"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches"), "got {err}");
+    }
+
+    #[test]
+    fn an_unknown_name_is_an_error() {
+        assert!(choose_devices(devices(), false, Some("nonexistent")).is_err());
     }
 
     #[test]

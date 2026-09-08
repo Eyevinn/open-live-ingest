@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod flow;
+pub mod process;
 pub mod supervisor;
 
 pub use supervisor::spawn_supervisors;

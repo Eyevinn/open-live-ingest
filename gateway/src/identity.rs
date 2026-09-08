@@ -20,6 +20,11 @@ pub struct PersistedState {
     /// the record to a registered source made both blind in exactly those cases.
     #[serde(default)]
     pub started: BTreeMap<String, StartedInput>,
+    /// The pid of a Strom this gateway started, if it started one. Recorded so a
+    /// `down` after a hard kill can stop it; an adopted Strom is never recorded,
+    /// and so never stopped.
+    #[serde(default)]
+    pub strom_pid: Option<u32>,
 }
 
 /// Enough about a started input to report on it and to tear it down.
@@ -66,6 +71,20 @@ pub fn forget_started(path: &Path, input_id: &str) -> Result<()> {
     let mut state = load(path)?;
     state.started.remove(input_id);
     state.source_ids.remove(input_id);
+    store(path, &state)
+}
+
+/// Records the pid of a Strom we started.
+pub fn record_strom_pid(path: &Path, pid: u32) -> Result<()> {
+    let mut state = load(path)?;
+    state.strom_pid = Some(pid);
+    store(path, &state)
+}
+
+/// Forgets a Strom pid, once it has been stopped.
+pub fn forget_strom_pid(path: &Path) -> Result<()> {
+    let mut state = load(path)?;
+    state.strom_pid = None;
     store(path, &state)
 }
 

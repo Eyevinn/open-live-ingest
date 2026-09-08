@@ -208,7 +208,7 @@ mod tests {
             },
             strom: StromConfig {
                 url: "http://127.0.0.1:8080".to_string(),
-                api_key: None,
+                ..StromConfig::default()
             },
             inputs: vec![InputConfig {
                 id: "cam1".to_string(),

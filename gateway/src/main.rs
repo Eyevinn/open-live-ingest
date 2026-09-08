@@ -38,7 +38,7 @@ enum Command {
         #[arg(long)]
         all: bool,
 
-        /// Only these devices, by number from the printed list, e.g. `--devices 1,3`.
+        /// Only these devices, by id or name, e.g. `--devices "FaceTime,DeckLink"`.
         #[arg(long)]
         devices: Option<String>,
 
@@ -50,6 +50,8 @@ enum Command {
     Down,
     /// Report what is running, from Strom and Open Live directly.
     Status,
+    /// List the capture devices Strom can see, without starting anything.
+    Devices,
     /// Ask for settings and store them without starting anything.
     Setup,
     /// Check the settings file and exit.
@@ -111,6 +113,11 @@ async fn main() -> Result<()> {
             config::validate(&cfg)?;
             let gateway_id = identity::resolve_gateway_id(&cfg);
             runner::down(cfg, gateway_id).await
+        }
+
+        Command::Devices => {
+            config::validate(&cfg)?;
+            runner::devices(cfg).await
         }
 
         Command::Status => {
