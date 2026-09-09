@@ -119,13 +119,17 @@ settings file. The Open Live credential kind is inferred from the address, since
 "osc or direct" from those words, and the local Strom's key is asked for only when Strom answers
 401, because "wants a credential" and "cannot be reached" send an operator to different places.
 
-**The Open Source Cloud credential is the OSC CLI's login.** `npx @osaas/cli login` signs in through
-a browser and saves a token that the platform exchanges exactly like a personal access token. Reading
-it from there means no secret crosses the terminal or lands in the settings file, and renewing it is
-logging in again, which a running gateway picks up at its next exchange instead of needing a restart.
-A token in the settings or the environment still wins: a deployment tool that injects one must not be
-overridden by whoever last logged in on the box. Pasting one remains the way in on a machine with no
-browser, since the login's redirect lands on the machine running the CLI.
+**The Open Source Cloud side is chosen, not typed.** Setup asks how to authenticate: the OSC CLI's
+environment variable, its browser login, or a pasted personal access token. With the token in hand it
+reads back the workspace the token belongs to, since that is what the operator picked in the browser
+and the platform offers no way to list or switch workspaces from outside, and then lists that
+workspace's Open Live instances the way `osc list` does, so the address is picked rather than pasted.
+The login is exchanged exactly like a personal access token, so nothing secret has to cross the
+terminal or land in the settings file; but it lasts an hour, so it fits setup and a personal access
+token carries the show. A token in the settings or the environment wins over the saved login: a
+deployment tool that injects one must not be overridden by whoever last signed in on the box. A
+typed address and a pasted token remain the way in on a machine with no browser, since the login's
+redirect lands on the machine running the CLI.
 
 **`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
 SIGHUP does not: a closed SSH session must not take a venue off air. A deliberate stop stops, an

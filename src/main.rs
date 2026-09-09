@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
         Command::Setup => {
             if setup::configure(&mut cfg, true).await? {
                 config::save(&path, &cfg)?;
-                println!("\nSaved to {}.", path.display());
+                setup::report_saved(&path);
             }
             Ok(())
         }
@@ -111,7 +111,7 @@ async fn main() -> Result<()> {
         } => {
             if setup::configure(&mut cfg, reconfigure).await? {
                 config::save(&path, &cfg)?;
-                println!("\nSaved to {}.\n", path.display());
+                setup::report_saved(&path);
             }
             config::validate(&cfg)?;
             run::up(cfg, all, devices, test).await

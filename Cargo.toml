@@ -21,8 +21,10 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4"
-# No-echo terminal input for credential prompts. Works on a dumb terminal over SSH.
-rpassword = "7"
+# Setup prompts: lists picked with the arrow keys, no-echo credential input, and a
+# coloured theme that steps back to plain text on a dumb terminal or under NO_COLOR.
+dialoguer = { version = "0.12", default-features = false, features = ["password"] }
+console = "0.16"
 # Signal 0 liveness checks and SIGTERM for `down`.
 libc = "0.2"
 # v5 for flow ids derived from gateway id + input id, so nothing has to be stored to

@@ -14,7 +14,7 @@ use tracing::debug;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_EXCHANGE_URL: &str = "https://token.svc.prod.osaas.io/servicetoken";
-const OPEN_LIVE_SERVICE_ID: &str = "eyevinn-open-live";
+pub const OPEN_LIVE_SERVICE_ID: &str = "eyevinn-open-live";
 /// Refresh this long before expiry, so a token never dies mid-request.
 const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
 
@@ -239,13 +239,24 @@ impl OscToken {
     fn read(&self) -> Result<String> {
         match self {
             OscToken::Configured(key) => Ok(key.clone()),
-            OscToken::CliLogin => osc::saved_token().with_context(|| {
-                format!(
-                    "the OSC CLI login is gone from {}; run `{}` again",
-                    osc::describe_location(),
-                    osc::LOGIN_COMMAND
-                )
-            }),
+            OscToken::CliLogin => {
+                let token = osc::saved_token().with_context(|| {
+                    format!(
+                        "the OSC CLI login is gone from {}; run `{}` again",
+                        osc::describe_location(),
+                        osc::LOGIN_COMMAND
+                    )
+                })?;
+                // A login lasts an hour. Saying so beats a bare 401 from the exchange.
+                if osc::inspect(&token).is_some_and(|info| info.is_expired()) {
+                    bail!(
+                        "the OSC CLI login in {} has expired; run `{}` again",
+                        osc::describe_location(),
+                        osc::LOGIN_COMMAND
+                    );
+                }
+                Ok(token)
+            }
         }
     }
 
@@ -314,14 +325,7 @@ fn is_expiring(cached: &CachedToken) -> bool {
 
 async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken> {
     let token = pat.read()?;
-    let res = http
-        .post(TOKEN_EXCHANGE_URL)
-        .header("x-pat-jwt", format!("Bearer {token}"))
-        .header("accept", "application/json")
-        .json(&serde_json::json!({ "serviceId": OPEN_LIVE_SERVICE_ID }))
-        .send()
-        .await
-        .context("POST service token")?;
+    let res = post_service_token(http, &token).await?;
     let status = res.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         bail!(
@@ -329,6 +333,26 @@ async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken>
             pat.rejected_hint()
         );
     }
+    decode_service_token(res).await
+}
+
+/// A one-off service token for Open Live, for setup to list instances with.
+pub async fn service_token(http: &reqwest::Client, pat: &str) -> Result<String> {
+    let res = post_service_token(http, pat).await?;
+    Ok(decode_service_token(res).await?.token)
+}
+
+async fn post_service_token(http: &reqwest::Client, pat: &str) -> Result<reqwest::Response> {
+    http.post(TOKEN_EXCHANGE_URL)
+        .header("x-pat-jwt", format!("Bearer {pat}"))
+        .header("accept", "application/json")
+        .json(&serde_json::json!({ "serviceId": OPEN_LIVE_SERVICE_ID }))
+        .send()
+        .await
+        .context("POST service token")
+}
+
+async fn decode_service_token(res: reqwest::Response) -> Result<CachedToken> {
     // Never include the body: it can echo the token back.
     let body: ServiceTokenResponse = ok(res, "OSC token exchange")?
         .json()
