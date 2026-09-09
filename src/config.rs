@@ -146,7 +146,7 @@ pub struct Uplink {
     /// This machine's address as the cloud sees it. Needed in listener mode, where
     /// the cloud dials the venue.
     pub public_host: Option<String>,
-    /// Inclusive `first-last` range, e.g. "9000-9100".
+    /// Inclusive `first-last` range, e.g. "47110-47129".
     pub port_range: String,
     /// Rule of thumb: 3-4x the measured RTT.
     pub latency_ms: u32,
@@ -161,7 +161,7 @@ impl Default for Uplink {
             mode: UplinkMode::Caller,
             host: None,
             public_host: None,
-            port_range: "9000-9100".to_string(),
+            port_range: "47110-47129".to_string(),
             latency_ms: 200,
             passphrase: None,
             pbkeylen: None,
@@ -723,7 +723,7 @@ mod tests {
             };
             assert!(u.ports().is_err(), "{bad:?} should be rejected");
         }
-        assert_eq!(Uplink::default().ports().unwrap(), 9000..=9100);
+        assert_eq!(Uplink::default().ports().unwrap(), 47110..=47129);
     }
 
     #[test]
