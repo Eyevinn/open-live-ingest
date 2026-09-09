@@ -82,7 +82,8 @@ open. `osc` mode always needs the token.
 ## Requirements
 
 - Linux or macOS, with a Strom instance on the same machine that can see the capture hardware
-- Rust 1.97.1 to build, pinned in `rust-toolchain.toml`
+- Rust 1.97.1 to build, pinned in `rust-toolchain.toml`. Strom's API types come from the `strom-types`
+  crate, pinned in `Cargo.toml` to the Strom release the venue runs
 
 The gateway itself is an ordinary HTTP client: no GStreamer, no device access, no privileges.
 

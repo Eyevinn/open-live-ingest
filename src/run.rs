@@ -18,6 +18,7 @@ use crate::strom::StromClient;
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::time::Duration;
+use strom_types::FlowId;
 use tracing::{info, warn};
 
 const TICK: Duration = Duration::from_secs(10);
@@ -81,7 +82,7 @@ pub async fn devices(cfg: Config) -> Result<()> {
         .devices()
         .await
         .context("asking Strom what capture devices it can see")?;
-    all.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    all.sort_by(|a, b| a.name.cmp(&b.name));
     if all.is_empty() {
         println!("Strom reports no video sources on this machine.");
         return Ok(());
@@ -95,7 +96,7 @@ pub async fn devices(cfg: Config) -> Result<()> {
         };
         println!(
             "{:<30} {:<24} {note}",
-            truncate(&device.display_name, 30),
+            truncate(&device.name, 30),
             truncate(&device.id, 24)
         );
     }
@@ -106,7 +107,7 @@ pub async fn devices(cfg: Config) -> Result<()> {
 /// One streaming input and what the last poll found out about it.
 struct Live {
     input: Input,
-    flow_id: String,
+    flow_id: FlowId,
     state: State,
     shown: Option<State>,
     last_bytes: Option<u64>,
@@ -244,9 +245,8 @@ async fn clear_conflicting_flows(
         })
         .collect();
     for existing in strom.list_flows().await.context("listing Strom's flows")? {
-        let ours = flow::is_ours(&existing.raw, gateway_id);
-        let holds_device =
-            flow::capture_device_of(&existing.raw).is_some_and(|d| devices.contains(&d));
+        let ours = flow::is_ours(&existing, gateway_id);
+        let holds_device = flow::capture_device_of(&existing).is_some_and(|d| devices.contains(&d));
         if !(ours || holds_device) {
             continue;
         }
@@ -261,7 +261,7 @@ async fn clear_conflicting_flows(
     Ok(())
 }
 
-async fn start(strom: &StromClient, flow_id: &str, desired: &serde_json::Value) -> Result<()> {
+async fn start(strom: &StromClient, flow_id: &FlowId, desired: &strom_types::Flow) -> Result<()> {
     strom.create_flow(desired).await?;
     match strom.start_flow(flow_id).await {
         Ok(true) => Ok(()),
@@ -276,7 +276,7 @@ async fn start(strom: &StromClient, flow_id: &str, desired: &serde_json::Value) 
     }
 }
 
-async fn remove_flow(strom: &StromClient, flow_id: &str) -> Result<()> {
+async fn remove_flow(strom: &StromClient, flow_id: &FlowId) -> Result<()> {
     strom.stop_flow(flow_id).await.ok();
     strom.delete_flow(flow_id).await
 }
@@ -381,10 +381,10 @@ async fn poll_flow(
     };
     // Bytes moving between two polls is the test, not growth: a reconnect resets the
     // counter. The first sample has nothing to compare against and proves nothing.
-    let delivering = l
-        .last_bytes
-        .is_some_and(|before| sample.bytes_sent != before && sample.bytes_sent > 0);
-    l.last_bytes = Some(sample.bytes_sent);
+    let delivering = l.last_bytes.is_some_and(|before| {
+        sample.bytes_sent.unwrap_or(0) != before && sample.bytes_sent.unwrap_or(0) > 0
+    });
+    l.last_bytes = Some(sample.bytes_sent.unwrap_or(0));
     if delivering {
         l.quiet_polls = 0;
         return Ok(State::OnAir);
@@ -551,7 +551,7 @@ pub async fn down(cfg: Config) -> Result<()> {
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
     match strom.list_flows().await {
         Ok(flows) => {
-            for f in flows.iter().filter(|f| flow::is_ours(&f.raw, &gateway_id)) {
+            for f in flows.iter().filter(|f| flow::is_ours(f, &gateway_id)) {
                 match remove_flow(&strom, &f.id).await {
                     Ok(()) => {
                         println!("  {} — flow stopped and removed", f.name);
@@ -590,7 +590,7 @@ pub async fn status(cfg: Config) -> Result<()> {
     let flows = match strom.list_flows().await {
         Ok(flows) => flows
             .into_iter()
-            .filter(|f| flow::is_ours(&f.raw, &gateway_id))
+            .filter(|f| flow::is_ours(f, &gateway_id))
             .collect(),
         Err(err) => {
             println!("Strom at {} is not reachable ({err}).", cfg.strom.url);
@@ -634,7 +634,7 @@ pub async fn status(cfg: Config) -> Result<()> {
             Some(f) => match strom.srt_uplink(&f.id).await {
                 Ok(Some(s)) => match (s.send_rate_mbps, s.rtt_ms) {
                     (Some(rate), Some(rtt)) => format!("{rate:.2} Mbps, rtt {rtt:.0} ms"),
-                    _ => format!("{} bytes sent", s.bytes_sent),
+                    _ => format!("{} bytes sent", s.bytes_sent.unwrap_or(0)),
                 },
                 _ => "no receiver".to_string(),
             },

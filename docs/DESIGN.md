@@ -82,8 +82,17 @@ the device it captures. That gives `down` and `status` a precise ownership test 
 and no naming convention, and a flow someone built by hand on the same camera is never touched.
 Changing `gateway.id` hides the flows already created.
 
-**Block ids and property names are Strom's**, sent as strings over HTTP, so a rename upstream fails
-at runtime rather than at compile time. `GET /api/blocks` on a live Strom is the authority.
+**The flow's structure is Strom's own type.** `strom-types` is pure serde with no GStreamer, so the
+gateway builds a typed `Flow` and decodes Strom's responses into Strom's types, pinned to the Strom
+release the venue runs. Block definition ids and property names remain strings: they live in each
+block's builder in the backend, so a rename there fails at runtime. `GET /api/blocks` on a live
+Strom is the authority for those.
+
+**The engine itself stays a separate process.** Linking it was considered and rejected: the gateway
+would become a GStreamer program with Strom's build and version lock, a gateway crash would take the
+camera off air, and the operator would lose Strom's editor and stats pages for field debugging.
+The cost of a separate process is one more thing to install, and adopt-or-start already makes that
+one command.
 
 ## 5. Which end dials
 

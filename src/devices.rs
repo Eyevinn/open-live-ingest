@@ -3,9 +3,9 @@
 
 use crate::config::{Capture, Uplink};
 use crate::flow::{self, Input, Source};
-use crate::strom::Device;
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
+use strom_types::discovery::DeviceResponse;
 
 /// Devices that exist but produce nothing unless another application is running.
 /// Streaming one registers a source that sits in Studio waiting for a picture, which
@@ -21,8 +21,8 @@ const VIRTUAL_HINTS: &[&str] = &[
     "desktop",
 ];
 
-pub fn is_probably_virtual(device: &Device) -> bool {
-    let name = device.display_name.to_lowercase();
+pub fn is_probably_virtual(device: &DeviceResponse) -> bool {
+    let name = device.name.to_lowercase();
     VIRTUAL_HINTS.iter().any(|hint| name.contains(hint))
 }
 
@@ -31,15 +31,15 @@ pub fn is_probably_virtual(device: &Device) -> bool {
 /// Selection is by id or by name fragment, never by position: a device list changes
 /// between runs, so a number that meant one camera yesterday can mean another today.
 pub fn choose(
-    all: Vec<Device>,
+    all: Vec<DeviceResponse>,
     include_virtual: bool,
     selection: Option<&str>,
-) -> Result<Vec<Device>> {
-    let mut devices: Vec<Device> = all
+) -> Result<Vec<DeviceResponse>> {
+    let mut devices: Vec<DeviceResponse> = all
         .into_iter()
         .filter(|d| include_virtual || !is_probably_virtual(d))
         .collect();
-    devices.sort_by(|a, b| a.display_name.cmp(&b.display_name));
+    devices.sort_by(|a, b| a.name.cmp(&b.name));
 
     let Some(selection) = selection else {
         return Ok(devices);
@@ -52,10 +52,10 @@ pub fn choose(
         .filter(|w| !w.is_empty())
     {
         let needle = wanted.to_lowercase();
-        let matches: Vec<&Device> = devices
+        let matches: Vec<&DeviceResponse> = devices
             .iter()
             .filter(|d| {
-                d.id.eq_ignore_ascii_case(wanted) || d.display_name.to_lowercase().contains(&needle)
+                d.id.eq_ignore_ascii_case(wanted) || d.name.to_lowercase().contains(&needle)
             })
             .collect();
         match matches.as_slice() {
@@ -69,7 +69,7 @@ pub fn choose(
                 several.len(),
                 several
                     .iter()
-                    .map(|d| d.display_name.as_str())
+                    .map(|d| d.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -91,7 +91,7 @@ pub fn name_prefix(gateway_name: &str) -> String {
 /// order. Deterministic, so the same devices land on the same ports across runs and
 /// the addresses registered in Open Live stay stable.
 pub fn inputs_for(
-    devices: &[Device],
+    devices: &[DeviceResponse],
     test_pattern: bool,
     gateway_name: &str,
     uplink: &Uplink,
@@ -130,7 +130,7 @@ pub fn inputs_for(
     for device in devices {
         inputs.push(Input {
             id: flow::device_input_id(&device.id),
-            name: format!("{prefix}{}", device.display_name),
+            name: format!("{prefix}{}", device.name),
             source: Source::Device {
                 device_id: device.id.clone(),
                 resolution: capture.video_resolution.clone(),
@@ -146,14 +146,20 @@ pub fn inputs_for(
 mod tests {
     use super::*;
 
-    fn device(id: &str, name: &str) -> Device {
-        Device {
+    fn device(id: &str, name: &str) -> DeviceResponse {
+        DeviceResponse {
             id: id.to_string(),
-            display_name: name.to_string(),
+            name: name.to_string(),
+            device_class: "Video/Source".to_string(),
+            category: strom_types::discovery::DeviceCategory::VideoSource,
+            provider: "test".to_string(),
+            properties: Default::default(),
+            first_seen_secs_ago: 0,
+            last_seen_secs_ago: 0,
         }
     }
 
-    fn devices() -> Vec<Device> {
+    fn devices() -> Vec<DeviceResponse> {
         vec![
             device("d1", "OBS Virtual Camera"),
             device("d2", "FaceTime HD Camera"),
@@ -166,7 +172,7 @@ mod tests {
         let names: Vec<String> = choose(devices(), false, None)
             .unwrap()
             .into_iter()
-            .map(|d| d.display_name)
+            .map(|d| d.name)
             .collect();
         assert_eq!(names, ["DeckLink Mini Recorder", "FaceTime HD Camera"]);
         assert_eq!(choose(devices(), true, None).unwrap().len(), 3);
