@@ -49,7 +49,7 @@ Three credentials exist in this system and it only ever asks for one:
 
 | Credential | Who needs it | Asked for |
 |---|---|---|
-| Open Live: an OSC personal access token, or Open Live's own `API_KEY` | the gateway, to register sources | **yes**, and the kind is inferred from the URL |
+| Open Live: an Open Source Cloud login, or Open Live's own `API_KEY` | the gateway, to register sources | **yes**, and the kind is inferred from the URL |
 | The local Strom's `STROM_API_KEY` | the gateway, only if that Strom runs with auth | only when Strom actually refuses without one |
 | The cloud Strom's token | Open Live holds it itself | never |
 
@@ -77,13 +77,26 @@ on macOS, or wherever `--config` points. The same format can be written by hand;
 | `OLG_LOG_LEVEL` | `log.level` |
 
 In `direct` mode the key is optional: a self-hosted Open Live with `API_KEY` unset leaves `/api/v1`
-open. `osc` mode always needs the token.
+open. `osc` mode always needs a credential, but it need not be in the settings at all:
+
+```bash
+npx @osaas/cli login
+```
+
+signs in through the browser and saves a token to `~/.osc/token`, which the gateway uses whenever
+`open_live.api_key` is unset. Setup offers to run it. The token is read again at each exchange, so
+when it expires, logging in again is enough; a running gateway picks it up on its next tick. The
+CLI's own `OSC_ACCESS_TOKEN` is honoured the same way. A key in the settings or in
+`OLG_OPEN_LIVE_API_KEY` takes precedence over the login. On a box with no browser, paste a
+personal access token at the setup prompt, or copy `~/.osc/token` over from a machine you logged
+in on.
 
 ## Requirements
 
 - Linux or macOS, with a Strom instance on the same machine that can see the capture hardware
 - Rust 1.97.1 to build, pinned in `rust-toolchain.toml`. Strom's API types come from the `strom-types`
   crate, pinned in `Cargo.toml` to the Strom release the venue runs
+- Node.js, only to sign in to Open Source Cloud with `npx @osaas/cli login`. A pasted token needs none
 
 The gateway itself is an ordinary HTTP client: no GStreamer, no device access, no privileges.
 

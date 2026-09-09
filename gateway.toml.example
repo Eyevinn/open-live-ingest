@@ -29,13 +29,16 @@ binary = "strom"
 
 [open_live]
 url = "https://my-instance.eyevinn-open-live.auto.prod-se.osaas.io"
-# osc:    api_key is an OSC personal access token, exchanged for a short-lived
-#         service token. Needed for an OSC-hosted instance, whose proxy rejects a
-#         PAT presented directly. Setup infers this from an osaas.io address.
+# osc:    an Open Source Cloud login, exchanged for a short-lived service token.
+#         Needed for an OSC-hosted instance, whose proxy rejects a personal access
+#         token presented directly. Setup infers this from an osaas.io address.
+#         With api_key unset, the login saved by `npx @osaas/cli login` is used
+#         (~/.osc/token, or OSC_ACCESS_TOKEN). Set api_key to a personal access
+#         token instead on a machine with no browser; it takes precedence.
 # direct: api_key is sent as the bearer token as-is, for a self-hosted Open Live
 #         with a static API_KEY, or none at all.
 auth_mode = "osc"
-api_key = "change-me"
+# api_key = "change-me"
 # Register one source per input. Off for a box that only streams to a Strom.
 register = true
 

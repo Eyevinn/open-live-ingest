@@ -119,6 +119,14 @@ settings file. The Open Live credential kind is inferred from the address, since
 "osc or direct" from those words, and the local Strom's key is asked for only when Strom answers
 401, because "wants a credential" and "cannot be reached" send an operator to different places.
 
+**The Open Source Cloud credential is the OSC CLI's login.** `npx @osaas/cli login` signs in through
+a browser and saves a token that the platform exchanges exactly like a personal access token. Reading
+it from there means no secret crosses the terminal or lands in the settings file, and renewing it is
+logging in again, which a running gateway picks up at its next exchange instead of needing a restart.
+A token in the settings or the environment still wins: a deployment tool that injects one must not be
+overridden by whoever last logged in on the box. Pasting one remains the way in on a machine with no
+browser, since the login's redirect lands on the machine running the CLI.
+
 **`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
 SIGHUP does not: a closed SSH session must not take a venue off air. A deliberate stop stops, an
 accident does not. This replaced an earlier daemon model in which flows were meant to outlive the
