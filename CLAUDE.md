@@ -29,8 +29,12 @@ Strom does the media.
 - Strom owns the media plane. Before adding anything to the gateway, check whether a Strom block
   already does it: encoder selection, SRT reconnect, capture handling, device discovery, and stats
   all exist there. A Strom bug is fixed in Strom, not worked around here.
-- Block ids and property names are Strom's, sent as strings over HTTP, so an upstream rename fails
-  at runtime rather than at compile time. `GET /api/blocks` on a live Strom is the authority.
+- Flow, block, link, device, and SRT statistics types come from `strom-types`, pinned in `Cargo.toml`
+  to the Strom release the venue runs. Bump the tag on purpose when that Strom is upgraded. Block
+  definition ids and property names are still Strom's strings, because they live in each block's
+  builder in the backend; `GET /api/blocks` on a live Strom is the authority for those.
+- Do not link the Strom engine itself. The process boundary is what keeps the gateway out of the
+  media path, keeps its build free of GStreamer, and lets Strom and the gateway upgrade separately.
 - Flow ids are derived (UUIDv5 over gateway id + input id), never stored. That is what lets `down`
   and `status` find the flows with no local state.
 - Do not restart a flow for a transient uplink drop. `builtin.mpegtssrt_output` reconnects itself.
