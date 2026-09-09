@@ -37,7 +37,9 @@ open-live-gateway check            # validate the settings file
 ```
 
 Run it and it asks for what it needs, checks each answer, remembers it, then registers every capture
-device Strom can see and starts streaming. Built for SSH: plain prompts on any terminal, no window.
+device Strom can see and starts streaming. Built for SSH: line-by-line prompts on any terminal, lists
+picked with the arrow keys, no window. Colour steps back to plain text under `NO_COLOR` or on a dumb
+terminal.
 
 `up` stays in the foreground and owns what it started. Ctrl-C or SIGTERM stops and removes the
 feeds. It **ignores SIGHUP**, so a closed session or a dropped link does not take a venue off air.
@@ -77,19 +79,22 @@ on macOS, or wherever `--config` points. The same format can be written by hand;
 | `OLG_LOG_LEVEL` | `log.level` |
 
 In `direct` mode the key is optional: a self-hosted Open Live with `API_KEY` unset leaves `/api/v1`
-open. `osc` mode always needs a credential, but it need not be in the settings at all:
+open. `osc` mode always needs a credential, and setup asks which of three to use:
 
-```bash
-npx @osaas/cli login
-```
+| Choice | Credential | Where it lives |
+|---|---|---|
+| `env` | the OSC CLI's `OSC_ACCESS_TOKEN` | the environment; nothing is stored |
+| `cli` | `npx @osaas/cli login`, a browser sign-in where you pick the workspace | `~/.osc/token`, written by the CLI |
+| `paste` | a personal access token from the OSC web console | `open_live.api_key`, mode 0600 |
 
-signs in through the browser and saves a token to `~/.osc/token`, which the gateway uses whenever
-`open_live.api_key` is unset. Setup offers to run it. The token is read again at each exchange, so
-when it expires, logging in again is enough; a running gateway picks it up on its next tick. The
-CLI's own `OSC_ACCESS_TOKEN` is honoured the same way. A key in the settings or in
-`OLG_OPEN_LIVE_API_KEY` takes precedence over the login. On a box with no browser, paste a
-personal access token at the setup prompt, or copy `~/.osc/token` over from a machine you logged
-in on.
+Setup then shows the workspace the token belongs to, lists that workspace's Open Live instances to
+pick from, and checks the pick before moving on. A typed address is always the last entry.
+
+A CLI login lasts one hour, which covers setup but not a show, so for `up` use `env` or `paste`. A
+key in the settings or in `OLG_OPEN_LIVE_API_KEY` wins over the environment, which wins over the
+saved login; the gateway reads the login again at each token exchange, so signing in again renews a
+running gateway. On a box with no browser, paste a token, or copy `~/.osc/token` over from a machine
+you signed in on.
 
 ## Requirements
 

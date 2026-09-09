@@ -182,15 +182,6 @@ pub enum UplinkMode {
     Listener,
 }
 
-impl UplinkMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            UplinkMode::Caller => "caller",
-            UplinkMode::Listener => "listener",
-        }
-    }
-}
-
 impl Uplink {
     pub fn ports(&self) -> Result<RangeInclusive<u16>> {
         let (first, last) = self.port_range.split_once('-').with_context(|| {

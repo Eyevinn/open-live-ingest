@@ -32,9 +32,10 @@ url = "https://my-instance.eyevinn-open-live.auto.prod-se.osaas.io"
 # osc:    an Open Source Cloud login, exchanged for a short-lived service token.
 #         Needed for an OSC-hosted instance, whose proxy rejects a personal access
 #         token presented directly. Setup infers this from an osaas.io address.
-#         With api_key unset, the login saved by `npx @osaas/cli login` is used
-#         (~/.osc/token, or OSC_ACCESS_TOKEN). Set api_key to a personal access
-#         token instead on a machine with no browser; it takes precedence.
+#         With api_key unset, OSC_ACCESS_TOKEN or the login saved by
+#         `npx @osaas/cli login` (~/.osc/token, valid for an hour) is used. Set
+#         api_key to a personal access token for a show or a machine with no
+#         browser; it takes precedence. Setup lists the workspace's instances.
 # direct: api_key is sent as the bearer token as-is, for a self-hosted Open Live
 #         with a static API_KEY, or none at all.
 auth_mode = "osc"
