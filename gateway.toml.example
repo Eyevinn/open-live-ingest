@@ -6,37 +6,36 @@
 # ~/Library/Application Support/open-live-gateway/gateway.toml on macOS), or wherever
 # --config points. Environment variables override the file: OLG_OPEN_LIVE_URL,
 # OLG_OPEN_LIVE_API_KEY, OLG_OPEN_LIVE_AUTH_MODE, OLG_STROM_URL, OLG_STROM_API_KEY.
+# Unknown keys are an error, so a typo cannot silently fall back to a default.
 
 [gateway]
 # Prefix of every source name in Open Live, so two venues' cameras can be told apart.
+# Setup defaults it to the hostname. An optional `id` seeds the flow ids and also
+# defaults to the hostname.
 name = "Venue A"
-# Stable identity for this machine. Seeds the flow ids, so `down` and `status` find
-# the flows again with nothing stored. Defaults to the hostname.
-# id = "venue-a"
 
 # The Strom on this machine, which does the capturing and encoding. Not the cloud
 # Strom, and not something Open Live knows about.
 [strom]
 url = "http://127.0.0.1:8080"
-# Set when Strom runs with STROM_API_KEY.
-# api_key = "change-me"
 # Start a headless Strom when nothing is listening at url, and stop it again on the
 # way out. A Strom already running is always adopted, never replaced or stopped.
 manage = true
-# The Strom executable: a name on PATH, or a path.
+# The Strom executable: a name on PATH, or a path. A managed Strom keeps its flows
+# in `data_dir`, which defaults to a directory beside this file.
 binary = "strom"
-# Where a managed Strom keeps its flows. Defaults beside these settings.
-# data_dir = "/var/lib/strom"
+# Set when an adopted Strom runs with STROM_API_KEY.
+# api_key = "change-me"
 
 [open_live]
-url = "https://open-live.example.com"
-# direct: api_key is sent as the bearer token as-is, for a self-hosted Open Live with
-#         a static API_KEY, or none at all.
+url = "https://my-instance.eyevinn-open-live.auto.prod-se.osaas.io"
 # osc:    api_key is an OSC personal access token, exchanged for a short-lived
 #         service token. Needed for an OSC-hosted instance, whose proxy rejects a
-#         PAT presented directly. Setup infers this from the address.
-auth_mode = "direct"
-# api_key = "change-me"
+#         PAT presented directly. Setup infers this from an osaas.io address.
+# direct: api_key is sent as the bearer token as-is, for a self-hosted Open Live
+#         with a static API_KEY, or none at all.
+auth_mode = "osc"
+api_key = "change-me"
 # Register one source per input. Off for a box that only streams to a Strom.
 register = true
 
@@ -47,12 +46,12 @@ register = true
 #           the ports.
 # listener: the cloud dials this machine. Needs public_host and inbound UDP here.
 mode = "caller"
+port_range = "47110-47129"
+# Rule of thumb: 3-4x the measured RTT.
+latency_ms = 200
 # The cloud Strom to send to. Leave unset to ask Open Live (GET /api/v1/server-info).
 # host = "strom.example.com"
 # public_host = "venue.example.com"
-port_range = "9000-9100"
-# Rule of thumb: 3-4x the measured RTT.
-latency_ms = 200
 # 10 to 79 characters; letters, digits, and - _ . ~ ! *
 # passphrase = "change-me-please"
 # pbkeylen = 16
@@ -70,7 +69,9 @@ keyframe_interval = 25          # frames; one or two seconds' worth
 
 # Capture format to request from each device. Blank takes whatever the device
 # offers, which suits most devices: builtin.local_input cannot scale or re-time, so
-# asking for a format a device does not advertise fails negotiation.
+# asking for a format a device does not advertise fails negotiation. Matching the
+# production's format exactly (e.g. 1280x720 at 25/1) avoids uneven frame drops
+# when the camera would otherwise pick its own rate.
 [capture]
 # video_resolution = "1280x720"
 # video_framerate = "25/1"
