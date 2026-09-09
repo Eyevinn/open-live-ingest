@@ -8,6 +8,7 @@
 
 use crate::config::{AuthMode, Config, UplinkMode};
 use crate::openlive::OpenLiveClient;
+use crate::osc;
 use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
 use std::io::{IsTerminal, Write};
@@ -87,8 +88,9 @@ pub fn infer_auth_mode(url: &str) -> AuthMode {
     }
 }
 
-/// Whether anything still has to be asked for.
-fn needs_setup(cfg: &Config) -> bool {
+/// Whether anything still has to be asked for. `osc_login` says whether the OSC CLI
+/// has a saved login, which serves in place of a token in the settings.
+fn needs_setup(cfg: &Config, osc_login: bool) -> bool {
     if cfg.gateway.name.trim().is_empty() {
         return true;
     }
@@ -98,13 +100,15 @@ fn needs_setup(cfg: &Config) -> bool {
         return false;
     }
     cfg.open_live.url.is_none()
-        || (cfg.open_live.auth_mode == AuthMode::Osc && cfg.open_live.api_key.is_none())
+        || (cfg.open_live.auth_mode == AuthMode::Osc
+            && cfg.open_live.api_key.is_none()
+            && !osc_login)
 }
 
 /// Fills in whatever is missing. Returns true when something changed and the file
 /// should be written.
 pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
-    if !force && !needs_setup(cfg) {
+    if !force && !needs_setup(cfg, osc::saved_token().is_some()) {
         return Ok(false);
     }
     // Refusing beats hanging on a closed stdin: a prompt in a service or a cron job
@@ -130,20 +134,21 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     cfg.open_live.auth_mode = infer_auth_mode(&url);
     cfg.open_live.url = Some(url);
 
-    let credential_label = match cfg.open_live.auth_mode {
+    match cfg.open_live.auth_mode {
         AuthMode::Osc => {
             println!(
-                "  that is an Open Source Cloud address, so it needs an OSC personal access token"
+                "  that is an Open Source Cloud address, so it needs an Open Source Cloud login"
             );
-            "OSC personal access token for Open Live"
+            osc_credential(cfg).await?;
         }
         AuthMode::Direct => {
             println!("  self-hosted Open Live: it may need an API key, or none at all");
-            "Open Live API key (blank if it needs none)"
+            if let Some(secret) =
+                blank_to_none(ask_secret("Open Live API key (blank if it needs none)").await?)
+            {
+                cfg.open_live.api_key = Some(secret);
+            }
         }
-    };
-    if let Some(secret) = blank_to_none(ask_secret(credential_label).await?) {
-        cfg.open_live.api_key = Some(secret);
     }
 
     // Checked before asking anything else, so a bad address or credential is
@@ -226,6 +231,45 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// The OSC CLI's login is preferred over a pasted token: no secret crosses the
+/// terminal or lands in the settings file, and `npx @osaas/cli login` again renews it.
+/// A pasted token remains the way in on a machine with no browser, and a token in
+/// the settings takes precedence, so an operator is told when one is in the way.
+async fn osc_credential(cfg: &mut Config) -> Result<()> {
+    if osc::saved_token().is_none() {
+        println!("  no OSC CLI login found. Logging in opens a browser on this machine; over SSH, paste a token instead, or copy ~/.osc/token from a machine you logged in on");
+        let login = ask_choice("Log in with the OSC CLI now", &["yes", "no"], "yes").await?;
+        if login == "yes" {
+            match osc::login().await {
+                Ok(()) if osc::saved_token().is_some() => {}
+                Ok(()) => println!("  the OSC CLI finished but saved no login"),
+                Err(err) => println!("  OSC CLI login failed: {err:#}"),
+            }
+        }
+    }
+    if let Some(location) = osc::saved_token().is_some().then(osc::describe_location) {
+        println!("  using the OSC CLI login in {location}");
+        if cfg.open_live.api_key.is_some() {
+            println!(
+                "  the settings also hold a token, which would take precedence over the login"
+            );
+            if ask_choice("Drop the stored token", &["yes", "no"], "yes").await? == "yes" {
+                cfg.open_live.api_key = None;
+            }
+        }
+        return Ok(());
+    }
+    let label = if cfg.open_live.api_key.is_some() {
+        "OSC personal access token for Open Live (blank keeps the stored one)"
+    } else {
+        "OSC personal access token for Open Live"
+    };
+    if let Some(secret) = blank_to_none(ask_secret(label).await?) {
+        cfg.open_live.api_key = Some(secret);
+    }
+    Ok(())
+}
+
 /// Confirms the address and credential work, returning the cloud Strom's host.
 async fn check_open_live(cfg: &Config) -> Result<Option<String>> {
     let client = OpenLiveClient::new(
@@ -281,17 +325,21 @@ mod tests {
     fn setup_is_needed_for_a_missing_name_url_or_osc_token() {
         let mut cfg = named();
         cfg.gateway.name = "   ".to_string();
-        assert!(needs_setup(&cfg));
+        assert!(needs_setup(&cfg, false));
 
         let cfg = named();
-        assert!(needs_setup(&cfg), "no Open Live URL");
+        assert!(needs_setup(&cfg, false), "no Open Live URL");
 
         let mut cfg = named();
         cfg.open_live.url = Some("https://x.osaas.io".to_string());
         cfg.open_live.auth_mode = AuthMode::Osc;
         assert!(
-            needs_setup(&cfg),
+            needs_setup(&cfg, false),
             "an OSC deployment cannot work without a token"
+        );
+        assert!(
+            !needs_setup(&cfg, true),
+            "the OSC CLI's login stands in for a token"
         );
     }
 
@@ -301,10 +349,10 @@ mod tests {
     fn setup_is_not_needed_for_a_complete_config() {
         let mut cfg = named();
         cfg.open_live.url = Some("http://127.0.0.1:3000".to_string());
-        assert!(!needs_setup(&cfg));
+        assert!(!needs_setup(&cfg, false));
 
         let mut cfg = named();
         cfg.open_live.register = false;
-        assert!(!needs_setup(&cfg));
+        assert!(!needs_setup(&cfg, false));
     }
 }

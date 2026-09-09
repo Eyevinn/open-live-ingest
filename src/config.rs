@@ -93,7 +93,8 @@ impl Default for Strom {
 pub struct OpenLive {
     pub url: Option<String>,
     pub auth_mode: AuthMode,
-    /// Bearer token or OSC personal access token, depending on `auth_mode`.
+    /// Bearer token or OSC personal access token, depending on `auth_mode`. In osc
+    /// mode it can stay unset, and the login saved by `npx @osaas/cli login` is used.
     pub api_key: Option<String>,
     /// Register a source per input. Off for a box that only streams to a Strom.
     pub register: bool,
@@ -423,6 +424,12 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
 
 /// Rejects settings that would otherwise fail confusingly at runtime.
 pub fn validate(cfg: &Config) -> Result<()> {
+    validate_with(cfg, crate::osc::saved_token().is_some())
+}
+
+/// `osc_login` says whether the OSC CLI has a saved login, which stands in for
+/// `open_live.api_key` in osc mode. Passed in so the check itself stays pure.
+fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
     if !cfg.strom.url.starts_with("http://") && !cfg.strom.url.starts_with("https://") {
         bail!(
             "strom.url must be an http or https URL, got {:?}",
@@ -497,7 +504,9 @@ pub fn validate(cfg: &Config) -> Result<()> {
         }
         // Only osc mode needs a credential: a self-hosted Open Live with API_KEY
         // unset leaves /api/v1 open, which is the normal local development case.
+        // The OSC CLI's saved login serves in place of a token in the file.
         if cfg.open_live.auth_mode == AuthMode::Osc
+            && !osc_login
             && cfg
                 .open_live
                 .api_key
@@ -505,7 +514,10 @@ pub fn validate(cfg: &Config) -> Result<()> {
                 .map(str::trim)
                 .is_none_or(str::is_empty)
         {
-            bail!("open_live.auth_mode is \"osc\" but open_live.api_key (the OSC token) is unset");
+            bail!(
+                "open_live.auth_mode is \"osc\" but there is no OSC token: log in with `{}`, or set open_live.api_key",
+                crate::osc::LOGIN_COMMAND
+            );
         }
     }
     Ok(())
@@ -637,7 +649,11 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gateway.toml.example"))
                 .expect("example config is missing");
         let cfg: Config = toml::from_str(&raw).expect("example config does not parse");
-        validate(&cfg).expect("example config does not validate");
+        assert!(
+            cfg.open_live.api_key.is_none(),
+            "the example shows the OSC CLI login path, with no token in the file"
+        );
+        validate_with(&cfg, true).expect("example config does not validate");
     }
 
     #[test]
@@ -650,14 +666,15 @@ mod tests {
     }
 
     /// OSC's proxy always wants a credential, and failing at startup beats every
-    /// request answering 401.
+    /// request answering 401. The OSC CLI's login counts as one.
     #[test]
-    fn osc_mode_requires_a_token() {
+    fn osc_mode_requires_a_token_or_an_osc_cli_login() {
         let mut cfg = valid();
         cfg.open_live.auth_mode = AuthMode::Osc;
-        assert!(validate(&cfg).is_err());
+        assert!(validate_with(&cfg, false).is_err());
+        validate_with(&cfg, true).expect("osc with a CLI login should validate");
         cfg.open_live.api_key = Some("pat".to_string());
-        validate(&cfg).expect("osc with a token should validate");
+        validate_with(&cfg, false).expect("osc with a token should validate");
     }
 
     /// The cloud cannot dial a venue whose address it does not know.

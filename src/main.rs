@@ -13,6 +13,7 @@ mod devices;
 mod flow;
 mod local_strom;
 mod openlive;
+mod osc;
 mod run;
 mod setup;
 mod strom;

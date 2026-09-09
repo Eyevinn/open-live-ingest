@@ -5,6 +5,7 @@
 //! request bodies are never dumped because the source address carries the passphrase.
 
 use crate::config::{mask_passphrase, AuthMode};
+use crate::osc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -89,7 +90,7 @@ impl OpenLiveClient {
                 .build()
                 .context("building HTTP client")?,
             base_url: base_url.trim_end_matches('/').to_string(),
-            auth: Auth::new(auth_mode, api_key.filter(|k| !k.trim().is_empty())),
+            auth: Auth::new(auth_mode, api_key.filter(|k| !k.trim().is_empty()))?,
         })
     }
 
@@ -203,9 +204,61 @@ fn ok(res: reqwest::Response, what: &str) -> Result<reqwest::Response> {
 enum Auth {
     Direct(Option<String>),
     Osc {
-        pat: String,
+        pat: OscToken,
         cache: Mutex<Option<CachedToken>>,
     },
+}
+
+/// Where the OSC personal access token comes from. A configured one wins, so a
+/// deployment tool that injects a key is not overridden by whoever logged in on the
+/// box; otherwise the OSC CLI's login is read afresh at each exchange, so logging in
+/// again renews a running gateway.
+pub enum OscToken {
+    Configured(String),
+    CliLogin,
+}
+
+impl OscToken {
+    pub fn resolve(configured: Option<&str>) -> Result<Self> {
+        Self::resolve_with(configured, osc::saved_token().is_some())
+    }
+
+    fn resolve_with(configured: Option<&str>, cli_login: bool) -> Result<Self> {
+        if let Some(key) = configured.map(str::trim).filter(|k| !k.is_empty()) {
+            return Ok(OscToken::Configured(key.to_string()));
+        }
+        if cli_login {
+            return Ok(OscToken::CliLogin);
+        }
+        bail!(
+            "open_live.auth_mode is \"osc\" but there is no OSC token: log in with `{}`, or set open_live.api_key",
+            osc::LOGIN_COMMAND
+        )
+    }
+
+    fn read(&self) -> Result<String> {
+        match self {
+            OscToken::Configured(key) => Ok(key.clone()),
+            OscToken::CliLogin => osc::saved_token().with_context(|| {
+                format!(
+                    "the OSC CLI login is gone from {}; run `{}` again",
+                    osc::describe_location(),
+                    osc::LOGIN_COMMAND
+                )
+            }),
+        }
+    }
+
+    /// The hint for a token the exchange refuses.
+    fn rejected_hint(&self) -> String {
+        match self {
+            OscToken::Configured(_) => "check open_live.api_key".to_string(),
+            OscToken::CliLogin => format!(
+                "the OSC CLI login has probably expired; run `{}` again",
+                osc::LOGIN_COMMAND
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -222,14 +275,14 @@ struct ServiceTokenResponse {
 }
 
 impl Auth {
-    fn new(mode: AuthMode, key: Option<&str>) -> Self {
-        match mode {
+    fn new(mode: AuthMode, key: Option<&str>) -> Result<Self> {
+        Ok(match mode {
             AuthMode::Direct => Auth::Direct(key.map(str::to_string)),
             AuthMode::Osc => Auth::Osc {
-                pat: key.unwrap_or_default().to_string(),
+                pat: OscToken::resolve(key)?,
                 cache: Mutex::new(None),
             },
-        }
+        })
     }
 
     async fn bearer(&self, http: &reqwest::Client) -> Result<Option<String>> {
@@ -259,15 +312,23 @@ fn is_expiring(cached: &CachedToken) -> bool {
     now() + REFRESH_BUFFER >= cached.expires_at
 }
 
-async fn exchange(http: &reqwest::Client, pat: &str) -> Result<CachedToken> {
+async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken> {
+    let token = pat.read()?;
     let res = http
         .post(TOKEN_EXCHANGE_URL)
-        .header("x-pat-jwt", format!("Bearer {pat}"))
+        .header("x-pat-jwt", format!("Bearer {token}"))
         .header("accept", "application/json")
         .json(&serde_json::json!({ "serviceId": OPEN_LIVE_SERVICE_ID }))
         .send()
         .await
         .context("POST service token")?;
+    let status = res.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        bail!(
+            "OSC token exchange failed with HTTP {status}; {}",
+            pat.rejected_hint()
+        );
+    }
     // Never include the body: it can echo the token back.
     let body: ServiceTokenResponse = ok(res, "OSC token exchange")?
         .json()
@@ -295,10 +356,27 @@ mod tests {
     #[test]
     fn direct_mode_sends_the_key_as_is_or_nothing() {
         assert_eq!(
-            bearer_of(&Auth::new(AuthMode::Direct, Some("k"))).as_deref(),
+            bearer_of(&Auth::new(AuthMode::Direct, Some("k")).unwrap()).as_deref(),
             Some("k")
         );
-        assert_eq!(bearer_of(&Auth::new(AuthMode::Direct, None)), None);
+        assert_eq!(bearer_of(&Auth::new(AuthMode::Direct, None).unwrap()), None);
+    }
+
+    /// A key in the settings or the environment is deliberate and wins; the CLI login
+    /// fills in only when there is none; and having neither fails at startup rather
+    /// than on the first request.
+    #[test]
+    fn a_configured_token_wins_over_the_cli_login_and_neither_is_an_error() {
+        assert!(matches!(
+            OscToken::resolve_with(Some("pat"), true),
+            Ok(OscToken::Configured(k)) if k == "pat"
+        ));
+        assert!(matches!(
+            OscToken::resolve_with(Some("  "), true),
+            Ok(OscToken::CliLogin)
+        ));
+        assert!(OscToken::resolve_with(None, false).is_err());
+        assert_eq!(OscToken::Configured("pat".into()).read().unwrap(), "pat");
     }
 
     /// A token inside the refresh buffer must count as expiring, or a request can go
