@@ -136,7 +136,8 @@ impl std::str::FromStr for AuthMode {
     }
 }
 
-/// The SRT link template. A port is allocated per input from `port_range`.
+/// The SRT link template. A port is allocated per input from a range: the one Open
+/// Live publishes for its Strom in caller mode, or `port_range` otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Uplink {
@@ -146,8 +147,11 @@ pub struct Uplink {
     /// This machine's address as the cloud sees it. Needed in listener mode, where
     /// the cloud dials the venue.
     pub public_host: Option<String>,
-    /// Inclusive `first-last` range, e.g. "47110-47129".
-    pub port_range: String,
+    /// Inclusive `first-last` range, e.g. "47110-47129". In listener mode these are
+    /// this machine's own ports and the range is required. In caller mode the ports
+    /// belong to the cloud Strom, so the range Open Live publishes is used and this
+    /// is only a fallback for an Open Live that publishes none.
+    pub port_range: Option<String>,
     /// Rule of thumb: 3-4x the measured RTT.
     pub latency_ms: u32,
     pub passphrase: Option<String>,
@@ -161,7 +165,7 @@ impl Default for Uplink {
             mode: UplinkMode::Caller,
             host: None,
             public_host: None,
-            port_range: "47110-47129".to_string(),
+            port_range: None,
             latency_ms: 200,
             passphrase: None,
             pbkeylen: None,
@@ -182,26 +186,58 @@ pub enum UplinkMode {
     Listener,
 }
 
+/// The range suggested when setup has to ask for one.
+pub const SUGGESTED_PORT_RANGE: &str = "47110-47129";
+
+/// An inclusive port range from its two ends, as read from the settings or from Open
+/// Live's server info. One check for both, so a range is valid by the same rules
+/// whichever side it came from.
+pub fn port_range(first: u64, last: u64) -> Result<RangeInclusive<u16>> {
+    let port = |n: u64, which: &str| -> Result<u16> {
+        u16::try_from(n)
+            .ok()
+            .filter(|p| *p != 0)
+            .with_context(|| format!("{which} port {n} is not in 1-65535"))
+    };
+    let first = port(first, "first")?;
+    let last = port(last, "last")?;
+    if last < first {
+        bail!("empty port range {first}-{last}");
+    }
+    Ok(first..=last)
+}
+
+/// Parses `first-last`.
+pub fn parse_port_range(raw: &str) -> Result<RangeInclusive<u16>> {
+    let (first, last) = raw
+        .split_once('-')
+        .with_context(|| format!("port_range must be \"first-last\", got {raw:?}"))?;
+    let first: u64 = first
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid first port in {raw:?}"))?;
+    let last: u64 = last
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid last port in {raw:?}"))?;
+    port_range(first, last).with_context(|| format!("port_range {raw:?}"))
+}
+
+/// The settings-file form of a range.
+pub fn format_port_range(range: &RangeInclusive<u16>) -> String {
+    format!("{}-{}", range.start(), range.end())
+}
+
 impl Uplink {
-    pub fn ports(&self) -> Result<RangeInclusive<u16>> {
-        let (first, last) = self.port_range.split_once('-').with_context(|| {
-            format!(
-                "port_range must be \"first-last\", got {:?}",
-                self.port_range
-            )
-        })?;
-        let first: u16 = first
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid first port in {:?}", self.port_range))?;
-        let last: u16 = last
-            .trim()
-            .parse()
-            .with_context(|| format!("invalid last port in {:?}", self.port_range))?;
-        if first == 0 || last < first {
-            bail!("empty port range {:?}", self.port_range);
-        }
-        Ok(first..=last)
+    /// The range from the settings, if one is set. Which range is actually used is
+    /// decided at startup, once Open Live has been asked.
+    pub fn local_ports(&self) -> Result<Option<RangeInclusive<u16>>> {
+        self.port_range
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(parse_port_range)
+            .transpose()
     }
 
     /// One concrete link, once a cloud host and a port are known.
@@ -428,19 +464,28 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
         );
     }
 
-    cfg.uplink.ports()?;
-    if cfg.uplink.mode == UplinkMode::Listener
-        && cfg
+    let local_ports = cfg.uplink.local_ports()?;
+    if cfg.uplink.mode == UplinkMode::Listener {
+        if cfg
             .uplink
             .public_host
             .as_deref()
             .map(str::trim)
             .is_none_or(str::is_empty)
-    {
-        bail!(
-            "uplink.mode is \"listener\", where the cloud dials this machine, so \
-             uplink.public_host must be its address as the cloud sees it"
-        );
+        {
+            bail!(
+                "uplink.mode is \"listener\", where the cloud dials this machine, so \
+                 uplink.public_host must be its address as the cloud sees it"
+            );
+        }
+        // In caller mode the ports are the cloud Strom's and Open Live publishes them;
+        // here they are this machine's own, and nobody else can know them.
+        if local_ports.is_none() {
+            bail!(
+                "uplink.mode is \"listener\", where this machine listens, so \
+                 uplink.port_range must name its own SRT ports"
+            );
+        }
     }
     if let Some(len) = cfg.uplink.pbkeylen {
         if !matches!(len, 16 | 24 | 32) {
@@ -673,6 +718,7 @@ mod tests {
     fn listener_mode_requires_a_public_host() {
         let mut cfg = valid();
         cfg.uplink.mode = UplinkMode::Listener;
+        cfg.uplink.port_range = Some("47110-47129".to_string());
         assert!(validate(&cfg).is_err());
         cfg.uplink.public_host = Some("venue.example.com".to_string());
         validate(&cfg).expect("with a public host it should validate");
@@ -707,14 +753,50 @@ mod tests {
 
     #[test]
     fn malformed_port_ranges_are_rejected() {
-        for bad in ["9000", "9100-9000", "", "abc-def", "0-10"] {
+        for bad in ["9000", "9100-9000", "abc-def", "0-10", "9000-70000"] {
+            assert!(parse_port_range(bad).is_err(), "{bad:?} should be rejected");
             let u = Uplink {
-                port_range: bad.to_string(),
+                port_range: Some(bad.to_string()),
                 ..Uplink::default()
             };
-            assert!(u.ports().is_err(), "{bad:?} should be rejected");
+            assert!(u.local_ports().is_err(), "{bad:?} should be rejected");
         }
-        assert_eq!(Uplink::default().ports().unwrap(), 47110..=47129);
+        assert_eq!(parse_port_range("47110-47129").unwrap(), 47110..=47129);
+        assert_eq!(Uplink::default().local_ports().unwrap(), None);
+        let blank = Uplink {
+            port_range: Some("  ".to_string()),
+            ..Uplink::default()
+        };
+        assert_eq!(blank.local_ports().unwrap(), None);
+    }
+
+    /// The same checks apply to the two numbers Open Live publishes.
+    #[test]
+    fn a_range_from_two_numbers_is_checked_the_same_way() {
+        assert_eq!(port_range(9000, 9002).unwrap(), 9000..=9002);
+        assert_eq!(port_range(9000, 9000).unwrap(), 9000..=9000);
+        assert!(port_range(0, 10).is_err());
+        assert!(port_range(9002, 9000).is_err());
+        assert!(port_range(9000, 65536).is_err());
+        assert_eq!(format_port_range(&(9000..=9002)), "9000-9002");
+    }
+
+    /// In caller mode the cloud owns the ports and Open Live publishes them, so a
+    /// range in the settings is optional. In listener mode they are this machine's
+    /// own ports and nobody else can supply them.
+    #[test]
+    fn only_listener_mode_requires_a_local_port_range() {
+        let mut cfg = valid();
+        assert_eq!(cfg.uplink.port_range, None);
+        validate(&cfg).expect("caller mode validates without a range");
+        cfg.uplink.mode = UplinkMode::Listener;
+        cfg.uplink.public_host = Some("venue.example.com".to_string());
+        assert!(validate(&cfg).is_err(), "listener mode needs a range");
+        cfg.uplink.port_range = Some("47110-47129".to_string());
+        validate(&cfg).expect("listener mode with a range validates");
+        cfg.uplink.mode = UplinkMode::Caller;
+        cfg.uplink.port_range = Some("9100-9000".to_string());
+        assert!(validate(&cfg).is_err(), "a set range is still checked");
     }
 
     #[test]
@@ -737,7 +819,7 @@ mod tests {
         let mut cfg = valid();
         cfg.open_live.auth_mode = AuthMode::Osc;
         cfg.open_live.api_key = Some("a-secret-token".to_string());
-        cfg.uplink.port_range = "9400-9500".to_string();
+        cfg.uplink.port_range = Some("9400-9500".to_string());
         cfg.video.bitrate_kbps = 7000;
 
         save(&path, &cfg).expect("saves");
@@ -745,7 +827,7 @@ mod tests {
         assert_eq!(loaded.gateway.name, "Venue A");
         assert_eq!(loaded.open_live.api_key, cfg.open_live.api_key);
         assert_eq!(loaded.open_live.auth_mode, AuthMode::Osc);
-        assert_eq!(loaded.uplink.port_range, "9400-9500");
+        assert_eq!(loaded.uplink.port_range.as_deref(), Some("9400-9500"));
         assert_eq!(loaded.video.bitrate_kbps, 7000);
 
         #[cfg(unix)]

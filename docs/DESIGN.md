@@ -110,6 +110,15 @@ land on the same ports across runs and the registered addresses stay stable. The
 by the gateway: Open Live masks it on read, so it is never read back and is compared masked.
 Rendezvous mode was removed; nobody used it, and it doubled the URI logic.
 
+**The end that listens owns the range.** In caller mode the listener ports are the cloud Strom's,
+and one cloud Strom serves several venues and several Open Live instances, so a range chosen at the
+venue is a fleet-wide collision waiting to happen. Open Live leases a range from Strom and publishes
+it with the Strom host on `server-info`; the gateway takes it from there, and Open Live rejects a
+registration outside it. A range in the settings is then only a fallback for an Open Live that
+publishes none, and is ignored with a warning when one is published, because a setting that silently
+overrode the cloud's allocation would recreate the collision. In listener mode the
+ports are the venue's own, which only the venue can know, so there the settings are required.
+
 ## 6. The command line owns what it starts
 
 There is one front end and it is a terminal, because the machine is reached over SSH.
@@ -174,8 +183,9 @@ that references its id survives a restart.
 
 ## 8. Open questions
 
-- **Who allocates SRT ports?** A range in the settings today, which makes fleet-wide collisions an
-  operator problem. An allocation endpoint in Open Live would remove it.
+- **Who allocates SRT ports?** Resolved: Strom does. Open Live leases a range from its Strom and
+  publishes it through `server-info`; in caller mode the gateway uses that range and treats one in
+  the settings as a fallback for an Open Live that publishes none. See §5.
 - **Should Open Live gain a gateway resource?** A source's `status` is the only channel, and there is
   nowhere to put telemetry, a version, or a last-seen timestamp. It would also collapse registration
   idempotency and cleanup into a server-side call.
