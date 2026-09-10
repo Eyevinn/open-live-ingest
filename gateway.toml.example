@@ -43,14 +43,17 @@ auth_mode = "osc"
 # Register one source per input. Off for a box that only streams to a Strom.
 register = true
 
-# builtin.mpegtssrt_output. One port per input is allocated from port_range, lowest
+# builtin.mpegtssrt_output. One port per input is allocated from a range, lowest
 # first in device-name order, so the same devices land on the same ports each run.
 [uplink]
-# caller:   this machine dials the cloud. Nothing inbound here; the cloud publishes
-#           the ports.
-# listener: the cloud dials this machine. Needs public_host and inbound UDP here.
+# caller:   this machine dials the cloud. Nothing inbound here; the ports are the
+#           cloud Strom's, and Open Live publishes the range it has leased from it
+#           (GET /api/v1/server-info), so port_range is not needed. Set it only for an
+#           Open Live that publishes no range; it is ignored when one is published.
+# listener: the cloud dials this machine. Needs public_host and inbound UDP here, and
+#           port_range names this machine's own ports.
 mode = "caller"
-port_range = "47110-47129"
+# port_range = "47110-47129"
 # Rule of thumb: 3-4x the measured RTT.
 latency_ms = 200
 # The cloud Strom to send to. Leave unset to ask Open Live (GET /api/v1/server-info).
