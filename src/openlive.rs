@@ -65,6 +65,21 @@ pub struct Source {
     pub latency: Option<u32>,
 }
 
+/// The port a hostless SRT listener address binds: `srt://:47100?mode=listener`
+/// gives 47100. Caller addresses, other schemes, and port 0 (the "assign me one"
+/// request) give `None`. Open Live returns addresses with the passphrase masked,
+/// which does not touch the port, so this reads a returned address as well as a
+/// requested one.
+pub fn listener_port(address: &str) -> Option<u16> {
+    let rest = address.trim().strip_prefix("srt://:")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let after = &rest[digits.len()..];
+    if !(after.is_empty() || after.starts_with('?')) {
+        return None;
+    }
+    digits.parse::<u16>().ok().filter(|p| *p != 0)
+}
+
 /// Whether a stored source needs a PATCH to match what the gateway wants. Only what
 /// differs is written: Open Live keeps a CouchDB revision per write, so a needless
 /// PATCH every tick would add thousands of revisions a day per source.
@@ -511,6 +526,23 @@ mod tests {
 
     /// A published range is checked like a configured one: a bad one is an error to
     /// report, not a range to allocate from.
+    #[test]
+    fn listener_port_reads_hostless_listener_addresses_only() {
+        assert_eq!(listener_port("srt://:47100?mode=listener"), Some(47100));
+        assert_eq!(
+            listener_port("srt://:47100?mode=listener&passphrase=***&pbkeylen=16"),
+            Some(47100)
+        );
+        assert_eq!(listener_port("srt://:47100"), Some(47100));
+        assert_eq!(listener_port("srt://:0?mode=listener"), None);
+        assert_eq!(
+            listener_port("srt://cloud.example.com:47100?mode=caller"),
+            None
+        );
+        assert_eq!(listener_port("srt://:47100x?mode=listener"), None);
+        assert_eq!(listener_port("https://example.com"), None);
+    }
+
     #[test]
     fn a_malformed_published_range_is_an_error() {
         for bad in [

@@ -43,8 +43,9 @@ auth_mode = "osc"
 # Register one source per input. Off for a box that only streams to a Strom.
 register = true
 
-# builtin.mpegtssrt_output. One port per input is allocated from a range, lowest
-# first in device-name order, so the same devices land on the same ports each run.
+# builtin.mpegtssrt_output. One port per input. In caller mode Open Live assigns it
+# inside the range it publishes, and a source left by an earlier run keeps its port;
+# in listener mode the lowest free port in port_range, in device-name order.
 [uplink]
 # caller:   this machine dials the cloud. Nothing inbound here; the ports are the
 #           cloud Strom's, and Open Live publishes the range it has leased from it
