@@ -78,6 +78,13 @@ on macOS, or wherever `--config` points. The same format can be written by hand;
 | `OLG_OPEN_LIVE_AUTH_MODE` | `open_live.auth_mode` (`direct` or `osc`) |
 | `OLG_LOG_LEVEL` | `log.level` |
 
+In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live leases a range
+from that Strom and publishes it on `GET /api/v1/server-info` together with the Strom host, and the
+gateway registers each input with port 0 and Open Live assigns it a free port in that range, so
+several gateways can feed one Open Live; `uplink.port_range` is only a fallback for an
+Open Live that publishes none. In `listener` mode the ports are the venue's own and
+`uplink.port_range` is required. `up` and `status` print the range in use and where it came from.
+
 In `direct` mode the key is optional: a self-hosted Open Live with `API_KEY` unset leaves `/api/v1`
 open. `osc` mode always needs a credential, and setup asks which of three to use:
 

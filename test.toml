@@ -1,0 +1,31 @@
+[gateway]
+name = "Mac"
+
+[strom]
+url = "http://127.0.0.1:8080"
+manage = true
+binary = "strom"
+
+[open_live]
+url = "http://localhost:3100"
+auth_mode = "direct"
+api_key = "smoke-api"
+register = true
+
+[uplink]
+mode = "caller"
+latency_ms = 200
+
+[video]
+codec = "h264"
+bitrate_kbps = 6000
+encoder_preference = "auto"
+quality_preset = "ultrafast"
+tune = "zerolatency"
+rate_control = "cbr"
+keyframe_interval = 25
+
+[capture]
+
+[log]
+level = "info"

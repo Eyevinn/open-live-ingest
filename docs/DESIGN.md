@@ -105,10 +105,31 @@ listens is the end that needs an inbound UDP port.**
 | `listener` | `srt://:9000?mode=listener` | `srt://venue:9000?mode=caller` | the venue |
 
 `srtsrc` defaults to caller mode, so the registered address always carries an explicit `mode=`.
-Ports are allocated per input from a range, lowest first in device-name order, so the same cameras
-land on the same ports across runs and the registered addresses stay stable. The passphrase is owned
+Ports come from a range, one per input. In listener mode the gateway allocates them itself, lowest
+first in device-name order, so the same cameras land on the same ports across runs. In caller mode
+Open Live assigns them (see §5), and a source left by an earlier run keeps its port, which stabilises
+the registered addresses the same way. The passphrase is owned
 by the gateway: Open Live masks it on read, so it is never read back and is compared masked.
 Rendezvous mode was removed; nobody used it, and it doubled the URI logic.
+
+**The end that listens owns the range.** In caller mode the listener ports are the cloud Strom's,
+and one cloud Strom serves several venues and several Open Live instances, so a range chosen at the
+venue is a fleet-wide collision waiting to happen. Open Live leases a range from Strom and publishes
+it with the Strom host on `server-info`; the gateway takes it from there, and Open Live rejects a
+registration outside it. A range in the settings is then only a fallback for an Open Live that
+publishes none, and is ignored with a warning when one is published, because a setting that silently
+overrode the cloud's allocation would recreate the collision. In listener mode the
+ports are the venue's own, which only the venue can know, so there the settings are required.
+
+**Inside the range, Open Live picks the port.** Several gateways can feed one Open Live, and each
+knows only its own inputs, so a gateway choosing "lowest free" inside the published range would
+collide with the next gateway doing the same. The one party that sees every source and output is
+Open Live, so in caller mode the gateway registers each input first with port 0, which asks Open Live
+to assign the lowest port no other source or output holds, and builds its flow to the port that
+comes back. A source of the same name left by an earlier run keeps its port when it is still inside
+the range, and is reassigned when it is not. Registration therefore precedes the flows in caller
+mode, where it used to follow them; Open Live being down at start-up is then a start-up error rather
+than a warning, which is right, since without a port there is nothing to build.
 
 ## 6. The command line owns what it starts
 
@@ -174,8 +195,9 @@ that references its id survives a restart.
 
 ## 8. Open questions
 
-- **Who allocates SRT ports?** A range in the settings today, which makes fleet-wide collisions an
-  operator problem. An allocation endpoint in Open Live would remove it.
+- **Who allocates SRT ports?** Resolved: Strom does. Open Live leases a range from its Strom and
+  publishes it through `server-info`; in caller mode the gateway uses that range and treats one in
+  the settings as a fallback for an Open Live that publishes none. See §5.
 - **Should Open Live gain a gateway resource?** A source's `status` is the only channel, and there is
   nowhere to put telemetry, a version, or a last-seen timestamp. It would also collapse registration
   idempotency and cleanup into a server-side call.

@@ -1,10 +1,11 @@
 //! From the devices Strom can see to the inputs the gateway streams: filtering,
 //! selection, naming, and port allocation.
 
-use crate::config::{Capture, Uplink};
+use crate::config::{format_port_range, Capture, Uplink};
 use crate::flow::{self, Input, Source};
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
+use std::ops::RangeInclusive;
 use strom_types::discovery::DeviceResponse;
 
 /// Devices that exist but produce nothing unless another application is running.
@@ -87,9 +88,10 @@ pub fn name_prefix(gateway_name: &str) -> String {
     format!("{} — ", gateway_name.trim())
 }
 
-/// Builds one input per device, allocating the lowest free port to each in name
-/// order. Deterministic, so the same devices land on the same ports across runs and
-/// the addresses registered in Open Live stay stable.
+/// Builds one input per device, allocating the lowest free port in `ports` to each in
+/// name order. Deterministic, so the same devices land on the same ports across runs
+/// and the addresses registered in Open Live stay stable. Whose ports they are is the
+/// caller's business: the cloud's range in caller mode, this machine's in listener.
 pub fn inputs_for(
     devices: &[DeviceResponse],
     test_pattern: bool,
@@ -97,12 +99,15 @@ pub fn inputs_for(
     uplink: &Uplink,
     capture: &Capture,
     cloud_host: &str,
+    ports: &RangeInclusive<u16>,
 ) -> Result<Vec<Input>> {
-    let ports = uplink.ports()?;
     let mut taken = BTreeSet::new();
     let mut next_port = || {
         let port = ports.clone().find(|p| !taken.contains(p)).ok_or_else(|| {
-            anyhow::anyhow!("no free SRT port left in range {}", uplink.port_range)
+            anyhow::anyhow!(
+                "no free SRT port left in range {}",
+                format_port_range(ports)
+            )
         })?;
         taken.insert(port);
         Ok::<u16, anyhow::Error>(port)
@@ -221,17 +226,14 @@ mod tests {
 
     #[test]
     fn inputs_get_stable_names_and_the_lowest_free_ports_in_order() {
-        let uplink = Uplink {
-            port_range: "9000-9002".to_string(),
-            ..Uplink::default()
-        };
         let inputs = inputs_for(
             &choose(devices(), false, None).unwrap(),
             true,
             " Venue A ",
-            &uplink,
+            &Uplink::default(),
             &Capture::default(),
             "cloud",
+            &(9000..=9002),
         )
         .unwrap();
         let summary: Vec<(String, u16)> = inputs
@@ -256,17 +258,14 @@ mod tests {
     /// Better a clear error than two inputs fighting over one port.
     #[test]
     fn an_exhausted_range_is_an_error() {
-        let uplink = Uplink {
-            port_range: "9000-9000".to_string(),
-            ..Uplink::default()
-        };
         let err = inputs_for(
             &choose(devices(), false, None).unwrap(),
             false,
             "V",
-            &uplink,
+            &Uplink::default(),
             &Capture::default(),
             "cloud",
+            &(9000..=9000),
         )
         .unwrap_err()
         .to_string();

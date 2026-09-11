@@ -9,14 +9,16 @@
 //! same whether `up` is running, finished, or was killed outright. The pidfile is only
 //! there so `down` can ask a running `up` to stop first.
 
-use crate::config::{self, mask_passphrase, Config, Video};
+use crate::config::{self, format_port_range, mask_passphrase, Config, UplinkMode, Video};
 use crate::devices;
 use crate::flow::{self, Input};
 use crate::local_strom::{self, LocalStrom};
-use crate::openlive::{drifted, OpenLiveClient, SourcePayload};
+use crate::openlive::{drifted, listener_port, OpenLiveClient, ServerInfo, Source, SourcePayload};
 use crate::strom::StromClient;
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt;
+use std::ops::RangeInclusive;
 use std::time::Duration;
 use strom_types::FlowId;
 use tracing::{info, warn};
@@ -54,24 +56,130 @@ fn open_live_client(cfg: &Config) -> Result<Option<OpenLiveClient>> {
     )?))
 }
 
-/// Where feeds are sent: configured, or asked of Open Live.
-async fn resolve_cloud_host(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Result<String> {
-    if let Some(host) = cfg
+/// Where feeds are sent, and which ports the links use.
+struct Cloud {
+    host: String,
+    ports: RangeInclusive<u16>,
+    port_source: PortSource,
+}
+
+impl Cloud {
+    fn describe_ports(&self) -> String {
+        format!(
+            "SRT ports {} from {}",
+            format_port_range(&self.ports),
+            self.port_source
+        )
+    }
+}
+
+/// Who chose the port range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PortSource {
+    /// Published by Open Live: the range its Strom has leased for callers.
+    OpenLive,
+    /// `uplink.port_range` in the settings.
+    Settings,
+}
+
+impl fmt::Display for PortSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            PortSource::OpenLive => "Open Live",
+            PortSource::Settings => "the settings",
+        })
+    }
+}
+
+/// Resolves the cloud host, configured or asked of Open Live, and the port range.
+/// Open Live is asked whenever it can be and something is needed from it: the host,
+/// or in caller mode its Strom's ports. A configured host together with a configured
+/// range still starts when Open Live is down, as it always has; the sources are
+/// registered once it is back.
+async fn resolve_cloud(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Result<Cloud> {
+    let configured_host = cfg
         .uplink
         .host
         .as_deref()
         .map(str::trim)
-        .filter(|h| !h.is_empty())
-    {
-        return Ok(host.to_string());
-    }
-    let client = open_live.context(
-        "no cloud Strom host configured, and registration is off so there is nobody to ask",
+        .filter(|h| !h.is_empty());
+    let local = cfg.uplink.local_ports()?;
+    let needs_open_live = configured_host.is_none() || cfg.uplink.mode == UplinkMode::Caller;
+    let info: Option<ServerInfo> = match open_live {
+        Some(client) if needs_open_live => match client.server_info().await {
+            Ok(info) => info,
+            Err(err) if configured_host.is_some() && local.is_some() => {
+                warn!(%err, "could not ask Open Live for its server info; using uplink.host and uplink.port_range from the settings");
+                None
+            }
+            Err(err) => return Err(err.context("asking Open Live where its Strom is")),
+        },
+        _ => None,
+    };
+
+    let host = match configured_host {
+        Some(host) => host.to_string(),
+        None => {
+            open_live.context(
+                "no cloud Strom host configured, and registration is off so there is nobody to ask",
+            )?;
+            info.as_ref()
+                .and_then(|i| i.strom_host.clone())
+                .context("Open Live did not report a Strom host; set uplink.host")?
+        }
+    };
+    let (ports, port_source) = choose_ports(
+        cfg.uplink.mode,
+        local,
+        info.as_ref().and_then(|i| i.srt_port_range.clone()),
+        info.as_ref().and_then(|i| i.srt_port_lease.as_deref()),
     )?;
-    client
-        .cloud_strom_host()
-        .await?
-        .context("Open Live did not report a Strom host; set uplink.host")
+    Ok(Cloud {
+        host,
+        ports,
+        port_source,
+    })
+}
+
+/// Which range the links use. In caller mode the ports are the cloud Strom's, and
+/// several venues share that Strom, so the range Open Live publishes wins over
+/// anything in the settings; the settings are only a fallback for an Open Live that
+/// publishes none. In listener mode the ports are this machine's own, which only the
+/// settings can know.
+fn choose_ports(
+    mode: UplinkMode,
+    local: Option<RangeInclusive<u16>>,
+    published: Option<RangeInclusive<u16>>,
+    lease_status: Option<&str>,
+) -> Result<(RangeInclusive<u16>, PortSource)> {
+    match mode {
+        UplinkMode::Listener => local.map(|range| (range, PortSource::Settings)).context(
+            "uplink.mode is \"listener\", so uplink.port_range must name this machine's SRT ports",
+        ),
+        UplinkMode::Caller => match (published, local) {
+            (Some(published), Some(local)) => {
+                if local != published {
+                    warn!(
+                        settings = %format_port_range(&local),
+                        open_live = %format_port_range(&published),
+                        "uplink.port_range is ignored: in caller mode the cloud Strom owns its ports, and Open Live publishes its range"
+                    );
+                }
+                Ok((published, PortSource::OpenLive))
+            }
+            (Some(published), None) => Ok((published, PortSource::OpenLive)),
+            (None, Some(local)) => Ok((local, PortSource::Settings)),
+            (None, None) => {
+                let why = match lease_status {
+                    Some("pending") => "Open Live is still waiting for its SRT port range from Strom (it retries every minute); wait and try again",
+                    Some("unsupported") => "Open Live's Strom does not lease SRT ports; upgrade it",
+                    Some("disabled") => "Open Live has SRT port leasing disabled",
+                    _ => "Open Live publishes no SRT port range; upgrade it, or turn registration on",
+                };
+                bail!("no SRT port range for the cloud Strom: {why}, or set uplink.port_range in the settings")
+            }
+        },
+    }
 }
 
 /// Lists what Strom can see, so an operator can pick before starting anything.
@@ -167,29 +275,43 @@ pub async fn up(
     }
 
     // Without somewhere to send there is no point starting: the feeds would go nowhere.
-    let cloud_host = resolve_cloud_host(&cfg, open_live.as_ref()).await?;
+    let cloud = resolve_cloud(&cfg, open_live.as_ref()).await?;
     let inputs = devices::inputs_for(
         &chosen,
         test_pattern,
         &cfg.gateway.name,
         &cfg.uplink,
         &cfg.capture,
-        &cloud_host,
+        &cloud.host,
+        &cloud.ports,
     )?;
 
     // Each input costs an encoder and its share of the uplink, which is easy to
     // overlook when one command starts all of them.
     println!(
-        "Bringing up {} input(s) to {cloud_host}, about {:.0} Mbps in total.",
+        "Bringing up {} input(s) to {}, {}, about {:.0} Mbps in total.",
         inputs.len(),
+        cloud.host,
+        cloud.describe_ports(),
         inputs.len() as f64 * cfg.video.bitrate_kbps as f64 / 1000.0
     );
+
+    // When the range is Open Live's, so is the port inside it: register first and
+    // take the port Open Live wrote into the source, then build the flows to it.
+    let mut inputs = inputs;
+    let mut source_ids = match (&open_live, cloud.port_source) {
+        (Some(client), PortSource::OpenLive) => {
+            assign_ports_from_open_live(client, &mut inputs, &cloud.ports).await?
+        }
+        _ => HashMap::new(),
+    };
 
     clear_conflicting_flows(&strom, &gateway_id, &inputs).await?;
 
     let mut live = Vec::new();
     for input in inputs {
         let flow_id = flow::flow_id(&gateway_id, &input.id);
+        let source_id = source_ids.remove(&input.id);
         match start(
             &strom,
             &flow_id,
@@ -204,7 +326,7 @@ pub async fn up(
                 shown: None,
                 last_bytes: None,
                 quiet_polls: 0,
-                source_id: None,
+                source_id,
             }),
             // One camera failing must not stop the rest of the venue coming up.
             Err(err) => warn!(input = %input.name, %err, "could not start this input"),
@@ -227,6 +349,117 @@ pub async fn up(
     drop(local_strom);
     remove_pidfile();
     outcome
+}
+
+/// What to do about an input's port given the source Open Live already holds for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortPlan {
+    /// The stored source names a port inside the range: build to it.
+    Keep { source_id: String, port: u16 },
+    /// The stored source has no usable port (none, or one outside the range Open
+    /// Live now publishes, left by an older run): ask Open Live to reassign it.
+    Reassign { source_id: String },
+    /// No source yet: create one and let Open Live pick the port.
+    Create,
+}
+
+/// Pure, so the three cases can be tested without a server.
+fn plan_port(existing: Option<&Source>, range: &RangeInclusive<u16>) -> PortPlan {
+    match existing {
+        None => PortPlan::Create,
+        Some(stored) => match listener_port(&stored.address) {
+            Some(port) if range.contains(&port) => PortPlan::Keep {
+                source_id: stored.id.clone(),
+                port,
+            },
+            _ => PortPlan::Reassign {
+                source_id: stored.id.clone(),
+            },
+        },
+    }
+}
+
+/// Lets Open Live choose each input's port inside the range it publishes. Several
+/// gateways can feed one Open Live, and each only knows its own inputs, so the one
+/// party that sees every source and output has to hand the ports out. An input
+/// registers with port 0, which means "assign one", and takes the port Open Live
+/// wrote into the source. A source left by an earlier run keeps its port, so the
+/// cloud side stays stable across restarts. Returns each input's source id.
+async fn assign_ports_from_open_live(
+    client: &OpenLiveClient,
+    inputs: &mut [Input],
+    range: &RangeInclusive<u16>,
+) -> Result<HashMap<String, String>> {
+    let sources = client
+        .list_sources()
+        .await
+        .context("listing Open Live's sources to assign ports")?;
+    let mut ids = HashMap::new();
+    for input in inputs.iter_mut() {
+        let existing = sources.iter().find(|s| s.name == input.name);
+        let (source_id, address) = match plan_port(existing, range) {
+            PortPlan::Keep { source_id, port } => {
+                input.endpoint.port = port;
+                ids.insert(input.id.clone(), source_id);
+                continue;
+            }
+            PortPlan::Create => {
+                input.endpoint.port = 0;
+                let payload = SourcePayload::new(
+                    &input.name,
+                    &input.endpoint.cloud_uri(),
+                    false,
+                    input.endpoint.latency_ms,
+                );
+                let created = client
+                    .create_source(&payload)
+                    .await
+                    .with_context(|| format!("registering {:?} with Open Live", input.name))?;
+                info!(input = %input.name, source_id = %created.id, "registered the source with Open Live");
+                (created.id, created.address)
+            }
+            PortPlan::Reassign { source_id } => {
+                input.endpoint.port = 0;
+                let payload = SourcePayload::new(
+                    &input.name,
+                    &input.endpoint.cloud_uri(),
+                    false,
+                    input.endpoint.latency_ms,
+                );
+                client
+                    .patch_source(&source_id, &payload)
+                    .await
+                    .with_context(|| {
+                        format!("asking Open Live for a new port for {:?}", input.name)
+                    })?;
+                // PATCH answers with the source, but the client does not read it back;
+                // the list is the one shape it already parses.
+                let address = client
+                    .list_sources()
+                    .await?
+                    .into_iter()
+                    .find(|s| s.id == source_id)
+                    .map(|s| s.address)
+                    .with_context(|| {
+                        format!(
+                            "Open Live lost the source for {:?} while reassigning its port",
+                            input.name
+                        )
+                    })?;
+                (source_id, address)
+            }
+        };
+        let port = listener_port(&address).with_context(|| {
+            format!(
+                "Open Live stored {} for {:?}, which names no listener port; is it running a version that assigns ports?",
+                mask_passphrase(&address),
+                input.name
+            )
+        })?;
+        input.endpoint.port = port;
+        ids.insert(input.id.clone(), source_id);
+    }
+    Ok(ids)
 }
 
 /// Removes our own leftovers from a run that ended without cleanup, and any other
@@ -582,8 +815,13 @@ pub async fn down(cfg: Config) -> Result<()> {
 pub async fn status(cfg: Config) -> Result<()> {
     let gateway_id = cfg.gateway.resolved_id();
     match read_pidfile() {
-        Some(pid) if is_running_gateway(pid) => println!("Gateway running (pid {pid}).\n"),
-        _ => println!("No gateway process running.\n"),
+        Some(pid) if is_running_gateway(pid) => println!("Gateway running (pid {pid})."),
+        _ => println!("No gateway process running."),
+    }
+    let open_live = open_live_client(&cfg)?;
+    match resolve_cloud(&cfg, open_live.as_ref()).await {
+        Ok(cloud) => println!("Uplink to {}, {}.\n", cloud.host, cloud.describe_ports()),
+        Err(err) => println!("Uplink not resolved: {err:#}.\n"),
     }
 
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
@@ -598,7 +836,7 @@ pub async fn status(cfg: Config) -> Result<()> {
         }
     };
     let prefix = devices::name_prefix(&cfg.gateway.name);
-    let sources = match open_live_client(&cfg)? {
+    let sources = match open_live {
         Some(client) => match client.list_sources().await {
             Ok(sources) => sources
                 .into_iter()
@@ -722,6 +960,115 @@ fn signal_stop(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CLOUD: RangeInclusive<u16> = 47110..=47129;
+    const LOCAL: RangeInclusive<u16> = 9000..=9019;
+
+    /// Several venues share the cloud Strom, so the venue must not pick its ports.
+    fn stored(address: &str) -> Source {
+        Source {
+            id: "src-1".to_string(),
+            name: "Venue — Cam".to_string(),
+            address: address.to_string(),
+            stream_type: "srt".to_string(),
+            status: "inactive".to_string(),
+            latency: None,
+        }
+    }
+
+    #[test]
+    fn a_stored_source_keeps_its_port_only_while_it_is_inside_the_range() {
+        let range = 47100..=47109;
+        assert_eq!(plan_port(None, &range), PortPlan::Create);
+        assert_eq!(
+            plan_port(
+                Some(&stored("srt://:47103?mode=listener&passphrase=***")),
+                &range
+            ),
+            PortPlan::Keep {
+                source_id: "src-1".to_string(),
+                port: 47103
+            }
+        );
+        // Left by a run against the old default range: Open Live would refuse it now.
+        assert_eq!(
+            plan_port(Some(&stored("srt://:47110?mode=listener")), &range),
+            PortPlan::Reassign {
+                source_id: "src-1".to_string()
+            }
+        );
+        assert_eq!(
+            plan_port(
+                Some(&stored("srt://cloud.example.com:47103?mode=caller")),
+                &range
+            ),
+            PortPlan::Reassign {
+                source_id: "src-1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn in_caller_mode_the_published_range_wins_over_the_settings() {
+        assert_eq!(
+            choose_ports(UplinkMode::Caller, Some(LOCAL), Some(CLOUD), Some("leased")).unwrap(),
+            (CLOUD, PortSource::OpenLive)
+        );
+        assert_eq!(
+            choose_ports(UplinkMode::Caller, None, Some(CLOUD), Some("leased")).unwrap(),
+            (CLOUD, PortSource::OpenLive)
+        );
+    }
+
+    /// An older Open Live, or one that cannot lease, leaves the settings in charge.
+    #[test]
+    fn in_caller_mode_the_settings_are_the_fallback_when_nothing_is_published() {
+        for status in [None, Some("pending"), Some("unsupported"), Some("disabled")] {
+            assert_eq!(
+                choose_ports(UplinkMode::Caller, Some(LOCAL), None, status).unwrap(),
+                (LOCAL, PortSource::Settings),
+                "{status:?}"
+            );
+        }
+    }
+
+    /// Neither side has a range: the error names both fixes, and says when the fix
+    /// is simply to wait for Open Live.
+    #[test]
+    fn in_caller_mode_no_range_at_all_is_an_error_that_names_the_fixes() {
+        let err = choose_ports(UplinkMode::Caller, None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uplink.port_range"), "{err}");
+        assert!(err.contains("upgrade"), "{err}");
+        assert!(!err.contains("waiting"), "{err}");
+
+        let err = choose_ports(UplinkMode::Caller, None, None, Some("pending"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uplink.port_range"), "{err}");
+        assert!(err.contains("waiting"), "{err}");
+        assert!(err.contains("try again"), "{err}");
+    }
+
+    /// Listener ports are this machine's own; nothing Open Live publishes applies.
+    #[test]
+    fn in_listener_mode_only_the_settings_count() {
+        assert_eq!(
+            choose_ports(
+                UplinkMode::Listener,
+                Some(LOCAL),
+                Some(CLOUD),
+                Some("leased")
+            )
+            .unwrap(),
+            (LOCAL, PortSource::Settings)
+        );
+        let err = choose_ports(UplinkMode::Listener, None, Some(CLOUD), Some("leased"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("uplink.port_range"), "{err}");
+    }
 
     #[test]
     fn truncation_keeps_names_within_the_column() {
