@@ -13,10 +13,10 @@ use crate::config::{self, format_port_range, mask_passphrase, Config, UplinkMode
 use crate::devices;
 use crate::flow::{self, Input};
 use crate::local_strom::{self, LocalStrom};
-use crate::openlive::{drifted, OpenLiveClient, ServerInfo, SourcePayload};
+use crate::openlive::{drifted, listener_port, OpenLiveClient, ServerInfo, Source, SourcePayload};
 use crate::strom::StromClient;
 use anyhow::{bail, Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::time::Duration;
@@ -296,11 +296,22 @@ pub async fn up(
         inputs.len() as f64 * cfg.video.bitrate_kbps as f64 / 1000.0
     );
 
+    // When the range is Open Live's, so is the port inside it: register first and
+    // take the port Open Live wrote into the source, then build the flows to it.
+    let mut inputs = inputs;
+    let mut source_ids = match (&open_live, cloud.port_source) {
+        (Some(client), PortSource::OpenLive) => {
+            assign_ports_from_open_live(client, &mut inputs, &cloud.ports).await?
+        }
+        _ => HashMap::new(),
+    };
+
     clear_conflicting_flows(&strom, &gateway_id, &inputs).await?;
 
     let mut live = Vec::new();
     for input in inputs {
         let flow_id = flow::flow_id(&gateway_id, &input.id);
+        let source_id = source_ids.remove(&input.id);
         match start(
             &strom,
             &flow_id,
@@ -315,7 +326,7 @@ pub async fn up(
                 shown: None,
                 last_bytes: None,
                 quiet_polls: 0,
-                source_id: None,
+                source_id,
             }),
             // One camera failing must not stop the rest of the venue coming up.
             Err(err) => warn!(input = %input.name, %err, "could not start this input"),
@@ -338,6 +349,117 @@ pub async fn up(
     drop(local_strom);
     remove_pidfile();
     outcome
+}
+
+/// What to do about an input's port given the source Open Live already holds for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PortPlan {
+    /// The stored source names a port inside the range: build to it.
+    Keep { source_id: String, port: u16 },
+    /// The stored source has no usable port (none, or one outside the range Open
+    /// Live now publishes, left by an older run): ask Open Live to reassign it.
+    Reassign { source_id: String },
+    /// No source yet: create one and let Open Live pick the port.
+    Create,
+}
+
+/// Pure, so the three cases can be tested without a server.
+fn plan_port(existing: Option<&Source>, range: &RangeInclusive<u16>) -> PortPlan {
+    match existing {
+        None => PortPlan::Create,
+        Some(stored) => match listener_port(&stored.address) {
+            Some(port) if range.contains(&port) => PortPlan::Keep {
+                source_id: stored.id.clone(),
+                port,
+            },
+            _ => PortPlan::Reassign {
+                source_id: stored.id.clone(),
+            },
+        },
+    }
+}
+
+/// Lets Open Live choose each input's port inside the range it publishes. Several
+/// gateways can feed one Open Live, and each only knows its own inputs, so the one
+/// party that sees every source and output has to hand the ports out. An input
+/// registers with port 0, which means "assign one", and takes the port Open Live
+/// wrote into the source. A source left by an earlier run keeps its port, so the
+/// cloud side stays stable across restarts. Returns each input's source id.
+async fn assign_ports_from_open_live(
+    client: &OpenLiveClient,
+    inputs: &mut [Input],
+    range: &RangeInclusive<u16>,
+) -> Result<HashMap<String, String>> {
+    let sources = client
+        .list_sources()
+        .await
+        .context("listing Open Live's sources to assign ports")?;
+    let mut ids = HashMap::new();
+    for input in inputs.iter_mut() {
+        let existing = sources.iter().find(|s| s.name == input.name);
+        let (source_id, address) = match plan_port(existing, range) {
+            PortPlan::Keep { source_id, port } => {
+                input.endpoint.port = port;
+                ids.insert(input.id.clone(), source_id);
+                continue;
+            }
+            PortPlan::Create => {
+                input.endpoint.port = 0;
+                let payload = SourcePayload::new(
+                    &input.name,
+                    &input.endpoint.cloud_uri(),
+                    false,
+                    input.endpoint.latency_ms,
+                );
+                let created = client
+                    .create_source(&payload)
+                    .await
+                    .with_context(|| format!("registering {:?} with Open Live", input.name))?;
+                info!(input = %input.name, source_id = %created.id, "registered the source with Open Live");
+                (created.id, created.address)
+            }
+            PortPlan::Reassign { source_id } => {
+                input.endpoint.port = 0;
+                let payload = SourcePayload::new(
+                    &input.name,
+                    &input.endpoint.cloud_uri(),
+                    false,
+                    input.endpoint.latency_ms,
+                );
+                client
+                    .patch_source(&source_id, &payload)
+                    .await
+                    .with_context(|| {
+                        format!("asking Open Live for a new port for {:?}", input.name)
+                    })?;
+                // PATCH answers with the source, but the client does not read it back;
+                // the list is the one shape it already parses.
+                let address = client
+                    .list_sources()
+                    .await?
+                    .into_iter()
+                    .find(|s| s.id == source_id)
+                    .map(|s| s.address)
+                    .with_context(|| {
+                        format!(
+                            "Open Live lost the source for {:?} while reassigning its port",
+                            input.name
+                        )
+                    })?;
+                (source_id, address)
+            }
+        };
+        let port = listener_port(&address).with_context(|| {
+            format!(
+                "Open Live stored {} for {:?}, which names no listener port; is it running a version that assigns ports?",
+                mask_passphrase(&address),
+                input.name
+            )
+        })?;
+        input.endpoint.port = port;
+        ids.insert(input.id.clone(), source_id);
+    }
+    Ok(ids)
 }
 
 /// Removes our own leftovers from a run that ended without cleanup, and any other
@@ -843,6 +965,49 @@ mod tests {
     const LOCAL: RangeInclusive<u16> = 9000..=9019;
 
     /// Several venues share the cloud Strom, so the venue must not pick its ports.
+    fn stored(address: &str) -> Source {
+        Source {
+            id: "src-1".to_string(),
+            name: "Venue — Cam".to_string(),
+            address: address.to_string(),
+            stream_type: "srt".to_string(),
+            status: "inactive".to_string(),
+            latency: None,
+        }
+    }
+
+    #[test]
+    fn a_stored_source_keeps_its_port_only_while_it_is_inside_the_range() {
+        let range = 47100..=47109;
+        assert_eq!(plan_port(None, &range), PortPlan::Create);
+        assert_eq!(
+            plan_port(
+                Some(&stored("srt://:47103?mode=listener&passphrase=***")),
+                &range
+            ),
+            PortPlan::Keep {
+                source_id: "src-1".to_string(),
+                port: 47103
+            }
+        );
+        // Left by a run against the old default range: Open Live would refuse it now.
+        assert_eq!(
+            plan_port(Some(&stored("srt://:47110?mode=listener")), &range),
+            PortPlan::Reassign {
+                source_id: "src-1".to_string()
+            }
+        );
+        assert_eq!(
+            plan_port(
+                Some(&stored("srt://cloud.example.com:47103?mode=caller")),
+                &range
+            ),
+            PortPlan::Reassign {
+                source_id: "src-1".to_string()
+            }
+        );
+    }
+
     #[test]
     fn in_caller_mode_the_published_range_wins_over_the_settings() {
         assert_eq!(

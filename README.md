@@ -80,7 +80,8 @@ on macOS, or wherever `--config` points. The same format can be written by hand;
 
 In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live leases a range
 from that Strom and publishes it on `GET /api/v1/server-info` together with the Strom host, and the
-gateway allocates one port per input from that range; `uplink.port_range` is only a fallback for an
+gateway registers each input with port 0 and Open Live assigns it a free port in that range, so
+several gateways can feed one Open Live; `uplink.port_range` is only a fallback for an
 Open Live that publishes none. In `listener` mode the ports are the venue's own and
 `uplink.port_range` is required. `up` and `status` print the range in use and where it came from.
 
