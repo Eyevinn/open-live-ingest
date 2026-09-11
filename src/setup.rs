@@ -8,8 +8,8 @@
 //! the prompt costs a retype; the same mistake surfacing later looks like a feed that
 //! silently goes nowhere.
 
-use crate::config::{AuthMode, Config, UplinkMode};
-use crate::openlive::OpenLiveClient;
+use crate::config::{format_port_range, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE};
+use crate::openlive::{OpenLiveClient, ServerInfo};
 use crate::osc;
 use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
@@ -259,13 +259,29 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     }
     // Checked before asking anything else, so a bad address or credential is
     // corrected while the operator is still looking at it.
+    let mut published = None;
     match check_open_live(cfg).await {
-        Ok(Some(host)) => {
-            if cfg.uplink.host.is_none() {
-                good(format!("reached Open Live; feeds will go to its Strom at {host}"));
-            } else {
-                good(format!("reached Open Live; its Strom is {host}"));
+        Ok(Some(info)) => {
+            match &info.strom_host {
+                Some(host) if cfg.uplink.host.is_none() => {
+                    good(format!("reached Open Live; feeds will go to its Strom at {host}"))
+                }
+                Some(host) => good(format!("reached Open Live; its Strom is {host}")),
+                None => warn(
+                    "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
+                ),
             }
+            match &info.srt_port_range {
+                Some(range) => good(format!(
+                    "its Strom takes SRT on ports {}, which callers use",
+                    format_port_range(range)
+                )),
+                None if info.lease_pending() => warn(
+                    "Open Live is still waiting for its SRT port range from Strom; it retries every minute, so run setup again later or set a range here",
+                ),
+                None => note("Open Live publishes no SRT port range; one has to be set here"),
+            }
+            published = info.srt_port_range;
         }
         Ok(None) => warn(
             "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
@@ -327,7 +343,34 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
             .await?,
         );
     }
-    cfg.uplink.port_range = ask("SRT port range", Some(&cfg.uplink.port_range)).await?;
+    // In caller mode the ports are the cloud Strom's, and Open Live publishes the
+    // range it leased; only when it publishes none, or in listener mode where the
+    // ports are this machine's own, is there anything to ask.
+    match (&published, cfg.uplink.mode) {
+        (Some(range), UplinkMode::Caller) => {
+            good(format!(
+                "SRT port range {} comes from Open Live",
+                format_port_range(range)
+            ));
+            if let Some(local) = cfg.uplink.port_range.as_deref() {
+                note(format!(
+                    "port_range = {local:?} in the settings is ignored while Open Live publishes one"
+                ));
+            }
+        }
+        _ => {
+            cfg.uplink.port_range = Some(
+                ask(
+                    "SRT port range",
+                    cfg.uplink
+                        .port_range
+                        .as_deref()
+                        .or(Some(SUGGESTED_PORT_RANGE)),
+                )
+                .await?,
+            );
+        }
+    }
     cfg.uplink.latency_ms = ask_number("SRT latency (ms)", cfg.uplink.latency_ms).await?;
 
     section("Capture");
@@ -504,8 +547,9 @@ async fn choose_instance(current: Option<&str>, token: &str) -> Result<String> {
     ask("Open Live URL", current.or(Some("https://"))).await
 }
 
-/// Confirms the address and credential work, returning the cloud Strom's host.
-async fn check_open_live(cfg: &Config) -> Result<Option<String>> {
+/// Confirms the address and credential work, returning what Open Live says about
+/// its cloud Strom: its host and the SRT ports it has leased.
+async fn check_open_live(cfg: &Config) -> Result<Option<ServerInfo>> {
     let client = OpenLiveClient::new(
         cfg.open_live.url.as_deref().unwrap_or_default(),
         cfg.open_live.auth_mode,
@@ -513,7 +557,7 @@ async fn check_open_live(cfg: &Config) -> Result<Option<String>> {
     )?;
     // Listing sources exercises the credential; server-info alone might not.
     client.list_sources().await?;
-    client.cloud_strom_host().await
+    client.server_info().await
 }
 
 async fn probe_strom(cfg: &Config) -> Reachability {

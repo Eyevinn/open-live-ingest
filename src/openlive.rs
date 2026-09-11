@@ -4,10 +4,11 @@
 //! The credential must never reach the logs: errors are built from status codes, and
 //! request bodies are never dumped because the source address carries the passphrase.
 
-use crate::config::{mask_passphrase, AuthMode};
+use crate::config::{mask_passphrase, port_range, AuthMode};
 use crate::osc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::ops::RangeInclusive;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -64,6 +65,21 @@ pub struct Source {
     pub latency: Option<u32>,
 }
 
+/// The port a hostless SRT listener address binds: `srt://:47100?mode=listener`
+/// gives 47100. Caller addresses, other schemes, and port 0 (the "assign me one"
+/// request) give `None`. Open Live returns addresses with the passphrase masked,
+/// which does not touch the port, so this reads a returned address as well as a
+/// requested one.
+pub fn listener_port(address: &str) -> Option<u16> {
+    let rest = address.trim().strip_prefix("srt://:")?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let after = &rest[digits.len()..];
+    if !(after.is_empty() || after.starts_with('?')) {
+        return None;
+    }
+    digits.parse::<u16>().ok().filter(|p| *p != 0)
+}
+
 /// Whether a stored source needs a PATCH to match what the gateway wants. Only what
 /// differs is written: Open Live keeps a CouchDB revision per write, so a needless
 /// PATCH every tick would add thousands of revisions a day per source.
@@ -74,6 +90,60 @@ pub fn drifted(stored: &Source, desired: &SourcePayload) -> bool {
         // Not reported at all is not drift; an older Open Live simply lacks the field.
         || stored.latency.is_some_and(|l| l != desired.latency)
         || mask_passphrase(&stored.address) != mask_passphrase(&desired.address)
+}
+
+/// What `GET /api/v1/server-info` says about the cloud side. Every field is optional
+/// because the route has grown over time: the oldest Open Live has no route at all,
+/// the next reports only the Strom host, and the current one adds the SRT port range
+/// its Strom has leased for callers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ServerInfo {
+    pub strom_host: Option<String>,
+    /// The cloud Strom's SRT listener ports, which Open Live leases from Strom and
+    /// which every source registered in caller mode must use.
+    pub srt_port_range: Option<RangeInclusive<u16>>,
+    /// `leased`, `pending`, `unsupported`, or `disabled`. `pending` means Open Live
+    /// has not yet obtained its range from Strom and is still retrying.
+    pub srt_port_lease: Option<String>,
+}
+
+impl ServerInfo {
+    pub fn lease_pending(&self) -> bool {
+        self.srt_port_lease.as_deref() == Some("pending")
+    }
+}
+
+/// Pure, so the shapes the route has had can be tested without a server.
+fn parse_server_info(body: &serde_json::Value) -> Result<ServerInfo> {
+    let strom_host = body
+        .get("stromHost")
+        .and_then(|v| v.as_str())
+        .filter(|h| !h.is_empty())
+        .map(str::to_string);
+    let srt_port_range = match body.get("srtPortRange").filter(|v| !v.is_null()) {
+        Some(range) => {
+            let end = |key: &str| {
+                range
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .with_context(|| format!("srtPortRange.{key} is missing or not a number"))
+            };
+            Some(
+                port_range(end("first")?, end("last")?)
+                    .context("Open Live published an invalid srtPortRange")?,
+            )
+        }
+        None => None,
+    };
+    let srt_port_lease = body
+        .get("srtPortLease")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(ServerInfo {
+        strom_host,
+        srt_port_range,
+        srt_port_lease,
+    })
 }
 
 pub struct OpenLiveClient {
@@ -94,9 +164,9 @@ impl OpenLiveClient {
         })
     }
 
-    /// The cloud Strom's hostname, so a venue needs only the Open Live address.
-    /// Older deployments lack the route, so a 404 is "unknown", not an error.
-    pub async fn cloud_strom_host(&self) -> Result<Option<String>> {
+    /// The cloud Strom's hostname and SRT ports, so a venue needs only the Open Live
+    /// address. Older deployments lack the route, so a 404 is "unknown", not an error.
+    pub async fn server_info(&self) -> Result<Option<ServerInfo>> {
         let res = self
             .get("/api/v1/server-info")
             .await?
@@ -110,11 +180,7 @@ impl OpenLiveClient {
             .json()
             .await
             .context("decoding server-info")?;
-        Ok(body
-            .get("stromHost")
-            .and_then(|v| v.as_str())
-            .filter(|h| !h.is_empty())
-            .map(str::to_string))
+        parse_server_info(&body).map(Some)
     }
 
     pub async fn list_sources(&self) -> Result<Vec<Source>> {
@@ -417,6 +483,78 @@ mod tests {
             expires_at: now() + Duration::from_secs(3600),
         };
         assert!(!is_expiring(&fresh));
+    }
+
+    /// The route has had three shapes; all of them must decode, and an absent range
+    /// is "not published", never an error.
+    #[test]
+    fn server_info_decodes_with_and_without_a_port_range() {
+        let current = parse_server_info(&serde_json::json!({
+            "stromHost": "strom.example.com",
+            "srtPortRange": { "first": 47110, "last": 47129 },
+            "srtPortLease": "leased"
+        }))
+        .unwrap();
+        assert_eq!(
+            current,
+            ServerInfo {
+                strom_host: Some("strom.example.com".into()),
+                srt_port_range: Some(47110..=47129),
+                srt_port_lease: Some("leased".into()),
+            }
+        );
+        assert!(!current.lease_pending());
+
+        let pending = parse_server_info(&serde_json::json!({
+            "stromHost": "strom.example.com",
+            "srtPortRange": null,
+            "srtPortLease": "pending"
+        }))
+        .unwrap();
+        assert_eq!(pending.srt_port_range, None);
+        assert!(pending.lease_pending());
+
+        let older =
+            parse_server_info(&serde_json::json!({ "stromHost": "strom.example.com" })).unwrap();
+        assert_eq!(older.strom_host.as_deref(), Some("strom.example.com"));
+        assert_eq!(older.srt_port_range, None);
+        assert_eq!(older.srt_port_lease, None);
+
+        let blank = parse_server_info(&serde_json::json!({ "stromHost": "" })).unwrap();
+        assert_eq!(blank, ServerInfo::default());
+    }
+
+    /// A published range is checked like a configured one: a bad one is an error to
+    /// report, not a range to allocate from.
+    #[test]
+    fn listener_port_reads_hostless_listener_addresses_only() {
+        assert_eq!(listener_port("srt://:47100?mode=listener"), Some(47100));
+        assert_eq!(
+            listener_port("srt://:47100?mode=listener&passphrase=***&pbkeylen=16"),
+            Some(47100)
+        );
+        assert_eq!(listener_port("srt://:47100"), Some(47100));
+        assert_eq!(listener_port("srt://:0?mode=listener"), None);
+        assert_eq!(
+            listener_port("srt://cloud.example.com:47100?mode=caller"),
+            None
+        );
+        assert_eq!(listener_port("srt://:47100x?mode=listener"), None);
+        assert_eq!(listener_port("https://example.com"), None);
+    }
+
+    #[test]
+    fn a_malformed_published_range_is_an_error() {
+        for bad in [
+            serde_json::json!({ "first": 47129, "last": 47110 }),
+            serde_json::json!({ "first": 0, "last": 10 }),
+            serde_json::json!({ "first": 1, "last": 65536 }),
+            serde_json::json!({ "first": "47110", "last": 47129 }),
+            serde_json::json!({ "last": 47129 }),
+        ] {
+            let body = serde_json::json!({ "stromHost": "h", "srtPortRange": bad });
+            assert!(parse_server_info(&body).is_err(), "{body}");
+        }
     }
 
     fn stored(address: &str, status: &str, latency: Option<u32>) -> Source {
