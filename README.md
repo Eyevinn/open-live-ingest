@@ -103,18 +103,43 @@ saved login; the gateway reads the login again at each token exchange, so signin
 running gateway. On a box with no browser, paste a token, or copy `~/.osc/token` over from a machine
 you signed in on.
 
+## Install
+
+Each [release](https://github.com/Eyevinn/open-live-ingest/releases) carries a static binary for
+Linux (x86_64 and aarch64) and macOS (Apple silicon and Intel). Unpack it and put the binary on
+your `PATH`:
+
+```bash
+tar xzf open-live-ingest-v*-x86_64-unknown-linux-musl.tar.gz
+sudo install open-live-ingest-*/open-live-ingest /usr/local/bin/
+```
+
+Or build it yourself with Rust 1.97.1, pinned in `rust-toolchain.toml`:
+
+```bash
+cargo build --release   # target/release/open-live-ingest
+```
+
 ## Requirements
 
 - Linux or macOS, with a Strom instance on the same machine that can see the capture hardware
-- Rust 1.97.1 to build, pinned in `rust-toolchain.toml`. Strom's API types come from the `strom-types`
-  crate, pinned in `Cargo.toml` to the Strom release the venue runs
 - Node.js, only to sign in to Open Source Cloud with `npx @osaas/cli login`. A pasted token needs none
 
 The gateway itself is an ordinary HTTP client: no GStreamer, no device access, no privileges.
+Strom's API types come from the `strom-types` crate, pinned in `Cargo.toml` to the Strom release
+the venue runs.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, then tag and push:
 
 ```bash
-cargo build --release
+git tag v0.3.0 && git push origin v0.3.0
 ```
+
+The release workflow refuses a tag that does not match `Cargo.toml`, builds the four binaries,
+and publishes them with a checksum file and generated notes. Run the workflow by hand from the
+Actions tab to build the artifacts without publishing.
 
 ## License
 

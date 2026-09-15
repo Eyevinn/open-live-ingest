@@ -1,0 +1,89 @@
+name: Release
+
+# Pushing a tag such as v0.3.0 builds one static binary per platform and attaches
+# them to a GitHub release. The manual trigger builds the same artifacts without
+# publishing anything, to try the workflow out.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: open-live-ingest
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest,     target: aarch64-apple-darwin }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tag must name the version Cargo.toml carries, so a release never ships a
+      # binary that reports a different version than its filename.
+      - name: Check the tag against Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          crate="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          test "$crate" = "${{ github.ref_name }}" \
+            || { echo "tag ${{ github.ref_name }} but Cargo.toml says $crate"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # musl gives a static binary that runs on any Linux distribution. The only C in
+      # the build is ring's, which needs a musl-aware compiler.
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
+
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          version="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
+          name="$BIN-$version-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/$BIN" LICENSE-MIT LICENSE-APACHE README.md gateway.toml.example "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ github.ref_name }}" \
+            --generate-notes
