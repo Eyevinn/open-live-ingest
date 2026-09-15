@@ -36,6 +36,8 @@ open-live-ingest setup            # ask for settings without starting anything
 open-live-ingest check            # validate the settings file
 ```
 
+`status --json` and `devices --json` print one JSON document instead of a table.
+
 Run it and it asks for what it needs, checks each answer, remembers it, then registers every capture
 device Strom can see and starts streaming. Built for SSH: line-by-line prompts on any terminal, lists
 picked with the arrow keys, no window. Colour steps back to plain text under `NO_COLOR` or on a dumb
@@ -77,6 +79,23 @@ on macOS, or wherever `--config` points. The same format can be written by hand;
 | `OLI_OPEN_LIVE_API_KEY` | `open_live.api_key` |
 | `OLI_OPEN_LIVE_AUTH_MODE` | `open_live.auth_mode` (`direct` or `osc`) |
 | `OLI_LOG_LEVEL` | `log.level` |
+
+### Without a terminal
+
+Every question has a flag, and `--non-interactive` runs the same checks without asking, failing
+on anything missing or wrong instead of prompting. That is how a script, or an agent, sets a box
+up:
+
+```bash
+OLI_OPEN_LIVE_API_KEY=... open-live-ingest setup --non-interactive \
+  --name "Venue" --open-live-url https://venue.eyevinn-open-live.auto.prod-se.osaas.io
+open-live-ingest check
+```
+
+Credentials are never flags, because a flag shows in process listings and shell history. They come
+from the environment variables above, or for Open Source Cloud from `OSC_ACCESS_TOKEN` or the CLI's
+saved login. Given interactively, the same flags become the defaults the prompts show. `setup
+--help` lists them all.
 
 In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live leases a range
 from that Strom and publishes it on `GET /api/v1/server-info` together with the Strom host, and the

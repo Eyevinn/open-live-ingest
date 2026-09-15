@@ -16,6 +16,7 @@ use crate::local_strom::{self, LocalStrom};
 use crate::openlive::{drifted, listener_port, OpenLiveClient, ServerInfo, Source, SourcePayload};
 use crate::strom::StromClient;
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::ops::RangeInclusive;
@@ -183,7 +184,7 @@ fn choose_ports(
 }
 
 /// Lists what Strom can see, so an operator can pick before starting anything.
-pub async fn devices(cfg: Config) -> Result<()> {
+pub async fn devices(cfg: Config, json: bool) -> Result<()> {
     // Started only to ask, if started at all; dropped again on the way out.
     let (_local, strom) = connect_strom(&cfg).await?;
     let mut all = strom
@@ -191,25 +192,51 @@ pub async fn devices(cfg: Config) -> Result<()> {
         .await
         .context("asking Strom what capture devices it can see")?;
     all.sort_by(|a, b| a.name.cmp(&b.name));
-    if all.is_empty() {
-        println!("Strom reports no video sources on this machine.");
-        return Ok(());
+    let report: Vec<DeviceReport> = all
+        .iter()
+        .map(|d| DeviceReport {
+            name: d.name.clone(),
+            id: d.id.clone(),
+            virtual_: devices::is_probably_virtual(d),
+        })
+        .collect();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_devices(&report));
     }
-    println!("{:<30} {:<24} NOTE", "DEVICE", "ID");
-    for device in &all {
-        let note = if devices::is_probably_virtual(device) {
+    Ok(())
+}
+
+/// One capture device, as `devices` reports it.
+#[derive(Debug, Serialize)]
+struct DeviceReport {
+    name: String,
+    id: String,
+    /// Skipped by `up` unless `--all`: it produces nothing on its own.
+    #[serde(rename = "virtual")]
+    virtual_: bool,
+}
+
+fn render_devices(all: &[DeviceReport]) -> String {
+    if all.is_empty() {
+        return "Strom reports no video sources on this machine.\n".to_string();
+    }
+    let mut out = format!("{:<30} {:<24} NOTE\n", "DEVICE", "ID");
+    for device in all {
+        let note = if device.virtual_ {
             "virtual, skipped unless --all"
         } else {
             ""
         };
-        println!(
-            "{:<30} {:<24} {note}",
+        out += &format!(
+            "{:<30} {:<24} {note}\n",
             truncate(&device.name, 30),
             truncate(&device.id, 24)
         );
     }
-    println!("\n`up` starts all of these except the virtual ones; `up --devices \"FaceTime\"` picks by name or id.");
-    Ok(())
+    out += "\n`up` starts all of these except the virtual ones; `up --devices \"FaceTime\"` picks by name or id.\n";
+    out
 }
 
 /// One streaming input and what the last poll found out about it.
@@ -812,42 +839,153 @@ pub async fn down(cfg: Config) -> Result<()> {
 }
 
 /// Reports what is running, from Strom and Open Live directly.
-pub async fn status(cfg: Config) -> Result<()> {
+pub async fn status(cfg: Config, json: bool) -> Result<()> {
+    let report = gather_status(&cfg).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_status(&report));
+    }
+    Ok(())
+}
+
+/// Everything `status` reports, gathered once and rendered as text or JSON.
+#[derive(Debug, Serialize)]
+struct StatusReport {
+    /// The `up` process, by its pidfile.
+    process: ProcessReport,
+    /// Where feeds go, or why that could not be worked out.
+    uplink: Option<UplinkReport>,
+    uplink_error: Option<String>,
+    strom: EndpointReport,
+    /// Absent when registration is off.
+    open_live: Option<EndpointReport>,
+    inputs: Vec<InputReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProcessReport {
+    running: bool,
+    pid: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct UplinkReport {
+    host: String,
+    ports: String,
+    port_source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EndpointReport {
+    url: String,
+    reachable: bool,
+    error: Option<String>,
+}
+
+/// One input, by name: its flow in Strom, that flow's uplink, and its source in
+/// Open Live. Any of the three may be missing; that is what `status` is for.
+#[derive(Debug, Serialize)]
+struct InputReport {
+    name: String,
+    flow: Option<FlowReport>,
+    uplink: Option<UplinkStatsReport>,
+    source: Option<SourceReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct FlowReport {
+    id: String,
+    running: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct UplinkStatsReport {
+    send_rate_mbps: Option<f64>,
+    rtt_ms: Option<f64>,
+    bytes_sent: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceReport {
+    id: String,
+    status: String,
+}
+
+async fn gather_status(cfg: &Config) -> Result<StatusReport> {
     let gateway_id = cfg.gateway.resolved_id();
-    match read_pidfile() {
-        Some(pid) if is_running_gateway(pid) => println!("Gateway running (pid {pid})."),
-        _ => println!("No gateway process running."),
-    }
-    let open_live = open_live_client(&cfg)?;
-    match resolve_cloud(&cfg, open_live.as_ref()).await {
-        Ok(cloud) => println!("Uplink to {}, {}.\n", cloud.host, cloud.describe_ports()),
-        Err(err) => println!("Uplink not resolved: {err:#}.\n"),
-    }
+    let process = match read_pidfile() {
+        Some(pid) if is_running_gateway(pid) => ProcessReport {
+            running: true,
+            pid: Some(pid),
+        },
+        _ => ProcessReport {
+            running: false,
+            pid: None,
+        },
+    };
+    let open_live = open_live_client(cfg)?;
+    let (uplink, uplink_error) = match resolve_cloud(cfg, open_live.as_ref()).await {
+        Ok(cloud) => (
+            Some(UplinkReport {
+                host: cloud.host,
+                ports: format_port_range(&cloud.ports),
+                port_source: cloud.port_source.to_string(),
+            }),
+            None,
+        ),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
 
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
-    let flows = match strom.list_flows().await {
-        Ok(flows) => flows
-            .into_iter()
-            .filter(|f| flow::is_ours(f, &gateway_id))
-            .collect(),
-        Err(err) => {
-            println!("Strom at {} is not reachable ({err}).", cfg.strom.url);
-            Vec::new()
-        }
+    let (flows, strom_report) = match strom.list_flows().await {
+        Ok(flows) => (
+            flows
+                .into_iter()
+                .filter(|f| flow::is_ours(f, &gateway_id))
+                .collect(),
+            EndpointReport {
+                url: cfg.strom.url.clone(),
+                reachable: true,
+                error: None,
+            },
+        ),
+        Err(err) => (
+            Vec::new(),
+            EndpointReport {
+                url: cfg.strom.url.clone(),
+                reachable: false,
+                error: Some(err.to_string()),
+            },
+        ),
     };
     let prefix = devices::name_prefix(&cfg.gateway.name);
-    let sources = match open_live {
-        Some(client) => match client.list_sources().await {
-            Ok(sources) => sources
-                .into_iter()
-                .filter(|s| s.name.starts_with(&prefix))
-                .collect(),
-            Err(err) => {
-                println!("Open Live is not reachable ({err}).");
-                Vec::new()
+    let (sources, open_live_report) = match &open_live {
+        Some(client) => {
+            let url = cfg.open_live.url.clone().unwrap_or_default();
+            match client.list_sources().await {
+                Ok(sources) => (
+                    sources
+                        .into_iter()
+                        .filter(|s| s.name.starts_with(&prefix))
+                        .collect(),
+                    Some(EndpointReport {
+                        url,
+                        reachable: true,
+                        error: None,
+                    }),
+                ),
+                Err(err) => (
+                    Vec::new(),
+                    Some(EndpointReport {
+                        url,
+                        reachable: false,
+                        error: Some(err.to_string()),
+                    }),
+                ),
             }
-        },
-        None => Vec::new(),
+        }
+        None => (Vec::new(), None),
     };
 
     let names: BTreeSet<&str> = flows
@@ -855,42 +993,102 @@ pub async fn status(cfg: Config) -> Result<()> {
         .map(|f| f.name.as_str())
         .chain(sources.iter().map(|s| s.name.as_str()))
         .collect();
-    if names.is_empty() {
-        println!("Nothing of ours in Strom or Open Live.");
-        return Ok(());
-    }
-
-    println!("{:<36} {:<9} {:<26} OPEN LIVE", "INPUT", "FLOW", "UPLINK");
+    let mut inputs = Vec::with_capacity(names.len());
     for name in names {
         let flow = flows.iter().find(|f| f.name == name);
-        let flow_state = match flow {
+        let uplink = match flow {
+            Some(f) => strom
+                .srt_uplink(&f.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|s| UplinkStatsReport {
+                    send_rate_mbps: s.send_rate_mbps,
+                    rtt_ms: s.rtt_ms,
+                    bytes_sent: s.bytes_sent,
+                }),
+            None => None,
+        };
+        inputs.push(InputReport {
+            name: name.to_string(),
+            flow: flow.map(|f| FlowReport {
+                id: f.id.to_string(),
+                running: f.running,
+            }),
+            uplink,
+            source: sources
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| SourceReport {
+                    id: s.id.clone(),
+                    status: s.status.clone(),
+                }),
+        });
+    }
+    Ok(StatusReport {
+        process,
+        uplink,
+        uplink_error,
+        strom: strom_report,
+        open_live: open_live_report,
+        inputs,
+    })
+}
+
+fn render_status(r: &StatusReport) -> String {
+    let mut out = String::new();
+    match r.process.pid {
+        Some(pid) => out += &format!("Gateway running (pid {pid}).\n"),
+        None => out += "No gateway process running.\n",
+    }
+    match (&r.uplink, &r.uplink_error) {
+        (Some(u), _) => {
+            out += &format!(
+                "Uplink to {}, SRT ports {} from {}.\n\n",
+                u.host, u.ports, u.port_source
+            )
+        }
+        (None, Some(err)) => out += &format!("Uplink not resolved: {err}.\n\n"),
+        (None, None) => {}
+    }
+    if let Some(err) = &r.strom.error {
+        out += &format!("Strom at {} is not reachable ({err}).\n", r.strom.url);
+    }
+    if let Some(err) = r.open_live.as_ref().and_then(|o| o.error.as_deref()) {
+        out += &format!("Open Live is not reachable ({err}).\n");
+    }
+    if r.inputs.is_empty() {
+        out += "Nothing of ours in Strom or Open Live.\n";
+        return out;
+    }
+    out += &format!("{:<36} {:<9} {:<26} OPEN LIVE\n", "INPUT", "FLOW", "UPLINK");
+    for input in &r.inputs {
+        let flow_state = match &input.flow {
             Some(f) if f.running => "running",
             Some(_) => "stopped",
             None => "-",
         };
-        let uplink = match flow {
-            Some(f) => match strom.srt_uplink(&f.id).await {
-                Ok(Some(s)) => match (s.send_rate_mbps, s.rtt_ms) {
-                    (Some(rate), Some(rtt)) => format!("{rate:.2} Mbps, rtt {rtt:.0} ms"),
-                    _ => format!("{} bytes sent", s.bytes_sent.unwrap_or(0)),
-                },
-                _ => "no receiver".to_string(),
+        let uplink = match (&input.flow, &input.uplink) {
+            (None, _) => "-".to_string(),
+            (Some(_), None) => "no receiver".to_string(),
+            (Some(_), Some(s)) => match (s.send_rate_mbps, s.rtt_ms) {
+                (Some(rate), Some(rtt)) => format!("{rate:.2} Mbps, rtt {rtt:.0} ms"),
+                _ => format!("{} bytes sent", s.bytes_sent.unwrap_or(0)),
             },
-            None => "-".to_string(),
         };
-        let source = sources
-            .iter()
-            .find(|s| s.name == name)
+        let source = input
+            .source
+            .as_ref()
             .map(|s| s.status.as_str())
             .unwrap_or("not registered");
-        println!(
-            "{:<36} {:<9} {:<26} {source}",
-            truncate(name, 36),
+        out += &format!(
+            "{:<36} {:<9} {:<26} {source}\n",
+            truncate(&input.name, 36),
             flow_state,
             uplink
         );
     }
-    Ok(())
+    out
 }
 
 fn write_pidfile() -> Result<()> {
@@ -960,6 +1158,129 @@ fn signal_stop(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_status() -> StatusReport {
+        StatusReport {
+            process: ProcessReport {
+                running: true,
+                pid: Some(4242),
+            },
+            uplink: Some(UplinkReport {
+                host: "cloud.example.com".to_string(),
+                ports: "47110-47129".to_string(),
+                port_source: PortSource::OpenLive.to_string(),
+            }),
+            uplink_error: None,
+            strom: EndpointReport {
+                url: "http://127.0.0.1:8080".to_string(),
+                reachable: true,
+                error: None,
+            },
+            open_live: Some(EndpointReport {
+                url: "https://open-live.example.com".to_string(),
+                reachable: false,
+                error: Some("connection refused".to_string()),
+            }),
+            inputs: vec![
+                InputReport {
+                    name: "Venue — Camera 1".to_string(),
+                    flow: Some(FlowReport {
+                        id: "f1".to_string(),
+                        running: true,
+                    }),
+                    uplink: Some(UplinkStatsReport {
+                        send_rate_mbps: Some(5.987),
+                        rtt_ms: Some(31.4),
+                        bytes_sent: Some(1_000),
+                    }),
+                    source: Some(SourceReport {
+                        id: "s1".to_string(),
+                        status: "active".to_string(),
+                    }),
+                },
+                InputReport {
+                    name: "Venue — Camera 2".to_string(),
+                    flow: Some(FlowReport {
+                        id: "f2".to_string(),
+                        running: true,
+                    }),
+                    uplink: None,
+                    source: None,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn status_text_reads_as_before() {
+        let text = render_status(&sample_status());
+        assert!(text.starts_with("Gateway running (pid 4242).\n"));
+        assert!(
+            text.contains("Uplink to cloud.example.com, SRT ports 47110-47129 from Open Live.\n")
+        );
+        assert!(text.contains("Open Live is not reachable (connection refused).\n"));
+        assert!(
+            !text.contains("Strom at"),
+            "a reachable Strom is not mentioned"
+        );
+        let camera_1 = text.lines().find(|l| l.contains("Camera 1")).unwrap();
+        assert!(camera_1.contains("running"));
+        assert!(camera_1.contains("5.99 Mbps, rtt 31 ms"));
+        assert!(camera_1.ends_with("active"));
+        let camera_2 = text.lines().find(|l| l.contains("Camera 2")).unwrap();
+        assert!(camera_2.contains("no receiver"));
+        assert!(camera_2.ends_with("not registered"));
+    }
+
+    /// The JSON is the contract a script reads, so its shape is pinned here.
+    #[test]
+    fn status_json_has_the_documented_shape() {
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&sample_status()).unwrap()).unwrap();
+        assert_eq!(v["process"]["running"], true);
+        assert_eq!(v["process"]["pid"], 4242);
+        assert_eq!(v["uplink"]["host"], "cloud.example.com");
+        assert_eq!(v["uplink"]["port_source"], "Open Live");
+        assert_eq!(v["uplink_error"], serde_json::Value::Null);
+        assert_eq!(v["strom"]["reachable"], true);
+        assert_eq!(v["open_live"]["reachable"], false);
+        assert_eq!(v["open_live"]["error"], "connection refused");
+        assert_eq!(v["inputs"][0]["flow"]["running"], true);
+        assert_eq!(v["inputs"][0]["uplink"]["rtt_ms"], 31.4);
+        assert_eq!(v["inputs"][0]["source"]["status"], "active");
+        assert_eq!(v["inputs"][1]["uplink"], serde_json::Value::Null);
+        assert_eq!(v["inputs"][1]["source"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn devices_render_as_a_table_and_as_json() {
+        let all = vec![
+            DeviceReport {
+                name: "DeckLink SDI".to_string(),
+                id: "decklink-0".to_string(),
+                virtual_: false,
+            },
+            DeviceReport {
+                name: "OBS Virtual Camera".to_string(),
+                id: "obs-0".to_string(),
+                virtual_: true,
+            },
+        ];
+        let text = render_devices(&all);
+        assert!(text.starts_with("DEVICE"));
+        assert!(text.contains("OBS Virtual Camera"));
+        assert!(text.contains("virtual, skipped unless --all"));
+        assert_eq!(
+            render_devices(&[]),
+            "Strom reports no video sources on this machine.\n"
+        );
+
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&all).unwrap()).unwrap();
+        assert_eq!(v[0]["id"], "decklink-0");
+        assert_eq!(v[0]["virtual"], false);
+        assert_eq!(v[1]["virtual"], true);
+    }
 
     const CLOUD: RangeInclusive<u16> = 47110..=47129;
     const LOCAL: RangeInclusive<u16> = 9000..=9019;

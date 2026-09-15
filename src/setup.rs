@@ -7,8 +7,13 @@
 //! Checking each answer as it is given is the point. A wrong credential caught at
 //! the prompt costs a retype; the same mistake surfacing later looks like a feed that
 //! silently goes nowhere.
+//!
+//! The same settings can be given up front, as flags and environment variables, and
+//! `--non-interactive` then runs the same checks without a terminal and refuses on
+//! anything missing. That is how a script or an agent sets a box up.
 
 use crate::config::{format_port_range, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE};
+use crate::local_strom;
 use crate::openlive::{OpenLiveClient, ServerInfo};
 use crate::osc;
 use crate::strom::{Reachability, StromClient};
@@ -17,6 +22,7 @@ use console::{style, Emoji, Style};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
 use std::io::IsTerminal;
+use std::ops::RangeInclusive;
 use std::path::Path;
 
 const OK: Emoji<'_, '_> = Emoji("✔", "ok");
@@ -152,6 +158,120 @@ fn blank_to_none(answer: String) -> Option<String> {
     Some(answer.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Settings given on the command line. Interactively they become the defaults the
+/// prompts show; with `--non-interactive` they are the answers. Credentials are never
+/// flags, because a flag shows up in process listings and shell history: they come
+/// from `OLI_OPEN_LIVE_API_KEY` and `OLI_STROM_API_KEY`, or for Open Source Cloud from
+/// `OSC_ACCESS_TOKEN` or the CLI's saved login.
+#[derive(Debug, Default, clap::Args)]
+pub struct Answers {
+    /// Never prompt. Take every setting from the flags, the environment, and the
+    /// existing file, check them, and save. Fails on anything missing or wrong.
+    #[arg(long)]
+    pub non_interactive: bool,
+
+    /// Name for this gateway. It prefixes every source name in Open Live.
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Open Live URL. An osaas.io address implies an Open Source Cloud login.
+    #[arg(long)]
+    pub open_live_url: Option<String>,
+
+    /// Do not register sources in Open Live; only stream to the cloud Strom named by
+    /// `--uplink-host`.
+    #[arg(long)]
+    pub no_register: bool,
+
+    /// The cloud Strom to send to. Discovered from Open Live when unset.
+    #[arg(long)]
+    pub uplink_host: Option<String>,
+
+    /// The Strom on this machine, which captures and encodes.
+    #[arg(long)]
+    pub strom_url: Option<String>,
+
+    /// Which end dials: `caller` (this machine dials the cloud; nothing inbound here)
+    /// or `listener` (the cloud dials this machine).
+    #[arg(long)]
+    pub uplink_mode: Option<UplinkMode>,
+
+    /// This machine's address as the cloud sees it. Listener mode only.
+    #[arg(long)]
+    pub public_host: Option<String>,
+
+    /// SRT port range, e.g. `47110-47129`. In caller mode Open Live's published range
+    /// wins; in listener mode these are this machine's own ports.
+    #[arg(long)]
+    pub port_range: Option<String>,
+
+    /// SRT latency in milliseconds. Rule of thumb: 3-4x the round-trip time.
+    #[arg(long)]
+    pub latency_ms: Option<u32>,
+
+    /// Capture resolution, e.g. `1280x720`. `auto` takes what the device offers.
+    #[arg(long)]
+    pub resolution: Option<String>,
+
+    /// Capture framerate, e.g. `25/1`. `auto` takes what the device offers.
+    #[arg(long)]
+    pub framerate: Option<String>,
+
+    /// Video bitrate in kbps.
+    #[arg(long)]
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl Answers {
+    /// Writes the given answers over the loaded settings. Nothing is checked here;
+    /// that is what the interactive or headless pass does next.
+    pub fn apply(&self, cfg: &mut Config) {
+        if let Some(name) = &self.name {
+            cfg.gateway.name = name.trim().to_string();
+        }
+        if let Some(url) = &self.open_live_url {
+            let url = url.trim().to_string();
+            cfg.open_live.auth_mode = infer_auth_mode(&url);
+            cfg.open_live.url = Some(url);
+        }
+        if self.no_register {
+            cfg.open_live.register = false;
+        }
+        if let Some(host) = &self.uplink_host {
+            cfg.uplink.host = blank_to_none(host.clone());
+        }
+        if let Some(url) = &self.strom_url {
+            cfg.strom.url = url.trim().to_string();
+        }
+        if let Some(mode) = self.uplink_mode {
+            cfg.uplink.mode = mode;
+        }
+        if let Some(host) = &self.public_host {
+            cfg.uplink.public_host = blank_to_none(host.clone());
+        }
+        if let Some(range) = &self.port_range {
+            cfg.uplink.port_range = blank_to_none(range.clone());
+        }
+        if let Some(ms) = self.latency_ms {
+            cfg.uplink.latency_ms = ms;
+        }
+        if let Some(res) = &self.resolution {
+            cfg.capture.video_resolution = auto_to_none(res);
+        }
+        if let Some(rate) = &self.framerate {
+            cfg.capture.video_framerate = auto_to_none(rate);
+        }
+        if let Some(kbps) = self.bitrate_kbps {
+            cfg.video.bitrate_kbps = kbps;
+        }
+    }
+}
+
+/// `auto` and blank both mean "take what the device offers", stored as unset.
+fn auto_to_none(value: &str) -> Option<String> {
+    blank_to_none(value.to_string()).filter(|v| !v.eq_ignore_ascii_case("auto"))
+}
+
 /// Which kind of credential an Open Live address implies. An Open Source Cloud
 /// instance sits behind a proxy that rejects a personal access token presented
 /// directly, so it needs the exchange; anything else takes a static key. Inferring it
@@ -261,31 +381,7 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     // corrected while the operator is still looking at it.
     let mut published = None;
     match check_open_live(cfg).await {
-        Ok(Some(info)) => {
-            match &info.strom_host {
-                Some(host) if cfg.uplink.host.is_none() => {
-                    good(format!("reached Open Live; feeds will go to its Strom at {host}"))
-                }
-                Some(host) => good(format!("reached Open Live; its Strom is {host}")),
-                None => warn(
-                    "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
-                ),
-            }
-            match &info.srt_port_range {
-                Some(range) => good(format!(
-                    "its Strom takes SRT on ports {}, which callers use",
-                    format_port_range(range)
-                )),
-                None if info.lease_pending() => warn(
-                    "Open Live is still waiting for its SRT port range from Strom; it retries every minute, so run setup again later or set a range here",
-                ),
-                None => note("Open Live publishes no SRT port range; one has to be set here"),
-            }
-            published = info.srt_port_range;
-        }
-        Ok(None) => warn(
-            "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
-        ),
+        Ok(info) => published = report_server_info(cfg, info),
         Err(err) => fail(format!("could not reach Open Live: {err:#}")),
     }
 
@@ -392,6 +488,186 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     cfg.video.bitrate_kbps = ask_number("Video bitrate (kbps)", cfg.video.bitrate_kbps).await?;
 
     Ok(true)
+}
+
+/// What Open Live said about its cloud Strom, read back to the operator. Returns the
+/// SRT port range it publishes, which callers use.
+fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<RangeInclusive<u16>> {
+    let Some(info) = info else {
+        warn(
+            "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
+        );
+        return None;
+    };
+    match &info.strom_host {
+        Some(host) if cfg.uplink.host.is_none() => {
+            good(format!("reached Open Live; feeds will go to its Strom at {host}"))
+        }
+        Some(host) => good(format!("reached Open Live; its Strom is {host}")),
+        None => warn(
+            "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
+        ),
+    }
+    match &info.srt_port_range {
+        Some(range) => good(format!(
+            "its Strom takes SRT on ports {}, which callers use",
+            format_port_range(range)
+        )),
+        None if info.lease_pending() => warn(
+            "Open Live is still waiting for its SRT port range from Strom; it retries every minute, so run setup again later or set a range here",
+        ),
+        None => note("Open Live publishes no SRT port range; one has to be set here"),
+    }
+    info.srt_port_range
+}
+
+/// The same checks as the prompts, with nothing asked. Every setting must already be
+/// in place, from the flags, the environment, or the file; anything missing or any
+/// check that fails is an error, because nobody is there to fix it on the spot. The
+/// one thing allowed to be absent is a running Strom, when the gateway is set to
+/// start its own.
+pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
+    println!(
+        "{}",
+        style("Open Live Ingest setup, non-interactive").bold()
+    );
+
+    section("Gateway");
+    if cfg.gateway.name.trim().is_empty() {
+        cfg.gateway.name = crate::config::hostname().unwrap_or_else(|| "gateway".to_string());
+    }
+    good(format!("gateway name {}", style(&cfg.gateway.name).bold()));
+
+    section("Open Live");
+    let mut published = None;
+    if !cfg.open_live.register {
+        note("registration is off; only streaming to the cloud Strom");
+        if cfg
+            .uplink
+            .host
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            bail!("with --no-register there is nobody to ask where the cloud Strom is: pass --uplink-host");
+        }
+    } else {
+        let url = cfg
+            .open_live
+            .url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .context("no Open Live URL: pass --open-live-url, or set OLI_OPEN_LIVE_URL")?;
+        if cfg.open_live.auth_mode == AuthMode::Osc {
+            let (token, source, is_login) = headless_osc_token(cfg)?;
+            good(format!("Open Source Cloud credential from {source}"));
+            if let Some(info) = osc::inspect(&token) {
+                if info.is_expired() {
+                    bail!("that Open Source Cloud token has expired");
+                }
+            }
+            describe_token(&token, is_login);
+        }
+        let info = check_open_live(cfg)
+            .await
+            .with_context(|| format!("could not reach Open Live at {url}"))?;
+        published = report_server_info(cfg, info);
+    }
+
+    section("Local Strom");
+    match probe_strom(cfg).await {
+        Reachability::Ok { video_sources } => good(format!(
+            "reached Strom at {}; it can see {video_sources} video source(s)",
+            cfg.strom.url
+        )),
+        Reachability::NeedsCredential => bail!(
+            "Strom at {} wants a credential; set OLI_STROM_API_KEY to its STROM_API_KEY",
+            cfg.strom.url
+        ),
+        Reachability::Unreachable(err) if cfg.strom.manage => {
+            let binary = local_strom::locate_binary(&cfg.strom.binary)?;
+            note(format!(
+                "nothing listening at {} ({err}); up will start {}",
+                cfg.strom.url,
+                binary.display()
+            ));
+        }
+        Reachability::Unreachable(err) => bail!(
+            "could not reach Strom at {}: {err}. Start it, or set strom.manage = true to let the gateway start one",
+            cfg.strom.url
+        ),
+    }
+
+    section("Uplink");
+    match (&published, cfg.uplink.mode) {
+        (Some(range), UplinkMode::Caller) => {
+            good(format!(
+                "caller; SRT port range {} comes from Open Live",
+                format_port_range(range)
+            ));
+            if let Some(local) = cfg.uplink.port_range.as_deref() {
+                note(format!(
+                    "port_range = {local:?} in the settings is ignored while Open Live publishes one"
+                ));
+            }
+        }
+        (None, UplinkMode::Caller) => match cfg.uplink.local_ports()? {
+            Some(range) => good(format!(
+                "caller; SRT port range {} from the settings",
+                format_port_range(&range)
+            )),
+            None => bail!(
+                "Open Live publishes no SRT port range, so one is needed: pass --port-range, e.g. {SUGGESTED_PORT_RANGE}"
+            ),
+        },
+        (_, UplinkMode::Listener) => {
+            // validate() insists on both of these; the message here says which flag.
+            let host = cfg
+                .uplink
+                .public_host
+                .as_deref()
+                .filter(|h| !h.trim().is_empty())
+                .context("listener mode needs this machine's public address: pass --public-host")?;
+            let range = cfg
+                .uplink
+                .local_ports()?
+                .context("listener mode needs this machine's own SRT ports: pass --port-range")?;
+            good(format!(
+                "listener on {host}, SRT ports {}",
+                format_port_range(&range)
+            ));
+        }
+    }
+    good(format!("SRT latency {} ms", cfg.uplink.latency_ms));
+
+    section("Capture");
+    let or_auto = |v: &Option<String>| v.clone().unwrap_or_else(|| "auto".to_string());
+    good(format!(
+        "resolution {}, framerate {}, {} kbps",
+        or_auto(&cfg.capture.video_resolution),
+        or_auto(&cfg.capture.video_framerate),
+        cfg.video.bitrate_kbps
+    ));
+    Ok(())
+}
+
+/// The Open Source Cloud credential a headless setup can use, in the order the
+/// running gateway would pick them, and where it came from.
+fn headless_osc_token(cfg: &Config) -> Result<(String, &'static str, bool)> {
+    if let Some(token) = cfg.open_live.api_key.clone() {
+        return Ok((token, "the settings (a personal access token)", false));
+    }
+    if let Some(token) = osc::env_token() {
+        return Ok((token, osc::ENV_TOKEN, false));
+    }
+    if let Some(token) = osc::login_token() {
+        return Ok((token, "the OSC CLI's saved login", true));
+    }
+    bail!(
+        "an Open Source Cloud instance needs a credential: set {}, run `{}`, or set OLI_OPEN_LIVE_API_KEY to a personal access token",
+        osc::ENV_TOKEN,
+        osc::LOGIN_COMMAND
+    )
 }
 
 /// Says where the settings went, in the same voice as the prompts.
@@ -568,7 +844,6 @@ async fn probe_strom(cfg: &Config) -> Reachability {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -592,6 +867,80 @@ mod tests {
             infer_auth_mode("https://myosaas.iohost.net"),
             AuthMode::Direct
         );
+    }
+
+    fn answers() -> Answers {
+        Answers {
+            name: Some("  Venue  ".to_string()),
+            open_live_url: Some("https://venue.osaas.io".to_string()),
+            strom_url: Some("http://127.0.0.1:9090".to_string()),
+            uplink_mode: Some(UplinkMode::Listener),
+            public_host: Some("198.51.100.7".to_string()),
+            port_range: Some("47110-47129".to_string()),
+            latency_ms: Some(400),
+            resolution: Some("1280x720".to_string()),
+            framerate: Some("auto".to_string()),
+            bitrate_kbps: Some(4000),
+            ..Answers::default()
+        }
+    }
+
+    #[test]
+    fn answers_land_in_the_settings_and_infer_the_auth_mode() {
+        let mut cfg = Config::default();
+        answers().apply(&mut cfg);
+        assert_eq!(cfg.gateway.name, "Venue");
+        assert_eq!(cfg.open_live.url.as_deref(), Some("https://venue.osaas.io"));
+        assert_eq!(cfg.open_live.auth_mode, AuthMode::Osc);
+        assert!(cfg.open_live.register);
+        assert_eq!(cfg.strom.url, "http://127.0.0.1:9090");
+        assert_eq!(cfg.uplink.mode, UplinkMode::Listener);
+        assert_eq!(cfg.uplink.public_host.as_deref(), Some("198.51.100.7"));
+        assert_eq!(cfg.uplink.port_range.as_deref(), Some("47110-47129"));
+        assert_eq!(cfg.uplink.latency_ms, 400);
+        assert_eq!(cfg.capture.video_resolution.as_deref(), Some("1280x720"));
+        assert_eq!(cfg.capture.video_framerate, None, "auto means unset");
+        assert_eq!(cfg.video.bitrate_kbps, 4000);
+    }
+
+    /// A flag that is not given leaves the loaded value alone, so a partial set of
+    /// flags refines an existing file instead of resetting it.
+    #[test]
+    fn absent_answers_keep_the_loaded_settings() {
+        let mut cfg = named();
+        cfg.open_live.url = Some("http://127.0.0.1:3000".to_string());
+        cfg.capture.video_resolution = Some("1920x1080".to_string());
+        cfg.video.bitrate_kbps = 8000;
+        Answers {
+            latency_ms: Some(120),
+            ..Answers::default()
+        }
+        .apply(&mut cfg);
+        assert_eq!(cfg.gateway.name, "Venue");
+        assert_eq!(cfg.open_live.url.as_deref(), Some("http://127.0.0.1:3000"));
+        assert_eq!(cfg.open_live.auth_mode, AuthMode::Direct);
+        assert_eq!(cfg.capture.video_resolution.as_deref(), Some("1920x1080"));
+        assert_eq!(cfg.video.bitrate_kbps, 8000);
+        assert_eq!(cfg.uplink.latency_ms, 120);
+    }
+
+    #[test]
+    fn no_register_turns_registration_off_and_blank_clears_optional_values() {
+        let mut cfg = named();
+        cfg.uplink.public_host = Some("old".to_string());
+        cfg.capture.video_resolution = Some("1280x720".to_string());
+        Answers {
+            no_register: true,
+            uplink_host: Some("cloud.example.com".to_string()),
+            public_host: Some("  ".to_string()),
+            resolution: Some("".to_string()),
+            ..Answers::default()
+        }
+        .apply(&mut cfg);
+        assert!(!cfg.open_live.register);
+        assert_eq!(cfg.uplink.host.as_deref(), Some("cloud.example.com"));
+        assert_eq!(cfg.uplink.public_host, None);
+        assert_eq!(cfg.capture.video_resolution, None);
     }
 
     fn named() -> Config {
