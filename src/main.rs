@@ -63,11 +63,24 @@ enum Command {
     /// Stop a running gateway and remove its flows and Open Live sources.
     Down,
     /// Report what is running, from Strom and Open Live directly.
-    Status,
+    Status {
+        /// Machine-readable output, one JSON document.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the capture devices Strom can see, without starting anything.
-    Devices,
-    /// Ask for settings and store them without starting anything.
-    Setup,
+    Devices {
+        /// Machine-readable output, one JSON document.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask for settings and store them without starting anything. Flags pre-answer
+    /// the questions; with --non-interactive nothing is asked.
+    #[command(
+        after_help = "Credentials are never flags. Set OLI_OPEN_LIVE_API_KEY and OLI_STROM_API_KEY, \
+or for Open Source Cloud set OSC_ACCESS_TOKEN or run `npx @osaas/cli login`."
+    )]
+    Setup(setup::Answers),
     /// Check the settings file and exit.
     Check,
 }
@@ -96,8 +109,15 @@ async fn main() -> Result<()> {
             println!("Settings at {} are valid.", path.display());
             Ok(())
         }
-        Command::Setup => {
-            if setup::configure(&mut cfg, true).await? {
+        Command::Setup(answers) => {
+            answers.apply(&mut cfg);
+            let changed = if answers.non_interactive {
+                setup::configure_headless(&mut cfg).await?;
+                true
+            } else {
+                setup::configure(&mut cfg, true).await?
+            };
+            if changed {
                 config::save(&path, &cfg)?;
                 setup::report_saved(&path);
             }
@@ -120,12 +140,59 @@ async fn main() -> Result<()> {
             config::validate(&cfg)?;
             run::down(cfg).await
         }
-        Command::Status => {
+        Command::Status { json } => {
             config::validate(&cfg)?;
-            run::status(cfg).await
+            run::status(cfg, json).await
         }
         // Listing devices needs only Strom, so an unfinished Open Live setup must not
         // stand in the way.
-        Command::Devices => run::devices(cfg).await,
+        Command::Devices { json } => run::devices(cfg, json).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::UplinkMode;
+
+    #[test]
+    fn setup_takes_its_answers_as_flags_but_never_a_credential() {
+        let cli = Cli::try_parse_from([
+            "open-live-ingest",
+            "setup",
+            "--non-interactive",
+            "--name",
+            "Venue",
+            "--open-live-url",
+            "https://open-live.example.com",
+            "--uplink-mode",
+            "listener",
+            "--public-host",
+            "198.51.100.7",
+            "--port-range",
+            "47110-47129",
+        ])
+        .expect("parses");
+        let Some(Command::Setup(answers)) = cli.command else {
+            panic!("not setup");
+        };
+        assert!(answers.non_interactive);
+        assert_eq!(answers.name.as_deref(), Some("Venue"));
+        assert_eq!(answers.uplink_mode, Some(UplinkMode::Listener));
+        assert_eq!(answers.public_host.as_deref(), Some("198.51.100.7"));
+
+        for secret in ["--open-live-api-key", "--strom-api-key", "--passphrase"] {
+            assert!(
+                Cli::try_parse_from(["open-live-ingest", "setup", secret, "x"]).is_err(),
+                "{secret} must not be a flag"
+            );
+        }
+    }
+
+    #[test]
+    fn status_and_devices_take_json() {
+        for sub in ["status", "devices"] {
+            Cli::try_parse_from(["open-live-ingest", sub, "--json"]).expect(sub);
+        }
     }
 }

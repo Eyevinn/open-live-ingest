@@ -173,7 +173,7 @@ fn tail_of_log(path: &Path) -> String {
 }
 
 /// An explicit path, or a name on `PATH`.
-fn locate_binary(configured: &str) -> Result<PathBuf> {
+pub fn locate_binary(configured: &str) -> Result<PathBuf> {
     const INSTALL_HINT: &str =
         "Install Strom, or set [strom] binary to its path:\n    curl -sSL https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh | bash";
     let candidate = Path::new(configured);
