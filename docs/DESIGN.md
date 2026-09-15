@@ -1,4 +1,4 @@
-# Open Live Gateway: Design
+# Open Live Ingest: Design
 
 > The code is the source of truth. This file records the decisions and the reasoning behind them,
 > not the current implementation.

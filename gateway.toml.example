@@ -1,11 +1,11 @@
-# Open Live Gateway settings.
+# Open Live Ingest settings.
 #
-# Normally written by `open-live-gateway setup`, which asks for each value and checks
+# Normally written by `open-live-ingest setup`, which asks for each value and checks
 # it. Written mode 0600: it holds the Open Live credential and any SRT passphrase.
-# The file lives per user (~/.config/open-live-gateway/gateway.toml on Linux,
-# ~/Library/Application Support/open-live-gateway/gateway.toml on macOS), or wherever
-# --config points. Environment variables override the file: OLG_OPEN_LIVE_URL,
-# OLG_OPEN_LIVE_API_KEY, OLG_OPEN_LIVE_AUTH_MODE, OLG_STROM_URL, OLG_STROM_API_KEY.
+# The file lives per user (~/.config/open-live-ingest/gateway.toml on Linux,
+# ~/Library/Application Support/open-live-ingest/gateway.toml on macOS), or wherever
+# --config points. Environment variables override the file: OLI_OPEN_LIVE_URL,
+# OLI_OPEN_LIVE_API_KEY, OLI_OPEN_LIVE_AUTH_MODE, OLI_STROM_URL, OLI_STROM_API_KEY.
 # Unknown keys are an error, so a typo cannot silently fall back to a default.
 
 [gateway]

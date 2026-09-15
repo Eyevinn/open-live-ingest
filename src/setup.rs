@@ -201,7 +201,7 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
         bail!("settings are incomplete and there is no terminal to ask on. Run it interactively once, or fill in the settings file.");
     }
 
-    println!("{}", style("Open Live Gateway setup").bold());
+    println!("{}", style("Open Live Ingest setup").bold());
     note("Enter accepts the highlighted value. Lists are picked with the arrow keys.");
 
     section("Gateway");

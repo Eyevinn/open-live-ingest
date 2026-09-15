@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
-const ENV_OPEN_LIVE_URL: &str = "OLG_OPEN_LIVE_URL";
-const ENV_OPEN_LIVE_API_KEY: &str = "OLG_OPEN_LIVE_API_KEY";
-const ENV_OPEN_LIVE_AUTH_MODE: &str = "OLG_OPEN_LIVE_AUTH_MODE";
-const ENV_STROM_URL: &str = "OLG_STROM_URL";
-const ENV_STROM_API_KEY: &str = "OLG_STROM_API_KEY";
+const ENV_OPEN_LIVE_URL: &str = "OLI_OPEN_LIVE_URL";
+const ENV_OPEN_LIVE_API_KEY: &str = "OLI_OPEN_LIVE_API_KEY";
+const ENV_OPEN_LIVE_AUTH_MODE: &str = "OLI_OPEN_LIVE_AUTH_MODE";
+const ENV_STROM_URL: &str = "OLI_STROM_URL";
+const ENV_STROM_API_KEY: &str = "OLI_STROM_API_KEY";
 
 // Unknown keys are an error rather than silently ignored: a file in an older layout
 // would otherwise load as all defaults and stream to the wrong ports.
@@ -48,7 +48,7 @@ impl Gateway {
             .filter(|id| !id.is_empty())
         {
             Some(id) => id.to_string(),
-            None => hostname().unwrap_or_else(|| "open-live-gateway".to_string()),
+            None => hostname().unwrap_or_else(|| "open-live-ingest".to_string()),
         }
     }
 }
@@ -379,7 +379,7 @@ pub fn user_dir() -> PathBuf {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     };
     base.unwrap_or_else(|| PathBuf::from("."))
-        .join("open-live-gateway")
+        .join("open-live-ingest")
 }
 
 pub fn default_path() -> PathBuf {

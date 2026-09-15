@@ -1,4 +1,4 @@
-| The local Strom's `STROM_API_KEY` | the gateway, only if an adopted Strom runs with auth | only when Strom actually refuses without one |# open-live-gateway
+# open-live-ingest
 
 A contribution gateway for [Open Live](https://github.com/Eyevinn/open-live). It runs on a Linux
 box or a laptop at the venue alongside a local [Strom](https://github.com/Eyevinn/strom), and drives
@@ -24,16 +24,16 @@ end of the SRT link dials, what is deliberately left to Strom, and what was remo
 ## Running it
 
 ```bash
-open-live-gateway                  # same as `up`
-open-live-gateway up --devices "FaceTime,DeckLink"   # only these, by name fragment or id
-open-live-gateway up --all         # include virtual devices, skipped by default
-open-live-gateway up --test        # a test pattern and tone, to commission the link
-open-live-gateway up --reconfigure # ask for every setting again
-open-live-gateway status           # what is running, from Strom and Open Live directly
-open-live-gateway down             # stop and remove the flows and sources
-open-live-gateway devices          # what Strom can see
-open-live-gateway setup            # ask for settings without starting anything
-open-live-gateway check            # validate the settings file
+open-live-ingest                  # same as `up`
+open-live-ingest up --devices "FaceTime,DeckLink"   # only these, by name fragment or id
+open-live-ingest up --all         # include virtual devices, skipped by default
+open-live-ingest up --test        # a test pattern and tone, to commission the link
+open-live-ingest up --reconfigure # ask for every setting again
+open-live-ingest status           # what is running, from Strom and Open Live directly
+open-live-ingest down             # stop and remove the flows and sources
+open-live-ingest devices          # what Strom can see
+open-live-ingest setup            # ask for settings without starting anything
+open-live-ingest check            # validate the settings file
 ```
 
 Run it and it asks for what it needs, checks each answer, remembers it, then registers every capture
@@ -64,19 +64,19 @@ stops it again on the way out. `down` also stops a Strom left behind by a hard k
 ## Settings
 
 Written by setup to a per-user file, mode 0600 because it holds the Open Live credential:
-`~/.config/open-live-gateway/gateway.toml` on Linux, `~/Library/Application Support/open-live-gateway/gateway.toml`
+`~/.config/open-live-ingest/gateway.toml` on Linux, `~/Library/Application Support/open-live-ingest/gateway.toml`
 on macOS, or wherever `--config` points. The same format can be written by hand; see
 [`gateway.toml.example`](gateway.toml.example) for every option.
 
 | Variable | Overrides |
 |---|---|
-| `OLG_CONFIG` | settings file path |
-| `OLG_STROM_URL` | `strom.url` |
-| `OLG_STROM_API_KEY` | `strom.api_key` |
-| `OLG_OPEN_LIVE_URL` | `open_live.url` |
-| `OLG_OPEN_LIVE_API_KEY` | `open_live.api_key` |
-| `OLG_OPEN_LIVE_AUTH_MODE` | `open_live.auth_mode` (`direct` or `osc`) |
-| `OLG_LOG_LEVEL` | `log.level` |
+| `OLI_CONFIG` | settings file path |
+| `OLI_STROM_URL` | `strom.url` |
+| `OLI_STROM_API_KEY` | `strom.api_key` |
+| `OLI_OPEN_LIVE_URL` | `open_live.url` |
+| `OLI_OPEN_LIVE_API_KEY` | `open_live.api_key` |
+| `OLI_OPEN_LIVE_AUTH_MODE` | `open_live.auth_mode` (`direct` or `osc`) |
+| `OLI_LOG_LEVEL` | `log.level` |
 
 In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live leases a range
 from that Strom and publishes it on `GET /api/v1/server-info` together with the Strom host, and the
@@ -98,7 +98,7 @@ Setup then shows the workspace the token belongs to, lists that workspace's Open
 pick from, and checks the pick before moving on. A typed address is always the last entry.
 
 A CLI login lasts one hour, which covers setup but not a show, so for `up` use `env` or `paste`. A
-key in the settings or in `OLG_OPEN_LIVE_API_KEY` wins over the environment, which wins over the
+key in the settings or in `OLI_OPEN_LIVE_API_KEY` wins over the environment, which wins over the
 saved login; the gateway reads the login again at each token exchange, so signing in again renews a
 running gateway. On a box with no browser, paste a token, or copy `~/.osc/token` over from a machine
 you signed in on.

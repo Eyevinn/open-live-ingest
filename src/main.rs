@@ -1,4 +1,4 @@
-//! Open Live Gateway.
+//! Open Live Ingest.
 //!
 //! Streams the capture devices on this machine into Open Live. Run it and it asks for
 //! whatever it needs, checks the answers, remembers them, then registers every device
@@ -23,14 +23,14 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "open-live-gateway", version, about)]
+#[command(name = "open-live-ingest", version, about)]
 struct Cli {
     /// Settings file. Defaults to a per-user location and is written on first setup.
-    #[arg(short, long, env = "OLG_CONFIG", global = true)]
+    #[arg(short, long, env = "OLI_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// Log level (`trace`, `debug`, `info`, `warn`, `error`).
-    #[arg(long, env = "OLG_LOG_LEVEL", global = true)]
+    #[arg(long, env = "OLI_LOG_LEVEL", global = true)]
     log_level: Option<String>,
 
     #[command(subcommand)]

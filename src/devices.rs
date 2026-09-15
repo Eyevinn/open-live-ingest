@@ -62,7 +62,7 @@ pub fn choose(
         match matches.as_slice() {
             [device] => chosen.push((*device).clone()),
             [] => {
-                bail!("no device matches {wanted:?}. Run `open-live-gateway devices` to see them.")
+                bail!("no device matches {wanted:?}. Run `open-live-ingest devices` to see them.")
             }
             // Starting the wrong camera is worse than asking again with a longer name.
             several => bail!(

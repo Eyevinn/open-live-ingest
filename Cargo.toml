@@ -1,9 +1,9 @@
 [package]
-name = "open-live-gateway"
+name = "open-live-ingest"
 version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Eyevinn/open-live-gateway"
+repository = "https://github.com/Eyevinn/open-live-ingest"
 description = "SDI/UVC contribution gateway for Open Live"
 
 [dependencies]

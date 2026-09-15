@@ -69,7 +69,7 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         // A running Strom that wants a credential is still a running Strom. Starting
         // a second one would fight it for the port.
         Reachability::NeedsCredential => bail!(
-            "Strom at {} wants a credential.\n\nIt runs with STROM_API_KEY set. Run `open-live-gateway setup` and enter that key when asked.",
+            "Strom at {} wants a credential.\n\nIt runs with STROM_API_KEY set. Run `open-live-ingest setup` and enter that key when asked.",
             cfg.strom.url
         ),
         Reachability::Unreachable(_) => {}
