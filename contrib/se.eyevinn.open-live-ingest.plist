@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent: keeps `open-live-ingest up` running and starts it at login.
+  Install with:
+
+    sed "s|REPLACE_ME|$USER|g" contrib/se.eyevinn.open-live-ingest.plist \
+        > ~/Library/LaunchAgents/se.eyevinn.open-live-ingest.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/se.eyevinn.open-live-ingest.plist
+
+  Stop and remove with:
+
+    launchctl bootout gui/$(id -u)/se.eyevinn.open-live-ingest
+
+  Logs: ~/Library/Logs/open-live-ingest.log
+
+  Run `open-live-ingest setup` as the same user first. launchd does not expand ~, hence
+  the sed. Adjust the program path if the binary was installed somewhere other than
+  /usr/local/bin, which is where install.sh puts it on a Mac.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>se.eyevinn.open-live-ingest</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/open-live-ingest</string>
+        <string>up</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>OLI_LOG_LEVEL</key>
+        <string>info</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/open-live-ingest.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/open-live-ingest.log</string>
+</dict>
+</plist>

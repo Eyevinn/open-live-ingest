@@ -105,20 +105,27 @@ you signed in on.
 
 ## Install
 
-Each [release](https://github.com/Eyevinn/open-live-ingest/releases) carries a static binary for
-Linux (x86_64 and aarch64) and macOS (Apple silicon and Intel). Unpack it and put the binary on
-your `PATH`:
+One command installs the latest release and, unless one is already on `PATH`, the Strom release
+it is built against, GStreamer included. Nothing is asked, so it works from a script too:
 
 ```bash
-tar xzf open-live-ingest-v*-x86_64-unknown-linux-musl.tar.gz
-sudo install open-live-ingest-*/open-live-ingest /usr/local/bin/
+curl -fsSL https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/install.sh | sh
 ```
 
-Or build it yourself with Rust 1.97.1, pinned in `rust-toolchain.toml`:
+Binaries land in `/usr/local/bin` when it is writable, else `~/.local/bin`. `INSTALL_DIR`,
+`VERSION`, and `SKIP_STROM=true` override that; the script's header lists every knob.
 
-```bash
-cargo build --release   # target/release/open-live-ingest
-```
+Other ways in:
+
+- **By hand.** Each [release](https://github.com/Eyevinn/open-live-ingest/releases) carries a
+  static binary for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), plus `SHA256SUMS`
+  and a signed build provenance you can check with `gh attestation verify`. The asset names do
+  not carry a version, so `releases/latest/download/open-live-ingest-<target>.tar.gz` is stable.
+- **Rust users.** `cargo binstall open-live-ingest` fetches the same tarball. `cargo build
+  --release` builds from source with Rust 1.97.1, pinned in `rust-toolchain.toml`.
+
+To keep it running across reboots, [`contrib/`](contrib/) has a systemd user unit and a launchd
+agent, each with install steps in its header.
 
 ## Requirements
 
@@ -138,7 +145,8 @@ git tag v0.3.0 && git push origin v0.3.0
 ```
 
 The release workflow refuses a tag that does not match `Cargo.toml`, builds the four binaries,
-and publishes them with a checksum file and generated notes. Run the workflow by hand from the
+and publishes them with a checksum file, build provenance, and generated notes. When the
+`strom-types` pin moves, move `STROM_VERSION` in `install.sh` with it; a test checks they agree. Run the workflow by hand from the
 Actions tab to build the artifacts without publishing.
 
 ## License

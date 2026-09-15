@@ -30,3 +30,9 @@ libc = "0.2"
 # v5 for flow ids derived from gateway id + input id, so nothing has to be stored to
 # find a flow again.
 uuid = { version = "1", features = ["v5"] }
+
+# `cargo binstall open-live-ingest` fetches the release tarball instead of compiling.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
