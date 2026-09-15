@@ -51,10 +51,11 @@ jobs:
 
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
+      # No version in the asset name, so releases/latest/download/<asset> is a stable
+      # URL. The tag names the version; so does the binary.
       - name: Package
         run: |
-          version="${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
-          name="$BIN-$version-${{ matrix.target }}"
+          name="$BIN-${{ matrix.target }}"
           mkdir "$name"
           cp "target/${{ matrix.target }}/release/$BIN" LICENSE-MIT LICENSE-APACHE README.md gateway.toml.example "$name/"
           tar czf "$name.tar.gz" "$name"
@@ -72,6 +73,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -79,6 +82,10 @@ jobs:
           merge-multiple: true
       - name: Checksums
         run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      # Signed build provenance for each tarball, checked with `gh attestation verify`.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,31 @@
+# systemd user unit: keeps `open-live-ingest up` running and brings it back after a
+# reboot or a crash. Install with:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp contrib/open-live-ingest.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now open-live-ingest
+#   sudo loginctl enable-linger "$USER"   # start at boot, without a login
+#
+# Logs: journalctl --user -u open-live-ingest -f
+#
+# A user unit, because the settings file is per user. Run `open-live-ingest setup`
+# as the same user first. ~/.local/bin is where install.sh puts the binary for a
+# non-root user; change ExecStart if it lives elsewhere.
+
+[Unit]
+Description=Open Live Ingest: contribution gateway driving a local Strom
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/open-live-ingest up
+# SIGTERM makes `up` remove its flows and sources before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+Environment=OLI_LOG_LEVEL=info
+
+[Install]
+WantedBy=default.target
