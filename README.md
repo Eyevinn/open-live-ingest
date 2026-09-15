@@ -21,6 +21,9 @@ tool that means a venue is one command rather than a set of flows built by hand 
 See [docs/DESIGN.md](docs/DESIGN.md) for the reasoning: why media never transits Open Live, which
 end of the SRT link dials, what is deliberately left to Strom, and what was removed.
 
+Setting a box up from scratch? [`docs/QUICKSTART.md`](docs/QUICKSTART.md) is the exact command
+sequence, with what success and each failure look like. It works for a person and for an agent.
+
 ## Running it
 
 ```bash
