@@ -3,7 +3,8 @@
 //! Streams the capture devices on this machine into Open Live. Run it and it asks for
 //! whatever it needs, checks the answers, remembers them, then registers every device
 //! it finds and starts sending. Built to be driven over SSH: prompts on a plain
-//! terminal, no window, no full-screen UI.
+//! terminal, no window. The one full-screen view, `status --watch`, is read-only and
+//! hands the terminal back when it quits.
 //!
 //! Strom does the media: capture, encode, mux, SRT. This drives it over HTTP and
 //! registers the result with Open Live. See docs/DESIGN.md for the reasoning.
@@ -17,6 +18,7 @@ mod osc;
 mod run;
 mod setup;
 mod strom;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -65,8 +67,13 @@ enum Command {
     /// Report what is running, from Strom and Open Live directly.
     Status {
         /// Machine-readable output, one JSON document.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "watch")]
         json: bool,
+
+        /// Keep watching: a full-screen view that refreshes every few seconds, with
+        /// the uplink rate, round-trip time, and losses per input. `q` quits.
+        #[arg(long)]
+        watch: bool,
     },
     /// List the capture devices Strom can see, without starting anything.
     Devices {
@@ -94,14 +101,16 @@ async fn main() -> Result<()> {
     if let Some(level) = &cli.log_level {
         cfg.log.level = level.clone();
     }
-    config::init_tracing(&cfg.log.level);
-
     let command = cli.command.unwrap_or(Command::Up {
         all: false,
         devices: None,
         test: false,
         reconfigure: false,
     });
+    // The watch view owns the screen; a log line written under it would tear it.
+    if !matches!(command, Command::Status { watch: true, .. }) {
+        config::init_tracing(&cfg.log.level);
+    }
 
     match command {
         Command::Check => {
@@ -140,9 +149,13 @@ async fn main() -> Result<()> {
             config::validate(&cfg)?;
             run::down(cfg).await
         }
-        Command::Status { json } => {
+        Command::Status { json, watch } => {
             config::validate(&cfg)?;
-            run::status(cfg, json).await
+            if watch {
+                tui::watch(cfg).await
+            } else {
+                run::status(cfg, json).await
+            }
         }
         // Listing devices needs only Strom, so an unfinished Open Live setup must not
         // stand in the way.
@@ -194,5 +207,20 @@ mod tests {
         for sub in ["status", "devices"] {
             Cli::try_parse_from(["open-live-ingest", sub, "--json"]).expect(sub);
         }
+    }
+
+    /// The watch view draws a screen and JSON is a document; one command cannot
+    /// produce both.
+    #[test]
+    fn status_watches_or_prints_json_but_not_both() {
+        let cli = Cli::try_parse_from(["open-live-ingest", "status", "--watch"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Status {
+                watch: true,
+                json: false
+            })
+        ));
+        assert!(Cli::try_parse_from(["open-live-ingest", "status", "--watch", "--json"]).is_err());
     }
 }

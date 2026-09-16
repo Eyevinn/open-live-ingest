@@ -173,6 +173,15 @@ Logs: `~/Library/Logs/open-live-ingest.log`.
 ## 6. Verify
 
 ```bash
+open-live-ingest status --watch
+```
+
+A full-screen view that refreshes every two seconds. Each input shows its flow state, its uplink
+(`no receiver` until the source is assigned to a production, `on air` once bytes are leaving), the
+send rate, round-trip time, and losses, and its Open Live source status. Anything wrong is listed
+under the table. Press `q` to leave. For a script, or to paste into a ticket:
+
+```bash
 open-live-ingest status --json
 ```
 

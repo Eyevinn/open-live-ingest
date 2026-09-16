@@ -8,6 +8,7 @@ Strom does the media.
 - `src/strom.rs`, `src/openlive.rs`: the two HTTP clients.
 - `src/devices.rs`: from Strom's device list to inputs with names and ports.
 - `src/run.rs`: `up`, `down`, `status`, `devices`.
+- `src/tui.rs`: `status --watch`, the read-only full-screen view over the status report.
 - `src/setup.rs`: interactive setup.
 - `src/local_strom.rs`: adopt a running Strom, or start and later stop a headless one.
 

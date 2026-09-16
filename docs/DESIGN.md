@@ -152,6 +152,15 @@ deployment tool that injects one must not be overridden by whoever last signed i
 typed address and a pasted token remain the way in on a machine with no browser, since the login's
 redirect lands on the machine running the CLI.
 
+**`status --watch` is the one full-screen view, and it only looks.** Someone who has just logged
+in over SSH wants to know in a glance whether the venue is on air, and a table printed once cannot
+say that: the proof of delivery is bytes moving between two polls, and the health of a link is a
+trend, not a number. So the watch view polls the same report `status` prints, every two seconds,
+and adds what only a second look can tell. It keeps the rest of the tool's rules: nothing on the
+screen can start, stop, or register anything, no state is kept beyond the samples in memory, it
+refuses to draw on a pipe, and it hands the terminal back on quit, on error, and on panic. Logging
+is not initialised under it, since a log line written into the alternate screen would tear it.
+
 **`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
 SIGHUP does not: a closed SSH session must not take a venue off air. A deliberate stop stops, an
 accident does not. This replaced an earlier daemon model in which flows were meant to outlive the
