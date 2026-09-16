@@ -849,70 +849,80 @@ pub async fn status(cfg: Config, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Everything `status` reports, gathered once and rendered as text or JSON.
+/// Everything `status` reports, gathered once and rendered as text or JSON. `status
+/// --watch` gathers it again every few seconds and draws it; see `tui`.
 #[derive(Debug, Serialize)]
-struct StatusReport {
+pub struct StatusReport {
     /// The `up` process, by its pidfile.
-    process: ProcessReport,
+    pub process: ProcessReport,
     /// Where feeds go, or why that could not be worked out.
-    uplink: Option<UplinkReport>,
-    uplink_error: Option<String>,
-    strom: EndpointReport,
+    pub uplink: Option<UplinkReport>,
+    pub uplink_error: Option<String>,
+    pub strom: EndpointReport,
     /// Absent when registration is off.
-    open_live: Option<EndpointReport>,
-    inputs: Vec<InputReport>,
+    pub open_live: Option<EndpointReport>,
+    pub inputs: Vec<InputReport>,
 }
 
 #[derive(Debug, Serialize)]
-struct ProcessReport {
-    running: bool,
-    pid: Option<u32>,
+pub struct ProcessReport {
+    pub running: bool,
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
-struct UplinkReport {
-    host: String,
-    ports: String,
-    port_source: String,
+pub struct UplinkReport {
+    pub host: String,
+    pub ports: String,
+    pub port_source: String,
 }
 
 #[derive(Debug, Serialize)]
-struct EndpointReport {
-    url: String,
-    reachable: bool,
-    error: Option<String>,
+pub struct EndpointReport {
+    pub url: String,
+    pub reachable: bool,
+    pub error: Option<String>,
 }
 
 /// One input, by name: its flow in Strom, that flow's uplink, and its source in
 /// Open Live. Any of the three may be missing; that is what `status` is for.
 #[derive(Debug, Serialize)]
-struct InputReport {
-    name: String,
-    flow: Option<FlowReport>,
-    uplink: Option<UplinkStatsReport>,
-    source: Option<SourceReport>,
+pub struct InputReport {
+    pub name: String,
+    pub flow: Option<FlowReport>,
+    pub uplink: Option<UplinkStatsReport>,
+    pub source: Option<SourceReport>,
 }
 
 #[derive(Debug, Serialize)]
-struct FlowReport {
-    id: String,
-    running: bool,
+pub struct FlowReport {
+    pub id: String,
+    pub running: bool,
+}
+
+/// The sender's view of the SRT link, as Strom's srtsink reports it. Counters are
+/// totals for the current connection; a reconnect starts them over.
+#[derive(Debug, Default, Serialize)]
+pub struct UplinkStatsReport {
+    pub send_rate_mbps: Option<f64>,
+    pub rtt_ms: Option<f64>,
+    pub bytes_sent: Option<u64>,
+    pub bandwidth_mbps: Option<f64>,
+    pub negotiated_latency_ms: Option<u32>,
+    pub packets_sent: Option<u64>,
+    pub packets_sent_lost: Option<u64>,
+    pub packets_sent_dropped: Option<u64>,
+    pub packets_retransmitted: Option<u64>,
+    pub snd_buf_level_ms: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
-struct UplinkStatsReport {
-    send_rate_mbps: Option<f64>,
-    rtt_ms: Option<f64>,
-    bytes_sent: Option<u64>,
+pub struct SourceReport {
+    pub id: String,
+    pub status: String,
 }
 
-#[derive(Debug, Serialize)]
-struct SourceReport {
-    id: String,
-    status: String,
-}
-
-async fn gather_status(cfg: &Config) -> Result<StatusReport> {
+pub async fn gather_status(cfg: &Config) -> Result<StatusReport> {
     let gateway_id = cfg.gateway.resolved_id();
     let process = match read_pidfile() {
         Some(pid) if is_running_gateway(pid) => ProcessReport {
@@ -1006,6 +1016,13 @@ async fn gather_status(cfg: &Config) -> Result<StatusReport> {
                     send_rate_mbps: s.send_rate_mbps,
                     rtt_ms: s.rtt_ms,
                     bytes_sent: s.bytes_sent,
+                    bandwidth_mbps: s.bandwidth_mbps,
+                    negotiated_latency_ms: s.negotiated_latency_ms,
+                    packets_sent: s.packets_sent,
+                    packets_sent_lost: s.packets_sent_lost,
+                    packets_sent_dropped: s.packets_sent_dropped,
+                    packets_retransmitted: s.packets_retransmitted,
+                    snd_buf_level_ms: s.snd_buf_level_ms,
                 }),
             None => None,
         };
@@ -1192,6 +1209,7 @@ mod tests {
                         send_rate_mbps: Some(5.987),
                         rtt_ms: Some(31.4),
                         bytes_sent: Some(1_000),
+                        ..UplinkStatsReport::default()
                     }),
                     source: Some(SourceReport {
                         id: "s1".to_string(),

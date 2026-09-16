@@ -33,18 +33,22 @@ open-live-ingest up --all         # include virtual devices, skipped by default
 open-live-ingest up --test        # a test pattern and tone, to commission the link
 open-live-ingest up --reconfigure # ask for every setting again
 open-live-ingest status           # what is running, from Strom and Open Live directly
+open-live-ingest status --watch   # the same, full screen and refreshing, with the uplink stats
 open-live-ingest down             # stop and remove the flows and sources
 open-live-ingest devices          # what Strom can see
 open-live-ingest setup            # ask for settings without starting anything
 open-live-ingest check            # validate the settings file
 ```
 
-`status --json` and `devices --json` print one JSON document instead of a table.
+`status --json` and `devices --json` print one JSON document instead of a table. `status --watch`
+is for a look over SSH at a running venue: it redraws every two seconds with each input's flow
+state, whether bytes are actually leaving, the send rate, round-trip time, losses, and a rate trend.
+It is read-only; `q` quits and hands the terminal back.
 
 Run it and it asks for what it needs, checks each answer, remembers it, then registers every capture
 device Strom can see and starts streaming. Built for SSH: line-by-line prompts on any terminal, lists
-picked with the arrow keys, no window. Colour steps back to plain text under `NO_COLOR` or on a dumb
-terminal.
+picked with the arrow keys, no window. The one full-screen view is `status --watch`, and it only
+looks. Colour steps back to plain text under `NO_COLOR` or on a dumb terminal.
 
 `up` stays in the foreground and owns what it started. Ctrl-C or SIGTERM stops and removes the
 feeds. It **ignores SIGHUP**, so a closed session or a dropped link does not take a venue off air.

@@ -25,6 +25,10 @@ hostname = "0.4"
 # coloured theme that steps back to plain text on a dumb terminal or under NO_COLOR.
 dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 console = "0.16"
+# `status --watch`: a full-screen view that redraws as Strom and Open Live answer.
+# Crossterm is what ratatui drives; no other terminal library is pulled in.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
 # Signal 0 liveness checks and SIGTERM for `down`.
 libc = "0.2"
 # v5 for flow ids derived from gateway id + input id, so nothing has to be stored to
