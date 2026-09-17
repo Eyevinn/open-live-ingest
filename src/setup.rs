@@ -13,6 +13,7 @@
 //! anything missing. That is how a script or an agent sets a box up.
 
 use crate::config::{format_port_range, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE};
+use crate::heartbeat;
 use crate::local_strom;
 use crate::openlive::{OpenLiveClient, ServerInfo};
 use crate::osc;
@@ -183,6 +184,12 @@ pub struct Answers {
     #[arg(long)]
     pub no_register: bool,
 
+    /// This gateway's id in Open Live, from `POST /api/v1/gateways`, which turns on the
+    /// status heartbeat Studio reads. Its token comes from `OLI_OPEN_LIVE_GATEWAY_TOKEN`.
+    /// Blank turns the heartbeat off.
+    #[arg(long)]
+    pub gateway_id: Option<String>,
+
     /// The cloud Strom to send to. Discovered from Open Live when unset.
     #[arg(long)]
     pub uplink_host: Option<String>,
@@ -236,6 +243,12 @@ impl Answers {
         }
         if self.no_register {
             cfg.open_live.register = false;
+        }
+        if let Some(id) = &self.gateway_id {
+            cfg.open_live.gateway_id = blank_to_none(id.clone());
+            if cfg.open_live.gateway_id.is_none() {
+                cfg.open_live.gateway_token = None;
+            }
         }
         if let Some(host) = &self.uplink_host {
             cfg.uplink.host = blank_to_none(host.clone());
@@ -383,6 +396,9 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     match check_open_live(cfg).await {
         Ok(info) => published = report_server_info(cfg, info),
         Err(err) => fail(format!("could not reach Open Live: {err:#}")),
+    }
+    if let Err(err) = report_heartbeat(cfg).await {
+        fail(format!("{err:#}"));
     }
 
     section("Local Strom");
@@ -573,6 +589,7 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
             .with_context(|| format!("could not reach Open Live at {url}"))?;
         published = report_server_info(cfg, info);
     }
+    report_heartbeat(cfg).await?;
 
     section("Local Strom");
     match probe_strom(cfg).await {
@@ -648,6 +665,27 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
         or_auto(&cfg.capture.video_framerate),
         cfg.video.bitrate_kbps
     ));
+    Ok(())
+}
+
+/// Says whether status will be pushed to Open Live, and when it will, opens the
+/// socket once to prove the token is accepted: a wrong one is caught here and not as
+/// a warning repeated through the show.
+async fn report_heartbeat(cfg: &Config) -> Result<()> {
+    match heartbeat::Target::from_config(&cfg.open_live)? {
+        None => {
+            note("status is not pushed to Open Live (no gateway id); the README says how to make this box visible in Studio");
+        }
+        Some(target) => {
+            heartbeat::probe(&target)
+                .await
+                .context("checking the heartbeat to Open Live")?;
+            good(format!(
+                "Open Live greets gateway {}; status will be pushed to it",
+                style(&target.gateway_id).bold()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -881,6 +919,7 @@ mod tests {
             resolution: Some("1280x720".to_string()),
             framerate: Some("auto".to_string()),
             bitrate_kbps: Some(4000),
+            gateway_id: Some("gw-1".to_string()),
             ..Answers::default()
         }
     }
@@ -901,6 +940,33 @@ mod tests {
         assert_eq!(cfg.capture.video_resolution.as_deref(), Some("1280x720"));
         assert_eq!(cfg.capture.video_framerate, None, "auto means unset");
         assert_eq!(cfg.video.bitrate_kbps, 4000);
+        assert_eq!(cfg.open_live.gateway_id.as_deref(), Some("gw-1"));
+    }
+
+    /// The token has no flag, so it stays where it was; a blank id switches the
+    /// heartbeat off and takes the now-orphaned token with it.
+    #[test]
+    fn a_blank_gateway_id_turns_the_heartbeat_off_and_clears_its_token() {
+        let mut cfg = named();
+        cfg.open_live.gateway_id = Some("gw-1".to_string());
+        cfg.open_live.gateway_token = Some("olgw_v1_secret".to_string());
+        Answers {
+            gateway_id: Some("gw-2".to_string()),
+            ..Answers::default()
+        }
+        .apply(&mut cfg);
+        assert_eq!(cfg.open_live.gateway_id.as_deref(), Some("gw-2"));
+        assert_eq!(
+            cfg.open_live.gateway_token.as_deref(),
+            Some("olgw_v1_secret")
+        );
+        Answers {
+            gateway_id: Some("  ".to_string()),
+            ..Answers::default()
+        }
+        .apply(&mut cfg);
+        assert_eq!(cfg.open_live.gateway_id, None);
+        assert_eq!(cfg.open_live.gateway_token, None);
     }
 
     /// A flag that is not given leaves the loaded value alone, so a partial set of

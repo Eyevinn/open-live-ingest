@@ -15,7 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 anyhow = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -30,6 +30,10 @@ libc = "0.2"
 # v5 for flow ids derived from gateway id + input id, so nothing has to be stored to
 # find a flow again.
 uuid = { version = "1", features = ["v5"] }
+# The status heartbeat to Open Live: one outbound WebSocket, over the same rustls
+# stack reqwest already uses.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 # `cargo binstall open-live-ingest` fetches the release tarball instead of compiling.
 [package.metadata.binstall]

@@ -11,6 +11,7 @@
 mod config;
 mod devices;
 mod flow;
+mod heartbeat;
 mod local_strom;
 mod openlive;
 mod osc;
@@ -37,6 +38,8 @@ struct Cli {
     command: Option<Command>,
 }
 
+// Parsed once and matched once; the size of the setup variant is not worth a Box.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Register every capture device with Open Live and stream it. Stays running:
@@ -78,7 +81,8 @@ enum Command {
     /// the questions; with --non-interactive nothing is asked.
     #[command(
         after_help = "Credentials are never flags. Set OLI_OPEN_LIVE_API_KEY and OLI_STROM_API_KEY, \
-or for Open Source Cloud set OSC_ACCESS_TOKEN or run `npx @osaas/cli login`."
+or for Open Source Cloud set OSC_ACCESS_TOKEN or run `npx @osaas/cli login`. The gateway token \
+that goes with --gateway-id is OLI_OPEN_LIVE_GATEWAY_TOKEN."
     )]
     Setup(setup::Answers),
     /// Check the settings file and exit.
@@ -171,6 +175,8 @@ mod tests {
             "198.51.100.7",
             "--port-range",
             "47110-47129",
+            "--gateway-id",
+            "gw-1",
         ])
         .expect("parses");
         let Some(Command::Setup(answers)) = cli.command else {
@@ -180,8 +186,14 @@ mod tests {
         assert_eq!(answers.name.as_deref(), Some("Venue"));
         assert_eq!(answers.uplink_mode, Some(UplinkMode::Listener));
         assert_eq!(answers.public_host.as_deref(), Some("198.51.100.7"));
+        assert_eq!(answers.gateway_id.as_deref(), Some("gw-1"));
 
-        for secret in ["--open-live-api-key", "--strom-api-key", "--passphrase"] {
+        for secret in [
+            "--open-live-api-key",
+            "--strom-api-key",
+            "--passphrase",
+            "--gateway-token",
+        ] {
             assert!(
                 Cli::try_parse_from(["open-live-ingest", "setup", secret, "x"]).is_err(),
                 "{secret} must not be a flag"

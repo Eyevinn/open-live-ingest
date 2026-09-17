@@ -6,6 +6,7 @@ Strom does the media.
 - `src/config.rs`: settings, validation, the two SRT URIs of a link.
 - `src/flow.rs`: the flow template and flow ownership by derived id.
 - `src/strom.rs`, `src/openlive.rs`: the two HTTP clients.
+- `src/heartbeat.rs`: the status heartbeat to Open Live, one outbound WebSocket.
 - `src/devices.rs`: from Strom's device list to inputs with names and ports.
 - `src/run.rs`: `up`, `down`, `status`, `devices`.
 - `src/setup.rs`: interactive setup.
