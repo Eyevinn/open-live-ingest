@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 const ENV_OPEN_LIVE_URL: &str = "OLI_OPEN_LIVE_URL";
 const ENV_OPEN_LIVE_API_KEY: &str = "OLI_OPEN_LIVE_API_KEY";
 const ENV_OPEN_LIVE_AUTH_MODE: &str = "OLI_OPEN_LIVE_AUTH_MODE";
+const ENV_OPEN_LIVE_GATEWAY_ID: &str = "OLI_OPEN_LIVE_GATEWAY_ID";
+const ENV_OPEN_LIVE_GATEWAY_TOKEN: &str = "OLI_OPEN_LIVE_GATEWAY_TOKEN";
 const ENV_STROM_URL: &str = "OLI_STROM_URL";
 const ENV_STROM_API_KEY: &str = "OLI_STROM_API_KEY";
 
@@ -98,6 +100,13 @@ pub struct OpenLive {
     pub api_key: Option<String>,
     /// Register a source per input. Off for a box that only streams to a Strom.
     pub register: bool,
+    /// This gateway's id in Open Live, from `POST /api/v1/gateways`. With its token
+    /// it turns on the status heartbeat: an outbound WebSocket carrying what `status`
+    /// reports, so a Studio operator sees the venue without shelling into it.
+    pub gateway_id: Option<String>,
+    /// The token Open Live returned once when the gateway was created. It opens the
+    /// heartbeat socket and nothing else; the API key is not accepted there.
+    pub gateway_token: Option<String>,
 }
 
 impl Default for OpenLive {
@@ -107,6 +116,8 @@ impl Default for OpenLive {
             auth_mode: AuthMode::Direct,
             api_key: None,
             register: true,
+            gateway_id: None,
+            gateway_token: None,
         }
     }
 }
@@ -420,6 +431,12 @@ fn with_env_overrides(mut cfg: Config) -> Result<Config> {
     if let Ok(mode) = std::env::var(ENV_OPEN_LIVE_AUTH_MODE) {
         cfg.open_live.auth_mode = mode.parse().context(ENV_OPEN_LIVE_AUTH_MODE)?;
     }
+    if let Ok(id) = std::env::var(ENV_OPEN_LIVE_GATEWAY_ID) {
+        cfg.open_live.gateway_id = Some(id);
+    }
+    if let Ok(token) = std::env::var(ENV_OPEN_LIVE_GATEWAY_TOKEN) {
+        cfg.open_live.gateway_token = Some(token);
+    }
     if let Ok(url) = std::env::var(ENV_STROM_URL) {
         cfg.strom.url = url;
     }
@@ -557,6 +574,9 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
             );
         }
     }
+    // An id without its token, or the reverse, is a half-finished provisioning step;
+    // it is refused here rather than warned about on every retry during the show.
+    crate::heartbeat::Target::from_config(&cfg.open_live)?;
     Ok(())
 }
 
@@ -712,6 +732,24 @@ mod tests {
         validate_with(&cfg, true).expect("osc with a CLI login should validate");
         cfg.open_live.api_key = Some("pat".to_string());
         validate_with(&cfg, false).expect("osc with a token should validate");
+    }
+
+    /// The heartbeat is optional, but half of its credential is a mistake.
+    #[test]
+    fn a_gateway_id_and_its_token_come_together_or_not_at_all() {
+        let mut cfg = valid();
+        validate(&cfg).expect("no gateway is fine");
+        cfg.open_live.gateway_id = Some("gw-1".to_string());
+        assert!(validate(&cfg).is_err(), "an id alone");
+        cfg.open_live.gateway_token = Some("olgw_v1_secret".to_string());
+        validate(&cfg).expect("both should validate");
+        cfg.open_live.gateway_id = None;
+        assert!(validate(&cfg).is_err(), "a token alone");
+        cfg.open_live.gateway_id = Some("gw 1".to_string());
+        assert!(
+            validate(&cfg).is_err(),
+            "an id that cannot go in a URL path"
+        );
     }
 
     /// The cloud cannot dial a venue whose address it does not know.

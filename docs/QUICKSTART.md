@@ -119,6 +119,27 @@ open-live-ingest check   # Settings at <path> are valid.   exit 0
 
 `setup --help` lists every flag. Rerunning setup with a subset of flags changes only those.
 
+### Optional: show the box in Studio
+
+Skip this unless whoever runs Open Live has given you a gateway id (`gw-…`) and its token
+(`olgw_v1_…`), created with `POST /api/v1/gateways`. With them, the gateway pushes its status to
+Open Live so a producer sees the venue in Studio:
+
+```bash
+OLI_OPEN_LIVE_GATEWAY_TOKEN='<token>' open-live-ingest setup --non-interactive --gateway-id '<id>'
+```
+
+Success adds one line under `Open Live`:
+
+```
+  ✔ Open Live greets gateway gw-…; status will be pushed to it
+```
+
+| Message contains | Do |
+|---|---|
+| `refused the token` | the id and token do not belong together, or the token was rotated; get a fresh pair |
+| `gateway_id is set but open_live.gateway_token is not` | the variable was not exported in this shell |
+
 ## 4. See the cameras
 
 ```bash

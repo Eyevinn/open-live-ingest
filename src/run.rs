@@ -12,6 +12,7 @@
 use crate::config::{self, format_port_range, mask_passphrase, Config, UplinkMode, Video};
 use crate::devices;
 use crate::flow::{self, Input};
+use crate::heartbeat::{self, Heartbeat};
 use crate::local_strom::{self, LocalStrom};
 use crate::openlive::{drifted, listener_port, OpenLiveClient, ServerInfo, Source, SourcePayload};
 use crate::strom::StromClient;
@@ -21,6 +22,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::time::Duration;
+use strom_types::api::SrtCallerStats;
 use strom_types::FlowId;
 use tracing::{info, warn};
 
@@ -248,6 +250,8 @@ struct Live {
     last_bytes: Option<u64>,
     quiet_polls: u32,
     source_id: Option<String>,
+    /// The last SRT sample with a peer, for the heartbeat. None while nothing receives.
+    uplink: Option<SrtCallerStats>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +278,78 @@ impl State {
             State::Unreachable => "lost contact with Strom".to_string(),
             State::Failed(err) => format!("failed: {err}"),
         }
+    }
+
+    /// What Strom would say about the flow, for the heartbeat. `Unreachable` cannot
+    /// be confirmed running and is reported as idle: a venue's inputs all dropping to
+    /// idle while its heartbeat keeps arriving is a true signal that the box has lost
+    /// its Strom, and the source status is what carries the benefit of the doubt.
+    fn flow_state(&self) -> heartbeat::FlowState {
+        match self {
+            State::Starting | State::Waiting | State::OnAir => heartbeat::FlowState::Playing,
+            State::Unreachable | State::Failed(_) => heartbeat::FlowState::Idle,
+        }
+    }
+}
+
+/// The heartbeat to Open Live and the facts about this box that do not change
+/// between ticks.
+struct Reporter {
+    heartbeat: Heartbeat,
+    host: String,
+    strom_version: Option<String>,
+}
+
+impl Reporter {
+    /// Starts the heartbeat when the settings name a gateway. Strom's version is asked
+    /// for once; an older Strom without the route simply goes unversioned.
+    async fn start(cfg: &Config, strom: &StromClient, live: &[Live]) -> Result<Option<Self>> {
+        let Some(target) = heartbeat::Target::from_config(&cfg.open_live)? else {
+            return Ok(None);
+        };
+        let host = config::hostname().unwrap_or_else(|| cfg.gateway.resolved_id());
+        let strom_version = strom.version().await.ok();
+        println!(
+            "Status is pushed to Open Live as gateway {}.",
+            target.gateway_id
+        );
+        let initial = snapshot_of(live, &host, strom_version.as_deref());
+        Ok(Some(Self {
+            heartbeat: Heartbeat::start(target, initial),
+            host,
+            strom_version,
+        }))
+    }
+
+    fn publish(&self, live: &[Live]) {
+        self.heartbeat
+            .update(snapshot_of(live, &self.host, self.strom_version.as_deref()));
+    }
+
+    async fn stop(self) {
+        self.heartbeat.stop().await;
+    }
+}
+
+/// What the last tick found out, in the shape Open Live stores. Pure, so the mapping
+/// from the loop's states to the wire can be tested without a socket.
+fn snapshot_of(live: &[Live], host: &str, strom_version: Option<&str>) -> heartbeat::Snapshot {
+    heartbeat::Snapshot {
+        host: host.to_string(),
+        strom_version: strom_version.map(str::to_string),
+        ingest_version: env!("CARGO_PKG_VERSION").to_string(),
+        device_count: live.len(),
+        streaming_count: live.iter().filter(|l| l.state == State::OnAir).count(),
+        inputs: live
+            .iter()
+            .map(|l| heartbeat::InputStatus {
+                input_id: l.input.id.clone(),
+                name: l.input.name.clone(),
+                flow_state: l.state.flow_state(),
+                source_id: l.source_id.clone(),
+                uplink: l.uplink.as_ref().map(heartbeat::Uplink::from_srt),
+            })
+            .collect(),
     }
 }
 
@@ -354,6 +430,7 @@ pub async fn up(
                 last_bytes: None,
                 quiet_polls: 0,
                 source_id,
+                uplink: None,
             }),
             // One camera failing must not stop the rest of the venue coming up.
             Err(err) => warn!(input = %input.name, %err, "could not start this input"),
@@ -367,10 +444,23 @@ pub async fn up(
     if let Err(err) = write_pidfile() {
         warn!(%err, "could not write the pidfile; `down` will still find the flows and sources");
     }
+    let reporter = Reporter::start(&cfg, &strom, &live).await?;
 
-    let outcome = run_until_stopped(&strom, open_live.as_ref(), &gateway_id, &cfg, &mut live).await;
+    let outcome = run_until_stopped(
+        &strom,
+        open_live.as_ref(),
+        reporter.as_ref(),
+        &gateway_id,
+        &cfg,
+        &mut live,
+    )
+    .await;
 
     println!("\nStopping.");
+    // Studio hears first, so the inputs vanishing next is read as a stop, not a fault.
+    if let Some(reporter) = reporter {
+        reporter.stop().await;
+    }
     teardown(&strom, open_live.as_ref(), &cfg.gateway.name, &live).await;
     // Only a Strom we started is stopped here; an adopted one is left running.
     drop(local_strom);
@@ -567,6 +657,7 @@ fn truncate(s: &str, width: usize) -> String {
 async fn run_until_stopped(
     strom: &StromClient,
     open_live: Option<&OpenLiveClient>,
+    reporter: Option<&Reporter>,
     gateway_id: &str,
     cfg: &Config,
     live: &mut [Live],
@@ -583,9 +674,15 @@ async fn run_until_stopped(
                         Err(err) => {
                             warn!(input = %l.input.name, %err, "lost contact with Strom, retrying next tick");
                             l.last_bytes = None;
+                            l.uplink = None;
                             State::Unreachable
                         }
                     };
+                }
+                // Handed over as a snapshot; the heartbeat sends it on its own clock,
+                // so a slow or absent Open Live never holds this loop.
+                if let Some(reporter) = reporter {
+                    reporter.publish(live);
                 }
                 if let Some(client) = open_live {
                     if let Err(err) = reconcile_sources(client, live).await {
@@ -627,6 +724,7 @@ async fn poll_flow(
     };
     if !running {
         l.last_bytes = None;
+        l.uplink = None;
         return Ok(if strom.start_flow(&l.flow_id).await? {
             State::Starting
         } else {
@@ -636,9 +734,11 @@ async fn poll_flow(
 
     let Some(sample) = strom.srt_uplink(&l.flow_id).await? else {
         l.last_bytes = None;
+        l.uplink = None;
         l.quiet_polls = 0;
         return Ok(State::Waiting);
     };
+    l.uplink = Some(sample.clone());
     // Bytes moving between two polls is the test, not growth: a reconnect resets the
     // counter. The first sample has nothing to compare against and proves nothing.
     let delivering = l.last_bytes.is_some_and(|before| {
@@ -1389,6 +1489,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("uplink.port_range"), "{err}");
+    }
+
+    fn live(
+        name: &str,
+        state: State,
+        source_id: Option<&str>,
+        uplink: Option<SrtCallerStats>,
+    ) -> Live {
+        let uplink_cfg = crate::config::Uplink::default();
+        Live {
+            input: Input {
+                id: format!("dev-{}", name.to_lowercase()),
+                name: format!("Venue — {name}"),
+                source: flow::Source::Test {
+                    resolution: "1280x720".to_string(),
+                    framerate: "25/1".to_string(),
+                },
+                endpoint: uplink_cfg.endpoint("cloud.example.com", 47110),
+            },
+            flow_id: flow::flow_id("gw", name),
+            state,
+            shown: None,
+            last_bytes: None,
+            quiet_polls: 0,
+            source_id: source_id.map(str::to_string),
+            uplink,
+        }
+    }
+
+    /// The heartbeat says what the loop knows, in Strom's flow vocabulary: a flow
+    /// that runs is playing whether or not anything receives it, and one that cannot
+    /// be confirmed is idle. Only a delivering uplink counts as streaming.
+    #[test]
+    fn the_heartbeat_snapshot_maps_the_loops_states_and_counts_delivering_inputs() {
+        let sample: SrtCallerStats = serde_json::from_value(serde_json::json!({
+            "send_rate_mbps": 6.2, "rtt_ms": 18.0, "bytes_sent": 1000
+        }))
+        .unwrap();
+        let live = vec![
+            live("A", State::OnAir, Some("src-a"), Some(sample)),
+            live("B", State::Waiting, Some("src-b"), None),
+            live("C", State::Starting, None, None),
+            live("D", State::Unreachable, Some("src-d"), None),
+            live("E", State::Failed("boom".to_string()), None, None),
+        ];
+        let snapshot = snapshot_of(&live, "venue-box", Some("0.6.8"));
+        assert_eq!(snapshot.host, "venue-box");
+        assert_eq!(snapshot.strom_version.as_deref(), Some("0.6.8"));
+        assert_eq!(snapshot.ingest_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(snapshot.device_count, 5);
+        assert_eq!(snapshot.streaming_count, 1);
+        let states: Vec<heartbeat::FlowState> =
+            snapshot.inputs.iter().map(|i| i.flow_state).collect();
+        use heartbeat::FlowState::{Idle, Playing};
+        assert_eq!(states, vec![Playing, Playing, Playing, Idle, Idle]);
+        assert_eq!(snapshot.inputs[0].input_id, "dev-a");
+        assert_eq!(snapshot.inputs[0].name, "Venue — A");
+        assert_eq!(snapshot.inputs[0].source_id.as_deref(), Some("src-a"));
+        assert_eq!(
+            snapshot.inputs[0].uplink,
+            Some(heartbeat::Uplink {
+                bitrate_kbps: 6200,
+                rtt_ms: 18.0,
+                dropped: 0
+            })
+        );
+        assert_eq!(snapshot.inputs[1].uplink, None);
+        assert_eq!(snapshot.inputs[2].source_id, None);
     }
 
     #[test]

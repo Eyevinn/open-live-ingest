@@ -60,11 +60,48 @@ Three credentials exist in this system and it only ever asks for one:
 | The local Strom's `STROM_API_KEY` | the gateway, only if that Strom runs with auth | only when Strom actually refuses without one |
 | The cloud Strom's token | Open Live holds it itself | never |
 
+A fourth is optional: a token of the gateway's own, which lets Studio see the venue and
+nothing more. See [Seen from Studio](#seen-from-studio).
+
 Strom does the capturing and encoding, as its own process on the same machine. If one is already
 listening at `strom.url` the gateway adopts it and never stops it. If nothing is listening, it
 starts a headless one from `strom.binary`, with its own data directory beside the settings, and
 stops it again on the way out. `down` also stops a Strom left behind by a hard kill. Set
 `strom.manage = false` to insist on a Strom you run yourself.
+
+## Seen from Studio
+
+Optionally, the gateway pushes what `status` reports to Open Live over one outbound WebSocket, so
+a producer in Open Live Studio sees whether the venue is reachable, which cameras are live and at
+what bitrate, without anyone shelling into the box. Open Live keeps the gateway as a resource of
+its own and derives its health from the age of the last heartbeat.
+
+The gateway identifies itself with a token of its own, not the API key, so a box at a venue holds
+nothing that can drive a production. Whoever runs Open Live creates the gateway with the API key
+and hands over the id and the token, which Open Live shows once:
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"Venue A"}' https://open-live.example.com/api/v1/gateways
+# {"id":"gw-…","name":"Venue A","health":"unknown",...,"token":"olgw_v1_…"}
+```
+
+On the box, the id is a setup flag and the token an environment variable, like every credential:
+
+```bash
+OLI_OPEN_LIVE_GATEWAY_TOKEN='olgw_v1_…' open-live-ingest setup --non-interactive --gateway-id gw-…
+```
+
+Setup opens the socket once and reports `Open Live greets gateway gw-…`, so a wrong token is caught
+there rather than during the show. `up` then pushes a heartbeat as often as Open Live asks in its
+greeting, five seconds by default: hostname, Strom and gateway versions, and for each input the
+flow state, the Open Live source it registered as, and the uplink's bitrate, round-trip time, and
+dropped packets. A stop announces itself before the feeds go down.
+
+The socket is outbound only and carries no commands: nothing on it can start or stop a feed. Open
+Live being unreachable is a warning and a retry with backoff, never a change to a flow, the same as
+registration. `setup --gateway-id ""` turns it off. A lost token is replaced with
+`POST /api/v1/gateways/<id>/rotate-token`, which keeps the id.
 
 ## Settings
 
@@ -81,6 +118,8 @@ on macOS, or wherever `--config` points. The same format can be written by hand;
 | `OLI_OPEN_LIVE_URL` | `open_live.url` |
 | `OLI_OPEN_LIVE_API_KEY` | `open_live.api_key` |
 | `OLI_OPEN_LIVE_AUTH_MODE` | `open_live.auth_mode` (`direct` or `osc`) |
+| `OLI_OPEN_LIVE_GATEWAY_ID` | `open_live.gateway_id` |
+| `OLI_OPEN_LIVE_GATEWAY_TOKEN` | `open_live.gateway_token` |
 | `OLI_LOG_LEVEL` | `log.level` |
 
 ### Without a terminal

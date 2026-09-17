@@ -5,7 +5,8 @@
 # The file lives per user (~/.config/open-live-ingest/gateway.toml on Linux,
 # ~/Library/Application Support/open-live-ingest/gateway.toml on macOS), or wherever
 # --config points. Environment variables override the file: OLI_OPEN_LIVE_URL,
-# OLI_OPEN_LIVE_API_KEY, OLI_OPEN_LIVE_AUTH_MODE, OLI_STROM_URL, OLI_STROM_API_KEY.
+# OLI_OPEN_LIVE_API_KEY, OLI_OPEN_LIVE_AUTH_MODE, OLI_OPEN_LIVE_GATEWAY_ID,
+# OLI_OPEN_LIVE_GATEWAY_TOKEN, OLI_STROM_URL, OLI_STROM_API_KEY.
 # Unknown keys are an error, so a typo cannot silently fall back to a default.
 
 [gateway]
@@ -42,6 +43,11 @@ auth_mode = "osc"
 # api_key = "change-me"
 # Register one source per input. Off for a box that only streams to a Strom.
 register = true
+# Push what `status` reports to Open Live over an outbound WebSocket, so Studio shows
+# the venue. Both come from `POST /api/v1/gateways` on Open Live; the token is shown
+# once and opens nothing but this socket. Leave both unset to push nothing.
+# gateway_id = "gw-00000000-0000-0000-0000-000000000000"
+# gateway_token = "change-me"
 
 # builtin.mpegtssrt_output. One port per input. In caller mode Open Live assigns it
 # inside the range it publishes, and a source left by an earlier run keeps its port;

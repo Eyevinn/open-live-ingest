@@ -193,13 +193,57 @@ with Strom is not evidence that the feed stopped.
 A source left by an earlier run is adopted by name rather than recreated, so a Studio assignment
 that references its id survives a restart.
 
-## 8. Open questions
+## 8. Seen from Studio
+
+Open Live has a gateway resource: an id, a name, a health derived from when it last heard from the
+box, and the last snapshot the box sent. The gateway pushes into it over **one outbound WebSocket**,
+for the reason everything here is outbound (§1): Open Live cannot dial a venue behind NAT, and the
+box can always dial out. Studio reads the resource; the gateway never hears from Studio.
+
+**The socket has a credential of its own.** Open Live mints a token per gateway when the gateway is
+created, stores only its hash, and accepts that token on the heartbeat socket and nowhere else; the
+API key is not accepted there. A box at a venue, run by venue staff, then holds nothing that can
+drive a production, and one lost box is revoked by rotating one token rather than re-keying a
+fleet. The token is a setting like the API key, with the same file mode and environment override,
+and it travels in a header, never in the URL, so it appears in no address anyone logs.
+
+**Nothing new is measured.** The loop in §6 already knows each flow's state, its uplink statistics,
+and the source it registered as, and hands that over as a snapshot after every tick. The socket
+re-sends the latest snapshot on its own clock, at the interval Open Live names in its greeting,
+five seconds by default. Two clocks rather than one because the loop's ten-second tick is set by
+how often Strom and Open Live's source list should be polled, while the heartbeat's cadence is set
+by Open Live's down threshold of fifteen seconds; tying them would mean polling Strom twice as
+often for Studio's benefit, or reading as down after one missed tick. A slow or absent Open Live
+never holds the loop, because the loop only writes a value.
+
+**The frame speaks Open Live's vocabulary**, which is Strom's: a flow is `playing` or `idle`. A flow
+the loop cannot confirm because Strom stopped answering is reported idle rather than as it last
+was: all of a venue's inputs dropping to idle while its heartbeat keeps arriving is a true
+description of a box that has lost its Strom, and the source status, not the heartbeat, is what
+carries the benefit of the doubt for a production already on air (§7).
+
+**Nothing inbound is acted on.** Open Live's frames are a greeting, acknowledgements, and errors;
+anything else is ignored, as the contract requires of both ends. Start, stop, and device picking
+over this socket are a later phase of the same epic, and adding them is a deliberate decision
+about what a venue accepts from the cloud, not an extension of this one.
+
+**Failure is a warning, once.** Like registration, the heartbeat is best effort and never touches
+a flow. A socket that cannot be opened is retried with exponential backoff to a minute; a refused
+token is reported once with the settings to check and retried once a minute, since nothing faster
+would help. Each failure is logged when it starts and when it ends, so a log read after the show
+says when Studio could and could not see the venue. A stop announces itself before the feeds go
+down, bounded by two seconds, so a dead socket cannot delay the teardown.
+
+Setup opens the socket once and waits for the greeting. A wrong token is then a failed check at
+the prompt, in the same voice as a wrong API key, rather than a warning repeated through a show.
+
+## 9. Open questions
 
 - **Who allocates SRT ports?** Resolved: Strom does. Open Live leases a range from its Strom and
   publishes it through `server-info`; in caller mode the gateway uses that range and treats one in
   the settings as a fallback for an Open Live that publishes none. See §5.
-- **Should Open Live gain a gateway resource?** A source's `status` is the only channel, and there is
-  nowhere to put telemetry, a version, or a last-seen timestamp. It would also collapse registration
-  idempotency and cleanup into a server-side call.
+- **Should Open Live gain a gateway resource?** Resolved: it has, and the heartbeat reports into
+  it (§8). Registering sources under the gateway, so that cleanup and idempotency become a
+  server-side call, remains open.
 - **EFP or MPEG-TS for contribution?** EFP carries multi-track audio and both ends support it;
   MPEG-TS is the interoperable default and is what ships.

@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
 use strom_types::api::{
-    FlowListResponse, FlowResponse, SrtCallerStats, SrtRole, SrtStats, SrtStatsResponse,
+    FlowListResponse, FlowResponse, SrtCallerStats, SrtRole, SrtStats, SrtStatsResponse, SystemInfo,
 };
 use strom_types::discovery::DeviceResponse;
 use strom_types::{Flow, FlowId};
@@ -147,6 +147,20 @@ impl StromClient {
         }
         ok(res, "DELETE flow")?;
         Ok(())
+    }
+
+    /// Strom's own version, reported in the heartbeat to Open Live.
+    pub async fn version(&self) -> Result<String> {
+        let res = self
+            .get("/api/version")
+            .send()
+            .await
+            .context("GET version")?;
+        let body: SystemInfo = ok(res, "GET version")?
+            .json()
+            .await
+            .context("decoding version")?;
+        Ok(body.version)
     }
 
     /// The uplink's SRT peer statistics. None when the flow reports no peer yet.
