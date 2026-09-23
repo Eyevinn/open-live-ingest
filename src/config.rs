@@ -240,6 +240,32 @@ pub fn format_port_range(range: &RangeInclusive<u16>) -> String {
     format!("{}-{}", range.start(), range.end())
 }
 
+/// How a set of ports reads to an operator: runs where they are consecutive,
+/// individual numbers where they are not.
+///
+/// The ports Open Live publishes are a set, not a range — Strom's pool can have
+/// holes and a port it found already bound leaves a gap — but the usual case is
+/// still one unbroken run, and that is what should appear in a log line.
+pub fn format_ports(ports: &std::collections::BTreeSet<u16>) -> String {
+    let mut runs: Vec<(u16, u16)> = Vec::new();
+    for port in ports {
+        match runs.last_mut() {
+            Some(run) if run.1 + 1 == *port => run.1 = *port,
+            _ => runs.push((*port, *port)),
+        }
+    }
+    runs.iter()
+        .map(|(a, b)| {
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl Uplink {
     /// The range from the settings, if one is set. Which range is actually used is
     /// decided at startup, once Open Live has been asked.

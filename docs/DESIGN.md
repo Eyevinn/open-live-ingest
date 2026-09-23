@@ -114,9 +114,12 @@ Rendezvous mode was removed; nobody used it, and it doubled the URI logic.
 
 **The end that listens owns the range.** In caller mode the listener ports are the cloud Strom's,
 and one cloud Strom serves several venues and several Open Live instances, so a range chosen at the
-venue is a fleet-wide collision waiting to happen. Open Live leases a range from Strom and publishes
-it with the Strom host on `server-info`; the gateway takes it from there, and Open Live rejects a
-registration outside it. A range in the settings is then only a fallback for an Open Live that
+venue is a fleet-wide collision waiting to happen. Open Live reserves ports from Strom's port pool
+and publishes them with the Strom host on `server-info`; the gateway takes them from there, and Open
+Live rejects a registration on a port it does not hold. The published ports are a list rather than a
+range, because Strom's pool can have holes and a port it found already bound leaves a gap — the
+gateway treats them as a set and must not assume they are consecutive. Ports in the settings are
+then only a fallback for an Open Live that
 publishes none, and is ignored with a warning when one is published, because a setting that silently
 overrode the cloud's allocation would recreate the collision. In listener mode the
 ports are the venue's own, which only the venue can know, so there the settings are required.
@@ -239,9 +242,10 @@ the prompt, in the same voice as a wrong API key, rather than a warning repeated
 
 ## 9. Open questions
 
-- **Who allocates SRT ports?** Resolved: Strom does. Open Live leases a range from its Strom and
-  publishes it through `server-info`; in caller mode the gateway uses that range and treats one in
-  the settings as a fallback for an Open Live that publishes none. See §5.
+- **Who allocates SRT ports?** Resolved: Strom does, through its port pool. Open Live reserves
+  ports from its Strom and publishes them through `server-info`; in caller mode the gateway uses
+  those ports and treats a range in the settings as a fallback for an Open Live that publishes
+  none. See §5.
 - **Should Open Live gain a gateway resource?** Resolved: it has, and the heartbeat reports into
   it (§8). Registering sources under the gateway, so that cleanup and idempotency become a
   server-side call, remains open.
