@@ -59,6 +59,13 @@ fn open_live_client(cfg: &Config) -> Result<Option<OpenLiveClient>> {
     )?))
 }
 
+/// The gateway id to tag registered sources with, so Open Live's forget-gateway
+/// cascade removes the right sources and Studio's Sources chip can attribute them.
+/// Present only when the heartbeat is configured; otherwise sources go untagged.
+fn source_gateway_id(cfg: &Config) -> Result<Option<String>> {
+    Ok(heartbeat::Target::from_config(&cfg.open_live)?.map(|t| t.gateway_id))
+}
+
 /// Where feeds are sent, and which ports the links use.
 struct Cloud {
     host: String,
@@ -361,6 +368,7 @@ pub async fn up(
     test_pattern: bool,
 ) -> Result<()> {
     let gateway_id = cfg.gateway.resolved_id();
+    let source_gateway_id = source_gateway_id(&cfg)?;
     let (local_strom, strom) = connect_strom(&cfg).await?;
     let open_live = open_live_client(&cfg)?;
 
@@ -404,7 +412,13 @@ pub async fn up(
     let mut inputs = inputs;
     let mut source_ids = match (&open_live, cloud.port_source) {
         (Some(client), PortSource::OpenLive) => {
-            assign_ports_from_open_live(client, &mut inputs, &cloud.ports).await?
+            assign_ports_from_open_live(
+                client,
+                &mut inputs,
+                &cloud.ports,
+                source_gateway_id.as_deref(),
+            )
+            .await?
         }
         _ => HashMap::new(),
     };
@@ -451,6 +465,7 @@ pub async fn up(
         open_live.as_ref(),
         reporter.as_ref(),
         &gateway_id,
+        source_gateway_id.as_deref(),
         &cfg,
         &mut live,
     )
@@ -506,6 +521,7 @@ async fn assign_ports_from_open_live(
     client: &OpenLiveClient,
     inputs: &mut [Input],
     range: &RangeInclusive<u16>,
+    gateway_id: Option<&str>,
 ) -> Result<HashMap<String, String>> {
     let sources = client
         .list_sources()
@@ -527,6 +543,7 @@ async fn assign_ports_from_open_live(
                     &input.endpoint.cloud_uri(),
                     false,
                     input.endpoint.latency_ms,
+                    gateway_id,
                 );
                 let created = client
                     .create_source(&payload)
@@ -542,6 +559,7 @@ async fn assign_ports_from_open_live(
                     &input.endpoint.cloud_uri(),
                     false,
                     input.endpoint.latency_ms,
+                    gateway_id,
                 );
                 client
                     .patch_source(&source_id, &payload)
@@ -659,6 +677,7 @@ async fn run_until_stopped(
     open_live: Option<&OpenLiveClient>,
     reporter: Option<&Reporter>,
     gateway_id: &str,
+    source_gateway_id: Option<&str>,
     cfg: &Config,
     live: &mut [Live],
 ) -> Result<()> {
@@ -685,7 +704,7 @@ async fn run_until_stopped(
                     reporter.publish(live);
                 }
                 if let Some(client) = open_live {
-                    if let Err(err) = reconcile_sources(client, live).await {
+                    if let Err(err) = reconcile_sources(client, live, source_gateway_id).await {
                         // Never fatal: the feeds are already flowing. Retried next tick.
                         warn!(%err, "could not update the Open Live sources, retrying next tick");
                     }
@@ -763,7 +782,11 @@ async fn poll_flow(
 /// serving and gives the stored sources to compare against. A source left by an
 /// earlier run is adopted by name rather than recreated, so a Studio assignment that
 /// references its id survives a restart.
-async fn reconcile_sources(client: &OpenLiveClient, live: &mut [Live]) -> Result<()> {
+async fn reconcile_sources(
+    client: &OpenLiveClient,
+    live: &mut [Live],
+    gateway_id: Option<&str>,
+) -> Result<()> {
     let sources = client.list_sources().await?;
     for l in live.iter_mut() {
         let existing = l
@@ -781,6 +804,7 @@ async fn reconcile_sources(client: &OpenLiveClient, live: &mut [Live]) -> Result
             &l.input.endpoint.cloud_uri(),
             active,
             l.input.endpoint.latency_ms,
+            gateway_id,
         );
         match existing {
             Some(stored) => {
@@ -1394,6 +1418,7 @@ mod tests {
             stream_type: "srt".to_string(),
             status: "inactive".to_string(),
             latency: None,
+            gateway_id: None,
         }
     }
 

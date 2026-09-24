@@ -35,10 +35,22 @@ pub struct SourcePayload {
     pub latency: u32,
     #[serde(rename = "liveCamera")]
     pub live_camera: bool,
+    /// The id of the gateway that owns this source, so Open Live's forget-gateway
+    /// cascade removes the right sources and Studio's Sources chip can show where a
+    /// source comes from. Set only when the heartbeat is configured; left off (and
+    /// so unsent) otherwise, which an older Open Live would strip anyway.
+    #[serde(rename = "gatewayId", skip_serializing_if = "Option::is_none")]
+    pub gateway_id: Option<String>,
 }
 
 impl SourcePayload {
-    pub fn new(name: &str, address: &str, active: bool, latency: u32) -> Self {
+    pub fn new(
+        name: &str,
+        address: &str,
+        active: bool,
+        latency: u32,
+        gateway_id: Option<&str>,
+    ) -> Self {
         Self {
             name: name.to_string(),
             address: address.to_string(),
@@ -46,6 +58,7 @@ impl SourcePayload {
             status: if active { "active" } else { "inactive" }.to_string(),
             latency,
             live_camera: true,
+            gateway_id: gateway_id.map(str::to_string),
         }
     }
 }
@@ -63,6 +76,8 @@ pub struct Source {
     pub status: String,
     #[serde(default)]
     pub latency: Option<u32>,
+    #[serde(rename = "gatewayId", default)]
+    pub gateway_id: Option<String>,
 }
 
 /// The port a hostless SRT listener address binds: `srt://:47100?mode=listener`
@@ -89,6 +104,15 @@ pub fn drifted(stored: &Source, desired: &SourcePayload) -> bool {
         || stored.status != desired.status
         // Not reported at all is not drift; an older Open Live simply lacks the field.
         || stored.latency.is_some_and(|l| l != desired.latency)
+        // When we tag (a gateway id is desired), a source missing it — left by an
+        // older run — or carrying a different one has drifted and is (re)tagged; once
+        // it matches nothing more is written. When we tag nothing the stored value is
+        // left alone, so an Open Live that does not return the field is not drift,
+        // the same rule latency follows.
+        || desired
+            .gateway_id
+            .as_deref()
+            .is_some_and(|want| stored.gateway_id.as_deref() != Some(want))
         || mask_passphrase(&stored.address) != mask_passphrase(&desired.address)
 }
 
@@ -565,12 +589,13 @@ mod tests {
             stream_type: "srt".into(),
             status: status.into(),
             latency,
+            gateway_id: None,
         }
     }
 
     #[test]
     fn an_identical_source_does_not_drift_but_status_port_and_latency_do() {
-        let want = SourcePayload::new("Venue — cam", "srt://:9000?mode=listener", true, 200);
+        let want = SourcePayload::new("Venue — cam", "srt://:9000?mode=listener", true, 200, None);
         assert!(!drifted(
             &stored("srt://:9000?mode=listener", "active", Some(200)),
             &want
@@ -598,6 +623,7 @@ mod tests {
             "srt://:9000?mode=listener&passphrase=s3cret",
             true,
             200,
+            None,
         );
         assert!(!drifted(
             &stored(
@@ -619,5 +645,64 @@ mod tests {
             ),
             &want
         ));
+    }
+
+    /// The gateway id rides in the payload as `gatewayId`, and is left out entirely
+    /// when there is none so an older Open Live never sees a field it would strip.
+    #[test]
+    fn the_payload_carries_the_gateway_id_only_when_set() {
+        let tagged = SourcePayload::new(
+            "Venue — cam",
+            "srt://:9000?mode=listener",
+            true,
+            200,
+            Some("gw-1"),
+        );
+        assert_eq!(
+            serde_json::to_value(&tagged).unwrap()["gatewayId"],
+            serde_json::json!("gw-1")
+        );
+
+        let untagged =
+            SourcePayload::new("Venue — cam", "srt://:9000?mode=listener", true, 200, None);
+        let json = serde_json::to_value(&untagged).unwrap();
+        assert!(
+            json.get("gatewayId").is_none(),
+            "gatewayId must be omitted when unset, got {json}"
+        );
+    }
+
+    fn stored_tagged(gateway_id: Option<&str>) -> Source {
+        Source {
+            gateway_id: gateway_id.map(str::to_string),
+            ..stored("srt://:9000?mode=listener", "active", Some(200))
+        }
+    }
+
+    /// Tagging drifts on a source that is missing the id or carries a different one,
+    /// so it is (re)tagged, and holds once it matches. A source we are not tagging is
+    /// left alone, so an Open Live that does not return the field is not drift.
+    #[test]
+    fn a_missing_or_different_gateway_id_is_drift_but_a_match_is_not() {
+        let want = SourcePayload::new(
+            "Venue — cam",
+            "srt://:9000?mode=listener",
+            true,
+            200,
+            Some("gw-1"),
+        );
+        // Missing: a source from an older run gets tagged on the first tick.
+        assert!(drifted(&stored_tagged(None), &want));
+        // Same: nothing is written once it matches.
+        assert!(!drifted(&stored_tagged(Some("gw-1")), &want));
+        // Different: a stale id is corrected.
+        assert!(drifted(&stored_tagged(Some("gw-2")), &want));
+
+        // Not tagging: the stored value is never drift, whether the field is absent
+        // or still carries an id, so we never fight an Open Live over it.
+        let untagged =
+            SourcePayload::new("Venue — cam", "srt://:9000?mode=listener", true, 200, None);
+        assert!(!drifted(&stored_tagged(None), &untagged));
+        assert!(!drifted(&stored_tagged(Some("gw-1")), &untagged));
     }
 }
