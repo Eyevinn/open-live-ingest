@@ -1,11 +1,10 @@
 //! From the devices Strom can see to the inputs the gateway streams: filtering,
 //! selection, naming, and port allocation.
 
-use crate::config::{format_port_range, Capture, Uplink};
+use crate::config::{format_ports, Capture, Uplink};
 use crate::flow::{self, Input, Source};
 use anyhow::{bail, Result};
 use std::collections::BTreeSet;
-use std::ops::RangeInclusive;
 use strom_types::discovery::DeviceResponse;
 
 /// Devices that exist but produce nothing unless another application is running.
@@ -99,16 +98,15 @@ pub fn inputs_for(
     uplink: &Uplink,
     capture: &Capture,
     cloud_host: &str,
-    ports: &RangeInclusive<u16>,
+    ports: &BTreeSet<u16>,
 ) -> Result<Vec<Input>> {
     let mut taken = BTreeSet::new();
     let mut next_port = || {
-        let port = ports.clone().find(|p| !taken.contains(p)).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no free SRT port left in range {}",
-                format_port_range(ports)
-            )
-        })?;
+        let port = ports
+            .iter()
+            .copied()
+            .find(|p| !taken.contains(p))
+            .ok_or_else(|| anyhow::anyhow!("no free SRT port left in {}", format_ports(ports)))?;
         taken.insert(port);
         Ok::<u16, anyhow::Error>(port)
     };
@@ -233,7 +231,7 @@ mod tests {
             &Uplink::default(),
             &Capture::default(),
             "cloud",
-            &(9000..=9002),
+            &(9000..=9002).collect(),
         )
         .unwrap();
         let summary: Vec<(String, u16)> = inputs
@@ -265,10 +263,11 @@ mod tests {
             &Uplink::default(),
             &Capture::default(),
             "cloud",
-            &(9000..=9000),
+            &(9000..=9000).collect(),
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("9000-9000"), "{err}");
+        // A one-port set reads as the port, not as "9000-9000".
+        assert!(err.contains("no free SRT port left in 9000"), "{err}");
     }
 }
