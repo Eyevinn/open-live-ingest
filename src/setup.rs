@@ -12,7 +12,9 @@
 //! `--non-interactive` then runs the same checks without a terminal and refuses on
 //! anything missing. That is how a script or an agent sets a box up.
 
-use crate::config::{format_port_range, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE};
+use crate::config::{
+    format_port_range, format_ports, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE,
+};
 use crate::heartbeat;
 use crate::local_strom;
 use crate::openlive::{OpenLiveClient, ServerInfo};
@@ -22,8 +24,8 @@ use anyhow::{bail, Context, Result};
 use console::{style, Emoji, Style};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
+use std::collections::BTreeSet;
 use std::io::IsTerminal;
-use std::ops::RangeInclusive;
 use std::path::Path;
 
 const OK: Emoji<'_, '_> = Emoji("✔", "ok");
@@ -459,10 +461,10 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     // range it leased; only when it publishes none, or in listener mode where the
     // ports are this machine's own, is there anything to ask.
     match (&published, cfg.uplink.mode) {
-        (Some(range), UplinkMode::Caller) => {
+        (Some(ports), UplinkMode::Caller) => {
             good(format!(
-                "SRT port range {} comes from Open Live",
-                format_port_range(range)
+                "SRT ports {} come from Open Live",
+                format_ports(ports)
             ));
             if let Some(local) = cfg.uplink.port_range.as_deref() {
                 note(format!(
@@ -508,7 +510,7 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
 
 /// What Open Live said about its cloud Strom, read back to the operator. Returns the
 /// SRT port range it publishes, which callers use.
-fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<RangeInclusive<u16>> {
+fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<BTreeSet<u16>> {
     let Some(info) = info else {
         warn(
             "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
@@ -524,17 +526,17 @@ fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<RangeInc
             "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
         ),
     }
-    match &info.srt_port_range {
-        Some(range) => good(format!(
+    match &info.srt_ports {
+        Some(ports) => good(format!(
             "its Strom takes SRT on ports {}, which callers use",
-            format_port_range(range)
+            format_ports(ports)
         )),
         None if info.lease_pending() => warn(
-            "Open Live is still waiting for its SRT port range from Strom; it retries every minute, so run setup again later or set a range here",
+            "Open Live is still waiting for its SRT ports from Strom; it retries every minute, so run setup again later or set a range here",
         ),
-        None => note("Open Live publishes no SRT port range; one has to be set here"),
+        None => note("Open Live publishes no SRT ports; a range has to be set here"),
     }
-    info.srt_port_range
+    info.srt_ports
 }
 
 /// The same checks as the prompts, with nothing asked. Every setting must already be
@@ -617,10 +619,10 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
 
     section("Uplink");
     match (&published, cfg.uplink.mode) {
-        (Some(range), UplinkMode::Caller) => {
+        (Some(ports), UplinkMode::Caller) => {
             good(format!(
-                "caller; SRT port range {} comes from Open Live",
-                format_port_range(range)
+                "caller; SRT ports {} come from Open Live",
+                format_ports(ports)
             ));
             if let Some(local) = cfg.uplink.port_range.as_deref() {
                 note(format!(

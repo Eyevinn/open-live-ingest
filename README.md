@@ -139,12 +139,14 @@ from the environment variables above, or for Open Source Cloud from `OSC_ACCESS_
 saved login. Given interactively, the same flags become the defaults the prompts show. `setup
 --help` lists them all.
 
-In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live leases a range
-from that Strom and publishes it on `GET /api/v1/server-info` together with the Strom host, and the
-gateway registers each input with port 0 and Open Live assigns it a free port in that range, so
+In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live reserves ports
+from that Strom's port pool and publishes them on `GET /api/v1/server-info` together with the Strom
+host, and the gateway registers each input with port 0 and Open Live assigns it a free one, so
 several gateways can feed one Open Live; `uplink.port_range` is only a fallback for an
-Open Live that publishes none. In `listener` mode the ports are the venue's own and
-`uplink.port_range` is required. `up` and `status` print the range in use and where it came from.
+Open Live that publishes none. The published ports are a list, not a range — Strom's pool can have
+holes — so they are usually but not always consecutive. In `listener` mode the ports are the venue's
+own and `uplink.port_range` is required. `up` and `status` print the ports in use and where they
+came from.
 
 In `direct` mode the key is optional: a self-hosted Open Live with `API_KEY` unset leaves `/api/v1`
 open. `osc` mode always needs a credential, and setup asks which of three to use:

@@ -9,7 +9,7 @@
 //! same whether `up` is running, finished, or was killed outright. The pidfile is only
 //! there so `down` can ask a running `up` to stop first.
 
-use crate::config::{self, format_port_range, mask_passphrase, Config, UplinkMode, Video};
+use crate::config::{self, format_ports, mask_passphrase, Config, UplinkMode, Video};
 use crate::devices;
 use crate::flow::{self, Input};
 use crate::heartbeat::{self, Heartbeat};
@@ -69,7 +69,7 @@ fn source_gateway_id(cfg: &Config) -> Result<Option<String>> {
 /// Where feeds are sent, and which ports the links use.
 struct Cloud {
     host: String,
-    ports: RangeInclusive<u16>,
+    ports: BTreeSet<u16>,
     port_source: PortSource,
 }
 
@@ -77,7 +77,7 @@ impl Cloud {
     fn describe_ports(&self) -> String {
         format!(
             "SRT ports {} from {}",
-            format_port_range(&self.ports),
+            format_ports(&self.ports),
             self.port_source
         )
     }
@@ -141,8 +141,8 @@ async fn resolve_cloud(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Resu
     let (ports, port_source) = choose_ports(
         cfg.uplink.mode,
         local,
-        info.as_ref().and_then(|i| i.srt_port_range.clone()),
-        info.as_ref().and_then(|i| i.srt_port_lease.as_deref()),
+        info.as_ref().and_then(|i| i.srt_ports.clone()),
+        info.as_ref().and_then(|i| i.srt_port_state.as_deref()),
     )?;
     Ok(Cloud {
         host,
@@ -159,9 +159,10 @@ async fn resolve_cloud(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Resu
 fn choose_ports(
     mode: UplinkMode,
     local: Option<RangeInclusive<u16>>,
-    published: Option<RangeInclusive<u16>>,
+    published: Option<BTreeSet<u16>>,
     lease_status: Option<&str>,
-) -> Result<(RangeInclusive<u16>, PortSource)> {
+) -> Result<(BTreeSet<u16>, PortSource)> {
+    let local = local.map(|range| range.collect::<BTreeSet<u16>>());
     match mode {
         UplinkMode::Listener => local.map(|range| (range, PortSource::Settings)).context(
             "uplink.mode is \"listener\", so uplink.port_range must name this machine's SRT ports",
@@ -170,8 +171,8 @@ fn choose_ports(
             (Some(published), Some(local)) => {
                 if local != published {
                     warn!(
-                        settings = %format_port_range(&local),
-                        open_live = %format_port_range(&published),
+                        settings = %format_ports(&local),
+                        open_live = %format_ports(&published),
                         "uplink.port_range is ignored: in caller mode the cloud Strom owns its ports, and Open Live publishes its range"
                     );
                 }
@@ -181,10 +182,10 @@ fn choose_ports(
             (None, Some(local)) => Ok((local, PortSource::Settings)),
             (None, None) => {
                 let why = match lease_status {
-                    Some("pending") => "Open Live is still waiting for its SRT port range from Strom (it retries every minute); wait and try again",
-                    Some("unsupported") => "Open Live's Strom does not lease SRT ports; upgrade it",
-                    Some("disabled") => "Open Live has SRT port leasing disabled",
-                    _ => "Open Live publishes no SRT port range; upgrade it, or turn registration on",
+                    Some("pending") => "Open Live is still waiting for its SRT ports from Strom (it retries every minute); wait and try again",
+                    Some("unsupported") => "Open Live's Strom hands out no SRT ports: it has no port pool configured (STROM_PORTS), or is too old to have one",
+                    Some("disabled") => "Open Live has SRT port reservation disabled",
+                    _ => "Open Live publishes no SRT ports; upgrade it, or turn registration on",
                 };
                 bail!("no SRT port range for the cloud Strom: {why}, or set uplink.port_range in the settings")
             }
@@ -488,19 +489,19 @@ pub async fn up(
 enum PortPlan {
     /// The stored source names a port inside the range: build to it.
     Keep { source_id: String, port: u16 },
-    /// The stored source has no usable port (none, or one outside the range Open
-    /// Live now publishes, left by an older run): ask Open Live to reassign it.
+    /// The stored source has no usable port (none, or one Open Live no longer
+    /// holds, left by an older run): ask Open Live to reassign it.
     Reassign { source_id: String },
     /// No source yet: create one and let Open Live pick the port.
     Create,
 }
 
 /// Pure, so the three cases can be tested without a server.
-fn plan_port(existing: Option<&Source>, range: &RangeInclusive<u16>) -> PortPlan {
+fn plan_port(existing: Option<&Source>, ports: &BTreeSet<u16>) -> PortPlan {
     match existing {
         None => PortPlan::Create,
         Some(stored) => match listener_port(&stored.address) {
-            Some(port) if range.contains(&port) => PortPlan::Keep {
+            Some(port) if ports.contains(&port) => PortPlan::Keep {
                 source_id: stored.id.clone(),
                 port,
             },
@@ -520,7 +521,7 @@ fn plan_port(existing: Option<&Source>, range: &RangeInclusive<u16>) -> PortPlan
 async fn assign_ports_from_open_live(
     client: &OpenLiveClient,
     inputs: &mut [Input],
-    range: &RangeInclusive<u16>,
+    ports: &BTreeSet<u16>,
     gateway_id: Option<&str>,
 ) -> Result<HashMap<String, String>> {
     let sources = client
@@ -530,7 +531,7 @@ async fn assign_ports_from_open_live(
     let mut ids = HashMap::new();
     for input in inputs.iter_mut() {
         let existing = sources.iter().find(|s| s.name == input.name);
-        let (source_id, address) = match plan_port(existing, range) {
+        let (source_id, address) = match plan_port(existing, ports) {
             PortPlan::Keep { source_id, port } => {
                 input.endpoint.port = port;
                 ids.insert(input.id.clone(), source_id);
@@ -1053,7 +1054,7 @@ async fn gather_status(cfg: &Config) -> Result<StatusReport> {
         Ok(cloud) => (
             Some(UplinkReport {
                 host: cloud.host,
-                ports: format_port_range(&cloud.ports),
+                ports: format_ports(&cloud.ports),
                 port_source: cloud.port_source.to_string(),
             }),
             None,
@@ -1409,6 +1410,14 @@ mod tests {
     const CLOUD: RangeInclusive<u16> = 47110..=47129;
     const LOCAL: RangeInclusive<u16> = 9000..=9019;
 
+    fn cloud() -> BTreeSet<u16> {
+        CLOUD.collect()
+    }
+
+    fn local() -> BTreeSet<u16> {
+        LOCAL.collect()
+    }
+
     /// Several venues share the cloud Strom, so the venue must not pick its ports.
     fn stored(address: &str) -> Source {
         Source {
@@ -1423,8 +1432,8 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_source_keeps_its_port_only_while_it_is_inside_the_range() {
-        let range = 47100..=47109;
+    fn a_stored_source_keeps_its_port_only_while_open_live_still_holds_it() {
+        let range: BTreeSet<u16> = (47100..=47109).collect();
         assert_eq!(plan_port(None, &range), PortPlan::Create);
         assert_eq!(
             plan_port(
@@ -1455,24 +1464,30 @@ mod tests {
     }
 
     #[test]
-    fn in_caller_mode_the_published_range_wins_over_the_settings() {
+    fn in_caller_mode_the_published_ports_win_over_the_settings() {
         assert_eq!(
-            choose_ports(UplinkMode::Caller, Some(LOCAL), Some(CLOUD), Some("leased")).unwrap(),
-            (CLOUD, PortSource::OpenLive)
+            choose_ports(
+                UplinkMode::Caller,
+                Some(LOCAL),
+                Some(cloud()),
+                Some("reserved")
+            )
+            .unwrap(),
+            (cloud(), PortSource::OpenLive)
         );
         assert_eq!(
-            choose_ports(UplinkMode::Caller, None, Some(CLOUD), Some("leased")).unwrap(),
-            (CLOUD, PortSource::OpenLive)
+            choose_ports(UplinkMode::Caller, None, Some(cloud()), Some("reserved")).unwrap(),
+            (cloud(), PortSource::OpenLive)
         );
     }
 
-    /// An older Open Live, or one that cannot lease, leaves the settings in charge.
+    /// An older Open Live, or one whose Strom hands out no ports, leaves the settings in charge.
     #[test]
     fn in_caller_mode_the_settings_are_the_fallback_when_nothing_is_published() {
         for status in [None, Some("pending"), Some("unsupported"), Some("disabled")] {
             assert_eq!(
                 choose_ports(UplinkMode::Caller, Some(LOCAL), None, status).unwrap(),
-                (LOCAL, PortSource::Settings),
+                (local(), PortSource::Settings),
                 "{status:?}"
             );
         }
@@ -1504,13 +1519,13 @@ mod tests {
             choose_ports(
                 UplinkMode::Listener,
                 Some(LOCAL),
-                Some(CLOUD),
+                Some(cloud()),
                 Some("leased")
             )
             .unwrap(),
-            (LOCAL, PortSource::Settings)
+            (local(), PortSource::Settings)
         );
-        let err = choose_ports(UplinkMode::Listener, None, Some(CLOUD), Some("leased"))
+        let err = choose_ports(UplinkMode::Listener, None, Some(cloud()), Some("reserved"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("uplink.port_range"), "{err}");

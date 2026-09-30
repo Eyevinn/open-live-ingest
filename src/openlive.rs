@@ -8,7 +8,7 @@ use crate::config::{mask_passphrase, port_range, AuthMode};
 use crate::osc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::ops::RangeInclusive;
+use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -118,22 +118,27 @@ pub fn drifted(stored: &Source, desired: &SourcePayload) -> bool {
 
 /// What `GET /api/v1/server-info` says about the cloud side. Every field is optional
 /// because the route has grown over time: the oldest Open Live has no route at all,
-/// the next reports only the Strom host, and the current one adds the SRT port range
-/// its Strom has leased for callers.
+/// the next reports only the Strom host, then one added the SRT port range its Strom
+/// had leased, and the current one reports an explicit list of ports reserved from
+/// Strom's port pool.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ServerInfo {
     pub strom_host: Option<String>,
-    /// The cloud Strom's SRT listener ports, which Open Live leases from Strom and
+    /// The cloud Strom's SRT listener ports, which Open Live reserves from Strom and
     /// which every source registered in caller mode must use.
-    pub srt_port_range: Option<RangeInclusive<u16>>,
-    /// `leased`, `pending`, `unsupported`, or `disabled`. `pending` means Open Live
-    /// has not yet obtained its range from Strom and is still retrying.
-    pub srt_port_lease: Option<String>,
+    ///
+    /// A set, not a range: Strom's pool can have holes, and a port it found already
+    /// bound leaves a gap, so consecutive numbers are the usual case rather than a
+    /// guarantee.
+    pub srt_ports: Option<BTreeSet<u16>>,
+    /// `reserved`, `pending`, `unsupported`, or `disabled`. `pending` means Open Live
+    /// has not yet obtained its ports from Strom and is still retrying.
+    pub srt_port_state: Option<String>,
 }
 
 impl ServerInfo {
     pub fn lease_pending(&self) -> bool {
-        self.srt_port_lease.as_deref() == Some("pending")
+        self.srt_port_state.as_deref() == Some("pending")
     }
 }
 
@@ -144,29 +149,53 @@ fn parse_server_info(body: &serde_json::Value) -> Result<ServerInfo> {
         .and_then(|v| v.as_str())
         .filter(|h| !h.is_empty())
         .map(str::to_string);
-    let srt_port_range = match body.get("srtPortRange").filter(|v| !v.is_null()) {
-        Some(range) => {
-            let end = |key: &str| {
-                range
-                    .get(key)
-                    .and_then(|v| v.as_u64())
-                    .with_context(|| format!("srtPortRange.{key} is missing or not a number"))
-            };
-            Some(
-                port_range(end("first")?, end("last")?)
-                    .context("Open Live published an invalid srtPortRange")?,
-            )
+    // Both shapes are read, because a gateway updates on its own schedule and can
+    // meet either side of the change. `srtPorts` is the current one; `srtPortRange`
+    // is what an Open Live older than Strom's port pool publishes, and expands into
+    // the same set.
+    let srt_ports = match body.get("srtPorts").filter(|v| !v.is_null()) {
+        Some(ports) => {
+            let list = ports
+                .as_array()
+                .context("Open Live published an srtPorts that is not a list")?;
+            let mut set = BTreeSet::new();
+            for value in list {
+                let port = value
+                    .as_u64()
+                    .and_then(|n| u16::try_from(n).ok())
+                    .filter(|p| *p != 0)
+                    .with_context(|| format!("srtPorts entry {value} is not a port number"))?;
+                set.insert(port);
+            }
+            (!set.is_empty()).then_some(set)
         }
-        None => None,
+        None => match body.get("srtPortRange").filter(|v| !v.is_null()) {
+            Some(range) => {
+                let end = |key: &str| {
+                    range
+                        .get(key)
+                        .and_then(|v| v.as_u64())
+                        .with_context(|| format!("srtPortRange.{key} is missing or not a number"))
+                };
+                Some(
+                    port_range(end("first")?, end("last")?)
+                        .context("Open Live published an invalid srtPortRange")?
+                        .collect(),
+                )
+            }
+            None => None,
+        },
     };
-    let srt_port_lease = body
-        .get("srtPortLease")
+    // `leased` was this state's name before the port pool; it means the same thing.
+    let srt_port_state = body
+        .get("srtPortState")
+        .or_else(|| body.get("srtPortLease"))
         .and_then(|v| v.as_str())
-        .map(str::to_string);
+        .map(|s| if s == "leased" { "reserved" } else { s }.to_string());
     Ok(ServerInfo {
         strom_host,
-        srt_port_range,
-        srt_port_lease,
+        srt_ports,
+        srt_port_state,
     })
 }
 
@@ -513,6 +542,9 @@ mod tests {
     /// is "not published", never an error.
     #[test]
     fn server_info_decodes_with_and_without_a_port_range() {
+        // The shape an Open Live older than Strom's port pool publishes. A gateway
+        // updates on its own schedule, so it has to keep reading this one: the range
+        // expands into the same set, and `leased` is `reserved` under its old name.
         let current = parse_server_info(&serde_json::json!({
             "stromHost": "strom.example.com",
             "srtPortRange": { "first": 47110, "last": 47129 },
@@ -523,8 +555,8 @@ mod tests {
             current,
             ServerInfo {
                 strom_host: Some("strom.example.com".into()),
-                srt_port_range: Some(47110..=47129),
-                srt_port_lease: Some("leased".into()),
+                srt_ports: Some((47110..=47129).collect()),
+                srt_port_state: Some("reserved".into()),
             }
         );
         assert!(!current.lease_pending());
@@ -535,17 +567,59 @@ mod tests {
             "srtPortLease": "pending"
         }))
         .unwrap();
-        assert_eq!(pending.srt_port_range, None);
+        assert_eq!(pending.srt_ports, None);
         assert!(pending.lease_pending());
 
         let older =
             parse_server_info(&serde_json::json!({ "stromHost": "strom.example.com" })).unwrap();
         assert_eq!(older.strom_host.as_deref(), Some("strom.example.com"));
-        assert_eq!(older.srt_port_range, None);
-        assert_eq!(older.srt_port_lease, None);
+        assert_eq!(older.srt_ports, None);
+        assert_eq!(older.srt_port_state, None);
 
         let blank = parse_server_info(&serde_json::json!({ "stromHost": "" })).unwrap();
         assert_eq!(blank, ServerInfo::default());
+    }
+
+    /// The current shape: an explicit list, which need not be contiguous.
+    #[test]
+    fn server_info_decodes_a_reserved_port_list() {
+        let info = parse_server_info(&serde_json::json!({
+            "stromHost": "strom.example.com",
+            "srtPorts": [47110, 47111, 47250],
+            "srtPortState": "reserved"
+        }))
+        .unwrap();
+        assert_eq!(
+            info,
+            ServerInfo {
+                strom_host: Some("strom.example.com".into()),
+                srt_ports: Some([47110, 47111, 47250].into_iter().collect()),
+                srt_port_state: Some("reserved".into()),
+            }
+        );
+        assert!(!info.lease_pending());
+
+        // `srtPorts` wins when both are present, so an Open Live that publishes both
+        // during a transition does not get read as a range with a hole filled in.
+        let both = parse_server_info(&serde_json::json!({
+            "srtPorts": [47110, 47250],
+            "srtPortRange": { "first": 47110, "last": 47250 },
+            "srtPortState": "reserved"
+        }))
+        .unwrap();
+        assert_eq!(both.srt_ports, Some([47110, 47250].into_iter().collect()));
+
+        // An empty list is "none", not a set nothing can be allocated from.
+        let empty =
+            parse_server_info(&serde_json::json!({ "srtPorts": [], "srtPortState": "pending" }))
+                .unwrap();
+        assert_eq!(empty.srt_ports, None);
+        assert!(empty.lease_pending());
+
+        // Garbage is an error to report, not a port to hand a pipeline.
+        assert!(parse_server_info(&serde_json::json!({ "srtPorts": [0] })).is_err());
+        assert!(parse_server_info(&serde_json::json!({ "srtPorts": [70000] })).is_err());
+        assert!(parse_server_info(&serde_json::json!({ "srtPorts": "47110" })).is_err());
     }
 
     /// A published range is checked like a configured one: a bad one is an error to
