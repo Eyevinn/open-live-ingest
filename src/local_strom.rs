@@ -103,12 +103,22 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         "Starting Strom on port {port} (logging to {}).",
         log_path.display()
     );
-    let child = Command::new(&binary)
+    let mut command = Command::new(&binary);
+    command
         .args(["--headless", "--port", &port.to_string(), "--data-dir"])
         .arg(&data_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
+        .stderr(Stdio::from(log_err));
+    // Its own process group, so a Ctrl-C in the terminal reaches only the gateway.
+    // Otherwise Strom exits with it, before the teardown has removed the flows; the
+    // gateway stops it itself afterwards, when `LocalStrom` is dropped.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
         .spawn()
         .with_context(|| format!("starting {}", binary.display()))?;
 
