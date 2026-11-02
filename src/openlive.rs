@@ -257,7 +257,8 @@ impl OpenLiveClient {
             .send()
             .await
             .context("POST source")?;
-        ok(res, "POST source")?
+        ok_or_refused(res, "POST source")
+            .await?
             .json()
             .await
             .context("decoding created source")
@@ -274,7 +275,7 @@ impl OpenLiveClient {
             .send()
             .await
             .context("PATCH source")?;
-        ok(res, "PATCH source")?;
+        ok_or_refused(res, "PATCH source").await?;
         Ok(())
     }
 
@@ -291,7 +292,7 @@ impl OpenLiveClient {
         if res.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(());
         }
-        ok(res, "DELETE source")?;
+        ok_or_refused(res, "DELETE source").await?;
         Ok(())
     }
 
@@ -315,6 +316,76 @@ fn ok(res: reqwest::Response, what: &str) -> Result<reqwest::Response> {
         bail!("{what} failed with HTTP {status}");
     }
     Ok(res)
+}
+
+/// Longest server message carried into an error. Open Live's are one short sentence;
+/// anything longer is not one of those and is cut rather than echoed whole.
+const MAX_REASON: usize = 200;
+
+/// A request Open Live refused because of the state it is in: a source in use by an
+/// active production, or a port another source already holds. Kept as its own type
+/// so callers can tell it apart from a transport failure and say what to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    pub what: String,
+    pub status: reqwest::StatusCode,
+    /// Open Live's `error` field, when the body carried one.
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} failed with HTTP {}", self.what, self.status)?;
+        if let Some(reason) = &self.reason {
+            write!(f, ": {reason}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Refused {}
+
+impl Refused {
+    /// Open Live's own words when it gave any, the status line otherwise.
+    pub fn explain(&self) -> String {
+        self.reason
+            .clone()
+            .unwrap_or_else(|| format!("HTTP {}", self.status))
+    }
+}
+
+/// The `error` field of an Open Live error body. Only the short message is taken,
+/// never the body itself, so nothing the request carried can be echoed back.
+fn error_reason(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let reason = value.get("error")?.as_str()?.trim();
+    if reason.is_empty() {
+        return None;
+    }
+    Some(if reason.chars().count() > MAX_REASON {
+        reason.chars().take(MAX_REASON).collect::<String>() + "…"
+    } else {
+        reason.to_string()
+    })
+}
+
+/// Like `ok`, but a 409 or 422 keeps Open Live's reason, as a `Refused`. Those are
+/// the answers an operator can act on: which production holds a source, which source
+/// holds a port.
+async fn ok_or_refused(res: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+    let status = res.status();
+    if status == reqwest::StatusCode::CONFLICT
+        || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    {
+        let reason = res.bytes().await.ok().and_then(|b| error_reason(&b));
+        return Err(Refused {
+            what: what.to_string(),
+            status,
+            reason,
+        }
+        .into());
+    }
+    ok(res, what)
 }
 
 /// The bearer token to present: a static key as-is, or an OSC personal access token
@@ -778,5 +849,98 @@ mod tests {
             SourcePayload::new("Venue — cam", "srt://:9000?mode=listener", true, 200, None);
         assert!(!drifted(&stored_tagged(None), &untagged));
         assert!(!drifted(&stored_tagged(Some("gw-1")), &untagged));
+    }
+
+    /// Serves one canned HTTP response on a local port and returns its base URL, so
+    /// the client is exercised end to end without an Open Live.
+    async fn serve_once(status_line: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// The body Open Live sends when a source is in an active production: the
+    /// production's name has to reach the error, or the operator sees a bare 409.
+    #[tokio::test]
+    async fn a_409_on_delete_carries_open_lives_reason() {
+        let base = serve_once(
+            "409 Conflict",
+            r#"{"error":"Source is in use by active production \"Morning Show\""}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client.delete_source("src-1").await.unwrap_err();
+        let refused = err.downcast_ref::<Refused>().expect("a Refused error");
+        assert_eq!(refused.status, reqwest::StatusCode::CONFLICT);
+        assert_eq!(
+            refused.reason.as_deref(),
+            Some(r#"Source is in use by active production "Morning Show""#)
+        );
+        assert!(format!("{err:#}").contains(r#"active production "Morning Show""#));
+    }
+
+    /// The port clash on create names the source holding the port.
+    #[tokio::test]
+    async fn a_409_on_create_names_the_source_holding_the_port() {
+        let base = serve_once(
+            "409 Conflict",
+            r#"{"error":"SRT listener port 47110 is already used by source \"Venue — cam\"","statusCode":409}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let payload = SourcePayload::new(
+            "Venue — test",
+            "srt://:47110?mode=listener",
+            false,
+            200,
+            None,
+        );
+        let err = client.create_source(&payload).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"POST source failed with HTTP 409 Conflict: SRT listener port 47110 is already used by source "Venue — cam""#
+        );
+    }
+
+    /// Other failures stay status-only, and are not mistaken for a refusal.
+    #[tokio::test]
+    async fn a_500_on_delete_is_not_a_refusal_and_keeps_no_body() {
+        let base = serve_once(
+            "500 Internal Server Error",
+            r#"{"error":"stack trace here"}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client.delete_source("src-1").await.unwrap_err();
+        assert!(err.downcast_ref::<Refused>().is_none());
+        assert_eq!(
+            err.to_string(),
+            "DELETE source failed with HTTP 500 Internal Server Error"
+        );
+    }
+
+    #[test]
+    fn only_a_short_error_field_is_taken_from_a_body() {
+        assert_eq!(error_reason(br#"{"error":"x"}"#).as_deref(), Some("x"));
+        assert_eq!(error_reason(br#"{"error":"  "}"#), None);
+        assert_eq!(error_reason(br#"{"message":"x"}"#), None);
+        assert_eq!(error_reason(br#"{"error":42}"#), None);
+        assert_eq!(error_reason(b"not json"), None);
+        let long = format!(r#"{{"error":"{}"}}"#, "a".repeat(500));
+        let cut = error_reason(long.as_bytes()).unwrap();
+        assert_eq!(cut.chars().count(), MAX_REASON + 1);
+        assert!(cut.ends_with('…'));
     }
 }

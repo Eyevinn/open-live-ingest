@@ -14,7 +14,9 @@ use crate::devices;
 use crate::flow::{self, Input};
 use crate::heartbeat::{self, Heartbeat};
 use crate::local_strom::{self, LocalStrom};
-use crate::openlive::{drifted, listener_port, OpenLiveClient, ServerInfo, Source, SourcePayload};
+use crate::openlive::{
+    drifted, listener_port, OpenLiveClient, Refused, ServerInfo, Source, SourcePayload,
+};
 use crate::strom::StromClient;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -119,7 +121,7 @@ async fn resolve_cloud(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Resu
         Some(client) if needs_open_live => match client.server_info().await {
             Ok(info) => info,
             Err(err) if configured_host.is_some() && local.is_some() => {
-                warn!(%err, "could not ask Open Live for its server info; using uplink.host and uplink.port_range from the settings");
+                warn!(err = %format_args!("{err:#}"), "could not ask Open Live for its server info; using uplink.host and uplink.port_range from the settings");
                 None
             }
             Err(err) => return Err(err.context("asking Open Live where its Strom is")),
@@ -424,6 +426,18 @@ pub async fn up(
         _ => HashMap::new(),
     };
 
+    // When the ports are the settings', nothing stops a source from an earlier run
+    // still holding one, and Open Live refuses every registration on it.
+    if let (Some(client), PortSource::Settings) = (&open_live, cloud.port_source) {
+        free_held_ports(
+            client,
+            &inputs,
+            &cfg.gateway.name,
+            source_gateway_id.as_deref(),
+        )
+        .await?;
+    }
+
     clear_conflicting_flows(&strom, &gateway_id, &inputs).await?;
 
     let mut live = Vec::new();
@@ -448,7 +462,9 @@ pub async fn up(
                 uplink: None,
             }),
             // One camera failing must not stop the rest of the venue coming up.
-            Err(err) => warn!(input = %input.name, %err, "could not start this input"),
+            Err(err) => {
+                warn!(input = %input.name, err = %format_args!("{err:#}"), "could not start this input")
+            }
         }
     }
     if live.is_empty() {
@@ -457,7 +473,7 @@ pub async fn up(
 
     print_summary(&live);
     if let Err(err) = write_pidfile() {
-        warn!(%err, "could not write the pidfile; `down` will still find the flows and sources");
+        warn!(err = %format_args!("{err:#}"), "could not write the pidfile; `down` will still find the flows and sources");
     }
     let reporter = Reporter::start(&cfg, &strom, &live).await?;
 
@@ -598,6 +614,119 @@ async fn assign_ports_from_open_live(
     Ok(ids)
 }
 
+/// An Open Live source holding a listener port one of the inputs is about to
+/// register on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortClash {
+    input: String,
+    port: u16,
+    holder_id: String,
+    holder_name: String,
+    /// Carries this gateway's name prefix, and its gateway id where both sides have
+    /// one: left by an earlier run of this gateway, so it may be removed.
+    ours: bool,
+}
+
+/// Which sources hold a port an input wants, under another name. A source with the
+/// input's own name is not a clash: the tick adopts it. Pure, so the choice of what
+/// to remove and what to report is tested without a server.
+fn port_clashes(
+    wanted: &[(String, u16)],
+    sources: &[Source],
+    prefix: &str,
+    gateway_id: Option<&str>,
+) -> Vec<PortClash> {
+    let mut clashes = Vec::new();
+    for (input, port) in wanted {
+        for holder in sources
+            .iter()
+            .filter(|s| listener_port(&s.address) == Some(*port) && s.name != *input)
+        {
+            let same_gateway = match (holder.gateway_id.as_deref(), gateway_id) {
+                (Some(theirs), Some(mine)) => theirs == mine,
+                _ => true,
+            };
+            clashes.push(PortClash {
+                input: input.clone(),
+                port: *port,
+                holder_id: holder.id.clone(),
+                holder_name: holder.name.clone(),
+                ours: holder.name.starts_with(prefix) && same_gateway,
+            });
+        }
+    }
+    clashes
+}
+
+/// Frees the inputs' ports from this gateway's own leftover sources, and stops with
+/// a message naming the holder when that cannot be done. Only sources actually on a
+/// wanted port are touched, never the whole prefix: nothing prevents a second `up`
+/// with the same settings, and its sources are not this run's to remove.
+async fn free_held_ports(
+    client: &OpenLiveClient,
+    inputs: &[Input],
+    gateway_name: &str,
+    gateway_id: Option<&str>,
+) -> Result<()> {
+    let wanted: Vec<(String, u16)> = inputs
+        .iter()
+        .filter_map(|i| listener_port(&i.endpoint.cloud_uri()).map(|p| (i.name.clone(), p)))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let sources = match client.list_sources().await {
+        Ok(sources) => sources,
+        // Open Live being away must not keep the feeds from starting; the tick
+        // registers them once it is back.
+        Err(err) => {
+            warn!(err = %format_args!("{err:#}"), "could not list Open Live sources to check the ports");
+            return Ok(());
+        }
+    };
+    let clashes = port_clashes(
+        &wanted,
+        &sources,
+        &devices::name_prefix(gateway_name),
+        gateway_id,
+    );
+    // Someone else's source is reported before anything of ours is removed.
+    if let Some(c) = clashes.iter().find(|c| !c.ours) {
+        bail!(
+            "port {} for {:?} is already used by the Open Live source {:?}, which is not this gateway's. Remove it in Studio, or set uplink.port_range to ports it does not use.",
+            c.port,
+            c.input,
+            c.holder_name
+        );
+    }
+    for c in &clashes {
+        match client.delete_source(&c.holder_id).await {
+            Ok(()) => println!(
+                "  removed Open Live source {:?}, left over from an earlier run (it held port {})",
+                c.holder_name, c.port
+            ),
+            Err(err) => match err.downcast_ref::<Refused>() {
+                Some(refused) => bail!(
+                    "port {} for {:?} is held by the Open Live source {:?}, left over from an earlier run, and Open Live will not remove it: {}. Deactivate that production, then start again.",
+                    c.port,
+                    c.input,
+                    c.holder_name,
+                    refused.explain()
+                ),
+                None => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "removing the Open Live source {:?}, which holds port {} for {:?}",
+                            c.holder_name, c.port, c.input
+                        )
+                    })
+                }
+            },
+        }
+    }
+    Ok(())
+}
+
 /// Removes our own leftovers from a run that ended without cleanup, and any other
 /// flow already holding one of the cameras about to be opened. Two pipelines on one
 /// device contend for frames, which presents as stutter rather than as an error.
@@ -625,7 +754,7 @@ async fn clear_conflicting_flows(
         } else {
             "which was holding one of these devices"
         };
-        println!("  removed {:?}, {why}", existing.name);
+        println!("  removed Strom flow {:?}, {why}", existing.name);
     }
     Ok(())
 }
@@ -692,7 +821,7 @@ async fn run_until_stopped(
                     l.state = match poll_flow(strom, gateway_id, &cfg.video, l).await {
                         Ok(state) => state,
                         Err(err) => {
-                            warn!(input = %l.input.name, %err, "lost contact with Strom, retrying next tick");
+                            warn!(input = %l.input.name, err = %format_args!("{err:#}"), "lost contact with Strom, retrying next tick");
                             l.last_bytes = None;
                             l.uplink = None;
                             State::Unreachable
@@ -707,7 +836,7 @@ async fn run_until_stopped(
                 if let Some(client) = open_live {
                     if let Err(err) = reconcile_sources(client, live, source_gateway_id).await {
                         // Never fatal: the feeds are already flowing. Retried next tick.
-                        warn!(%err, "could not update the Open Live sources, retrying next tick");
+                        warn!(err = %format_args!("{err:#}"), "could not update the Open Live sources, retrying next tick");
                     }
                 }
                 // Appended lines rather than a redrawn screen: this is read over SSH,
@@ -868,15 +997,21 @@ async fn teardown(
     gateway_name: &str,
     live: &[Live],
 ) {
+    // Sources Open Live refused to remove, already reported, so the sweep below does
+    // not try them again and print the same refusal twice.
+    let mut kept = BTreeSet::new();
     for l in live {
         match remove_flow(strom, &l.flow_id).await {
             Ok(()) => println!("  {} — flow stopped and removed", l.input.name),
-            Err(err) => warn!(input = %l.input.name, %err, "could not remove the flow"),
+            Err(err) => {
+                warn!(input = %l.input.name, err = %format_args!("{err:#}"), "could not remove the flow")
+            }
         }
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
-            match client.delete_source(id).await {
-                Ok(()) => println!("  {} — source removed from Open Live", l.input.name),
-                Err(err) => warn!(input = %l.input.name, %err, "could not remove the source"),
+            if remove_source(client, id, &l.input.name).await {
+                println!("  {} — source removed from Open Live", l.input.name);
+            } else {
+                kept.insert(id.clone());
             }
         }
     }
@@ -884,28 +1019,59 @@ async fn teardown(
     // whose id we never learned. Matched on the name prefix, so sources belonging to
     // another gateway or made by hand are never touched.
     if let Some(client) = open_live {
-        sweep_sources(client, gateway_name).await;
+        sweep_sources(client, gateway_name, &kept).await;
     }
 }
 
-/// Removes every source carrying this gateway's name prefix. Returns how many.
-async fn sweep_sources(client: &OpenLiveClient, gateway_name: &str) -> usize {
+/// Deletes one source, and says so plainly when Open Live refuses: a source in an
+/// active production stays, and the operator needs to know which production holds
+/// it and how to clear it. Returns whether the source is gone.
+async fn remove_source(client: &OpenLiveClient, id: &str, name: &str) -> bool {
+    match client.delete_source(id).await {
+        Ok(()) => true,
+        Err(err) => {
+            match err.downcast_ref::<Refused>() {
+                Some(refused) => println!("  {}", kept_message(name, refused)),
+                None => {
+                    warn!(source = %name, err = %format_args!("{err:#}"), "could not remove the source")
+                }
+            }
+            false
+        }
+    }
+}
+
+/// The line for a source Open Live would not remove. Pure, so its wording is tested.
+fn kept_message(name: &str, refused: &Refused) -> String {
+    format!(
+        "{name} stays in Open Live: {}. Deactivate that production, then run `open-live-ingest down`.",
+        refused.explain()
+    )
+}
+
+/// Removes every source carrying this gateway's name prefix, except the ids in
+/// `skip`. Returns how many.
+async fn sweep_sources(
+    client: &OpenLiveClient,
+    gateway_name: &str,
+    skip: &BTreeSet<String>,
+) -> usize {
     let prefix = devices::name_prefix(gateway_name);
     let sources = match client.list_sources().await {
         Ok(sources) => sources,
         Err(err) => {
-            warn!(%err, "could not list Open Live sources to clean up");
+            warn!(err = %format_args!("{err:#}"), "could not list Open Live sources to clean up");
             return 0;
         }
     };
     let mut removed = 0;
-    for source in sources.iter().filter(|s| s.name.starts_with(&prefix)) {
-        match client.delete_source(&source.id).await {
-            Ok(()) => {
-                println!("  {} — source removed from Open Live", source.name);
-                removed += 1;
-            }
-            Err(err) => warn!(source = %source.name, %err, "could not remove the source"),
+    for source in sources
+        .iter()
+        .filter(|s| s.name.starts_with(&prefix) && !skip.contains(&s.id))
+    {
+        if remove_source(client, &source.id, &source.name).await {
+            println!("  {} — source removed from Open Live", source.name);
+            removed += 1;
         }
     }
     removed
@@ -942,7 +1108,9 @@ pub async fn down(cfg: Config) -> Result<()> {
                         println!("  {} — flow stopped and removed", f.name);
                         removed += 1;
                     }
-                    Err(err) => warn!(flow = %f.name, %err, "could not remove the flow"),
+                    Err(err) => {
+                        warn!(flow = %f.name, err = %format_args!("{err:#}"), "could not remove the flow")
+                    }
                 }
             }
         }
@@ -954,7 +1122,7 @@ pub async fn down(cfg: Config) -> Result<()> {
         ),
     }
     if let Some(client) = open_live_client(&cfg)? {
-        removed += sweep_sources(&client, &cfg.gateway.name).await;
+        removed += sweep_sources(&client, &cfg.gateway.name, &BTreeSet::new()).await;
     }
     local_strom::stop_recorded();
     if removed == 0 {
@@ -1608,5 +1776,76 @@ mod tests {
                 .count(),
             10
         );
+    }
+
+    fn source_at(id: &str, name: &str, port: u16, gateway_id: Option<&str>) -> Source {
+        Source {
+            id: id.into(),
+            name: name.into(),
+            address: format!("srt://:{port}?mode=listener"),
+            stream_type: "srt".into(),
+            status: "inactive".into(),
+            latency: Some(200),
+            gateway_id: gateway_id.map(str::to_string),
+        }
+    }
+
+    /// A source this gateway left on a port a new input wants is ours to remove; one
+    /// on that port from another gateway or made by hand is reported, never removed;
+    /// one with the input's own name is adopted by the tick, so it is no clash.
+    #[test]
+    fn port_clashes_tell_our_leftovers_from_other_holders() {
+        let prefix = devices::name_prefix("Venue");
+        let wanted = vec![("Venue — Test pattern".to_string(), 47110)];
+
+        let leftover = [source_at("s1", "Venue — Camera", 47110, Some("gw-1"))];
+        let clashes = port_clashes(&wanted, &leftover, &prefix, Some("gw-1"));
+        assert_eq!(
+            clashes,
+            vec![PortClash {
+                input: "Venue — Test pattern".into(),
+                port: 47110,
+                holder_id: "s1".into(),
+                holder_name: "Venue — Camera".into(),
+                ours: true,
+            }]
+        );
+        // Untagged on either side: the name prefix decides.
+        assert!(port_clashes(&wanted, &leftover, &prefix, None)[0].ours);
+        let untagged = [source_at("s1", "Venue — Camera", 47110, None)];
+        assert!(port_clashes(&wanted, &untagged, &prefix, Some("gw-1"))[0].ours);
+
+        // Same prefix, another gateway's id: not ours.
+        assert!(!port_clashes(&wanted, &leftover, &prefix, Some("gw-2"))[0].ours);
+        // Another venue's source, or one made by hand.
+        let foreign = [source_at("s2", "Studio B — Camera", 47110, None)];
+        assert!(!port_clashes(&wanted, &foreign, &prefix, Some("gw-1"))[0].ours);
+
+        // The input's own source, or one on another port, is no clash.
+        let fine = [
+            source_at("s3", "Venue — Test pattern", 47110, Some("gw-1")),
+            source_at("s4", "Venue — Camera", 47111, Some("gw-1")),
+        ];
+        assert!(port_clashes(&wanted, &fine, &prefix, Some("gw-1")).is_empty());
+    }
+
+    /// The line printed when Open Live keeps a source names the production holding
+    /// it and what to do, rather than a bare status.
+    #[test]
+    fn a_kept_source_names_the_production_and_the_way_out() {
+        let refused = Refused {
+            what: "DELETE source".into(),
+            status: reqwest::StatusCode::CONFLICT,
+            reason: Some(r#"Source is in use by active production "Morning Show""#.into()),
+        };
+        assert_eq!(
+            kept_message("Venue — Camera", &refused),
+            r#"Venue — Camera stays in Open Live: Source is in use by active production "Morning Show". Deactivate that production, then run `open-live-ingest down`."#
+        );
+        let bare = Refused {
+            reason: None,
+            ..refused
+        };
+        assert!(kept_message("Venue — Camera", &bare).contains("HTTP 409 Conflict"));
     }
 }
