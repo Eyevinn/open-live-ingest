@@ -192,7 +192,10 @@ agent, each with install steps in its header.
 
 ## Requirements
 
-- Linux or macOS, with a Strom instance on the same machine that can see the capture hardware
+- Linux or macOS, with a Strom instance on the same machine that can see the capture hardware.
+  `install.sh` installs Strom v0.7.2 when none is on PATH. If Strom's installer stops on an
+  unaccepted Xcode license on a Mac that already has GStreamer, rerun with
+  `SKIP_GSTREAMER=true`, which it passes through to Strom's installer
 - Node.js, only to sign in to Open Source Cloud with `npx @osaas/cli login`. A pasted token needs none
 
 The gateway itself is an ordinary HTTP client: no GStreamer, no device access, no privileges.
