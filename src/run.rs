@@ -1574,9 +1574,9 @@ mod tests {
             live("D", State::Unreachable, Some("src-d"), None),
             live("E", State::Failed("boom".to_string()), None, None),
         ];
-        let snapshot = snapshot_of(&live, "venue-box", Some("0.6.8"));
+        let snapshot = snapshot_of(&live, "venue-box", Some("0.7.2"));
         assert_eq!(snapshot.host, "venue-box");
-        assert_eq!(snapshot.strom_version.as_deref(), Some("0.6.8"));
+        assert_eq!(snapshot.strom_version.as_deref(), Some("0.7.2"));
         assert_eq!(snapshot.ingest_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(snapshot.device_count, 5);
         assert_eq!(snapshot.streaming_count, 1);

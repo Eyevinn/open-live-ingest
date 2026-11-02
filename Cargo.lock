@@ -1128,10 +1128,11 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "strom-types"
-version = "0.6.8"
-source = "git+https://github.com/Eyevinn/strom.git?tag=v0.6.8#13722d5a17b3f203908055f1d45c2b360d762a98"
+version = "0.7.2"
+source = "git+https://github.com/Eyevinn/strom.git?tag=v0.7.2#172ac8ac2915e08833306aa7deb7d79a2bb026c9"
 dependencies = [
  "serde",
+ "serde_json",
  "uuid",
 ]
 

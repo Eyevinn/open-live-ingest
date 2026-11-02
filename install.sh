@@ -11,6 +11,7 @@
 #   SKIP_STROM      set to "true" to leave Strom alone
 #   INSTALL_STROM   set to "always" to (re)install Strom even if one is already on PATH
 #   GSTREAMER_INSTALL_TYPE  passed to Strom's installer: "minimal" or "full" (default: full)
+#   SKIP_GSTREAMER  set to "true" to have Strom's installer leave GStreamer alone (inherited by it)
 #
 # Strom is installed with its own installer, pinned to STROM_VERSION below. That tag
 # must match the strom-types pin in Cargo.toml; a test in tests/pins.rs checks it.
@@ -19,7 +20,7 @@ set -eu
 
 REPO="Eyevinn/open-live-ingest"
 BIN="open-live-ingest"
-STROM_VERSION="v0.6.8"
+STROM_VERSION="v0.7.2"
 STROM_INSTALLER="https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh"
 
 VERSION="${VERSION:-latest}"

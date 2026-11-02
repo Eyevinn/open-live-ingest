@@ -672,7 +672,7 @@ mod tests {
     fn sample() -> Snapshot {
         Snapshot {
             host: "venue-box".into(),
-            strom_version: Some("0.6.8".into()),
+            strom_version: Some("0.7.2".into()),
             ingest_version: "0.3.0".into(),
             device_count: 2,
             streaming_count: 1,
@@ -710,7 +710,7 @@ mod tests {
         assert_eq!(v["seq"], 1);
         assert!(v["ts"].as_str().unwrap().ends_with('Z'));
         assert_eq!(v["host"], "venue-box");
-        assert_eq!(v["stromVersion"], "0.6.8");
+        assert_eq!(v["stromVersion"], "0.7.2");
         assert_eq!(v["ingestVersion"], "0.3.0");
         assert_eq!(v["deviceCount"], 2);
         assert_eq!(v["streamingCount"], 1);
