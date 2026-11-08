@@ -58,10 +58,13 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # The checkout keeps no credentials in .git/config, so `cargo update` never runs
+      # next to a write token. The steps that talk to the remote pass the App token to
+      # git through the environment, for that step only.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
 
       # The forced tag is untrusted input: it reaches the script only through the
       # environment and must be a plain vX.Y.Z naming a published, stable release.
@@ -115,6 +118,12 @@ jobs:
           fi
 
           branch="chore/strom-$tag"
+          # Authenticate git to github.com with the App token, for this step only.
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$basic"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"
           if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
             echo "::notice title=Strom pin::Branch $branch already exists; not opening another PR. Delete the branch to retry."
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -166,6 +175,13 @@ jobs:
           bot_id="$(gh api "users/$bot" --jq .id)"
           git config user.name "$bot"
           git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+
+          # Authenticate git to github.com with the App token, for this step only.
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$basic"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"
 
           git switch -c "$BRANCH"
           git add -u

@@ -220,7 +220,9 @@ the pin, opens one PR that moves both pins and the Requirements line to it
 (`.github/scripts/bump-strom-pin.sh` does the edit, and works by hand too). Its CI run is the
 compatibility check; release the gateway after merging it. A manual run can force a target tag.
 The workflow needs a GitHub App with Contents and Pull requests write on this repository, in the
-secrets `STROM_PIN_APP_CLIENT_ID` and `STROM_PIN_APP_PRIVATE_KEY`.
+secrets `STROM_PIN_APP_CLIENT_ID` and `STROM_PIN_APP_PRIVATE_KEY`. GitHub disables scheduled
+workflows in a public repository after 60 days without repository activity; if that happens,
+re-enable it from the Actions tab (select `Strom pin`, then "Enable workflow").
 
 ## License
 

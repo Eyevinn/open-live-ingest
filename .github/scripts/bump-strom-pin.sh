@@ -23,12 +23,21 @@ if [[ ! "$current" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
     echo "cannot read the strom-types tag from Cargo.toml (got '$current')" >&2
     exit 1
 fi
+# The tags as regex patterns: the only special characters they can hold are dots.
+tag_re="${tag//./\\.}"
+current_re="${current//./\\.}"
+lock_pins_tag() { grep -q "strom\.git?tag=$tag_re#" Cargo.lock; }
 if [[ "$current" == "$tag" ]]; then
-    echo "Cargo.toml already pins strom-types to $tag" >&2
+    if lock_pins_tag; then
+        echo "Cargo.toml and Cargo.lock already pin strom-types to $tag" >&2
+        exit 0
+    fi
+    # An earlier run edited the files but `cargo update` did not finish.
+    echo "Cargo.toml already pins strom-types to $tag but Cargo.lock does not; updating it" >&2
+    cargo update -p strom-types
+    lock_pins_tag || { echo "Cargo.lock does not resolve strom-types from tag $tag" >&2; exit 1; }
     exit 0
 fi
-# The old tag as a sed pattern: the only special characters it can hold are dots.
-current_re="${current//./\\.}"
 
 sed -i -E "/^strom-types = /s/tag = \"[^\"]*\"/tag = \"$tag\"/" Cargo.toml
 sed -i -E "s/^STROM_VERSION=\"[^\"]*\"/STROM_VERSION=\"$tag\"/" install.sh
@@ -43,14 +52,14 @@ cargo update -p strom-types
 
 # Check the result rather than trust the edits: each place must now name the tag.
 fail=0
-grep -q "^strom-types = .*tag = \"$tag\"" Cargo.toml \
+grep -q "^strom-types = .*tag = \"$tag_re\"" Cargo.toml \
     || { echo "Cargo.toml does not pin strom-types to $tag" >&2; fail=1; }
-grep -q "^STROM_VERSION=\"$tag\"" install.sh \
+grep -q "^STROM_VERSION=\"$tag_re\"" install.sh \
     || { echo "install.sh does not set STROM_VERSION=\"$tag\"" >&2; fail=1; }
-grep -q "strom\.git?tag=$tag#" Cargo.lock \
+lock_pins_tag \
     || { echo "Cargo.lock does not resolve strom-types from tag $tag" >&2; fail=1; }
 if $readme_had_mention; then
-    grep -q "Strom $tag" README.md \
+    grep -q "Strom $tag_re" README.md \
         || { echo "README.md does not name Strom $tag" >&2; fail=1; }
 else
     echo "warning: README.md named no 'Strom $current'; nothing changed there" >&2
