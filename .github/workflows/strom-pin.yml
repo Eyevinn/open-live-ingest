@@ -1,0 +1,221 @@
+name: Strom pin
+
+# When Strom publishes a stable release, open one PR that moves every Strom pin to
+# it: the strom-types tag in Cargo.toml, Cargo.lock, STROM_VERSION in install.sh and
+# the README. CI on that PR is the compatibility check; a gateway release follows the
+# merge. Prereleases and drafts never open a PR.
+#
+# The branch and the PR are created with a GitHub App installation token, because a
+# PR opened with the default GITHUB_TOKEN does not trigger the CI workflow. The App
+# needs Contents and Pull requests read and write on this repository, and two repo
+# secrets: STROM_PIN_APP_CLIENT_ID and STROM_PIN_APP_PRIVATE_KEY. Without them every
+# run fails at the first step.
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Strom stable tag to pin, e.g. v0.8.1. Empty: Strom's latest stable release."
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: strom-pin
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  STROM_REPO: Eyevinn/strom
+
+jobs:
+  pin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Every write goes through the App token below; GITHUB_TOKEN only reads.
+    permissions:
+      contents: read
+    steps:
+      - name: Check the App secrets
+        env:
+          CLIENT_ID: ${{ secrets.STROM_PIN_APP_CLIENT_ID }}
+          PRIVATE_KEY: ${{ secrets.STROM_PIN_APP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ -z "$PRIVATE_KEY" ]; then
+            echo "::error title=Strom pin::The repo secrets STROM_PIN_APP_CLIENT_ID and STROM_PIN_APP_PRIVATE_KEY must both be set (a GitHub App with Contents and Pull requests read/write on this repo). GITHUB_TOKEN is not used instead, because a PR it opens does not trigger CI."
+            exit 1
+          fi
+
+      - name: Mint the App token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.STROM_PIN_APP_CLIENT_ID }}
+          private-key: ${{ secrets.STROM_PIN_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # The checkout keeps no credentials in .git/config, so `cargo update` never runs
+      # next to a write token. The steps that talk to the remote pass the App token to
+      # git through the environment, for that step only.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      # The forced tag is untrusted input: it reaches the script only through the
+      # environment and must be a plain vX.Y.Z naming a published, stable release.
+      - name: Pick the target Strom release
+        id: target
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          FORCED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          stable='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [ -n "$FORCED_TAG" ]; then
+            if [[ ! "$FORCED_TAG" =~ $stable ]]; then
+              echo "::error title=Strom pin::The tag input must look like v1.2.3."
+              exit 1
+            fi
+            release="$(gh api "repos/$STROM_REPO/releases/tags/$FORCED_TAG" \
+              --jq '[.tag_name, .prerelease, .draft] | @tsv')" \
+              || { echo "::error title=Strom pin::$STROM_REPO has no release $FORCED_TAG."; exit 1; }
+            IFS=$'\t' read -r tag prerelease draft <<<"$release"
+            if [ "$tag" != "$FORCED_TAG" ] || [ "$prerelease" != false ] || [ "$draft" != false ]; then
+              echo "::error title=Strom pin::$FORCED_TAG is not a stable $STROM_REPO release."
+              exit 1
+            fi
+          else
+            # releases/latest leaves out drafts and prereleases already.
+            tag="$(gh api "repos/$STROM_REPO/releases/latest" --jq .tag_name)"
+            if [[ ! "$tag" =~ $stable ]]; then
+              echo "::notice title=Strom pin::Latest $STROM_REPO release '$tag' is not a plain vX.Y.Z; skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          current="$(sed -n 's/^strom-types = .*tag = "\([^"]*\)".*/\1/p' Cargo.toml)"
+          if [ -z "$current" ]; then
+            echo "::error title=Strom pin::Cannot read the strom-types tag from Cargo.toml."
+            exit 1
+          fi
+          if [ "$current" = "$tag" ]; then
+            echo "::notice title=Strom pin::Already pinned to Strom $tag; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # On a schedule, only move forward. A dispatch may name any stable tag.
+          if [ -z "$FORCED_TAG" ] \
+            && [ "$(printf '%s\n%s\n' "$current" "$tag" | sort -V | tail -n1)" = "$current" ]; then
+            echo "::notice title=Strom pin::Pin $current is newer than the latest stable Strom $tag; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          branch="chore/strom-$tag"
+          # Authenticate git to github.com with the App token, for this step only.
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$basic"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"
+          if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null; then
+            echo "::notice title=Strom pin::Branch $branch already exists; not opening another PR. Delete the branch to retry."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Any PR ever opened from that branch counts, so a PR closed unmerged on
+          # purpose is not reopened by the next run.
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state all \
+            --json number,state --jq '.[] | "#\(.number) (\(.state))"')"
+          if [ -n "$existing" ]; then
+            echo "::notice title=Strom pin::PR $existing already exists for $branch; not opening another."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "skip=false"
+            echo "tag=$tag"
+            echo "current=$current"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+
+      # rustup reads rust-toolchain.toml, the same toolchain CI tests with.
+      - name: Install the pinned toolchain
+        if: steps.target.outputs.skip == 'false'
+        run: rustup toolchain install
+
+      - name: Move the pins
+        if: steps.target.outputs.skip == 'false'
+        env:
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          .github/scripts/bump-strom-pin.sh "$TAG" | tee "$RUNNER_TEMP/bump.log"
+          grep '^leftover: ' "$RUNNER_TEMP/bump.log" | sed 's/^leftover: //' > "$RUNNER_TEMP/leftovers" || true
+          git status --short
+
+      - name: Open the PR
+        if: steps.target.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          TAG: ${{ steps.target.outputs.tag }}
+          CURRENT: ${{ steps.target.outputs.current }}
+          BRANCH: ${{ steps.target.outputs.branch }}
+        run: |
+          set -euo pipefail
+          bot="${APP_SLUG}[bot]"
+          bot_id="$(gh api "users/$bot" --jq .id)"
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+
+          # Authenticate git to github.com with the App token, for this step only.
+          basic="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$basic"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic"
+
+          git switch -c "$BRANCH"
+          git add -u
+          if git diff --cached --quiet; then
+            echo "::error title=Strom pin::Moving the pin to $TAG changed no files."
+            exit 1
+          fi
+          git commit -q -m "Pin Strom $TAG" \
+            -m "Move the strom-types tag in Cargo.toml, Cargo.lock, STROM_VERSION in install.sh and the README from $CURRENT to $TAG."
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Strom [$TAG](https://github.com/$STROM_REPO/releases/tag/$TAG) is out as a stable release. This moves every Strom pin from $CURRENT to $TAG:"
+            echo
+            echo "- \`Cargo.toml\`: the \`strom-types\` tag, and \`Cargo.lock\` through \`cargo update -p strom-types\`"
+            echo "- \`install.sh\`: \`STROM_VERSION\`"
+            echo "- \`README.md\`: the Strom version the Requirements name"
+            echo
+            echo "Changes in Strom: [release notes](https://github.com/$STROM_REPO/releases/tag/$TAG), [diff $CURRENT...$TAG](https://github.com/$STROM_REPO/compare/$CURRENT...$TAG)."
+            echo
+            echo "CI on this PR is the compatibility check against the new \`strom-types\`. If it fails, fix the gateway on this branch, or close the PR to skip $TAG; a closed PR is not reopened."
+            if [ -s "$RUNNER_TEMP/leftovers" ]; then
+              echo
+              echo "These lines still name $CURRENT and look like a Strom pin. Check whether they should move too:"
+              echo
+              # shellcheck disable=SC2016 # the backticks are Markdown, not expansions
+              sed 's/^/- `/; s/$/`/' "$RUNNER_TEMP/leftovers"
+            fi
+            echo
+            echo "After the merge, a gateway release follows (bump \`version\` in \`Cargo.toml\` and push the tag; see the README's Releasing section), so the one-line install picks up Strom $TAG."
+            echo
+            echo "Opened by the \`strom-pin\` workflow ([run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID))."
+          } > "$body"
+
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+            --title "Pin Strom $TAG" --body-file "$body"
