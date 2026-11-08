@@ -20,7 +20,7 @@ set -eu
 
 REPO="Eyevinn/open-live-ingest"
 BIN="open-live-ingest"
-STROM_VERSION="v0.7.2"
+STROM_VERSION="v0.8.0"
 STROM_INSTALLER="https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh"
 
 VERSION="${VERSION:-latest}"

@@ -17,7 +17,7 @@ use crate::local_strom::{self, LocalStrom};
 use crate::openlive::{
     drifted, listener_port, OpenLiveClient, Refused, ServerInfo, Source, SourcePayload,
 };
-use crate::strom::StromClient;
+use crate::strom::{self as strom_api, StromClient};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
@@ -311,14 +311,13 @@ struct Reporter {
 }
 
 impl Reporter {
-    /// Starts the heartbeat when the settings name a gateway. Strom's version is asked
-    /// for once; an older Strom without the route simply goes unversioned.
-    async fn start(cfg: &Config, strom: &StromClient, live: &[Live]) -> Result<Option<Self>> {
+    /// Starts the heartbeat when the settings name a gateway. `strom_version` is the
+    /// one `up` read at startup; an older Strom without the route goes unversioned.
+    fn start(cfg: &Config, strom_version: Option<String>, live: &[Live]) -> Result<Option<Self>> {
         let Some(target) = heartbeat::Target::from_config(&cfg.open_live)? else {
             return Ok(None);
         };
         let host = config::hostname().unwrap_or_else(|| cfg.gateway.resolved_id());
-        let strom_version = strom.version().await.ok();
         println!(
             "Status is pushed to Open Live as gateway {}.",
             target.gateway_id
@@ -373,6 +372,14 @@ pub async fn up(
     let gateway_id = cfg.gateway.resolved_id();
     let source_gateway_id = source_gateway_id(&cfg)?;
     let (local_strom, strom) = connect_strom(&cfg).await?;
+    // Asked once, here, whether or not the heartbeat is on; the heartbeat reuses it.
+    // An older Strom without the route is warned about, never refused.
+    let strom_version = strom.version().await.ok();
+    if let Some(warning) =
+        strom_api::version_warning(strom_api::PINNED_VERSION, strom_version.as_deref())
+    {
+        warn!("{warning}");
+    }
     let open_live = open_live_client(&cfg)?;
 
     let chosen = if test_pattern {
@@ -475,7 +482,7 @@ pub async fn up(
     if let Err(err) = write_pidfile() {
         warn!(err = %format_args!("{err:#}"), "could not write the pidfile; `down` will still find the flows and sources");
     }
-    let reporter = Reporter::start(&cfg, &strom, &live).await?;
+    let reporter = Reporter::start(&cfg, strom_version, &live)?;
 
     let outcome = run_until_stopped(
         &strom,

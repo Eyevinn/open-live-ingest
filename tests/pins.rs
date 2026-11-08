@@ -1,5 +1,6 @@
 //! The install script installs the Strom release the gateway is built against. That
-//! version is written in two places, so this checks they agree.
+//! version is written in two places, so this checks they agree, and that build.rs
+//! hands the same one to the binary.
 
 use std::fs;
 use std::path::Path;
@@ -38,5 +39,17 @@ fn install_script_pins_the_same_strom_as_cargo_toml() {
     assert_eq!(
         script_version, tag,
         "install.sh installs Strom {script_version} but Cargo.toml pins strom-types to {tag}"
+    );
+}
+
+/// build.rs hands the binary the `strom-types` tag as the pinned Strom; the startup
+/// version check compares the running Strom with it.
+#[test]
+fn the_binary_is_given_the_strom_types_tag_as_its_pinned_strom() {
+    let cargo = read("Cargo.toml");
+    assert!(
+        cargo.contains(&format!("tag = \"{}\"", env!("STROM_PINNED_VERSION"))),
+        "STROM_PINNED_VERSION is {} but Cargo.toml pins strom-types elsewhere",
+        env!("STROM_PINNED_VERSION")
     );
 }

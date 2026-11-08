@@ -14,6 +14,10 @@ use strom_types::{Flow, FlowId};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The Strom release this gateway is built against: the `strom-types` tag in
+/// Cargo.toml, handed over by build.rs.
+pub const PINNED_VERSION: &str = env!("STROM_PINNED_VERSION");
+
 pub enum Reachability {
     Ok {
         video_sources: usize,
@@ -149,7 +153,8 @@ impl StromClient {
         Ok(())
     }
 
-    /// Strom's own version, reported in the heartbeat to Open Live.
+    /// Strom's own version, checked against [`PINNED_VERSION`] at startup and reported
+    /// in the heartbeat to Open Live.
     pub async fn version(&self) -> Result<String> {
         let res = self
             .get("/api/version")
@@ -213,6 +218,27 @@ fn uplink_peer(stats: &SrtStats) -> Option<SrtCallerStats> {
         .cloned()
 }
 
+/// The warning to print when the running Strom is not the release this gateway is
+/// built against, or None when it is. One leading `v` is ignored on either side; any
+/// other difference, a prerelease or build suffix included, is a mismatch. `running`
+/// is None when the version could not be read.
+pub fn version_warning(pinned: &str, running: Option<&str>) -> Option<String> {
+    let pinned = strip_v(pinned);
+    match running.map(strip_v) {
+        Some(running) if running == pinned => None,
+        Some(running) => Some(format!(
+            "Strom {running} is running, but this gateway is built against Strom {pinned}; flows may fail. Install Strom v{pinned} or a gateway release built for {running}."
+        )),
+        None => Some(format!(
+            "Could not read the running Strom's version, but this gateway is built against Strom {pinned}; flows may fail on another version. Install Strom v{pinned} if they do."
+        )),
+    }
+}
+
+fn strip_v(version: &str) -> &str {
+    version.strip_prefix('v').unwrap_or(version)
+}
+
 fn ok(res: reqwest::Response, what: &str) -> Result<reqwest::Response> {
     let status = res.status();
     if !status.is_success() {
@@ -225,6 +251,40 @@ fn ok(res: reqwest::Response, what: &str) -> Result<reqwest::Response> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_same_strom_gives_no_warning() {
+        assert_eq!(version_warning("v0.8.0", Some("v0.8.0")), None);
+        assert_eq!(version_warning("0.8.0", Some("0.8.0")), None);
+    }
+
+    #[test]
+    fn one_leading_v_is_ignored_on_either_side() {
+        assert_eq!(version_warning("v0.8.0", Some("0.8.0")), None);
+        assert_eq!(version_warning("0.8.0", Some("v0.8.0")), None);
+    }
+
+    #[test]
+    fn another_strom_is_warned_about_by_both_versions() {
+        let warning = version_warning("v0.8.0", Some("0.7.2")).expect("a warning");
+        assert!(warning.contains("Strom 0.7.2 is running"), "{warning}");
+        assert!(warning.contains("built against Strom 0.8.0"), "{warning}");
+    }
+
+    #[test]
+    fn a_prerelease_of_the_pinned_strom_is_a_mismatch() {
+        let warning = version_warning("v0.8.0", Some("0.8.0-alpha.5")).expect("a warning");
+        assert!(warning.contains("0.8.0-alpha.5"), "{warning}");
+        assert!(version_warning("v0.8.0", Some("0.8.0+build.1")).is_some());
+        assert!(version_warning("v0.8.0", Some("vv0.8.0")).is_some());
+    }
+
+    #[test]
+    fn an_unreadable_version_is_warned_about_by_the_pinned_one() {
+        let warning = version_warning("v0.8.0", None).expect("a warning");
+        assert!(warning.contains("Strom 0.8.0"), "{warning}");
+        assert!(warning.contains("Could not read"), "{warning}");
+    }
 
     fn stats(body: serde_json::Value) -> SrtStats {
         serde_json::from_value(body).expect("srt-stats body in Strom's shape")
