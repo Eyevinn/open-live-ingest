@@ -78,6 +78,28 @@ pub struct Source {
     pub latency: Option<u32>,
     #[serde(rename = "gatewayId", default)]
     pub gateway_id: Option<String>,
+    /// What Open Live derived about reaching this source. Read-only, and absent from
+    /// an Open Live older than the field.
+    #[serde(default)]
+    pub connect: Option<Connect>,
+}
+
+/// The part of a source's server-derived `connect` block the gateway reads. Its
+/// `uri` is deliberately not decoded: only the address, masked, is ever printed.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct Connect {
+    /// A reason the address may not work against the cloud Strom, such as
+    /// `srt-listener-unsupported`. Reported, never enforced: the source is stored all
+    /// the same. Kept as a string so a code this gateway does not know still shows.
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
+impl Source {
+    /// Open Live's `connect.warning` for this source, if it reports one.
+    pub fn connect_warning(&self) -> Option<&str> {
+        self.connect.as_ref()?.warning.as_deref()
+    }
 }
 
 /// The port a hostless SRT listener address binds: `srt://:47100?mode=listener`
@@ -264,7 +286,9 @@ impl OpenLiveClient {
             .context("decoding created source")
     }
 
-    pub async fn patch_source(&self, id: &str, payload: &SourcePayload) -> Result<()> {
+    /// Answers with the source as stored, which carries the address Open Live
+    /// assigned and any `connect.warning`.
+    pub async fn patch_source(&self, id: &str, payload: &SourcePayload) -> Result<Source> {
         let res = self
             .auth(
                 self.http
@@ -275,8 +299,11 @@ impl OpenLiveClient {
             .send()
             .await
             .context("PATCH source")?;
-        ok_or_refused(res, "PATCH source").await?;
-        Ok(())
+        ok_or_refused(res, "PATCH source")
+            .await?
+            .json()
+            .await
+            .context("decoding patched source")
     }
 
     pub async fn delete_source(&self, id: &str) -> Result<()> {
@@ -735,6 +762,7 @@ mod tests {
             status: status.into(),
             latency,
             gateway_id: None,
+            connect: None,
         }
     }
 
@@ -928,6 +956,78 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "DELETE source failed with HTTP 500 Internal Server Error"
+        );
+    }
+
+    fn decode(body: serde_json::Value) -> Source {
+        serde_json::from_value(body).unwrap()
+    }
+
+    /// `connect.warning` is optional at every level: an Open Live older than the
+    /// field sends no `connect`, and one with nothing to warn about sends `connect`
+    /// without it. A code this gateway has never heard of still decodes and shows.
+    #[test]
+    fn a_source_decodes_with_or_without_a_connect_warning() {
+        let base = serde_json::json!({
+            "id": "src-1",
+            "name": "Venue — cam",
+            "address": "srt://:47110?mode=listener&passphrase=***",
+            "streamType": "srt",
+            "status": "inactive"
+        });
+        let with = |connect: serde_json::Value| {
+            let mut body = base.clone();
+            body["connect"] = connect;
+            decode(body)
+        };
+
+        let warned = with(serde_json::json!({
+            "uri": "srt://cloud.example.com:47110?mode=caller",
+            "host": "cloud.example.com",
+            "port": 47110,
+            "mode": "caller",
+            "source": "strom-host",
+            "warning": "srt-listener-unsupported"
+        }));
+        assert_eq!(warned.connect_warning(), Some("srt-listener-unsupported"));
+
+        let quiet = with(serde_json::json!({
+            "uri": "srt://cloud.example.com:47110?mode=caller",
+            "host": "cloud.example.com",
+            "port": 47110,
+            "mode": "caller",
+            "source": "strom-host"
+        }));
+        assert!(quiet.connect.is_some());
+        assert_eq!(quiet.connect_warning(), None);
+
+        let older = decode(base.clone());
+        assert!(older.connect.is_none());
+        assert_eq!(older.connect_warning(), None);
+
+        let unknown = with(serde_json::json!({ "warning": "srt-something-new" }));
+        assert_eq!(unknown.connect_warning(), Some("srt-something-new"));
+
+        let null = with(serde_json::Value::Null);
+        assert_eq!(null.connect_warning(), None);
+    }
+
+    /// PATCH answers with the source, and the gateway reads it: the assigned address
+    /// and the warning both come from that answer.
+    #[tokio::test]
+    async fn a_patch_answers_with_the_source_and_its_warning() {
+        let base = serve_once(
+            "200 OK",
+            r#"{"id":"src-1","name":"Venue — cam","address":"srt://:47112?mode=listener","streamType":"srt","status":"inactive","connect":{"uri":"srt://cloud.example.com:47112?mode=caller","host":"cloud.example.com","port":47112,"mode":"caller","source":"strom-host","warning":"srt-port-outside-strom-ports"}}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let payload = SourcePayload::new("Venue — cam", "srt://:0?mode=listener", false, 200, None);
+        let patched = client.patch_source("src-1", &payload).await.unwrap();
+        assert_eq!(patched.address, "srt://:47112?mode=listener");
+        assert_eq!(
+            patched.connect_warning(),
+            Some("srt-port-outside-strom-ports")
         );
     }
 
