@@ -260,6 +260,9 @@ struct Live {
     last_bytes: Option<u64>,
     quiet_polls: u32,
     source_id: Option<String>,
+    /// The `connect.warning` Open Live last reported for the source, so one that
+    /// persists is logged once per run rather than every tick.
+    connect_warning: Option<String>,
     /// The last SRT sample with a peer, for the heartbeat. None while nothing receives.
     uplink: Option<SrtCallerStats>,
 }
@@ -420,7 +423,7 @@ pub async fn up(
     // When the range is Open Live's, so is the port inside it: register first and
     // take the port Open Live wrote into the source, then build the flows to it.
     let mut inputs = inputs;
-    let mut source_ids = match (&open_live, cloud.port_source) {
+    let mut registered = match (&open_live, cloud.port_source) {
         (Some(client), PortSource::OpenLive) => {
             assign_ports_from_open_live(
                 client,
@@ -450,7 +453,10 @@ pub async fn up(
     let mut live = Vec::new();
     for input in inputs {
         let flow_id = flow::flow_id(&gateway_id, &input.id);
-        let source_id = source_ids.remove(&input.id);
+        let (source_id, connect_warning) = match registered.remove(&input.id) {
+            Some(r) => (Some(r.source_id), r.warning),
+            None => (None, None),
+        };
         match start(
             &strom,
             &flow_id,
@@ -466,6 +472,7 @@ pub async fn up(
                 last_bytes: None,
                 quiet_polls: 0,
                 source_id,
+                connect_warning,
                 uplink: None,
             }),
             // One camera failing must not stop the rest of the venue coming up.
@@ -540,13 +547,14 @@ fn plan_port(existing: Option<&Source>, ports: &BTreeSet<u16>) -> PortPlan {
 /// party that sees every source and output has to hand the ports out. An input
 /// registers with port 0, which means "assign one", and takes the port Open Live
 /// wrote into the source. A source left by an earlier run keeps its port, so the
-/// cloud side stays stable across restarts. Returns each input's source id.
+/// cloud side stays stable across restarts. Returns what each input registered as,
+/// by input id.
 async fn assign_ports_from_open_live(
     client: &OpenLiveClient,
     inputs: &mut [Input],
     ports: &BTreeSet<u16>,
     gateway_id: Option<&str>,
-) -> Result<HashMap<String, String>> {
+) -> Result<HashMap<String, Registered>> {
     let sources = client
         .list_sources()
         .await
@@ -554,10 +562,14 @@ async fn assign_ports_from_open_live(
     let mut ids = HashMap::new();
     for input in inputs.iter_mut() {
         let existing = sources.iter().find(|s| s.name == input.name);
+        let mut warning = None;
         let (source_id, address) = match plan_port(existing, ports) {
             PortPlan::Keep { source_id, port } => {
+                if let Some(stored) = existing {
+                    note_connect_warning(&input.name, stored, &mut warning, false);
+                }
                 input.endpoint.port = port;
-                ids.insert(input.id.clone(), source_id);
+                ids.insert(input.id.clone(), Registered { source_id, warning });
                 continue;
             }
             PortPlan::Create => {
@@ -574,6 +586,7 @@ async fn assign_ports_from_open_live(
                     .await
                     .with_context(|| format!("registering {:?} with Open Live", input.name))?;
                 info!(input = %input.name, source_id = %created.id, "registered the source with Open Live");
+                note_connect_warning(&input.name, &created, &mut warning, true);
                 (created.id, created.address)
             }
             PortPlan::Reassign { source_id } => {
@@ -585,27 +598,14 @@ async fn assign_ports_from_open_live(
                     input.endpoint.latency_ms,
                     gateway_id,
                 );
-                client
+                let patched = client
                     .patch_source(&source_id, &payload)
                     .await
                     .with_context(|| {
                         format!("asking Open Live for a new port for {:?}", input.name)
                     })?;
-                // PATCH answers with the source, but the client does not read it back;
-                // the list is the one shape it already parses.
-                let address = client
-                    .list_sources()
-                    .await?
-                    .into_iter()
-                    .find(|s| s.id == source_id)
-                    .map(|s| s.address)
-                    .with_context(|| {
-                        format!(
-                            "Open Live lost the source for {:?} while reassigning its port",
-                            input.name
-                        )
-                    })?;
-                (source_id, address)
+                note_connect_warning(&input.name, &patched, &mut warning, true);
+                (source_id, patched.address)
             }
         };
         let port = listener_port(&address).with_context(|| {
@@ -616,9 +616,42 @@ async fn assign_ports_from_open_live(
             )
         })?;
         input.endpoint.port = port;
-        ids.insert(input.id.clone(), source_id);
+        ids.insert(input.id.clone(), Registered { source_id, warning });
     }
     Ok(ids)
+}
+
+/// What registering an input with Open Live left behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Registered {
+    source_id: String,
+    /// The `connect.warning` already logged for it, if any.
+    warning: Option<String>,
+}
+
+/// Whether Open Live's `connect.warning` for a source is logged. A create or PATCH
+/// answer (`written`) is logged whenever it carries one: it is the answer to a write
+/// the gateway just made. A source adopted unchanged from the list is logged only
+/// when its warning differs from the one last logged for the input, so a warning
+/// that persists is said once per run, not on every tick.
+fn should_log_warning(current: Option<&str>, last: Option<&str>, written: bool) -> bool {
+    current.is_some() && (written || current != last)
+}
+
+/// Logs Open Live's `connect.warning` for an input's source when
+/// [`should_log_warning`] says so, and remembers it in `last`. Registration has
+/// already succeeded; the warning is only reported, never an error.
+fn note_connect_warning(input: &str, source: &Source, last: &mut Option<String>, written: bool) {
+    let current = source.connect_warning();
+    if should_log_warning(current, last.as_deref(), written) {
+        warn!(
+            input = %input,
+            address = %mask_passphrase(&source.address),
+            warning = current.unwrap_or_default(),
+            "Open Live registered the source but warns its address may not work against the cloud Strom"
+        );
+    }
+    *last = current.map(str::to_string);
 }
 
 /// An Open Live source holding a listener port one of the inputs is about to
@@ -946,13 +979,17 @@ async fn reconcile_sources(
         match existing {
             Some(stored) => {
                 if drifted(stored, &desired) {
-                    client.patch_source(&stored.id, &desired).await?;
+                    let patched = client.patch_source(&stored.id, &desired).await?;
+                    note_connect_warning(&l.input.name, &patched, &mut l.connect_warning, true);
+                } else {
+                    note_connect_warning(&l.input.name, stored, &mut l.connect_warning, false);
                 }
                 l.source_id = Some(stored.id.clone());
             }
             None => {
                 let created = client.create_source(&desired).await?;
                 info!(input = %l.input.name, source_id = %created.id, "registered the source with Open Live");
+                note_connect_warning(&l.input.name, &created, &mut l.connect_warning, true);
                 l.source_id = Some(created.id);
             }
         }
@@ -1210,6 +1247,9 @@ struct UplinkStatsReport {
 struct SourceReport {
     id: String,
     status: String,
+    /// Open Live's `connect.warning`, such as `srt-listener-unsupported`. `null` when
+    /// it reports none, or is older than the field.
+    warning: Option<String>,
 }
 
 async fn gather_status(cfg: &Config) -> Result<StatusReport> {
@@ -1322,6 +1362,7 @@ async fn gather_status(cfg: &Config) -> Result<StatusReport> {
                 .map(|s| SourceReport {
                     id: s.id.clone(),
                     status: s.status.clone(),
+                    warning: s.connect_warning().map(str::to_string),
                 }),
         });
     }
@@ -1376,11 +1417,14 @@ fn render_status(r: &StatusReport) -> String {
                 _ => format!("{} bytes sent", s.bytes_sent.unwrap_or(0)),
             },
         };
-        let source = input
-            .source
-            .as_ref()
-            .map(|s| s.status.as_str())
-            .unwrap_or("not registered");
+        // Last column, so a warning lengthens the line without moving any column.
+        let source = match &input.source {
+            Some(s) => match &s.warning {
+                Some(warning) => format!("{} (warning: {warning})", s.status),
+                None => s.status.clone(),
+            },
+            None => "not registered".to_string(),
+        };
         out += &format!(
             "{:<36} {:<9} {:<26} {source}\n",
             truncate(&input.name, 36),
@@ -1496,6 +1540,7 @@ mod tests {
                     source: Some(SourceReport {
                         id: "s1".to_string(),
                         status: "active".to_string(),
+                        warning: None,
                     }),
                 },
                 InputReport {
@@ -1548,8 +1593,81 @@ mod tests {
         assert_eq!(v["inputs"][0]["flow"]["running"], true);
         assert_eq!(v["inputs"][0]["uplink"]["rtt_ms"], 31.4);
         assert_eq!(v["inputs"][0]["source"]["status"], "active");
+        assert_eq!(v["inputs"][0]["source"]["warning"], serde_json::Value::Null);
         assert_eq!(v["inputs"][1]["uplink"], serde_json::Value::Null);
         assert_eq!(v["inputs"][1]["source"], serde_json::Value::Null);
+
+        let mut warned = sample_status();
+        warned.inputs[0].source.as_mut().unwrap().warning =
+            Some("srt-port-outside-strom-ports".to_string());
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&warned).unwrap()).unwrap();
+        assert_eq!(
+            v["inputs"][0]["source"]["warning"],
+            "srt-port-outside-strom-ports"
+        );
+    }
+
+    /// A source Open Live warns about shows the code in the last column, and the
+    /// columns before it do not move.
+    #[test]
+    fn status_text_shows_a_connect_warning_without_moving_the_columns() {
+        let plain = render_status(&sample_status());
+        let mut warned = sample_status();
+        warned.inputs[0].source.as_mut().unwrap().warning =
+            Some("srt-listener-unsupported".to_string());
+        let text = render_status(&warned);
+        let before = plain.lines().find(|l| l.contains("Camera 1")).unwrap();
+        let camera_1 = text.lines().find(|l| l.contains("Camera 1")).unwrap();
+        assert_eq!(
+            camera_1,
+            format!("{before} (warning: srt-listener-unsupported)")
+        );
+        // Every other line is unchanged.
+        let others = |t: &str| {
+            t.lines()
+                .filter(|l| !l.contains("Camera 1"))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(others(&text), others(&plain));
+    }
+
+    /// A warning that persists is logged once per run for a source adopted as is,
+    /// while every create or PATCH answer that carries one is logged.
+    #[test]
+    fn a_persisting_connect_warning_is_logged_once_but_every_write_reports_it() {
+        let code = Some("srt-listener-unsupported");
+        // Adopted unchanged: first sighting logs, the same one on later ticks does not.
+        assert!(should_log_warning(code, None, false));
+        assert!(!should_log_warning(code, code, false));
+        // A different code is news.
+        assert!(should_log_warning(
+            Some("srt-port-outside-strom-ports"),
+            code,
+            false
+        ));
+        // A write answered with a warning always says so.
+        assert!(should_log_warning(code, code, true));
+        // Nothing to warn about is never logged.
+        assert!(!should_log_warning(None, code, false));
+        assert!(!should_log_warning(None, None, true));
+    }
+
+    /// `note_connect_warning` remembers what it saw, so a warning that clears and
+    /// comes back is logged again, and one that holds is not.
+    #[test]
+    fn the_last_connect_warning_is_remembered_and_cleared() {
+        let mut warned = stored("srt://:47103?mode=listener");
+        warned.connect = Some(crate::openlive::Connect {
+            warning: Some("srt-listener-unsupported".to_string()),
+        });
+        let clear = stored("srt://:47103?mode=listener");
+        let mut last = None;
+        note_connect_warning("Venue — Cam", &warned, &mut last, false);
+        assert_eq!(last.as_deref(), Some("srt-listener-unsupported"));
+        note_connect_warning("Venue — Cam", &clear, &mut last, false);
+        assert_eq!(last, None);
     }
 
     #[test]
@@ -1603,6 +1721,7 @@ mod tests {
             status: "inactive".to_string(),
             latency: None,
             gateway_id: None,
+            connect: None,
         }
     }
 
@@ -1729,6 +1848,7 @@ mod tests {
             last_bytes: None,
             quiet_polls: 0,
             source_id: source_id.map(str::to_string),
+            connect_warning: None,
             uplink,
         }
     }
@@ -1794,6 +1914,7 @@ mod tests {
             status: "inactive".into(),
             latency: Some(200),
             gateway_id: gateway_id.map(str::to_string),
+            connect: None,
         }
     }
 
