@@ -9,6 +9,7 @@
 use crate::config::{self, Config};
 use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -84,7 +85,7 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         );
     }
 
-    let binary = locate_binary(&cfg.strom.binary)?;
+    let strom = locate_binary(&cfg.strom.binary)?;
     let port = port_of(&cfg.strom.url).with_context(|| {
         format!(
             "strom.url {:?} names no port, so there is nothing to start a Strom on",
@@ -103,10 +104,11 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         "Starting Strom on port {port} (logging to {}).",
         log_path.display()
     );
-    let mut command = Command::new(&binary);
+    let mut command = Command::new(&strom.path);
     command
         .args(["--headless", "--port", &port.to_string(), "--data-dir"])
         .arg(&data_dir)
+        .envs(strom.gst_env(&data_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -120,7 +122,7 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
     }
     let child = command
         .spawn()
-        .with_context(|| format!("starting {}", binary.display()))?;
+        .with_context(|| format!("starting {}", strom.path.display()))?;
 
     // Recorded so a `down` after a hard kill can still stop it. Written before the
     // readiness wait, so a failure there cannot leak a running Strom either.
@@ -182,21 +184,157 @@ fn tail_of_log(path: &Path) -> String {
     out
 }
 
-/// An explicit path, or a name on `PATH`.
-pub fn locate_binary(configured: &str) -> Result<PathBuf> {
-    const INSTALL_HINT: &str =
-        "Install Strom, or set [strom] binary to its path:\n    curl -sSL https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh | bash";
+/// The self-contained macOS app ships the gateway and Strom side by side, with the
+/// GStreamer that Strom links against under `Frameworks`:
+///
+/// ```text
+/// Open Live Ingest.app/Contents/
+///     MacOS/open-live-ingest
+///     MacOS/strom
+///     Frameworks/                                  GStreamer and GLib libraries
+///     Frameworks/gstreamer-1.0/                    GStreamer plugins
+///     Frameworks/gstreamer-1.0/gst-plugin-scanner  the plugin scanner
+/// ```
+///
+/// The paths below are relative to `Contents`, the parent of the directory holding
+/// the executables. The script that builds the bundle (OL-57b) must put the files
+/// exactly there; change both together.
+pub const BUNDLE_PLUGIN_DIR: &str = "Frameworks/gstreamer-1.0";
+/// See [`BUNDLE_PLUGIN_DIR`]. GStreamer only loads plugin files by their library
+/// suffix, so the scanner can sit in the plugin directory.
+pub const BUNDLE_PLUGIN_SCANNER: &str = "Frameworks/gstreamer-1.0/gst-plugin-scanner";
+/// The GStreamer registry of a bundled Strom, kept in the managed Strom's data
+/// directory so it never shares a registry with another GStreamer on the machine.
+pub const BUNDLE_REGISTRY_FILE: &str = "gstreamer-registry.bin";
+
+const INSTALL_HINT: &str =
+    "Install Strom, or set [strom] binary to its path:\n    curl -sSL https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh | bash";
+
+/// Where the Strom to start was found, which decides how it is started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StromOrigin {
+    /// `strom.binary` names a path.
+    Configured,
+    /// Next to the gateway's own executable, as in the app bundle. Runs with the
+    /// bundle's GStreamer only.
+    Bundled { exe_dir: PathBuf },
+    /// Found on `PATH`.
+    Path,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedStrom {
+    pub path: PathBuf,
+    pub origin: StromOrigin,
+}
+
+impl LocatedStrom {
+    /// Why this Strom was chosen, for the log and the setup check.
+    pub fn reason(&self) -> &'static str {
+        match self.origin {
+            StromOrigin::Configured => "the path set in [strom] binary",
+            StromOrigin::Bundled { .. } => "the one next to open-live-ingest",
+            StromOrigin::Path => "found on PATH",
+        }
+    }
+
+    /// The GStreamer environment for starting this Strom. Empty unless it is the
+    /// bundled one: a Strom on `PATH` or set explicitly brings its own GStreamer.
+    /// For the bundled one, plugins and the scanner come from the bundle only, and
+    /// the registry lives in `data_dir`, so a Homebrew GStreamer is never mixed in.
+    pub fn gst_env(&self, data_dir: &Path) -> Vec<(&'static str, OsString)> {
+        let StromOrigin::Bundled { exe_dir } = &self.origin else {
+            return Vec::new();
+        };
+        let contents = exe_dir.parent().unwrap_or(exe_dir);
+        let plugins = contents.join(BUNDLE_PLUGIN_DIR).into_os_string();
+        let scanner = contents.join(BUNDLE_PLUGIN_SCANNER).into_os_string();
+        let registry = data_dir.join(BUNDLE_REGISTRY_FILE).into_os_string();
+        vec![
+            ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.clone()),
+            ("GST_PLUGIN_SYSTEM_PATH", plugins),
+            ("GST_PLUGIN_PATH_1_0", OsString::new()),
+            ("GST_PLUGIN_PATH", OsString::new()),
+            ("GST_PLUGIN_SCANNER_1_0", scanner.clone()),
+            ("GST_PLUGIN_SCANNER", scanner),
+            ("GST_REGISTRY_1_0", registry.clone()),
+            ("GST_REGISTRY", registry),
+        ]
+    }
+}
+
+/// The Strom to start: an explicit setting, else one next to this executable, else
+/// one on `PATH`.
+pub fn locate_binary(configured: &str) -> Result<LocatedStrom> {
+    let exe_dir = own_exe_dir();
+    let located = resolve_binary(
+        configured,
+        exe_dir.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )?;
+    info!(path = %located.path.display(), reason = located.reason(), "chose the Strom to start");
+    Ok(located)
+}
+
+/// The directory of the running executable with symlinks resolved, so a
+/// `/usr/local/bin` link into the app still finds the Strom in the app.
+fn own_exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    exe.parent().map(Path::to_path_buf)
+}
+
+/// The lookup order, kept free of the process environment so it can be tested.
+/// A path in `configured` always wins and is never looked up elsewhere. Only the
+/// default name looks next to the executable before `PATH`; any other name is a
+/// deliberate choice and is looked up on `PATH` alone.
+fn resolve_binary(
+    configured: &str,
+    exe_dir: Option<&Path>,
+    path_var: Option<&OsStr>,
+) -> Result<LocatedStrom> {
     let candidate = Path::new(configured);
     if candidate.is_absolute() || configured.contains('/') {
         if candidate.is_file() {
-            return Ok(candidate.to_path_buf());
+            return Ok(LocatedStrom {
+                path: candidate.to_path_buf(),
+                origin: StromOrigin::Configured,
+            });
         }
         bail!("no Strom executable at {configured}.\n\n{INSTALL_HINT}");
     }
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+    if configured == config::DEFAULT_STROM_BINARY {
+        if let Some(dir) = exe_dir {
+            let beside = dir.join(configured);
+            if is_executable(&beside) {
+                return Ok(LocatedStrom {
+                    path: beside,
+                    origin: StromOrigin::Bundled {
+                        exe_dir: dir.to_path_buf(),
+                    },
+                });
+            }
+        }
+    }
+    std::env::split_paths(path_var.unwrap_or_default())
         .map(|dir| dir.join(configured))
         .find(|full| full.is_file())
+        .map(|path| LocatedStrom {
+            path,
+            origin: StromOrigin::Path,
+        })
         .with_context(|| format!("could not find {configured:?} on PATH.\n\n{INSTALL_HINT}"))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Beside our own settings by default, so a managed Strom never writes into an
@@ -271,7 +409,156 @@ mod tests {
             .to_string()
             .contains("/nonexistent/strom"));
         assert!(locate_binary("definitely-not-a-real-binary-xyz").is_err());
-        assert!(locate_binary("sh").expect("sh is on PATH").ends_with("sh"));
+        assert!(locate_binary("sh")
+            .expect("sh is on PATH")
+            .path
+            .ends_with("sh"));
+    }
+
+    /// A fresh directory per test, removed again when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("oli-local-strom-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        /// An executable file at `rel`, with its directories.
+        fn exe(&self, rel: &str) -> PathBuf {
+            let path = self.0.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn an_explicit_path_wins_then_the_strom_next_to_us_then_path() {
+        let scratch = Scratch::new("order");
+        let macos = scratch.0.join("App.app/Contents/MacOS");
+        let bundled = scratch.exe("App.app/Contents/MacOS/strom");
+        let on_path = scratch.exe("bin/strom");
+        let explicit = scratch.exe("elsewhere/strom");
+        let path_var = std::env::join_paths([scratch.0.join("bin")]).unwrap();
+
+        // An explicit path wins over a strom next to the executable.
+        let got =
+            resolve_binary(explicit.to_str().unwrap(), Some(&macos), Some(&path_var)).unwrap();
+        assert_eq!(got.path, explicit);
+        assert_eq!(got.origin, StromOrigin::Configured);
+
+        // The default name finds the strom next to the executable before PATH.
+        let got = resolve_binary("strom", Some(&macos), Some(&path_var)).unwrap();
+        assert_eq!(got.path, bundled);
+        assert_eq!(
+            got.origin,
+            StromOrigin::Bundled {
+                exe_dir: macos.clone()
+            }
+        );
+
+        // With nothing next to the executable, PATH.
+        let empty_dir = scratch.0.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let got = resolve_binary("strom", Some(&empty_dir), Some(&path_var)).unwrap();
+        assert_eq!(got.path, on_path);
+        assert_eq!(got.origin, StromOrigin::Path);
+        let got = resolve_binary("strom", None, Some(&path_var)).unwrap();
+        assert_eq!(got.origin, StromOrigin::Path);
+
+        // A missing explicit path still errors, and is not rescued by the bundle.
+        let missing = scratch.0.join("nowhere/strom");
+        let err = resolve_binary(missing.to_str().unwrap(), Some(&macos), Some(&path_var))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(missing.to_str().unwrap()), "{err}");
+
+        // Nothing anywhere is an error naming the binary.
+        assert!(resolve_binary("strom", Some(&empty_dir), None).is_err());
+    }
+
+    /// Any name other than the default is a deliberate choice, looked up on PATH only.
+    #[test]
+    fn a_non_default_name_is_not_looked_up_next_to_us() {
+        let scratch = Scratch::new("name");
+        let macos = scratch.0.join("MacOS");
+        scratch.exe("MacOS/strom-dev");
+        let on_path = scratch.exe("bin/strom-dev");
+        let path_var = std::env::join_paths([scratch.0.join("bin")]).unwrap();
+        let got = resolve_binary("strom-dev", Some(&macos), Some(&path_var)).unwrap();
+        assert_eq!(got.path, on_path);
+        assert_eq!(got.origin, StromOrigin::Path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_strom_next_to_us_that_is_not_executable_is_skipped() {
+        let scratch = Scratch::new("noexec");
+        let macos = scratch.0.join("MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("strom"), "").unwrap();
+        let on_path = scratch.exe("bin/strom");
+        let path_var = std::env::join_paths([scratch.0.join("bin")]).unwrap();
+        let got = resolve_binary("strom", Some(&macos), Some(&path_var)).unwrap();
+        assert_eq!(got.path, on_path);
+    }
+
+    #[test]
+    fn only_a_bundled_strom_gets_the_bundles_gstreamer() {
+        let data_dir = PathBuf::from("/data/strom-data");
+        let macos = PathBuf::from("/Applications/Open Live Ingest.app/Contents/MacOS");
+        let contents = PathBuf::from("/Applications/Open Live Ingest.app/Contents");
+
+        for origin in [StromOrigin::Configured, StromOrigin::Path] {
+            let strom = LocatedStrom {
+                path: PathBuf::from("/usr/local/bin/strom"),
+                origin,
+            };
+            assert!(strom.gst_env(&data_dir).is_empty());
+        }
+
+        let strom = LocatedStrom {
+            path: macos.join("strom"),
+            origin: StromOrigin::Bundled {
+                exe_dir: macos.clone(),
+            },
+        };
+        let env: std::collections::HashMap<_, _> = strom.gst_env(&data_dir).into_iter().collect();
+        let plugins = contents.join("Frameworks/gstreamer-1.0");
+        let scanner = contents.join("Frameworks/gstreamer-1.0/gst-plugin-scanner");
+        let registry = data_dir.join("gstreamer-registry.bin");
+        for (key, want) in [
+            ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.as_os_str()),
+            ("GST_PLUGIN_SYSTEM_PATH", plugins.as_os_str()),
+            ("GST_PLUGIN_PATH_1_0", OsStr::new("")),
+            ("GST_PLUGIN_PATH", OsStr::new("")),
+            ("GST_PLUGIN_SCANNER_1_0", scanner.as_os_str()),
+            ("GST_PLUGIN_SCANNER", scanner.as_os_str()),
+            ("GST_REGISTRY_1_0", registry.as_os_str()),
+            ("GST_REGISTRY", registry.as_os_str()),
+        ] {
+            assert_eq!(env.get(key).map(OsString::as_os_str), Some(want), "{key}");
+        }
+        assert_eq!(env.len(), 8);
+        for key in ["GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SCANNER_1_0"] {
+            assert!(Path::new(&env[key]).starts_with(&contents), "{key}");
+        }
+        assert!(Path::new(&env["GST_REGISTRY_1_0"]).starts_with(&data_dir));
     }
 
     #[test]

@@ -171,6 +171,15 @@ what lets a laptop run the whole venue side from one command; a fixed installati
 as a service is adopted the same way. `down` does *not* refuse when Strom is gone: its flows are
 already stopped and the sources still need removing.
 
+**The bundled Strom comes first, and brings its own GStreamer.** The macOS app ships Strom next to
+the gateway in `Contents/MacOS`, with GStreamer under `Contents/Frameworks`. With `strom.binary` at
+its default, a `strom` next to the running executable (symlinks resolved) is used before `PATH`;
+an explicit setting always wins. Only that bundled Strom is started with the GStreamer plugin path,
+scanner and registry pointed into the bundle and the managed data directory, so a Homebrew
+GStreamer on the same Mac is never mixed in. A Strom from `PATH` or an explicit path brings its own
+GStreamer and gets no GStreamer environment. The bundle-relative paths are constants in
+`src/local_strom.rs` that the bundle script must match.
+
 **No local state.** Flows are found by derived id, sources by the gateway's name prefix. The
 exceptions are two pidfiles: the running `up`, so `down` can ask it to stop before sweeping, and a
 Strom the gateway started, so `down` can stop it after a hard kill. Both pids are checked against

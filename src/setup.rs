@@ -604,11 +604,12 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
             cfg.strom.url
         ),
         Reachability::Unreachable(err) if cfg.strom.manage => {
-            let binary = local_strom::locate_binary(&cfg.strom.binary)?;
+            let strom = local_strom::locate_binary(&cfg.strom.binary)?;
             note(format!(
-                "nothing listening at {} ({err}); up will start {}",
+                "nothing listening at {} ({err}); up will start {} ({})",
                 cfg.strom.url,
-                binary.display()
+                strom.path.display(),
+                strom.reason()
             ));
         }
         Reachability::Unreachable(err) => bail!(

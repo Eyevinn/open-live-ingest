@@ -59,6 +59,9 @@ pub fn hostname() -> Option<String> {
     hostname::get().ok().and_then(|h| h.into_string().ok())
 }
 
+/// `strom.binary` when it is not set. Only this value looks next to the gateway first.
+pub const DEFAULT_STROM_BINARY: &str = "strom";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Strom {
@@ -71,7 +74,8 @@ pub struct Strom {
     /// on the way out. A Strom already running is always adopted, never replaced or
     /// stopped: it may be a service this box depends on, or someone else's.
     pub manage: bool,
-    /// The Strom executable: a name to find on `PATH`, or a path.
+    /// The Strom executable: a name to find on `PATH`, or a path. Left at the default,
+    /// a `strom` next to the running gateway (as in the macOS app bundle) is used first.
     pub binary: String,
     /// Where a managed Strom keeps its flows. Defaults beside our own settings, so it
     /// never disturbs an existing install.
@@ -84,7 +88,7 @@ impl Default for Strom {
             url: "http://127.0.0.1:8080".to_string(),
             api_key: None,
             manage: true,
-            binary: "strom".to_string(),
+            binary: DEFAULT_STROM_BINARY.to_string(),
             data_dir: None,
         }
     }
