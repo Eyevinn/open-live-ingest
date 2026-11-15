@@ -199,6 +199,15 @@ directory that does not exist would leave it with no plugins at all. The bundle-
 constants in `src/local_strom.rs` that the bundle script must match; a unit test checks that it
 does.
 
+**Every Mach-O in the app runs under the hardened runtime, signed or not.** Notarization requires
+the hardened runtime, so the bundle script always signs with it, ad hoc when the release workflow
+has no Developer ID certificate and with that certificate when it has. The ad hoc build then hits
+the same hardened-runtime rules the notarized one will, on every pull request that touches the
+build, and the workflow starts the bundled Strom from the DMG to prove it still loads its GStreamer.
+Only `strom` and `open-live-ingest` carry entitlements, camera and microphone, because Strom opens
+the devices. No hardened-runtime exception is granted: every library and plugin is in the bundle and
+signed with the same identity, so library validation can stay on.
+
 **No local state.** Flows are found by derived id, sources by the gateway's name prefix. The
 exceptions are two pidfiles: the running `up`, so `down` can ask it to stop before sweeping, and a
 Strom the gateway started, so `down` can stop it after a hard kill. Both pids are checked against

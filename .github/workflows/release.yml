@@ -14,6 +14,7 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
+      - .github/scripts/open-live-ingest.entitlements
 
 env:
   CARGO_TERM_COLOR: always
@@ -107,14 +108,27 @@ jobs:
   # script bundles the Strom the strom-types tag in Cargo.toml names, so the workflow
   # never names a Strom version itself.
   #
-  # The DMG is not signed yet, so it never reaches a release. It is uploaded as a
-  # workflow artifact only on a manual run from a branch or a pull request run: the
-  # upload step is gated on workflow_dispatch or pull_request AND a non-tag ref.
-  # `release` runs on any tag ref, a manual run from a tag included, and downloads
-  # every artifact of the run, so a DMG uploaded on a tag ref could be published
-  # (e.g. by a re-run of `release`). On a tag ref this job builds and checks the DMG
-  # but uploads nothing. `release` does not wait for this job, so its tarballs,
-  # SHA256SUMS and attestations are what they were.
+  # Every Mach-O in the app is signed with the hardened runtime, and strom and
+  # open-live-ingest with the entitlements in .github/scripts/open-live-ingest.entitlements.
+  # The identity depends on the repository secrets (#25):
+  #   - APPLE_DEVELOPER_ID_P12 set: its Developer ID Application certificate is imported
+  #     into a temporary keychain, which the last step deletes on every outcome, and the
+  #     app and the DMG are signed with it and a secure timestamp.
+  #   - not set (pull requests, and every run until #25 is done): both are signed ad hoc.
+  #     The same hardened-runtime signing and checks run, so a signing or layout problem
+  #     shows up now, but the DMG cannot be notarized.
+  # Notarizing (notarytool, App Store Connect API key) and stapling run only when the
+  # Developer ID certificate and all three APPLE_NOTARY_* secrets are there; otherwise
+  # those steps are skipped. Secrets are read only through step env, never echoed.
+  #
+  # The DMG never reaches a release yet (#27). It is uploaded as a workflow artifact
+  # only on a manual run from a branch or a pull request run: the upload step is gated
+  # on workflow_dispatch or pull_request AND a non-tag ref. `release` runs on any tag
+  # ref, a manual run from a tag included, and downloads every artifact of the run, so
+  # a DMG uploaded on a tag ref could be published (e.g. by a re-run of `release`). On
+  # a tag ref this job builds, signs and checks the DMG but uploads nothing. `release`
+  # does not wait for this job, so its tarballs, SHA256SUMS and attestations are what
+  # they were.
   macos-app:
     needs: build
     runs-on: macos-latest
@@ -124,6 +138,9 @@ jobs:
       TARGET: aarch64-apple-darwin
       DMG: open-live-ingest-macos-aarch64.dmg
       APP: Open Live Ingest.app
+      # "true" or "false"; secrets cannot be read in `if:` directly.
+      HAS_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID_P12 != '' }}
+      HAS_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY_ID != '' && secrets.APPLE_NOTARY_ISSUER_ID != '' && secrets.APPLE_NOTARY_KEY_P8 != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -137,20 +154,55 @@ jobs:
       - name: Install GStreamer
         run: brew install gstreamer
 
-      # dmg-root becomes the DMG's volume: the app and an /Applications link.
-      - name: Build the app bundle
+      # A keychain of its own with a random password, first in the search list so
+      # codesign finds the identity. KEYCHAIN is exported before anything that can
+      # fail, so the cleanup step deletes it whatever happens next.
+      - name: Import the Developer ID certificate
+        if: env.HAS_DEVELOPER_ID == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/developer-id.keychain-db"
+          kc_pw="$(openssl rand -hex 32)"
+          echo "::add-mask::$kc_pw"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$kc_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pw" "$keychain"
+          p12="$RUNNER_TEMP/developer-id.p12"
+          trap 'rm -f "$p12"' EXIT
+          base64 --decode <<<"$P12_BASE64" > "$p12"
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$keychain" >/dev/null
+          existing=()
+          while IFS= read -r k; do existing+=("$k"); done < <(security list-keychains -d user | tr -d '" ')
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          identities="$(security find-identity -v -p codesigning "$keychain")"
+          pattern='"Developer ID Application: .*'
+          if [[ -n "$TEAM_ID" ]]; then pattern+="\\($TEAM_ID\\)"; fi
+          hash="$(grep -E "$pattern" <<<"$identities" | awk 'NR == 1 { print $2 }')"
+          [[ -n "$hash" ]] || { echo "the certificate holds no valid Developer ID Application identity"; exit 1; }
+          echo "MACOS_SIGN_IDENTITY=$hash" >> "$GITHUB_ENV"
+          echo "MACOS_SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "Signing with Developer ID identity $hash"
+
+      - name: Say the build is signed ad hoc
+        if: env.HAS_DEVELOPER_ID != 'true'
+        run: echo "::notice title=Ad hoc signed::APPLE_DEVELOPER_ID_P12 is not set, so the app and the DMG are signed ad hoc (hardened runtime, no Developer ID). This DMG is not notarized; Gatekeeper rejects it once downloaded."
+
+      # dmg-root becomes the DMG's volume: the app and an /Applications link. The script
+      # signs with MACOS_SIGN_IDENTITY when the import step set it, ad hoc otherwise,
+      # and fails unless every Mach-O carries the hardened runtime and the executables
+      # the camera and microphone entitlements.
+      - name: Build and sign the app bundle
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           .github/scripts/build-macos-app.sh "tarball/$BIN-$TARGET/$BIN" dmg-root
           ln -s /Applications dmg-root/Applications
-
-      # Signing placeholder (#27, needs the Apple secrets of #25). It goes here, before
-      # the DMG is made: set MACOS_SIGN_IDENTITY on the step above (after importing the
-      # Developer ID certificate into a temporary keychain) so the script signs the
-      # bundle with the hardened runtime, then sign the DMG below, notarize it with
-      # notarytool, staple it, and only then hand it to `release` with SHA256SUMS and
-      # an attestation. Until then nothing here is published.
 
       # hdiutil on hosted runners sometimes fails with "Resource busy"; retry it.
       - name: Build the DMG
@@ -163,22 +215,80 @@ jobs:
           done
           exit 1
 
-      # AC2, on the app as the DMG carries it, mounted away from the build path: no
-      # Mach-O load command or rpath names /opt/homebrew or /usr/local (the script's
-      # check covers MacOS/strom, MacOS/open-live-ingest and every bundled dylib), and
-      # the bundled Strom reports 0.8.1 or later.
+      - name: Sign the DMG
+        run: |
+          set -euo pipefail
+          if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+            codesign --force --timestamp --sign "$MACOS_SIGN_IDENTITY" --keychain "$MACOS_SIGN_KEYCHAIN" "$DMG"
+          else
+            echo "Signing $DMG ad hoc"
+            codesign --force --sign - "$DMG"
+          fi
+          codesign --verify --strict --verbose=2 "$DMG"
+
+      # The .p8 is written to a private directory and removed when the step ends; the
+      # cleanup step removes it too if the runner is cut short.
+      - name: Notarize the DMG
+        if: env.HAS_DEVELOPER_ID == 'true' && env.HAS_NOTARY_KEY == 'true'
+        env:
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/notary"
+          mkdir -p "$dir"
+          chmod 700 "$dir"
+          trap 'rm -rf "$dir"' EXIT
+          key="$dir/AuthKey.p8"
+          # The secret is the base64 of the .p8 (#25); the PEM text itself works too.
+          if [[ "$NOTARY_KEY_P8" == -----BEGIN* ]]; then
+            printf '%s\n' "$NOTARY_KEY_P8" > "$key"
+          else
+            base64 --decode <<<"$NOTARY_KEY_P8" > "$key"
+          fi
+          auth=(--key "$key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
+          xcrun notarytool submit "$DMG" "${auth[@]}" --wait --timeout 1h \
+            --output-format json > "$dir/result.json" || true
+          status="$(jq -r '.status // empty' "$dir/result.json" 2>/dev/null || true)"
+          id="$(jq -r '.id // empty' "$dir/result.json" 2>/dev/null || true)"
+          echo "notarytool: submission ${id:-<none>}, status ${status:-<none>}"
+          if [[ "$status" != Accepted ]]; then
+            if [[ -n "$id" ]]; then xcrun notarytool log "$id" "${auth[@]}" || true; fi
+            echo "notarization did not succeed"; exit 1
+          fi
+
+      - name: Staple the notarization ticket
+        if: env.HAS_DEVELOPER_ID == 'true' && env.HAS_NOTARY_KEY == 'true'
+        run: xcrun stapler staple "$DMG"
+
+      # On every run, on the app as the DMG carries it, mounted away from the build path:
+      # - build-macos-app.sh --check: no Mach-O load command or rpath names /opt/homebrew
+      #   or /usr/local, every Mach-O has the hardened runtime, strom and open-live-ingest
+      #   have the camera and microphone entitlements, and the strict deep codesign
+      #   verify passes.
+      # - the signature and entitlements of the main executable, for the log.
+      # - the bundled Strom reports 0.8.1 or later.
+      # - the bundled Strom starts under the hardened runtime with the bundle's
+      #   GStreamer, as the gateway starts it: the plugin scanner builds the registry,
+      #   device discovery answers, and nothing in its log says a library or plugin
+      #   failed to load (library validation, a bad signature).
       - name: Check the DMG
         run: |
+          set -euo pipefail
           mnt="$RUNNER_TEMP/dmg"
           mkdir -p "$mnt"
           hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
-          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
+          strom_pid=""
+          trap 'if [[ -n "$strom_pid" ]]; then kill "$strom_pid" 2>/dev/null || true; fi; hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
           test -d "$mnt/$APP" || { echo "$APP is missing from the DMG"; exit 1; }
           test "$(readlink "$mnt/Applications")" = /Applications \
             || { echo "the DMG has no /Applications link"; exit 1; }
+          contents="$mnt/$APP/Contents"
           .github/scripts/build-macos-app.sh --check "$mnt/$APP"
-          otool -L "$mnt/$APP/Contents/MacOS/strom"
-          out="$("$mnt/$APP/Contents/MacOS/strom" --version)"
+          codesign -dv --entitlements - "$contents/MacOS/open-live-ingest"
+          otool -L "$contents/MacOS/strom"
+          out="$("$contents/MacOS/strom" --version)"
           echo "bundled Strom: $out"
           version="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$out" | head -n 1)"
           IFS=. read -r major minor patch <<<"$version"
@@ -186,9 +296,61 @@ jobs:
             echo "the bundled Strom must be 0.8.1 or later (got '$out')"; exit 1
           fi
 
+          data="$RUNNER_TEMP/strom-data"
+          mkdir -p "$data"
+          log="$data/strom.log"
+          port=18080
+          GST_PLUGIN_SYSTEM_PATH_1_0="$contents/PlugIns/gstreamer" \
+          GST_PLUGIN_SYSTEM_PATH="$contents/PlugIns/gstreamer" \
+          GST_PLUGIN_PATH_1_0="" GST_PLUGIN_PATH="" \
+          GST_PLUGIN_SCANNER_1_0="$contents/Helpers/gst-plugin-scanner" \
+          GST_PLUGIN_SCANNER="$contents/Helpers/gst-plugin-scanner" \
+          GST_REGISTRY_1_0="$data/gstreamer-registry.bin" \
+          GST_REGISTRY="$data/gstreamer-registry.bin" \
+          GST_DEBUG="*:2" \
+            "$contents/MacOS/strom" --headless --port "$port" --data-dir "$data" >"$log" 2>&1 &
+          strom_pid=$!
+          ready=false
+          for _ in $(seq 1 90); do
+            if ! kill -0 "$strom_pid" 2>/dev/null; then echo "the bundled Strom exited"; cat "$log"; exit 1; fi
+            if curl -fsS -m 5 "http://127.0.0.1:$port/api/version" >/dev/null 2>&1; then ready=true; break; fi
+            sleep 1
+          done
+          $ready || { echo "the bundled Strom did not answer within 90s"; cat "$log"; exit 1; }
+          echo "Strom version API: $(curl -fsS -m 5 "http://127.0.0.1:$port/api/version")"
+          devices="$(curl -fsS -m 60 "http://127.0.0.1:$port/api/discovery/devices?category=video_source")" \
+            || { echo "device discovery failed"; cat "$log"; exit 1; }
+          echo "Strom device discovery: $devices"
+          kill "$strom_pid"; wait "$strom_pid" || true; strom_pid=""
+          echo "--- strom log (tail) ---"; tail -n 60 "$log"
+          test -s "$data/gstreamer-registry.bin" \
+            || { echo "the bundled Strom built no GStreamer registry"; exit 1; }
+          if grep -nE 'not valid for use in process|Library Validation|Failed to load plugin|code signature|Code Signature' "$log"; then
+            echo "the bundled Strom could not load bundled code under the hardened runtime"; exit 1
+          fi
+          echo "OK: the bundled Strom runs under the hardened runtime and loads the bundle's GStreamer"
+
+      - name: Check the notarization
+        if: env.HAS_DEVELOPER_ID == 'true' && env.HAS_NOTARY_KEY == 'true'
+        run: |
+          set -euo pipefail
+          xcrun stapler validate "$DMG"
+          spctl -a -vvv -t install "$DMG"
+
       - uses: actions/upload-artifact@v4
         if: (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && github.ref_type != 'tag'
         with:
           name: ${{ env.DMG }}
           path: ${{ env.DMG }}
           if-no-files-found: error
+
+      - name: Remove the temporary keychain
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/notary" "$RUNNER_TEMP/developer-id.p12"
+          if [[ -n "${KEYCHAIN:-}" && -e "$KEYCHAIN" ]]; then
+            security delete-keychain "$KEYCHAIN"
+            echo "Deleted the temporary keychain"
+          else
+            echo "No temporary keychain to delete"
+          fi

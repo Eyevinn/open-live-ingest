@@ -35,18 +35,23 @@
 # @executable_path/../Frameworks for MacOS/* and Helpers/*, @loader_path for
 # Frameworks/* and @loader_path/../../Frameworks for the plugins. Rpaths the Homebrew
 # builds carried are removed. The last step fails if `otool -L` (or an LC_RPATH) of
-# any Mach-O in the bundle still names /opt/homebrew or /usr/local, or if
-# `codesign --verify --strict` rejects the bundle.
+# any Mach-O in the bundle still names /opt/homebrew or /usr/local, if one is not
+# signed with the hardened runtime, if strom or open-live-ingest lacks the camera or
+# microphone entitlement, or if `codesign --verify --deep --strict` rejects the bundle.
 #
-# Signing, inside out and never with --deep: the libraries, plugins, the scanner and
-# strom first, then the bundle, which signs the main executable (open-live-ingest)
-# and seals everything else. By default everything is signed ad hoc, which Apple
-# silicon requires to load it at all, so an unsigned run gives a bundle that works
-# on the build Mac. Set MACOS_SIGN_IDENTITY (a "Developer ID Application: ..."
-# identity in a keychain the caller has unlocked) to sign with it instead, with the
-# hardened runtime and a timestamp, ready for notarization. MACOS_ENTITLEMENTS
-# overrides the entitlements file used for the two executables (the default allows
-# camera and microphone access). Notarizing and stapling is left to the caller.
+# Signing, inside out and never with --deep: the libraries and plugins, then
+# gst-plugin-scanner and strom, then the bundle, which signs the main executable
+# (open-live-ingest) and seals everything else. Every Mach-O gets the hardened runtime
+# (--options runtime), and the two executables that run as the app, strom and
+# open-live-ingest, get the entitlements in open-live-ingest.entitlements next to this
+# script (camera and microphone; the file says why each one is there). By default the
+# signature is ad hoc, which Apple silicon requires to load the code at all: the bundle
+# runs on the build Mac and exercises the hardened runtime, but it cannot be
+# notarized. Set MACOS_SIGN_IDENTITY (a "Developer ID Application: ..." identity, or
+# its SHA-1 hash, in a keychain the caller has unlocked) to sign with it instead, with
+# a secure timestamp, ready for notarization; MACOS_SIGN_KEYCHAIN names that keychain
+# when it is not in the search list. MACOS_ENTITLEMENTS overrides the entitlements
+# file. Signing the DMG, notarizing and stapling is left to the caller.
 #
 # Other environment knobs:
 #   BUNDLE_ID             CFBundleIdentifier (default: com.eyevinn.open-live-ingest)
@@ -116,7 +121,7 @@ rpaths_of() {
 # it fails closed: a missing tool, an otool that fails, a file that cannot be read or
 # a bundle without its executables or plugins is an error, never a pass.
 check_bundle() {
-    local app="${1%/}" f d tool req bad=0 checked=0 list load_cmds rpaths hits dotted
+    local app="${1%/}" f d tool req key bad=0 checked=0 list load_cmds rpaths hits dotted sig ents
     [[ -d "$app/Contents" ]] || die "$app is not an app bundle"
     for tool in file otool find awk sed grep codesign; do
         command -v "$tool" >/dev/null 2>&1 || die "$tool not found (the check needs it)"
@@ -157,6 +162,23 @@ check_bundle() {
     done <<<"$list"
     [[ $bad -eq 0 ]] || die "the bundle still references build-host libraries"
     say "OK: none of the $checked Mach-O files in the bundle references /opt/homebrew or /usr/local"
+    # Notarization requires the hardened runtime on every executable and library.
+    while IFS= read -r f; do
+        sig="$(codesign -d --verbose=2 "$f" 2>&1)" || die "${f#"$app"/} is not signed: $sig"
+        grep -qE '^CodeDirectory .*flags=0x[0-9a-f]+\([^)]*runtime' <<<"$sig" \
+            || { echo "${f#"$app"/}: no hardened runtime" >&2; bad=1; }
+    done <<<"$list"
+    [[ $bad -eq 0 ]] || die "Mach-O files in the bundle are signed without the hardened runtime"
+    say "OK: all $checked Mach-O files are signed with the hardened runtime"
+    for req in MacOS/open-live-ingest MacOS/strom; do
+        ents="$(codesign -d --entitlements - --xml "$app/Contents/$req" 2>/dev/null)" \
+            || die "cannot read the entitlements of Contents/$req"
+        for key in com.apple.security.device.camera com.apple.security.device.audio-input; do
+            grep -qF "<key>$key</key><true/>" <<<"$(tr -d ' \t\n' <<<"$ents")" \
+                || die "Contents/$req lacks the entitlement $key"
+        done
+    done
+    say "OK: strom and open-live-ingest carry the camera and microphone entitlements"
     codesign --verify --deep --strict --verbose=2 "$app" || die "codesign does not accept $app"
     say "OK: codesign --verify --strict accepts the bundle"
 }
@@ -427,39 +449,29 @@ done <"$origins"
 # Rewriting breaks the signatures; Apple silicon refuses to load unsigned code. Inside
 # out, no --deep: every nested Mach-O first, then the bundle. Signing the bundle signs
 # its main executable (open-live-ingest) and seals the nested code, which must already
-# be signed, so open-live-ingest is never signed on its own.
+# be signed, so open-live-ingest is never signed on its own. The bundle is signed with
+# the entitlements too, since that signature is the main executable's.
+entitlements="${MACOS_ENTITLEMENTS:-$root/.github/scripts/open-live-ingest.entitlements}"
+[[ -f "$entitlements" ]] || die "no entitlements file at $entitlements"
+plutil -lint "$entitlements" >/dev/null || die "$entitlements is not a valid plist"
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
-    entitlements="${MACOS_ENTITLEMENTS:-$work/entitlements.plist}"
-    if [[ -z "${MACOS_ENTITLEMENTS:-}" ]]; then
-        cat >"$entitlements" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.device.camera</key>
-    <true/>
-    <key>com.apple.security.device.audio-input</key>
-    <true/>
-</dict>
-</plist>
-EOF
-    fi
-    say "Signing with $MACOS_SIGN_IDENTITY (hardened runtime)"
-    sign() { codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" "$@" </dev/null; }
+    say "Signing with the Developer ID identity (hardened runtime, secure timestamp)"
+    sign_args=(--timestamp --sign "$MACOS_SIGN_IDENTITY")
+    if [[ -n "${MACOS_SIGN_KEYCHAIN:-}" ]]; then sign_args+=(--keychain "$MACOS_SIGN_KEYCHAIN"); fi
 else
-    entitlements=""
-    say "MACOS_SIGN_IDENTITY not set: signing ad hoc only"
-    sign() { codesign --force --sign - "$@" </dev/null; }
+    say "MACOS_SIGN_IDENTITY not set: signing AD HOC (hardened runtime, no timestamp)."
+    say "An ad hoc signed app cannot be notarized, and Gatekeeper rejects it once downloaded."
+    sign_args=(--sign -)
 fi
-ent_args=()
-[[ -z "$entitlements" ]] || ent_args=(--entitlements "$entitlements")
+sign() { codesign --force --options runtime "${sign_args[@]}" "$@" </dev/null; }
 while IFS= read -r entry; do
     file="${entry%%$'\t'*}"
-    case "$file" in "$contents/MacOS/"*) continue ;; esac
+    case "$file" in "$contents/MacOS/"* | "$contents/$SCANNER_REL") continue ;; esac
     sign "$file"
 done <"$origins"
-sign "${ent_args[@]+"${ent_args[@]}"}" "$contents/MacOS/strom"
-sign "${ent_args[@]+"${ent_args[@]}"}" "$app"
+sign "$contents/$SCANNER_REL"
+sign --entitlements "$entitlements" "$contents/MacOS/strom"
+sign --entitlements "$entitlements" "$app"
 
 # --- AC1 ------------------------------------------------------------------------------
 check_bundle "$app"
