@@ -1,6 +1,7 @@
 //! The install script installs the Strom release the gateway is built against. That
 //! version is written in two places, so this checks they agree, and that build.rs
-//! hands the same one to the binary. The macOS app script reads it from Cargo.toml.
+//! hands the same one to the binary. The macOS app script reads it from Cargo.toml, and
+//! the release workflow's DMG is built by that script.
 
 use std::fs;
 use std::path::Path;
@@ -97,6 +98,26 @@ fn the_macos_app_script_bundles_the_strom_cargo_toml_pins() {
         assert_eq!(
             literal, pinned,
             "build-macos-app.sh names Strom {literal} but Cargo.toml pins strom-types to {pinned}"
+        );
+    }
+}
+
+/// The release DMG is built by the macOS app script, so it bundles the Strom the
+/// strom-types tag names. The workflow must not hand the script a Strom of its own.
+#[test]
+fn the_release_dmg_bundles_the_strom_cargo_toml_pins() {
+    let workflow = read(".github/workflows/release.yml");
+    assert!(
+        workflow.lines().any(|l| {
+            let l = l.trim_start();
+            !l.starts_with('#') && l.contains(".github/scripts/build-macos-app.sh \"")
+        }),
+        "release.yml must build the app with build-macos-app.sh"
+    );
+    for knob in ["STROM_ASSET", "STROM_VERSION", "strom_tag"] {
+        assert!(
+            !workflow.contains(knob),
+            "release.yml sets {knob}; the DMG must bundle the Strom Cargo.toml pins"
         );
     }
 }
