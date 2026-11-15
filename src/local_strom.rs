@@ -360,7 +360,15 @@ fn resolve_binary(
         }
         bail!("no Strom executable at {configured}.\n\n{INSTALL_HINT}");
     }
-    let file = file_name(configured);
+    // Strom's own name, in whatever case it was configured, is looked up by its
+    // canonical spelling (`strom.exe` on Windows). Windows matches `STROM.EXE`
+    // case-insensitively but the path would keep the configured casing, so the log
+    // and the setup check would name a file that is not spelled that way on disk.
+    let file = if is_default_name(configured) {
+        file_name(config::DEFAULT_STROM_BINARY)
+    } else {
+        file_name(configured)
+    };
     if is_default_name(configured) {
         if let Some(dir) = exe_dir {
             let beside = dir.join(&file);
@@ -813,6 +821,11 @@ mod tests {
             assert_eq!(got.path, app.join("strom.exe"), "{name}");
             assert_eq!(got.origin, StromOrigin::Beside, "{name}");
         }
+        // The PATH lookup reports the canonical spelling too.
+        let app_on_path = std::env::join_paths([&app]).unwrap();
+        let got = resolve_binary("STROM.EXE", None, Some(&app_on_path), None).unwrap();
+        assert_eq!(got.path, app.join("strom.exe"));
+        assert_eq!(got.origin, StromOrigin::Path);
 
         let bare_dir = scratch.0.join("bare");
         std::fs::create_dir_all(&bare_dir).unwrap();
