@@ -1460,8 +1460,24 @@ fn remove_pidfile() {
 /// Whether the pid is alive and is a gateway. Pids are reused after a reboot, so a
 /// stale pidfile must never have `down` signal an unrelated process.
 fn is_running_gateway(pid: u32) -> bool {
-    // Linux truncates the command name to 15 characters.
-    process_named(pid, "open-live-gatew")
+    process_named(pid, GATEWAY_COMM)
+}
+
+/// What `ps -o comm=` shows for this binary. Linux keeps only the first 15 bytes of
+/// a command name (`open-live-inges`); macOS prints the full path, which ends in the
+/// whole name. The truncated name is contained in both.
+const GATEWAY_COMM: &str = truncate_comm(env!("CARGO_PKG_NAME"));
+
+/// The first 15 bytes of `name`, Linux's limit for a command name.
+const fn truncate_comm(name: &str) -> &str {
+    let bytes = name.as_bytes();
+    if bytes.len() <= 15 {
+        return name;
+    }
+    match std::str::from_utf8(bytes.split_at(15).0) {
+        Ok(head) => head,
+        Err(_) => panic!("the package name must be ASCII"),
+    }
 }
 
 /// Whether the pid is alive and its command name contains `needle`.
@@ -1475,7 +1491,12 @@ pub fn process_named(pid: u32, needle: &str) -> bool {
     else {
         return false;
     };
-    String::from_utf8_lossy(&out.stdout).contains(needle)
+    comm_matches(&String::from_utf8_lossy(&out.stdout), needle)
+}
+
+/// Whether a command name from `ps -o comm=` contains `needle`.
+fn comm_matches(comm: &str, needle: &str) -> bool {
+    comm.contains(needle)
 }
 
 #[cfg(unix)]
@@ -1975,5 +1996,29 @@ mod tests {
             ..refused
         };
         assert!(kept_message("Venue — Camera", &bare).contains("HTTP 409 Conflict"));
+    }
+
+    /// `down` finds a running `up` by its command name, so the needle must be what
+    /// `ps` prints for this binary: a prefix of the package name, within Linux's
+    /// 15-byte limit.
+    #[test]
+    fn the_gateway_comm_is_the_package_name_cut_to_fifteen_bytes() {
+        assert!(env!("CARGO_PKG_NAME").starts_with(GATEWAY_COMM));
+        assert!(GATEWAY_COMM.len() <= 15);
+        assert_eq!(GATEWAY_COMM, "open-live-inges");
+        assert_eq!(truncate_comm("strom"), "strom");
+    }
+
+    #[test]
+    fn a_running_gateway_is_recognised_on_linux_and_macos() {
+        // Linux: the comm truncated to 15 characters, with ps's trailing newline.
+        assert!(comm_matches("open-live-inges\n", GATEWAY_COMM));
+        // macOS: the full path of the executable.
+        assert!(comm_matches(
+            "/usr/local/bin/open-live-ingest\n",
+            GATEWAY_COMM
+        ));
+        assert!(!comm_matches("strom\n", GATEWAY_COMM));
+        assert!(!comm_matches("", GATEWAY_COMM));
     }
 }
