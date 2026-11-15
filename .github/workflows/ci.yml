@@ -10,10 +10,15 @@ env:
 
 jobs:
   # No system dependencies: the gateway drives Strom over HTTP rather than linking
-  # GStreamer, so one job covers everything. The toolchain comes from
-  # rust-toolchain.toml, so CI tests the version the repo pins.
+  # GStreamer, so one job per OS covers everything. The toolchain comes from
+  # rust-toolchain.toml, so CI tests the version the repo pins. Formatting does not
+  # depend on the OS, so it is checked on Ubuntu only.
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -21,6 +26,7 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
