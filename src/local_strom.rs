@@ -34,7 +34,14 @@ impl Drop for LocalStrom {
         };
         let pid = child.id();
         info!(pid, "stopping the Strom we started");
+        // Unix: SIGTERM, then the wait below gives it time to exit cleanly. Windows
+        // has no SIGTERM, so it is ended hard (TerminateProcess) through the handle we
+        // hold. That is fine here: the teardown has already removed the flows and the
+        // Open Live sources by the time this runs.
+        #[cfg(not(windows))]
         signal_term(pid);
+        #[cfg(windows)]
+        let _ = child.kill();
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             match child.try_wait() {
@@ -119,6 +126,12 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
     let child = command
         .spawn()
@@ -412,7 +425,19 @@ fn signal_term(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows has no SIGTERM, so a Strom known only by its pid is ended hard, with its
+/// child processes. This is only used after the flows are gone (`down` removes them
+/// first), so nothing is left half torn down. CTRL_BREAK_EVENT is not used because it
+/// has not been checked that Strom shuts down cleanly on it.
+#[cfg(windows)]
+fn signal_term(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .output();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn signal_term(_pid: u32) {}
 
 #[cfg(test)]
