@@ -75,7 +75,8 @@ pub struct Strom {
     /// stopped: it may be a service this box depends on, or someone else's.
     pub manage: bool,
     /// The Strom executable: a name to find on `PATH`, or a path. Left at the default,
-    /// a `strom` next to the running gateway (as in the macOS app bundle) is used first.
+    /// a `strom` next to the running gateway is used first. It gets the bundle's
+    /// GStreamer only inside the macOS app bundle (see `local_strom::BUNDLE_PLUGIN_DIR`).
     pub binary: String,
     /// Where a managed Strom keeps its flows. Defaults beside our own settings, so it
     /// never disturbs an existing install.

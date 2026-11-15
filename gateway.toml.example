@@ -23,7 +23,8 @@ url = "http://127.0.0.1:8080"
 # way out. A Strom already running is always adopted, never replaced or stopped.
 manage = true
 # The Strom executable: a name on PATH, or a path. Left at "strom", a strom next to
-# open-live-ingest (as in the macOS app) is used before PATH. A managed Strom keeps
+# open-live-ingest (as in the macOS app, or after install.sh) is used before PATH;
+# set a full path here to use another one. A managed Strom keeps
 # its flows in `data_dir`, which defaults to a directory beside this file.
 binary = "strom"
 # Set when an adopted Strom runs with STROM_API_KEY.

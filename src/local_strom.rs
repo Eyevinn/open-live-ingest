@@ -199,6 +199,11 @@ fn tail_of_log(path: &Path) -> String {
 /// The paths below are relative to `Contents`, the parent of the directory holding
 /// the executables. The script that builds the bundle (OL-57b) must put the files
 /// exactly there; change both together.
+///
+/// A `strom` next to the gateway counts as bundled only when this directory exists
+/// relative to it. That is what tells the app apart from a plain install such as
+/// `install.sh`'s, which puts both executables in `/usr/local/bin` or `~/.local/bin`
+/// with no GStreamer of their own.
 pub const BUNDLE_PLUGIN_DIR: &str = "Frameworks/gstreamer-1.0";
 /// See [`BUNDLE_PLUGIN_DIR`]. GStreamer only loads plugin files by their library
 /// suffix, so the scanner can sit in the plugin directory.
@@ -215,9 +220,13 @@ const INSTALL_HINT: &str =
 pub enum StromOrigin {
     /// `strom.binary` names a path.
     Configured,
-    /// Next to the gateway's own executable, as in the app bundle. Runs with the
-    /// bundle's GStreamer only.
-    Bundled { exe_dir: PathBuf },
+    /// Next to the gateway's own executable, inside the app bundle: the parent of
+    /// that directory (`contents`, the bundle's `Contents`) holds
+    /// [`BUNDLE_PLUGIN_DIR`]. Runs with the bundle's GStreamer only.
+    Bundled { contents: PathBuf },
+    /// Next to the gateway's own executable, but with no bundle around it, as after
+    /// `install.sh`. Brings its own GStreamer, like a Strom on `PATH`.
+    Beside,
     /// Found on `PATH`.
     Path,
 }
@@ -233,20 +242,21 @@ impl LocatedStrom {
     pub fn reason(&self) -> &'static str {
         match self.origin {
             StromOrigin::Configured => "the path set in [strom] binary",
-            StromOrigin::Bundled { .. } => "the one next to open-live-ingest",
+            StromOrigin::Bundled { .. } => "the one bundled with open-live-ingest",
+            StromOrigin::Beside => "the one next to open-live-ingest",
             StromOrigin::Path => "found on PATH",
         }
     }
 
     /// The GStreamer environment for starting this Strom. Empty unless it is the
-    /// bundled one: a Strom on `PATH` or set explicitly brings its own GStreamer.
+    /// bundled one: a Strom on `PATH`, set explicitly, or next to the gateway outside
+    /// a bundle brings its own GStreamer.
     /// For the bundled one, plugins and the scanner come from the bundle only, and
     /// the registry lives in `data_dir`, so a Homebrew GStreamer is never mixed in.
     pub fn gst_env(&self, data_dir: &Path) -> Vec<(&'static str, OsString)> {
-        let StromOrigin::Bundled { exe_dir } = &self.origin else {
+        let StromOrigin::Bundled { contents } = &self.origin else {
             return Vec::new();
         };
-        let contents = exe_dir.parent().unwrap_or(exe_dir);
         let plugins = contents.join(BUNDLE_PLUGIN_DIR).into_os_string();
         let scanner = contents.join(BUNDLE_PLUGIN_SCANNER).into_os_string();
         let registry = data_dir.join(BUNDLE_REGISTRY_FILE).into_os_string();
@@ -287,7 +297,9 @@ fn own_exe_dir() -> Option<PathBuf> {
 /// The lookup order, kept free of the process environment so it can be tested.
 /// A path in `configured` always wins and is never looked up elsewhere. Only the
 /// default name looks next to the executable before `PATH`; any other name is a
-/// deliberate choice and is looked up on `PATH` alone.
+/// deliberate choice and is looked up on `PATH` alone. A Strom found next to the
+/// executable is [`StromOrigin::Bundled`] only when the bundle layout is there
+/// (see [`bundle_contents`]), and [`StromOrigin::Beside`] otherwise.
 fn resolve_binary(
     configured: &str,
     exe_dir: Option<&Path>,
@@ -307,11 +319,13 @@ fn resolve_binary(
         if let Some(dir) = exe_dir {
             let beside = dir.join(configured);
             if is_executable(&beside) {
+                let origin = match bundle_contents(dir) {
+                    Some(contents) => StromOrigin::Bundled { contents },
+                    None => StromOrigin::Beside,
+                };
                 return Ok(LocatedStrom {
                     path: beside,
-                    origin: StromOrigin::Bundled {
-                        exe_dir: dir.to_path_buf(),
-                    },
+                    origin,
                 });
             }
         }
@@ -324,6 +338,18 @@ fn resolve_binary(
             origin: StromOrigin::Path,
         })
         .with_context(|| format!("could not find {configured:?} on PATH.\n\n{INSTALL_HINT}"))
+}
+
+/// The bundle's `Contents` directory when `exe_dir` sits inside the app bundle,
+/// that is when its parent holds [`BUNDLE_PLUGIN_DIR`]. None for a plain directory
+/// such as `/usr/local/bin`, where pointing GStreamer at a plugin directory that does
+/// not exist would leave Strom with no plugins at all.
+fn bundle_contents(exe_dir: &Path) -> Option<PathBuf> {
+    let contents = exe_dir.parent()?;
+    contents
+        .join(BUNDLE_PLUGIN_DIR)
+        .is_dir()
+        .then(|| contents.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -451,7 +477,9 @@ mod tests {
     #[test]
     fn an_explicit_path_wins_then_the_strom_next_to_us_then_path() {
         let scratch = Scratch::new("order");
-        let macos = scratch.0.join("App.app/Contents/MacOS");
+        let contents = scratch.0.join("App.app/Contents");
+        let macos = contents.join("MacOS");
+        std::fs::create_dir_all(contents.join(BUNDLE_PLUGIN_DIR)).unwrap();
         let bundled = scratch.exe("App.app/Contents/MacOS/strom");
         let on_path = scratch.exe("bin/strom");
         let explicit = scratch.exe("elsewhere/strom");
@@ -469,7 +497,7 @@ mod tests {
         assert_eq!(
             got.origin,
             StromOrigin::Bundled {
-                exe_dir: macos.clone()
+                contents: contents.clone()
             }
         );
 
@@ -519,13 +547,43 @@ mod tests {
         assert_eq!(got.path, on_path);
     }
 
+    /// `install.sh` puts the gateway and Strom side by side in a plain `bin`
+    /// directory. That Strom is still preferred, but it is not bundled: it must keep
+    /// its own GStreamer, so it gets no GST_* environment.
+    #[test]
+    fn a_strom_next_to_us_in_a_plain_bin_dir_is_not_bundled() {
+        let scratch = Scratch::new("plainbin");
+        let bin = scratch.0.join("usr/local/bin");
+        let beside = scratch.exe("usr/local/bin/strom");
+        scratch.exe("usr/local/bin/open-live-ingest");
+        assert!(!scratch.0.join("usr/local").join(BUNDLE_PLUGIN_DIR).exists());
+
+        let got = resolve_binary("strom", Some(&bin), None).unwrap();
+        assert_eq!(got.path, beside);
+        assert_eq!(got.origin, StromOrigin::Beside);
+        assert_eq!(got.reason(), "the one next to open-live-ingest");
+        let env = got.gst_env(&scratch.0.join("strom-data"));
+        assert!(env.is_empty(), "{env:?}");
+
+        // A MacOS directory without the bundle's plugin directory is not a bundle either.
+        let macos = scratch.0.join("Broken.app/Contents/MacOS");
+        scratch.exe("Broken.app/Contents/MacOS/strom");
+        let got = resolve_binary("strom", Some(&macos), None).unwrap();
+        assert_eq!(got.origin, StromOrigin::Beside);
+        assert!(got.gst_env(&scratch.0.join("strom-data")).is_empty());
+    }
+
     #[test]
     fn only_a_bundled_strom_gets_the_bundles_gstreamer() {
         let data_dir = PathBuf::from("/data/strom-data");
         let macos = PathBuf::from("/Applications/Open Live Ingest.app/Contents/MacOS");
         let contents = PathBuf::from("/Applications/Open Live Ingest.app/Contents");
 
-        for origin in [StromOrigin::Configured, StromOrigin::Path] {
+        for origin in [
+            StromOrigin::Configured,
+            StromOrigin::Path,
+            StromOrigin::Beside,
+        ] {
             let strom = LocatedStrom {
                 path: PathBuf::from("/usr/local/bin/strom"),
                 origin,
@@ -536,7 +594,7 @@ mod tests {
         let strom = LocatedStrom {
             path: macos.join("strom"),
             origin: StromOrigin::Bundled {
-                exe_dir: macos.clone(),
+                contents: contents.clone(),
             },
         };
         let env: std::collections::HashMap<_, _> = strom.gst_env(&data_dir).into_iter().collect();
