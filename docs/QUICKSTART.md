@@ -1,6 +1,7 @@
 # Quickstart
 
-An exact command sequence for a fresh Linux box or Mac, written to be followed by a script or an
+An exact command sequence for a fresh Linux box or Mac (Windows: see [Windows](#windows) at the
+end), written to be followed by a script or an
 agent as well as a person. Each step gives the command, what success looks like, and what to do
 when it does not. Nothing here prompts.
 
@@ -244,3 +245,49 @@ started. With a service installed, stop the service instead, which does the same
 systemctl --user disable --now open-live-ingest        # Linux
 launchctl bootout gui/$(id -u)/se.eyevinn.open-live-ingest   # macOS
 ```
+
+## Windows
+
+On 64-bit (x86_64) Windows the steps are the same, in PowerShell rather than a POSIX shell. Only
+what differs is listed here.
+
+Install:
+
+```powershell
+irm https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/install.ps1 | iex
+```
+
+Success: no red error text, and the last lines read
+
+```
+==> Installed C:\Users\<user>\AppData\Local\Programs\open-live-ingest\open-live-ingest.exe (open-live-ingest X.Y.Z)
+==> Added C:\Users\<user>\AppData\Local\Programs\open-live-ingest to your user PATH; consoles opened from now on find open-live-ingest
+==> Downloading Strom vX.Y.Z (strom-X.Y.Z-windows-x86_64.msi)
+...
+==> Installed C:\Program Files\Strom\bin\strom.exe
+...
+==> Done. Next: open-live-ingest setup, then open-live-ingest up
+```
+
+The gateway needs no administrator rights. Strom's MSI does, so in a console that is not elevated
+Windows asks once to allow `msiexec`; refusing stops the script with `elevation was refused`. If a
+Strom is already installed (`strom.exe` on PATH or in `%ProgramFiles%\Strom\bin`) the script
+leaves it alone and says `Strom already installed at ...`. Then **open a new console**, so the user
+PATH and Strom's `GST_PLUGIN_PATH` apply.
+
+The binary is unsigned, so SmartScreen or Defender may warn on the first run; allow it.
+
+Credential (step 2):
+
+```powershell
+Set-Item Env:OLI_OPEN_LIVE_API_KEY '<token>'
+```
+
+Settings are saved to `%APPDATA%\open-live-ingest\gateway.toml`, readable by your user, SYSTEM
+and Administrators only.
+
+Start (step 5): there is no Windows service. Run `open-live-ingest up` in a console and leave
+the window open. Ctrl-C, or closing the window, stops and removes the feeds. `open-live-ingest
+down` from a second console stops a running `up` the same way.
+
+Not covered on Windows: ARM64 (there is no build) and running as a Windows service.

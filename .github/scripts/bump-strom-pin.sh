@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Move every Strom pin to one tag: the strom-types tag in Cargo.toml, Cargo.lock,
-# STROM_VERSION in install.sh, and the version the README names. Run from the
-# repository root:
+# STROM_VERSION in install.sh, $StromVersion in install.ps1, and the version the
+# README names. Run from the repository root:
 #
 #   .github/scripts/bump-strom-pin.sh v0.8.1
 #
@@ -41,6 +41,7 @@ fi
 
 sed -i -E "/^strom-types = /s/tag = \"[^\"]*\"/tag = \"$tag\"/" Cargo.toml
 sed -i -E "s/^STROM_VERSION=\"[^\"]*\"/STROM_VERSION=\"$tag\"/" install.sh
+sed -i -E "s/^([[:space:]]*)\\\$StromVersion = \"[^\"]*\"/\1\\\$StromVersion = \"$tag\"/" install.ps1
 
 readme_had_mention=false
 if grep -q "Strom $current_re\b" README.md; then
@@ -56,6 +57,8 @@ grep -q "^strom-types = .*tag = \"$tag_re\"" Cargo.toml \
     || { echo "Cargo.toml does not pin strom-types to $tag" >&2; fail=1; }
 grep -q "^STROM_VERSION=\"$tag_re\"" install.sh \
     || { echo "install.sh does not set STROM_VERSION=\"$tag\"" >&2; fail=1; }
+grep -q "^[[:space:]]*\\\$StromVersion = \"$tag_re\"" install.ps1 \
+    || { echo "install.ps1 does not set \$StromVersion = \"$tag\"" >&2; fail=1; }
 lock_pins_tag \
     || { echo "Cargo.lock does not resolve strom-types from tag $tag" >&2; fail=1; }
 if $readme_had_mention; then
