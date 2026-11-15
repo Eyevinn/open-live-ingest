@@ -1,8 +1,8 @@
 name: Release
 
-# Pushing a tag such as v0.3.0 builds one static binary per platform and attaches
-# them to a GitHub release. The manual trigger builds the same artifacts without
-# publishing anything, to try the workflow out.
+# Pushing a tag such as v0.3.0 builds one binary per platform and attaches them
+# to a GitHub release. The manual trigger builds the same artifacts and SHA256SUMS
+# without publishing anything, to try the workflow out.
 on:
   push:
     tags: ["v*"]
@@ -22,7 +22,12 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest,     target: aarch64-apple-darwin }
           - { os: macos-15-intel,   target: x86_64-apple-darwin }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
+    # Git Bash on Windows, so every step is the same script on every runner.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -52,14 +57,21 @@ jobs:
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
       # No version in the asset name, so releases/latest/download/<asset> is a stable
-      # URL. The tag names the version; so does the binary.
+      # URL. The tag names the version; so does the binary. Windows gets a zip (7-Zip
+      # is preinstalled on the runner), the rest a tarball, same folder layout.
       - name: Package
         run: |
           name="$BIN-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/$BIN" LICENSE-MIT LICENSE-APACHE README.md gateway.toml.example "$name/"
-          tar czf "$name.tar.gz" "$name"
-          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          case "${{ matrix.target }}" in *-windows-*) exe=.exe ;; *) exe= ;; esac
+          cp "target/${{ matrix.target }}/release/$BIN$exe" LICENSE-MIT LICENSE-APACHE README.md gateway.toml.example "$name/"
+          if [ -n "$exe" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -67,9 +79,29 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  # Runs on the manual trigger too, so a dry run shows the SHA256SUMS a release
+  # would carry. It needs no write permission; publishing stays in `release`.
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, checksums]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -80,12 +112,14 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
-      # Signed build provenance for each tarball, checked with `gh attestation verify`.
+      - name: Verify the checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+      # Signed build provenance for each archive, checked with `gh attestation verify`.
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/*.tar.gz
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
