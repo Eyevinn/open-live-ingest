@@ -182,21 +182,60 @@ fn tail_of_log(path: &Path) -> String {
     out
 }
 
-/// An explicit path, or a name on `PATH`.
+#[cfg(not(windows))]
+const INSTALL_HINT: &str =
+    "Install Strom, or set [strom] binary to its path:\n    curl -sSL https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh | bash";
+#[cfg(windows)]
+const INSTALL_HINT: &str = "Install Strom with install.ps1, or with the Strom MSI from https://github.com/Eyevinn/strom/releases,\nor set [strom] binary to the path of strom.exe:\n    irm https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/install.ps1 | iex";
+
+/// An explicit path, or a name on `PATH`. On Windows also `<name>.exe` on `PATH`,
+/// and then where the Strom MSI installs, which a console opened before the
+/// install does not yet have on its `PATH`.
 pub fn locate_binary(configured: &str) -> Result<PathBuf> {
-    const INSTALL_HINT: &str =
-        "Install Strom, or set [strom] binary to its path:\n    curl -sSL https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh | bash";
     let candidate = Path::new(configured);
-    if candidate.is_absolute() || configured.contains('/') {
+    let is_path = configured.contains('/') || (cfg!(windows) && configured.contains('\\'));
+    if candidate.is_absolute() || is_path {
         if candidate.is_file() {
             return Ok(candidate.to_path_buf());
         }
         bail!("no Strom executable at {configured}.\n\n{INSTALL_HINT}");
     }
-    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|dir| dir.join(configured))
-        .find(|full| full.is_file())
-        .with_context(|| format!("could not find {configured:?} on PATH.\n\n{INSTALL_HINT}"))
+    let names = file_names(configured);
+    let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|full| full.is_file());
+    if let Some(found) = on_path {
+        return Ok(found);
+    }
+    #[cfg(windows)]
+    if let Some(found) = msi_install(configured) {
+        return Ok(found);
+    }
+    bail!("could not find {configured:?} on PATH.\n\n{INSTALL_HINT}")
+}
+
+/// The file names a command name stands for: on Windows `<name>.exe` first.
+fn file_names(name: &str) -> Vec<String> {
+    if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") {
+        vec![format!("{name}.exe"), name.to_string()]
+    } else {
+        vec![name.to_string()]
+    }
+}
+
+/// `%ProgramFiles%\Strom\bin\strom.exe`, where the Strom MSI installs, when the
+/// configured name is Strom's own.
+#[cfg(windows)]
+fn msi_install(configured: &str) -> Option<PathBuf> {
+    let name = configured.to_ascii_lowercase();
+    if name != "strom" && name != "strom.exe" {
+        return None;
+    }
+    let full = PathBuf::from(std::env::var_os("ProgramFiles")?)
+        .join("Strom")
+        .join("bin")
+        .join("strom.exe");
+    full.is_file().then_some(full)
 }
 
 /// Beside our own settings by default, so a managed Strom never writes into an
@@ -273,6 +312,29 @@ mod tests {
         assert!(locate_binary("definitely-not-a-real-binary-xyz").is_err());
         #[cfg(unix)]
         assert!(locate_binary("sh").expect("sh is on PATH").ends_with("sh"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_name_on_path_is_found_with_its_exe_extension() {
+        let found = locate_binary("cmd").expect("cmd.exe is on PATH");
+        let file = found.file_name().unwrap().to_string_lossy().to_lowercase();
+        assert_eq!(file, "cmd.exe");
+    }
+
+    /// A relative Windows path is a path, not a name to look up on PATH.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_value_with_a_backslash_is_a_path() {
+        assert_eq!(
+            locate_binary(r"src\main.rs").expect("cargo test runs in the crate root"),
+            PathBuf::from(r"src\main.rs")
+        );
+        let err = locate_binary(r"no-such-dir\cmd").unwrap_err().to_string();
+        assert!(
+            err.contains(r"no Strom executable at no-such-dir\cmd"),
+            "{err}"
+        );
     }
 
     #[test]
