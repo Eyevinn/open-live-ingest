@@ -63,14 +63,19 @@ FORBIDDEN_RE='/opt/homebrew|/usr/local'
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "==> $*" >&2; }
 
-is_macho() { file -b "$1" | grep -q 'Mach-O'; }
-
-# Every Mach-O file under a directory, one per line.
+# Every Mach-O file under a directory, one per line. Fails (rather than skipping the
+# file) when `find` or `file` fails, so the AC1 check below cannot pass by not looking.
 macho_files() {
-    local f
-    find "$1" -type f | while IFS= read -r f; do
-        if is_macho "$f"; then printf '%s\n' "$f"; fi
-    done
+    local f kind list
+    list="$(find "$1" -type f)" || { echo "error: cannot list the files in $1" >&2; return 1; }
+    [[ -n "$list" ]] || return 0
+    while IFS= read -r f; do
+        kind="$(file -b "$f")" || { echo "error: file failed on $f" >&2; return 1; }
+        case "$kind" in
+            '' | 'cannot open'* | 'ERROR'*) echo "error: file cannot read $f ($kind)" >&2; return 1 ;;
+            *Mach-O*) printf '%s\n' "$f" ;;
+        esac
+    done <<<"$list"
 }
 
 # The libraries a Mach-O loads, without its own install name.
@@ -82,27 +87,52 @@ deps_of() {
     done
 }
 
+# The LC_RPATH entries of a Mach-O, one per line. A path may contain spaces, so take
+# everything between "path " and the trailing " (offset N)".
 rpaths_of() {
-    otool -l "$1" | awk '/cmd LC_RPATH/ {r = 1} r && $1 == "path" {print $2; r = 0}'
+    otool -l "$1" | awk '
+        /cmd LC_RPATH/ { r = 1 }
+        r && $1 == "path" {
+            sub(/^[ \t]*path /, ""); sub(/ \(offset [0-9]+\)$/, ""); print; r = 0
+        }'
 }
 
-# AC1: fail on any Mach-O whose load commands still name a build-host prefix.
+# AC1: fail on any Mach-O whose load commands still name a build-host prefix. This is
+# the gate the release build relies on, so it fails closed: a missing tool, an otool
+# that fails, a file that cannot be read or a bundle without its two executables is an
+# error, never a pass.
 check_bundle() {
-    local app="$1" f bad=0 hits
+    local app="${1%/}" f tool req bad=0 checked=0 list load_cmds rpaths hits
     [[ -d "$app/Contents" ]] || die "$app is not an app bundle"
+    for tool in file otool find awk sed grep; do
+        command -v "$tool" >/dev/null 2>&1 || die "$tool not found (the check needs it)"
+    done
     say "Checking every Mach-O in $app for $FORBIDDEN_RE"
+    list="$(macho_files "$app")" || die "cannot list the Mach-O files in $app"
+    for req in MacOS/open-live-ingest MacOS/strom; do
+        grep -qxF "$app/Contents/$req" <<<"$list" || die "Contents/$req is missing or is not a Mach-O"
+    done
     while IFS= read -r f; do
-        # Line 1 of `otool -L` is the file's own path, which may sit anywhere.
-        hits="$( { otool -L "$f" | tail -n +2; rpaths_of "$f" | sed 's/^/LC_RPATH /'; } \
-            | grep -E "$FORBIDDEN_RE" || true)"
+        load_cmds="$(otool -L "$f")" || die "otool -L failed on ${f#"$app"/}"
+        # Line 1 of `otool -L` is the file's own path, which may sit anywhere. Every
+        # Mach-O here links at least libSystem, so no reference at all means otool
+        # did not really read the file.
+        [[ "$(printf '%s\n' "$load_cmds" | wc -l)" -ge 2 ]] \
+            || die "otool -L shows no libraries for ${f#"$app"/}: $load_cmds"
+        rpaths="$(rpaths_of "$f")" || die "otool -l failed on ${f#"$app"/}"
+        hits="$( {
+            printf '%s\n' "$load_cmds" | tail -n +2
+            if [[ -n "$rpaths" ]]; then printf '%s\n' "$rpaths" | sed 's/^/LC_RPATH /'; fi
+        } | grep -E "$FORBIDDEN_RE" || true)"
         if [[ -n "$hits" ]]; then
             echo "${f#"$app"/}:" >&2
             printf '%s\n' "$hits" | sed 's/^/    /' >&2
             bad=1
         fi
-    done < <(macho_files "$app")
+        checked=$((checked + 1))
+    done <<<"$list"
     [[ $bad -eq 0 ]] || die "the bundle still references build-host libraries"
-    say "OK: no Mach-O in the bundle references /opt/homebrew or /usr/local"
+    say "OK: none of the $checked Mach-O files in the bundle references /opt/homebrew or /usr/local"
 }
 
 # Follow symlinks to the file itself (macOS readlink has no -f before macOS 13).
@@ -117,25 +147,46 @@ real_path() {
     printf '%s/%s\n' "$dir" "$(basename "$p")"
 }
 
+# The build-host paths of the bundle's executables (open-live-ingest, strom and
+# gst-plugin-scanner), set once they are known. dyld resolves @executable_path, and
+# the rpaths of the image chain, from whichever of them loaded a library.
+exec_origins=()
+
 # Resolve a dependency of the build-host file `origin` (as it sat before copying) to
 # a file on this machine. Prints nothing for a system library.
+#   @executable_path/... : the origin's own directory, then each executable's.
+#   @rpath/...           : the origin's own LC_RPATHs, then each executable's (dyld
+#                          searches the rpaths of the whole chain of loaders; the
+#                          libraries in between are not tracked, but Homebrew
+#                          bottles use absolute install names, so this rarely matters).
+# Anything it still cannot find is an error, never a guess.
 resolve_dep() {
-    local dep="$1" origin="$2" origin_dir rp cand rest
+    local dep="$1" origin="$2" origin_dir rp cand rest dir loader loader_dir
     origin_dir="$(dirname "$origin")"
     case "$dep" in
         /usr/lib/* | /System/*) return 0 ;;
-        @loader_path/* | @executable_path/*)
+        @loader_path/*)
             cand="$origin_dir/${dep#*/}"
             [[ -e "$cand" ]] && { printf '%s\n' "$cand"; return 0; }
             ;;
+        @executable_path/*)
+            for dir in "$origin_dir" "${exec_origins[@]+"${exec_origins[@]}"}"; do
+                [[ "$dir" == "$origin_dir" ]] || dir="$(dirname "$dir")"
+                cand="$dir/${dep#*/}"
+                [[ -e "$cand" ]] && { printf '%s\n' "$cand"; return 0; }
+            done
+            ;;
         @rpath/*)
             rest="${dep#@rpath/}"
-            while IFS= read -r rp; do
-                rp="${rp/#@loader_path/$origin_dir}"
-                rp="${rp/#@executable_path/$origin_dir}"
-                cand="$rp/$rest"
-                [[ -e "$cand" ]] && { printf '%s\n' "$cand"; return 0; }
-            done < <(rpaths_of "$origin")
+            for loader in "$origin" "${exec_origins[@]+"${exec_origins[@]}"}"; do
+                loader_dir="$(dirname "$loader")"
+                while IFS= read -r rp; do
+                    rp="${rp/#@loader_path/$loader_dir}"
+                    rp="${rp/#@executable_path/$loader_dir}"
+                    cand="$rp/$rest"
+                    [[ -e "$cand" ]] && { printf '%s\n' "$cand"; return 0; }
+                done < <(rpaths_of "$loader")
+            done
             ;;
         /*)
             [[ -e "$dep" ]] && { printf '%s\n' "$dep"; return 0; }
@@ -285,6 +336,7 @@ done
 [[ $plugin_count -gt 0 ]] || die "no plugins found in $gst_prefix/lib/gstreamer-1.0"
 cp -L "$gst_scanner" "$contents/$PLUGIN_DIR_REL/gst-plugin-scanner"
 printf '%s\t%s\n' "$contents/$PLUGIN_DIR_REL/gst-plugin-scanner" "$(real_path "$gst_scanner")" >>"$origins"
+exec_origins=("$(real_path "$ingest_bin")" "$strom_bin" "$(real_path "$gst_scanner")")
 say "Copied $plugin_count GStreamer plugins and gst-plugin-scanner"
 
 # Walk the closure breadth first. origins.tsv grows as libraries are copied in, so
@@ -378,7 +430,9 @@ EOF
     done <"$origins"
     sign --entitlements "$entitlements" "$contents/MacOS/strom"
     sign --entitlements "$entitlements" "$contents/MacOS/open-live-ingest"
-    sign --entitlements "$entitlements" "$app"
+    # The bundle seal needs no entitlements: they belong to the executables, which
+    # are already signed with them.
+    sign "$app"
     codesign --verify --deep --strict "$app"
 else
     say "MACOS_SIGN_IDENTITY not set: the bundle is signed ad hoc only"
