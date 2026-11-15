@@ -41,6 +41,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the shutdown notice may hold up the rest of the teardown.
 const OFFLINE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long to wait for Open Live to answer our close frame. Well under
+/// `OFFLINE_TIMEOUT`, which aborts the task and would cut the handshake short.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Open Live's application close code for a refused token.
 const CLOSE_UNAUTHORIZED: u16 = 4401;
@@ -216,7 +219,7 @@ impl Heartbeat {
 pub async fn probe(target: &Target) -> Result<()> {
     let mut socket = connect(target).await?;
     let outcome = greeting(&mut socket).await;
-    socket.close(None).await.ok();
+    close(&mut socket).await;
     match outcome? {
         Greeting::Hello { .. } => Ok(()),
         Greeting::Unauthorized => bail!(
@@ -341,10 +344,31 @@ async fn session(
             },
             _ = &mut *stop => {
                 send(&mut socket, seq, "GATEWAY_OFFLINE", &Offline { reason: "operator-stop" }).await.ok();
-                socket.close(None).await.ok();
+                close(&mut socket).await;
                 return Ok(Ending::Stopped);
             }
         }
+    }
+}
+
+/// Sends a close frame and reads until Open Live answers it or drops the stream, so
+/// the TCP connection is not torn down under frames Open Live has not read yet. A
+/// socket closed with its peer's frames still unread may be reset rather than shut
+/// down (Windows does this), and a reset can discard what was sent last, such as the
+/// offline notice. Bounded by `CLOSE_TIMEOUT`.
+async fn close(socket: &mut Socket) {
+    if socket.close(None).await.is_err() {
+        return;
+    }
+    let drain = async {
+        while let Some(Ok(message)) = socket.next().await {
+            if message.is_close() {
+                break;
+            }
+        }
+    };
+    if tokio::time::timeout(CLOSE_TIMEOUT, drain).await.is_err() {
+        debug!("Open Live did not answer the close frame in time");
     }
 }
 
@@ -885,11 +909,12 @@ mod tests {
 
     async fn next_frame(
         received: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        label: &str,
     ) -> serde_json::Value {
         tokio::time::timeout(Duration::from_secs(5), received.recv())
             .await
-            .expect("a frame within 5s")
-            .expect("the fake Open Live is still up")
+            .unwrap_or_else(|_| panic!("no {label} frame within 5s"))
+            .unwrap_or_else(|| panic!("the fake Open Live went away before the {label} frame"))
     }
 
     /// End to end against a local stand-in: the token goes in the header, the first
@@ -901,7 +926,7 @@ mod tests {
         let (target, mut received) = fake_open_live("olgw_v1_secret", 1.0).await;
         let heartbeat = Heartbeat::start(target, sample());
 
-        let online = next_frame(&mut received).await;
+        let online = next_frame(&mut received, "GATEWAY_ONLINE").await;
         assert_eq!(online["type"], "GATEWAY_ONLINE");
         assert_eq!(online["seq"], 1);
         assert_eq!(online["deviceCount"], 2);
@@ -912,7 +937,7 @@ mod tests {
         changed.inputs[0].flow_state = FlowState::Idle;
         heartbeat.update(changed);
 
-        let beat = next_frame(&mut received).await;
+        let beat = next_frame(&mut received, "HEARTBEAT").await;
         assert_eq!(beat["type"], "HEARTBEAT");
         assert_eq!(beat["seq"], 2);
         assert_eq!(
@@ -922,11 +947,11 @@ mod tests {
         assert_eq!(beat["inputs"][0]["flowState"], "idle");
 
         heartbeat.stop().await;
-        let mut last = next_frame(&mut received).await;
+        let mut last = next_frame(&mut received, "GATEWAY_OFFLINE").await;
         // A heartbeat may have slipped out just before the stop; the offline notice
         // is the last frame either way.
         while last["type"] == "HEARTBEAT" {
-            last = next_frame(&mut received).await;
+            last = next_frame(&mut received, "GATEWAY_OFFLINE").await;
         }
         assert_eq!(last["type"], "GATEWAY_OFFLINE");
         assert_eq!(last["reason"], "operator-stop");
