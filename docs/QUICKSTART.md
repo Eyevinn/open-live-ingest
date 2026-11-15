@@ -84,7 +84,7 @@ Open Live
   ✔ its Strom takes SRT on ports 47110-47129, which callers use
 
 Local Strom
-  nothing listening at http://127.0.0.1:8080 (...); up will start /usr/local/bin/strom
+  nothing listening at http://127.0.0.1:8080 (...); up will start /usr/local/bin/strom (the one next to open-live-ingest)
 
 Uplink
   ✔ caller; SRT port range 47110-47129 comes from Open Live
@@ -107,6 +107,7 @@ Failure: exit code 1 and an `Error:` line. The message names the fix.
 | `token has expired` | get a new token, step 2 |
 | `could not reach Open Live at` | check the URL and that the box has internet; a `401` or `403` under `Caused by` means the credential is wrong |
 | `could not find "strom" on PATH` | step 1 did not install Strom, or `PATH` lacks its directory |
+| `up will start` names a different Strom than `which strom` | a `strom` in the same directory as `open-live-ingest` is used before `PATH`; to use another one, set `binary` under `[strom]` in `gateway.toml` to its full path |
 | `Strom at ... wants a credential` | an existing Strom runs with `STROM_API_KEY`; `export OLI_STROM_API_KEY='<that key>'` and rerun |
 | `Open Live publishes no SRT port range` | pass `--port-range 47110-47129` |
 | `listener mode needs` | you chose `--uplink-mode listener`; pass `--public-host` and `--port-range` |

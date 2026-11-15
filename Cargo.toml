@@ -25,8 +25,6 @@ hostname = "0.4"
 # coloured theme that steps back to plain text on a dumb terminal or under NO_COLOR.
 dialoguer = { version = "0.12", default-features = false, features = ["password"] }
 console = "0.16"
-# Signal 0 liveness checks and SIGTERM for `down`.
-libc = "0.2"
 # v5 for flow ids derived from gateway id + input id, so nothing has to be stored to
 # find a flow again.
 uuid = { version = "1", features = ["v5"] }
@@ -34,6 +32,11 @@ uuid = { version = "1", features = ["v5"] }
 # stack reqwest already uses.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+# Signal 0 liveness checks and SIGTERM for `down`. Windows uses tasklist and
+# taskkill instead, so this is Unix only.
+libc = "0.2"
 
 # `cargo binstall open-live-ingest` fetches the release tarball instead of compiling.
 [package.metadata.binstall]
