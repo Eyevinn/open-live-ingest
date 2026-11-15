@@ -107,7 +107,7 @@ registration. `setup --gateway-id ""` turns it off. A lost token is replaced wit
 
 Written by setup to a per-user file, mode 0600 because it holds the Open Live credential:
 `~/.config/open-live-ingest/gateway.toml` on Linux, `~/Library/Application Support/open-live-ingest/gateway.toml`
-on macOS, or wherever `--config` points. The same format can be written by hand; see
+on macOS, `%APPDATA%\open-live-ingest\gateway.toml` on Windows, or wherever `--config` points. The same format can be written by hand; see
 [`gateway.toml.example`](gateway.toml.example) for every option.
 
 | Variable | Overrides |
@@ -178,6 +178,31 @@ curl -fsSL https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/insta
 Binaries land in `/usr/local/bin` when it is writable, else `~/.local/bin`. `INSTALL_DIR`,
 `VERSION`, and `SKIP_STROM=true` override that; the script's header lists every knob.
 
+### Windows
+
+On 64-bit (x86_64) Windows, from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/install.ps1 | iex
+```
+
+It installs the gateway to `%LOCALAPPDATA%\Programs\open-live-ingest` and adds that folder to your
+user PATH, with no administrator rights. Unless a Strom is already installed (`strom.exe` on PATH
+or in `%ProgramFiles%\Strom\bin`), it then installs the pinned Strom MSI, GStreamer included,
+which installs for all users: Windows asks once to allow it. The gateway zip is checked against
+`SHA256SUMS`, and the MSI against the SHA-256 digest GitHub records for it. If that digest cannot
+be read (the GitHub API is unreachable or rate-limited; set `GH_TOKEN` to lift the limit) the
+script stops rather than run an unchecked MSI; `SKIP_STROM=true` and a manual Strom install get
+past that. `INSTALL_DIR`, `VERSION`, `SKIP_STROM` and `INSTALL_STROM` work as in `install.sh`; the
+script's header lists them. Open a new console afterwards so the PATH changes apply.
+
+Settings live in `%APPDATA%\open-live-ingest\gateway.toml`. `up` runs in its console window:
+Ctrl-C, or closing the window, stops and removes the feeds. `open-live-ingest down` from a second
+console stops a running `up` the same way.
+
+Not covered on Windows: ARM64 (there is no build), a Windows service (run `up` in a console), and
+code signing. The binary is unsigned, so SmartScreen or Defender may warn before the first run.
+
 Other ways in:
 
 - **By hand.** Each [release](https://github.com/Eyevinn/open-live-ingest/releases) carries a
@@ -193,8 +218,8 @@ agent, each with install steps in its header.
 
 ## Requirements
 
-- Linux or macOS, with a Strom instance on the same machine that can see the capture hardware.
-  `install.sh` installs Strom v0.8.2 when none is on PATH. If Strom's installer stops on an
+- Linux, macOS or Windows (x86_64), with a Strom instance on the same machine that can see the
+  capture hardware. `install.sh` and `install.ps1` install Strom v0.8.2 when none is found. If Strom's installer stops on an
   unaccepted Xcode license on a Mac that already has GStreamer, rerun with
   `SKIP_GSTREAMER=true`, which it passes through to Strom's installer
 - Node.js, only to sign in to Open Source Cloud with `npx @osaas/cli login`. A pasted token needs none
@@ -213,7 +238,8 @@ git tag v0.5.0 && git push origin v0.5.0
 
 The release workflow refuses a tag that does not match `Cargo.toml`, builds the five binaries,
 and publishes them with a checksum file, build provenance, and generated notes. When the
-`strom-types` pin moves, move `STROM_VERSION` in `install.sh` with it; a test checks they agree. Run the workflow by hand from the
+`strom-types` pin moves, move `STROM_VERSION` in `install.sh` and `$StromVersion` in `install.ps1`
+with it; a test checks they agree. Run the workflow by hand from the
 Actions tab to build the artifacts and `SHA256SUMS` without publishing.
 
 The `Strom pin` workflow checks Strom's latest stable release daily and, when it differs from

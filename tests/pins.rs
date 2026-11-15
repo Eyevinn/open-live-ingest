@@ -1,6 +1,7 @@
-//! The install script installs the Strom release the gateway is built against. That
-//! version is written in two places, so this checks they agree, and that build.rs
-//! hands the same one to the binary. The macOS app script reads it from Cargo.toml.
+//! The install scripts install the Strom release the gateway is built against. That
+//! version is written in Cargo.toml, install.sh and install.ps1, so this checks they
+//! agree, and that build.rs hands the same one to the binary. The macOS app script
+//! reads it from Cargo.toml.
 
 use std::fs;
 use std::path::Path;
@@ -20,9 +21,8 @@ fn quoted_after<'a>(text: &'a str, key: &str) -> &'a str {
     &line[start..end]
 }
 
-#[test]
-fn install_script_pins_the_same_strom_as_cargo_toml() {
-    let cargo = read("Cargo.toml");
+/// The `tag = "..."` of the strom-types dependency in Cargo.toml.
+fn strom_types_tag(cargo: &str) -> &str {
     let strom_line = cargo
         .lines()
         .find(|l| l.starts_with("strom-types"))
@@ -31,7 +31,13 @@ fn install_script_pins_the_same_strom_as_cargo_toml() {
         .find("tag = \"")
         .expect("strom-types pinned by tag")
         + 7;
-    let tag = &strom_line[tag_pos..tag_pos + strom_line[tag_pos..].find('"').unwrap()];
+    &strom_line[tag_pos..tag_pos + strom_line[tag_pos..].find('"').unwrap()]
+}
+
+#[test]
+fn install_script_pins_the_same_strom_as_cargo_toml() {
+    let cargo = read("Cargo.toml");
+    let tag = strom_types_tag(&cargo);
 
     let script = read("install.sh");
     let script_version = quoted_after(&script, "STROM_VERSION=");
@@ -39,6 +45,20 @@ fn install_script_pins_the_same_strom_as_cargo_toml() {
     assert_eq!(
         script_version, tag,
         "install.sh installs Strom {script_version} but Cargo.toml pins strom-types to {tag}"
+    );
+}
+
+#[test]
+fn windows_install_script_pins_the_same_strom_as_cargo_toml() {
+    let cargo = read("Cargo.toml");
+    let tag = strom_types_tag(&cargo);
+
+    let script = read("install.ps1");
+    let script_version = quoted_after(&script, "$StromVersion =");
+
+    assert_eq!(
+        script_version, tag,
+        "install.ps1 installs Strom {script_version} ($StromVersion) but Cargo.toml pins strom-types to {tag}"
     );
 }
 
