@@ -11,11 +11,16 @@
 #   VERSION         open-live-ingest release tag to install (default: latest)
 #   SKIP_STROM      set to "true" to leave Strom alone
 #   INSTALL_STROM   set to "always" to (re)install Strom even if one is already present
+#   GH_TOKEN        optional GitHub token for the Strom release lookup (GITHUB_TOKEN works
+#                   too), for when the unauthenticated API rate limit is used up
 #
 # The gateway goes in a per-user folder that is added to the user PATH, so it needs
 # no administrator rights. Strom comes as an MSI that installs per machine, under
 # %ProgramFiles%\Strom, with GStreamer bundled; that needs administrator rights, so
 # the script asks Windows to elevate msiexec when the session is not elevated.
+# The MSI is only run once it matches the SHA-256 digest GitHub records for it; if
+# that digest cannot be read the script stops (SKIP_STROM=true and a manual Strom
+# install is the way past that).
 #
 # Strom is pinned to $StromVersion below. That tag must match the strom-types pin in
 # Cargo.toml; a test in tests/pins.rs checks it.
@@ -49,6 +54,14 @@ function Get-File([string]$Url, [string]$OutFile) {
 
 function Get-Sha256([string]$Path) {
     (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+# Dies unless the file at $Path matches $Digest, a GitHub `sha256:<hex>` asset digest.
+function Assert-Digest([string]$Path, [string]$Digest) {
+    $have = Get-Sha256 $Path
+    if ("sha256:$have" -ne $Digest) {
+        Die "$(Split-Path -Leaf $Path): SHA-256 $have does not match the release ($Digest)"
+    }
 }
 
 function Test-Elevated {
@@ -143,10 +156,17 @@ function Install-Gateway([string]$Tmp) {
     }
 }
 
+# The 64-bit Program Files folder, where the x64 Strom MSI installs. A 32-bit
+# PowerShell on 64-bit Windows sees `C:\Program Files (x86)` as ProgramFiles;
+# ProgramW6432 holds the 64-bit one in both 32- and 64-bit processes.
+function Get-ProgramFiles64 {
+    if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+}
+
 function Find-Strom {
     $cmd = Get-Command strom.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($cmd) { return $cmd.Source }
-    $msi = Join-Path $env:ProgramFiles 'Strom\bin\strom.exe'
+    $msi = Join-Path (Get-ProgramFiles64) 'Strom\bin\strom.exe'
     if (Test-Path -LiteralPath $msi) { return $msi }
     return $null
 }
@@ -168,33 +188,37 @@ function Install-Strom([string]$Tmp) {
     try { Get-File "https://github.com/$StromRepo/releases/download/$StromVersion/$asset" $msi }
     catch { Die "could not download $asset from the Strom $StromVersion release ($($_.Exception.Message))" }
 
-    # Strom publishes no checksum file of its own; GitHub records a SHA-256 digest for
-    # each release asset, which is what build-macos-app.sh checks against as well.
-    $digest = $null
+    # Strom ships no checksum file of its own; the check is against the SHA-256 digest
+    # GitHub records for each release asset. Like build-macos-app.sh, this fails closed:
+    # no digest, no install, because the MSI is about to run with administrator rights.
+    $wayOut = "Set SKIP_STROM=true to install only the gateway, then install Strom $StromVersion yourself from https://github.com/$StromRepo/releases/tag/$StromVersion (the MSI is $asset)"
+    $headers = @{}
+    $token = Get-Setting 'GH_TOKEN' (Get-Setting 'GITHUB_TOKEN' '')
+    if ($token) { $headers['Authorization'] = "Bearer $token" }
     try {
-        $release = Invoke-RestMethod -UseBasicParsing -Uri "https://api.github.com/repos/$StromRepo/releases/tags/$StromVersion"
-        $digest = ($release.assets | Where-Object { $_.name -ceq $asset } | Select-Object -First 1).digest
+        $release = Invoke-RestMethod -UseBasicParsing -Headers $headers -Uri "https://api.github.com/repos/$StromRepo/releases/tags/$StromVersion"
     } catch {
-        Say "Note: could not ask GitHub for the digest of $asset ($($_.Exception.Message))"
+        Die "cannot read the Strom $StromVersion release from the GitHub API to get the SHA-256 digest of $asset, so it is not installed ($($_.Exception.Message)). $wayOut"
     }
-    if ($digest -like 'sha256:*') {
-        $have = Get-Sha256 $msi
-        if ("sha256:$have" -ne $digest.ToLowerInvariant()) {
-            Die "${asset}: SHA-256 $have does not match the release ($digest)"
-        }
-        Say "Checked $asset against the SHA-256 digest GitHub records for it"
-    } else {
-        Say "Note: Strom publishes no checksum for $asset, so it is installed unverified"
+    $digest = [string]($release.assets | Where-Object { $_.name -ceq $asset } | Select-Object -First 1).digest
+    if ($digest -notlike 'sha256:*') {
+        Die "GitHub records no SHA-256 digest for $asset, so it is not installed. $wayOut"
     }
+    $digest = $digest.ToLowerInvariant()
 
+    $programFiles = Get-ProgramFiles64
     # Outside $Tmp, which is removed on the way out, so the log outlives a failure.
     $log = Join-Path ([IO.Path]::GetTempPath()) 'open-live-ingest-strom-msi.log'
     $msiArgs = "/i `"$msi`" /passive /norestart /l*v `"$log`""
+    # Hashed here, after the API round trip and right before msiexec, so the MSI in
+    # %TEMP% has as little time as possible to change between the check and the run.
+    Assert-Digest $msi $digest
+    Say "Checked $asset against the SHA-256 digest GitHub records for it"
     if (Test-Elevated) {
-        Say "Installing Strom $StromVersion (GStreamer included) under $env:ProgramFiles\Strom"
+        Say "Installing Strom $StromVersion (GStreamer included) under $programFiles\Strom"
         $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
     } else {
-        Say "Strom installs for all users under $env:ProgramFiles\Strom, which needs administrator rights."
+        Say "Strom installs for all users under $programFiles\Strom, which needs administrator rights."
         Say "Windows will ask to allow msiexec to make changes; the gateway itself was installed without them."
         try {
             $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Verb RunAs -Wait -PassThru
@@ -208,7 +232,7 @@ function Install-Strom([string]$Tmp) {
     } elseif ($proc.ExitCode -ne 0) {
         Die "msiexec exited with $($proc.ExitCode) installing $asset; its log is $log"
     }
-    $installed = Join-Path $env:ProgramFiles 'Strom\bin\strom.exe'
+    $installed = Join-Path $programFiles 'Strom\bin\strom.exe'
     if (-not (Test-Path -LiteralPath $installed)) { Die "msiexec succeeded but $installed is missing; its log is $log" }
     Say "Installed $installed"
     Say "Strom's installer set the system PATH and GST_PLUGIN_PATH; open a new console to pick them up"

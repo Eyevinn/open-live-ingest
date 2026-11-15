@@ -272,8 +272,12 @@ Success: no red error text, and the last lines read
 The gateway needs no administrator rights. Strom's MSI does, so in a console that is not elevated
 Windows asks once to allow `msiexec`; refusing stops the script with `elevation was refused`. If a
 Strom is already installed (`strom.exe` on PATH or in `%ProgramFiles%\Strom\bin`) the script
-leaves it alone and says `Strom already installed at ...`. Then **open a new console**, so the user
-PATH and Strom's `GST_PLUGIN_PATH` apply.
+leaves it alone and says `Strom already installed at ...`. The MSI only runs once it matches the
+SHA-256 digest GitHub records for it. If the script cannot read that digest (`cannot read the Strom
+... release from the GitHub API`, typically the unauthenticated rate limit on a shared network),
+it stops: set `GH_TOKEN` and rerun, or rerun with `SKIP_STROM=true` and install the Strom MSI
+from its release page yourself. Then **open a new console**, so the user PATH and Strom's
+`GST_PLUGIN_PATH` apply.
 
 The binary is unsigned, so SmartScreen or Defender may warn on the first run; allow it.
 

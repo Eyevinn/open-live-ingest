@@ -190,9 +190,11 @@ It installs the gateway to `%LOCALAPPDATA%\Programs\open-live-ingest` and adds t
 user PATH, with no administrator rights. Unless a Strom is already installed (`strom.exe` on PATH
 or in `%ProgramFiles%\Strom\bin`), it then installs the pinned Strom MSI, GStreamer included,
 which installs for all users: Windows asks once to allow it. The gateway zip is checked against
-`SHA256SUMS`, and the MSI against the digest GitHub records for it. `INSTALL_DIR`, `VERSION`,
-`SKIP_STROM` and `INSTALL_STROM` work as in `install.sh`; the script's header lists them. Open a
-new console afterwards so the PATH changes apply.
+`SHA256SUMS`, and the MSI against the SHA-256 digest GitHub records for it. If that digest cannot
+be read (the GitHub API is unreachable or rate-limited; set `GH_TOKEN` to lift the limit) the
+script stops rather than run an unchecked MSI; `SKIP_STROM=true` and a manual Strom install get
+past that. `INSTALL_DIR`, `VERSION`, `SKIP_STROM` and `INSTALL_STROM` work as in `install.sh`; the
+script's header lists them. Open a new console afterwards so the PATH changes apply.
 
 Settings live in `%APPDATA%\open-live-ingest\gateway.toml`. `up` runs in its console window:
 Ctrl-C, or closing the window, stops and removes the feeds. `open-live-ingest down` from a second
