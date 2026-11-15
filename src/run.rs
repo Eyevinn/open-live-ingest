@@ -1700,6 +1700,7 @@ const fn truncate_comm(name: &str) -> &str {
 }
 
 /// Whether the pid is alive and its command name contains `needle`.
+#[cfg(not(windows))]
 pub fn process_named(pid: u32, needle: &str) -> bool {
     if !process_alive(pid) {
         return false;
@@ -1713,9 +1714,89 @@ pub fn process_named(pid: u32, needle: &str) -> bool {
     comm_matches(&String::from_utf8_lossy(&out.stdout), needle)
 }
 
+/// Whether the pid is alive and its image name (`strom.exe`,
+/// `open-live-ingest.exe`) contains `needle`, ignoring case. The image name comes
+/// from the row tasklist prints for exactly this pid, so a stale pid that has been
+/// reused matches only if the new process has the same name.
+#[cfg(windows)]
+pub fn process_named(pid: u32, needle: &str) -> bool {
+    tasklist_image(pid).is_some_and(|image| image_matches(&image, needle))
+}
+
 /// Whether a command name from `ps -o comm=` contains `needle`.
+#[cfg_attr(windows, allow(dead_code))]
 fn comm_matches(comm: &str, needle: &str) -> bool {
     comm.contains(needle)
+}
+
+/// Whether a Windows image name contains `needle`. Windows file names are case
+/// insensitive, so `Strom.exe` is the same program as `strom.exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn image_matches(image: &str, needle: &str) -> bool {
+    !needle.is_empty() && image.to_lowercase().contains(&needle.to_lowercase())
+}
+
+/// The image name tasklist reports for `pid`, or None when no such process runs.
+#[cfg(windows)]
+fn tasklist_image(pid: u32) -> Option<String> {
+    let filter = format!("PID eq {pid}");
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_tasklist_csv(&String::from_utf8_lossy(&out.stdout), pid)
+}
+
+/// The image name in the row of `tasklist /FO CSV /NH` output whose PID column is
+/// `pid`. A row looks like `"strom.exe","4242","Console","1","51,204 K"`. When
+/// nothing matches, tasklist prints a localised `INFO: ...` line instead of a row,
+/// so only a row whose second field is exactly this pid counts; anything else,
+/// including text in another language, means "not running".
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_tasklist_csv(output: &str, pid: u32) -> Option<String> {
+    let pid = pid.to_string();
+    output.lines().find_map(|line| {
+        let fields = csv_fields(line.trim())?;
+        match fields.as_slice() {
+            [image, row_pid, ..] if *row_pid == pid && !image.is_empty() => Some(image.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// The fields of one CSV line in which every field is quoted, as tasklist writes
+/// them, with `""` standing for a literal quote. None for a line that is not in that
+/// form.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn csv_fields(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        if chars.next()? != '"' {
+            return None;
+        }
+        let mut field = String::new();
+        loop {
+            match chars.next()? {
+                '"' if chars.peek() == Some(&'"') => {
+                    chars.next();
+                    field.push('"');
+                }
+                '"' => break,
+                c => field.push(c),
+            }
+        }
+        fields.push(field);
+        match chars.next() {
+            None => return Some(fields),
+            Some(',') => {}
+            Some(_) => return None,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1731,12 +1812,30 @@ fn signal_stop(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    tasklist_image(pid).is_some()
+}
+
+/// Windows cannot deliver a Ctrl-C to a process in another console, and has no
+/// SIGTERM, so the running `up` is ended hard and does not get to tear down. That is
+/// safe because `down` does the teardown itself after this: it removes the flows and
+/// the Open Live sources, then `local_strom::stop_recorded()` stops the Strom that
+/// `up` started and left behind.
+#[cfg(windows)]
+fn signal_stop(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .stdin(std::process::Stdio::null())
+        .output();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_alive(_pid: u32) -> bool {
     false
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn signal_stop(_pid: u32) {}
 
 #[cfg(test)]
@@ -2239,5 +2338,99 @@ mod tests {
         ));
         assert!(!comm_matches("strom\n", GATEWAY_COMM));
         assert!(!comm_matches("", GATEWAY_COMM));
+    }
+
+    /// What `tasklist /FI "PID eq <pid>" /FO CSV /NH` prints, parsed on every OS.
+    #[test]
+    fn a_running_gateway_and_strom_are_recognised_on_windows() {
+        let gateway = "\"open-live-ingest.exe\",\"4242\",\"Console\",\"1\",\"12,345 K\"\r\n";
+        let image = parse_tasklist_csv(gateway, 4242).expect("a row for pid 4242");
+        assert_eq!(image, "open-live-ingest.exe");
+        assert!(image_matches(&image, GATEWAY_COMM));
+        assert!(!image_matches(&image, "strom"));
+
+        let strom = "\"Strom.EXE\",\"77\",\"Services\",\"0\",\"51,204 K\"\r\n";
+        let image = parse_tasklist_csv(strom, 77).expect("a row for pid 77");
+        assert!(image_matches(&image, "strom"));
+        assert!(!image_matches(&image, GATEWAY_COMM));
+        assert!(!image_matches(&image, ""));
+    }
+
+    /// A stale pid must never match an unrelated process: no row, a localised
+    /// "no tasks" message, or a row for another pid all mean "not running".
+    #[test]
+    fn a_tasklist_row_for_another_pid_or_no_row_is_not_a_match() {
+        assert_eq!(parse_tasklist_csv("", 4242), None);
+        assert_eq!(
+            parse_tasklist_csv(
+                "INFO: No tasks are running which match the specified criteria.\r\n",
+                4242
+            ),
+            None
+        );
+        assert_eq!(
+            parse_tasklist_csv(
+                "INFORMATION: Det finns inga aktiviteter som matchar angivna villkor.\r\n",
+                4242
+            ),
+            None
+        );
+        // 42 is a prefix of 4242, and 42424 contains it: neither is the same pid.
+        assert_eq!(
+            parse_tasklist_csv("\"strom.exe\",\"42424\",\"Console\",\"1\",\"1 K\"", 4242),
+            None
+        );
+        assert_eq!(
+            parse_tasklist_csv("\"strom.exe\",\"4242\",\"Console\",\"1\",\"1 K\"", 42),
+            None
+        );
+    }
+
+    #[test]
+    fn tasklist_csv_fields_are_unquoted() {
+        assert_eq!(
+            csv_fields(r#""a b.exe","1","x ""y""","2,5 K""#),
+            Some(vec![
+                "a b.exe".to_string(),
+                "1".to_string(),
+                "x \"y\"".to_string(),
+                "2,5 K".to_string()
+            ])
+        );
+        assert_eq!(csv_fields("INFO: nothing"), None);
+        assert_eq!(csv_fields(r#""unterminated"#), None);
+        assert_eq!(csv_fields(r#""a"b"#), None);
+    }
+
+    /// The real thing, on the windows-latest CI leg. `ping` is started directly
+    /// rather than through `cmd /c`, so the pid is ping.exe's own and not cmd.exe's.
+    /// The `Child` is dropped at once, so this test holds no handle that could keep
+    /// the process object around after it is ended.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_process_is_seen_named_and_stopped() {
+        let pid = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("starting ping")
+            .id();
+        assert!(process_alive(pid));
+        assert!(process_named(pid, "ping"));
+        assert!(process_named(pid, "PING.EXE"));
+        assert!(!process_named(pid, "strom"));
+
+        signal_stop(pid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_alive(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            !process_alive(pid),
+            "pid {pid} is still running after signal_stop"
+        );
+        assert!(!process_named(pid, "ping"));
     }
 }
