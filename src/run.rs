@@ -491,7 +491,7 @@ pub async fn up(
     }
     let reporter = Reporter::start(&cfg, strom_version, &live)?;
 
-    let outcome = run_until_stopped(
+    let (outcome, stop) = match run_until_stopped(
         &strom,
         open_live.as_ref(),
         reporter.as_ref(),
@@ -500,14 +500,41 @@ pub async fn up(
         &cfg,
         &mut live,
     )
-    .await;
+    .await
+    {
+        Ok(stop) => (Ok(()), stop),
+        Err(err) => (Err(err), Stop::Interrupt),
+    };
 
     println!("\nStopping.");
-    // Studio hears first, so the inputs vanishing next is read as a stop, not a fault.
-    if let Some(reporter) = reporter {
-        reporter.stop().await;
+    match stop {
+        Stop::Interrupt => {
+            // Studio hears first, so the inputs vanishing next is read as a stop, not a fault.
+            if let Some(reporter) = reporter {
+                reporter.stop().await;
+            }
+            teardown(&strom, open_live.as_ref(), &cfg.gateway.name, &live).await;
+        }
+        Stop::Ending => {
+            // Windows ends the process shortly after, so nothing waits on anything else.
+            let deadline = tokio::time::Instant::now() + ENDING_TEARDOWN;
+            let quiet = async {
+                if let Some(reporter) = reporter {
+                    reporter.stop().await;
+                }
+            };
+            tokio::join!(
+                quiet,
+                teardown_within(
+                    &strom,
+                    open_live.as_ref(),
+                    &cfg.gateway.name,
+                    &live,
+                    deadline
+                )
+            );
+        }
     }
-    teardown(&strom, open_live.as_ref(), &cfg.gateway.name, &live).await;
     // Only a Strom we started is stopped here; an adopted one is left running.
     drop(local_strom);
     remove_pidfile();
@@ -850,7 +877,7 @@ async fn run_until_stopped(
     source_gateway_id: Option<&str>,
     cfg: &Config,
     live: &mut [Live],
-) -> Result<()> {
+) -> Result<Stop> {
     let mut ticker = tokio::time::interval(TICK);
     let stop = stop_signal();
     tokio::pin!(stop);
@@ -888,7 +915,7 @@ async fn run_until_stopped(
                     }
                 }
             }
-            _ = &mut stop => return Ok(()),
+            stop = &mut stop => return Ok(stop),
         }
     }
 }
@@ -1001,7 +1028,7 @@ async fn reconcile_sources(
 /// session, or a link dropping mid-show, must not tear down a venue's feeds. The
 /// signal streams live for the whole run, so a signal is never lost between polls.
 #[cfg(unix)]
-async fn stop_signal() {
+async fn stop_signal() -> Stop {
     use tokio::signal::unix::{signal, Signal, SignalKind};
 
     async fn recv(sig: &mut Option<Signal>) {
@@ -1018,20 +1045,92 @@ async fn stop_signal() {
     let mut hangup = signal(SignalKind::hangup()).ok();
     if interrupt.is_none() && terminate.is_none() {
         let _ = tokio::signal::ctrl_c().await;
-        return;
+        return Stop::Interrupt;
     }
     loop {
         tokio::select! {
-            _ = recv(&mut interrupt) => return,
-            _ = recv(&mut terminate) => return,
+            _ = recv(&mut interrupt) => return Stop::Interrupt,
+            _ = recv(&mut terminate) => return Stop::Interrupt,
             _ = recv(&mut hangup) => info!("ignoring SIGHUP so the feeds survive a closed session"),
         }
     }
 }
 
-#[cfg(not(unix))]
-async fn stop_signal() {
-    let _ = tokio::signal::ctrl_c().await;
+/// Resolves on Ctrl-C, Ctrl-Break, closing the console window, logoff or shutdown.
+/// The last three come with a deadline: Windows ends the process about five seconds
+/// later whatever it is doing. The streams live for the whole run, as on Unix.
+#[cfg(windows)]
+async fn stop_signal() -> Stop {
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+
+    // Each event has its own stream type; one that could not be registered never fires.
+    macro_rules! recv {
+        ($stream:expr) => {
+            async {
+                match $stream.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }
+        };
+    }
+
+    let mut interrupt = ctrl_c().ok();
+    let mut brk = ctrl_break().ok();
+    let mut close = ctrl_close().ok();
+    let mut logoff = ctrl_logoff().ok();
+    let mut shutdown = ctrl_shutdown().ok();
+    if interrupt.is_none() && brk.is_none() {
+        let _ = tokio::signal::ctrl_c().await;
+        return Stop::Interrupt;
+    }
+    tokio::select! {
+        _ = recv!(interrupt) => Stop::Interrupt,
+        _ = recv!(brk) => Stop::Interrupt,
+        _ = recv!(close) => Stop::Ending,
+        _ = recv!(logoff) => Stop::Ending,
+        _ = recv!(shutdown) => Stop::Ending,
+    }
+}
+
+/// Why `up` is stopping, which decides how long teardown may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    /// Ctrl-C, Ctrl-Break or SIGTERM: teardown takes as long as it needs.
+    Interrupt,
+    /// The console window closed, or the user is logging off or the machine shutting
+    /// down: Windows ends the process about five seconds later.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Ending,
+}
+
+/// How long teardown may take when Windows is ending the process, leaving a second
+/// of the five Windows allows for stopping the managed Strom.
+const ENDING_TEARDOWN: Duration = Duration::from_secs(4);
+
+/// Removes one flow and says so. Returns whether it is gone.
+async fn remove_flow_reported(strom: &StromClient, l: &Live) -> bool {
+    match remove_flow(strom, &l.flow_id).await {
+        Ok(()) => {
+            println!("  {} — flow stopped and removed", l.input.name);
+            true
+        }
+        Err(err) => {
+            warn!(input = %l.input.name, err = %format_args!("{err:#}"), "could not remove the flow");
+            false
+        }
+    }
+}
+
+/// Removes one input's Open Live source and says so. Returns whether it is gone.
+async fn remove_source_reported(client: &OpenLiveClient, id: &str, l: &Live) -> bool {
+    let gone = remove_source(client, id, &l.input.name).await;
+    if gone {
+        println!("  {} — source removed from Open Live", l.input.name);
+    }
+    gone
 }
 
 /// Stops and removes everything the run created.
@@ -1045,16 +1144,9 @@ async fn teardown(
     // not try them again and print the same refusal twice.
     let mut kept = BTreeSet::new();
     for l in live {
-        match remove_flow(strom, &l.flow_id).await {
-            Ok(()) => println!("  {} — flow stopped and removed", l.input.name),
-            Err(err) => {
-                warn!(input = %l.input.name, err = %format_args!("{err:#}"), "could not remove the flow")
-            }
-        }
+        remove_flow_reported(strom, l).await;
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
-            if remove_source(client, id, &l.input.name).await {
-                println!("  {} — source removed from Open Live", l.input.name);
-            } else {
+            if !remove_source_reported(client, id, l).await {
                 kept.insert(id.clone());
             }
         }
@@ -1064,6 +1156,133 @@ async fn teardown(
     // another gateway or made by hand are never touched.
     if let Some(client) = open_live {
         sweep_sources(client, gateway_name, &kept).await;
+    }
+}
+
+/// Teardown for when Windows is ending the process: every flow and source removal
+/// runs at once, and whatever has not finished by `deadline` is named in the log and
+/// left for the next `up` or `down`, which find it by derived id and name prefix.
+async fn teardown_within(
+    strom: &StromClient,
+    open_live: Option<&OpenLiveClient>,
+    gateway_name: &str,
+    live: &[Live],
+    deadline: tokio::time::Instant,
+) {
+    type Job<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>>;
+    // What each job removes, and the source id when it is a source.
+    let mut what: Vec<(String, Option<String>)> = Vec::new();
+    let mut jobs: Vec<Job> = Vec::new();
+    for l in live {
+        what.push((format!("flow of {}", l.input.name), None));
+        jobs.push(Box::pin(remove_flow_reported(strom, l)));
+        if let (Some(client), Some(id)) = (open_live, &l.source_id) {
+            what.push((format!("source of {}", l.input.name), Some(id.clone())));
+            jobs.push(Box::pin(remove_source_reported(client, id, l)));
+        }
+    }
+    let mut kept = BTreeSet::new();
+    let mut left = Vec::new();
+    for ((label, id), done) in what.into_iter().zip(join_until(deadline, jobs).await) {
+        match done {
+            Some(true) => {}
+            Some(false) => {
+                kept.extend(id);
+                left.push(label);
+            }
+            None => left.push(label),
+        }
+    }
+    if let Some(client) = open_live {
+        let sweep = sweep_sources(client, gateway_name, &kept);
+        if tokio::time::timeout_at(deadline, sweep).await.is_err() {
+            left.push("the sweep for other sources of this gateway".to_string());
+        }
+    }
+    if !left.is_empty() {
+        warn!(
+            left = %left.join(", "),
+            "not removed before Windows ends the process; the next `open-live-ingest up` or `down` removes them"
+        );
+    }
+}
+
+/// Runs every job at once and collects what finished by `deadline`, in job order;
+/// `None` for a job still running then, which is dropped.
+async fn join_until<T, F>(deadline: tokio::time::Instant, jobs: Vec<F>) -> Vec<Option<T>>
+where
+    F: std::future::Future<Output = T>,
+{
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let mut results: Vec<Option<T>> = jobs.iter().map(|_| None).collect();
+    let mut running: FuturesUnordered<_> = jobs
+        .into_iter()
+        .enumerate()
+        .map(|(i, job)| async move { (i, job.await) })
+        .collect();
+    let _ = tokio::time::timeout_at(deadline, async {
+        while let Some((i, out)) = running.next().await {
+            results[i] = Some(out);
+        }
+    })
+    .await;
+    results
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn join_until_returns_at_the_deadline_when_a_job_never_finishes() {
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let jobs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = u8>>>> = vec![
+            Box::pin(async { 1 }),
+            Box::pin(std::future::pending()),
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                3
+            }),
+        ];
+        let results = join_until(deadline, jobs).await;
+        let took = started.elapsed();
+        assert_eq!(results, vec![Some(1), None, Some(3)]);
+        assert!(
+            took >= Duration::from_millis(200),
+            "returned early: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(2),
+            "overran the deadline: {took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_until_runs_the_jobs_concurrently() {
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let jobs: Vec<_> = (0..4u8)
+            .map(|i| async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                i
+            })
+            .collect();
+        let results = join_until(deadline, jobs).await;
+        assert_eq!(results, vec![Some(0), Some(1), Some(2), Some(3)]);
+        // One after another would take 1.2 s.
+        assert!(started.elapsed() < Duration::from_millis(900));
+    }
+
+    #[tokio::test]
+    async fn join_until_with_no_jobs_returns_at_once() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        let results = join_until::<u8, std::future::Ready<u8>>(deadline, Vec::new()).await;
+        assert!(results.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
 

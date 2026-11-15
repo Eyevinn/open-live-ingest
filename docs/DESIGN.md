@@ -157,7 +157,10 @@ redirect lands on the machine running the CLI.
 
 **`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
 SIGHUP does not: a closed SSH session must not take a venue off air. A deliberate stop stops, an
-accident does not. This replaced an earlier daemon model in which flows were meant to outlive the
+accident does not. On Windows, Ctrl-C and Ctrl-Break stop the same way, and so do closing the
+console window, logoff and shutdown. Windows ends the process about five seconds after those three,
+so their teardown removes flows and sources concurrently under a four-second deadline, names what
+it could not remove for the next `up` or `down` to sweep, and then stops the managed Strom. This replaced an earlier daemon model in which flows were meant to outlive the
 agent and be reconciled forever from a config file. Carrying both models meant drift detection,
 per-input supervisor tasks, a persisted state file, and a control API that the command line never
 used. The daemon is a different product; if it is ever wanted, it should be built as one.
