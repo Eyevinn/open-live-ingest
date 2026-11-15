@@ -1,6 +1,6 @@
 //! The install script installs the Strom release the gateway is built against. That
 //! version is written in two places, so this checks they agree, and that build.rs
-//! hands the same one to the binary.
+//! hands the same one to the binary. The macOS app script reads it from Cargo.toml.
 
 use std::fs;
 use std::path::Path;
@@ -52,4 +52,57 @@ fn the_binary_is_given_the_strom_types_tag_as_its_pinned_strom() {
         "STROM_PINNED_VERSION is {} but Cargo.toml pins strom-types elsewhere",
         env!("STROM_PINNED_VERSION")
     );
+}
+
+/// Every `vX.Y.Z` written in `text`.
+fn version_literals(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    for (i, _) in text.match_indices('v') {
+        let rest = &text[i + 1..];
+        let len = rest
+            .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .unwrap_or(rest.len());
+        let candidate = rest[..len].trim_end_matches('.');
+        let parts: Vec<&str> = candidate.split('.').collect();
+        let preceded_by_word =
+            i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if !preceded_by_word && parts.len() == 3 && parts.iter().all(|p| !p.is_empty()) {
+            found.push(&text[i..i + 1 + candidate.len()]);
+        }
+    }
+    found
+}
+
+/// The macOS app script bundles the Strom release named by the strom-types tag. It reads
+/// the tag from Cargo.toml rather than carrying its own copy, so it cannot drift; any
+/// version it does spell out (in its docs, say) must be the pinned one.
+#[test]
+fn the_macos_app_script_bundles_the_strom_cargo_toml_pins() {
+    let script = read(".github/scripts/build-macos-app.sh");
+    assert!(
+        script
+            .lines()
+            .any(|l| l.trim_start().starts_with("strom_tag=")
+                && l.contains("strom-types")
+                && l.contains("Cargo.toml")),
+        "build-macos-app.sh must derive strom_tag from the strom-types tag in Cargo.toml"
+    );
+    assert!(
+        !script.contains("STROM_VERSION="),
+        "build-macos-app.sh must not carry its own STROM_VERSION"
+    );
+    let pinned = env!("STROM_PINNED_VERSION");
+    for literal in version_literals(&script) {
+        assert_eq!(
+            literal, pinned,
+            "build-macos-app.sh names Strom {literal} but Cargo.toml pins strom-types to {pinned}"
+        );
+    }
+}
+
+#[test]
+fn version_literals_finds_tags_and_skips_the_rest() {
+    let text = "Strom v0.8.2, not v0.8, nor env1.2.3, regex ^v[0-9]+, and v1.10.0.";
+    assert_eq!(version_literals(text), vec!["v0.8.2", "v1.10.0"]);
 }

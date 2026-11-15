@@ -224,6 +224,26 @@ secrets `STROM_PIN_APP_CLIENT_ID` and `STROM_PIN_APP_PRIVATE_KEY`. GitHub disabl
 workflows in a public repository after 60 days without repository activity; if that happens,
 re-enable it from the Actions tab (select `Strom pin`, then "Enable workflow").
 
+### The macOS app bundle
+
+`.github/scripts/build-macos-app.sh` builds `Open Live Ingest.app` for Apple silicon: the gateway,
+the Strom release the `strom-types` tag pins (checked against the SHA-256 digest GitHub records for
+the asset), and the Homebrew GStreamer that Strom links against, with every library reference
+rewritten to point inside the bundle. It refuses to finish if any Mach-O in the bundle still names
+`/opt/homebrew` or `/usr/local`. To run it by hand on an Apple silicon Mac with Homebrew, `jq` and
+the Xcode command line tools:
+
+```bash
+brew install gstreamer jq
+cargo build --release --target aarch64-apple-darwin
+.github/scripts/build-macos-app.sh target/aarch64-apple-darwin/release/open-live-ingest dist
+.github/scripts/build-macos-app.sh --check "dist/Open Live Ingest.app"   # the check step on its own
+```
+
+Without `MACOS_SIGN_IDENTITY` the bundle is signed ad hoc, which is enough to run it on that Mac.
+With it set to a Developer ID identity, everything is signed with the hardened runtime, ready to
+notarize. The script's header lists the other knobs.
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
