@@ -100,10 +100,13 @@ jobs:
   # script bundles the Strom the strom-types tag in Cargo.toml names, so the workflow
   # never names a Strom version itself.
   #
-  # The DMG is not signed yet, so it never reaches a release: the manual trigger uploads
-  # it as a workflow artifact, and a tag run builds and checks it but uploads nothing
-  # (`release` downloads every artifact of the run). `release` does not wait for this
-  # job, so its tarballs, SHA256SUMS and attestations are what they were.
+  # The DMG is not signed yet, so it never reaches a release. It is uploaded as a
+  # workflow artifact only on a manual run from a branch: the upload step is gated on
+  # workflow_dispatch AND a non-tag ref. `release` runs on any tag ref, a manual run
+  # from a tag included, and downloads every artifact of the run, so a DMG uploaded on
+  # a tag ref could be published (e.g. by a re-run of `release`). On a tag ref this
+  # job builds and checks the DMG but uploads nothing. `release` does not wait for
+  # this job, so its tarballs, SHA256SUMS and attestations are what they were.
   macos-app:
     needs: build
     runs-on: macos-latest
@@ -147,7 +150,8 @@ jobs:
           for attempt in 1 2 3; do
             hdiutil create -volname "Open Live Ingest" -srcfolder dmg-root \
               -fs HFS+ -format UDZO -ov "$DMG" && exit 0
-            echo "hdiutil create failed (attempt $attempt)"; sleep 10
+            echo "hdiutil create failed (attempt $attempt)"
+            if (( attempt < 3 )); then sleep 10; fi
           done
           exit 1
 
@@ -158,6 +162,7 @@ jobs:
       - name: Check the DMG
         run: |
           mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
           hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
           trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
           test -d "$mnt/$APP" || { echo "$APP is missing from the DMG"; exit 1; }
@@ -174,7 +179,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && github.ref_type != 'tag'
         with:
           name: ${{ env.DMG }}
           path: ${{ env.DMG }}
