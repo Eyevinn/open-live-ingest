@@ -20,24 +20,33 @@
 #   Open Live Ingest.app/Contents/
 #     Info.plist
 #     MacOS/open-live-ingest, MacOS/strom
-#     Frameworks/                                  GStreamer, GLib and the rest of the closure
-#     Frameworks/gstreamer-1.0/                    GStreamer plugins
-#     Frameworks/gstreamer-1.0/gst-plugin-scanner
+#     Frameworks/                      GStreamer, GLib and the rest of the closure (files only)
+#     PlugIns/gstreamer/               GStreamer plugins
+#     Helpers/gst-plugin-scanner
 #     Resources/
 #
-# Every non-system reference becomes @rpath/<name>. The rpath is
-# @executable_path/../Frameworks for MacOS/*, @loader_path for Frameworks/* and
-# @loader_path/.. for the plugins and the scanner. Rpaths the Homebrew builds carried
-# are removed. The last step fails if `otool -L` (or an LC_RPATH) of any Mach-O in
-# the bundle still names /opt/homebrew or /usr/local.
+# Each kind of code sits where Apple's bundle layout puts it, because codesign only
+# accepts nested code in those places. Frameworks, PlugIns, Helpers and MacOS are
+# nested-code locations, and codesign takes any directory in them whose name has a
+# dot (such as "gstreamer-1.0") for a nested bundle and rejects the app when it is
+# not one. Hence "gstreamer", and the --check below fails on such a directory.
 #
-# Signing. Every rewritten Mach-O is signed ad hoc, which Apple silicon requires to
-# load it at all, so an unsigned run gives a bundle that works on the build Mac.
-# Set MACOS_SIGN_IDENTITY (a "Developer ID Application: ..." identity in a keychain
-# the caller has unlocked) to sign everything with it instead, with the hardened
-# runtime and a timestamp, ready for notarization. MACOS_ENTITLEMENTS overrides the
-# entitlements file used for the two executables (the default allows camera and
-# microphone access). Notarizing and stapling is left to the caller.
+# Every non-system reference becomes @rpath/<name>. The rpath is
+# @executable_path/../Frameworks for MacOS/* and Helpers/*, @loader_path for
+# Frameworks/* and @loader_path/../../Frameworks for the plugins. Rpaths the Homebrew
+# builds carried are removed. The last step fails if `otool -L` (or an LC_RPATH) of
+# any Mach-O in the bundle still names /opt/homebrew or /usr/local, or if
+# `codesign --verify --strict` rejects the bundle.
+#
+# Signing, inside out and never with --deep: the libraries, plugins, the scanner and
+# strom first, then the bundle, which signs the main executable (open-live-ingest)
+# and seals everything else. By default everything is signed ad hoc, which Apple
+# silicon requires to load it at all, so an unsigned run gives a bundle that works
+# on the build Mac. Set MACOS_SIGN_IDENTITY (a "Developer ID Application: ..."
+# identity in a keychain the caller has unlocked) to sign with it instead, with the
+# hardened runtime and a timestamp, ready for notarization. MACOS_ENTITLEMENTS
+# overrides the entitlements file used for the two executables (the default allows
+# camera and microphone access). Notarizing and stapling is left to the caller.
 #
 # Other environment knobs:
 #   BUNDLE_ID             CFBundleIdentifier (default: com.eyevinn.open-live-ingest)
@@ -57,7 +66,12 @@ set -euo pipefail
 APP_NAME="Open Live Ingest.app"
 STROM_REPO="Eyevinn/strom"
 FRAMEWORKS_REL="Frameworks"
-PLUGIN_DIR_REL="Frameworks/gstreamer-1.0"
+# These two must match BUNDLE_PLUGIN_DIR and BUNDLE_PLUGIN_SCANNER in src/local_strom.rs
+# (a unit test there reads them from this file).
+PLUGIN_DIR_REL="PlugIns/gstreamer"
+SCANNER_REL="Helpers/gst-plugin-scanner"
+# The nested-code locations of a bundle (see the layout above).
+NESTED_CODE_DIRS="Frameworks PlugIns Helpers MacOS"
 FORBIDDEN_RE='/opt/homebrew|/usr/local'
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -97,21 +111,31 @@ rpaths_of() {
         }'
 }
 
-# AC1: fail on any Mach-O whose load commands still name a build-host prefix. This is
-# the gate the release build relies on, so it fails closed: a missing tool, an otool
-# that fails, a file that cannot be read or a bundle without its two executables is an
-# error, never a pass.
+# AC1: fail on any Mach-O whose load commands still name a build-host prefix, and on
+# a bundle codesign does not accept. This is the gate the release build relies on, so
+# it fails closed: a missing tool, an otool that fails, a file that cannot be read or
+# a bundle without its executables or plugins is an error, never a pass.
 check_bundle() {
-    local app="${1%/}" f tool req bad=0 checked=0 list load_cmds rpaths hits
+    local app="${1%/}" f d tool req bad=0 checked=0 list load_cmds rpaths hits dotted
     [[ -d "$app/Contents" ]] || die "$app is not an app bundle"
-    for tool in file otool find awk sed grep; do
+    for tool in file otool find awk sed grep codesign; do
         command -v "$tool" >/dev/null 2>&1 || die "$tool not found (the check needs it)"
     done
+    # codesign treats a dotted directory in a nested-code location as a bundle.
+    dotted=""
+    for d in $NESTED_CODE_DIRS; do
+        [[ -d "$app/Contents/$d" ]] || continue
+        dotted+="$(find "$app/Contents/$d" -mindepth 1 -type d -name '*.*')"$'\n' \
+            || die "cannot list the directories in Contents/$d"
+    done
+    dotted="$(grep -v '^$' <<<"$dotted" || true)"
+    [[ -z "$dotted" ]] || die "codesign would take these directories for nested bundles: $dotted"
     say "Checking every Mach-O in $app for $FORBIDDEN_RE"
     list="$(macho_files "$app")" || die "cannot list the Mach-O files in $app"
-    for req in MacOS/open-live-ingest MacOS/strom; do
+    for req in MacOS/open-live-ingest MacOS/strom "$SCANNER_REL"; do
         grep -qxF "$app/Contents/$req" <<<"$list" || die "Contents/$req is missing or is not a Mach-O"
     done
+    grep -qF "$app/Contents/$PLUGIN_DIR_REL/" <<<"$list" || die "Contents/$PLUGIN_DIR_REL holds no plugins"
     while IFS= read -r f; do
         load_cmds="$(otool -L "$f")" || die "otool -L failed on ${f#"$app"/}"
         # Line 1 of `otool -L` is the file's own path, which may sit anywhere. Every
@@ -133,6 +157,8 @@ check_bundle() {
     done <<<"$list"
     [[ $bad -eq 0 ]] || die "the bundle still references build-host libraries"
     say "OK: none of the $checked Mach-O files in the bundle references /opt/homebrew or /usr/local"
+    codesign --verify --deep --strict --verbose=2 "$app" || die "codesign does not accept $app"
+    say "OK: codesign --verify --strict accepts the bundle"
 }
 
 # Follow symlinks to the file itself (macOS readlink has no -f before macOS 13).
@@ -270,7 +296,8 @@ mkdir -p "$out_dir"
 app="$(cd "$out_dir" && pwd -P)/$APP_NAME"
 rm -rf "$app"
 contents="$app/Contents"
-mkdir -p "$contents/MacOS" "$contents/$PLUGIN_DIR_REL" "$contents/Resources"
+mkdir -p "$contents/MacOS" "$contents/$FRAMEWORKS_REL" "$contents/$PLUGIN_DIR_REL" \
+    "$contents/$(dirname "$SCANNER_REL")" "$contents/Resources"
 say "Assembling $app"
 
 install -m 0755 "$ingest_bin" "$contents/MacOS/open-live-ingest"
@@ -334,8 +361,8 @@ for p in "$gst_prefix"/lib/gstreamer-1.0/*.dylib "$gst_prefix"/lib/gstreamer-1.0
     plugin_count=$((plugin_count + 1))
 done
 [[ $plugin_count -gt 0 ]] || die "no plugins found in $gst_prefix/lib/gstreamer-1.0"
-cp -L "$gst_scanner" "$contents/$PLUGIN_DIR_REL/gst-plugin-scanner"
-printf '%s\t%s\n' "$contents/$PLUGIN_DIR_REL/gst-plugin-scanner" "$(real_path "$gst_scanner")" >>"$origins"
+cp -L "$gst_scanner" "$contents/$SCANNER_REL"
+printf '%s\t%s\n' "$contents/$SCANNER_REL" "$(real_path "$gst_scanner")" >>"$origins"
 exec_origins=("$(real_path "$ingest_bin")" "$strom_bin" "$(real_path "$gst_scanner")")
 say "Copied $plugin_count GStreamer plugins and gst-plugin-scanner"
 
@@ -371,8 +398,9 @@ say "Bundled $(($(wc -l <"$origins") - plugin_count - 3)) libraries into $FRAMEW
 while IFS= read -r entry; do
     file="${entry%%$'\t'*}"
     case "$file" in
-        "$contents/MacOS/"*) rpath="@executable_path/../$FRAMEWORKS_REL" ;;
-        "$contents/$PLUGIN_DIR_REL/"*) rpath="@loader_path/.." ;;
+        "$contents/MacOS/"* | "$contents/$(dirname "$SCANNER_REL")/"*)
+            rpath="@executable_path/../$FRAMEWORKS_REL" ;;
+        "$contents/$PLUGIN_DIR_REL/"*) rpath="@loader_path/../../$FRAMEWORKS_REL" ;;
         *) rpath="@loader_path" ;;
     esac
     # One call per file: the shorter @rpath names free the header space the new
@@ -395,15 +423,11 @@ while IFS= read -r entry; do
     fi
 done <"$origins"
 
-# Rewriting breaks the signatures; Apple silicon refuses to load unsigned code.
-while IFS= read -r entry; do
-    codesign --force --sign - "${entry%%$'\t'*}" </dev/null
-done <"$origins"
-
-# --- AC1 ------------------------------------------------------------------------------
-check_bundle "$app"
-
-# --- Optional signing ---------------------------------------------------------------------
+# --- Signing ------------------------------------------------------------------------------
+# Rewriting breaks the signatures; Apple silicon refuses to load unsigned code. Inside
+# out, no --deep: every nested Mach-O first, then the bundle. Signing the bundle signs
+# its main executable (open-live-ingest) and seals the nested code, which must already
+# be signed, so open-live-ingest is never signed on its own.
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
     entitlements="${MACOS_ENTITLEMENTS:-$work/entitlements.plist}"
     if [[ -z "${MACOS_ENTITLEMENTS:-}" ]]; then
@@ -421,22 +445,24 @@ if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
 EOF
     fi
     say "Signing with $MACOS_SIGN_IDENTITY (hardened runtime)"
-    sign() { codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" "$@"; }
-    # Inside out: libraries and plugins, then the executables, then the bundle.
-    while IFS= read -r entry; do
-        file="${entry%%$'\t'*}"
-        case "$file" in "$contents/MacOS/"*) continue ;; esac
-        sign "$file" </dev/null
-    done <"$origins"
-    sign --entitlements "$entitlements" "$contents/MacOS/strom"
-    sign --entitlements "$entitlements" "$contents/MacOS/open-live-ingest"
-    # The bundle seal needs no entitlements: they belong to the executables, which
-    # are already signed with them.
-    sign "$app"
-    codesign --verify --deep --strict "$app"
+    sign() { codesign --force --timestamp --options runtime --sign "$MACOS_SIGN_IDENTITY" "$@" </dev/null; }
 else
-    say "MACOS_SIGN_IDENTITY not set: the bundle is signed ad hoc only"
+    entitlements=""
+    say "MACOS_SIGN_IDENTITY not set: signing ad hoc only"
+    sign() { codesign --force --sign - "$@" </dev/null; }
 fi
+ent_args=()
+[[ -z "$entitlements" ]] || ent_args=(--entitlements "$entitlements")
+while IFS= read -r entry; do
+    file="${entry%%$'\t'*}"
+    case "$file" in "$contents/MacOS/"*) continue ;; esac
+    sign "$file"
+done <"$origins"
+sign "${ent_args[@]+"${ent_args[@]}"}" "$contents/MacOS/strom"
+sign "${ent_args[@]+"${ent_args[@]}"}" "$app"
+
+# --- AC1 ------------------------------------------------------------------------------
+check_bundle "$app"
 
 say "Built $app (Strom $strom_tag)"
 printf '%s\n' "$app"

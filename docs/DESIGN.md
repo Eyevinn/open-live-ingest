@@ -183,18 +183,21 @@ as a service is adopted the same way. `down` does *not* refuse when Strom is gon
 already stopped and the sources still need removing.
 
 **The bundled Strom comes first, and brings its own GStreamer.** The macOS app ships Strom next to
-the gateway in `Contents/MacOS`, with GStreamer under `Contents/Frameworks`. With `strom.binary` at
-its default, a `strom` next to the running executable (symlinks resolved) is used before `PATH`;
-an explicit setting always wins. A `strom` next to the executable is *bundled* only when the bundle
-layout is really there: the parent of the executable's directory (the bundle's `Contents`) holds
-`Frameworks/gstreamer-1.0`. Only a bundled Strom is started with the GStreamer plugin path, scanner
-and registry pointed into the bundle and the managed data directory, so a Homebrew GStreamer on the
-same Mac is never mixed in. A `strom` next to the executable without that layout, as `install.sh`
-leaves it in `/usr/local/bin` or `~/.local/bin`, is still preferred over `PATH` but is not bundled:
-like a Strom from `PATH` or an explicit path, it brings its own GStreamer and gets no GStreamer
-environment. Pointing `GST_PLUGIN_SYSTEM_PATH` at a directory that does not exist would leave it
-with no plugins at all. The bundle-relative paths are constants in `src/local_strom.rs` that the
-bundle script must match.
+the gateway in `Contents/MacOS`, with GStreamer's libraries under `Contents/Frameworks`, its plugins
+under `Contents/PlugIns/gstreamer` and the plugin scanner in `Contents/Helpers`: the places
+`codesign` accepts nested code, with no dotted directory names, which `codesign` would take for
+nested bundles. With `strom.binary` at its default, a `strom` next to the running executable
+(symlinks resolved) is used before `PATH`; an explicit setting always wins. A `strom` next to the
+executable is *bundled* only when the bundle layout is really there: the parent of the executable's
+directory (the bundle's `Contents`) holds `PlugIns/gstreamer`. Only a bundled Strom is started with
+the GStreamer plugin path, scanner and registry pointed into the bundle and the managed data
+directory, so a Homebrew GStreamer on the same Mac is never mixed in. A `strom` next to the
+executable without that layout, as `install.sh` leaves it in `/usr/local/bin` or `~/.local/bin`, is
+still preferred over `PATH` but is not bundled: like a Strom from `PATH` or an explicit path, it
+brings its own GStreamer and gets no GStreamer environment. Pointing `GST_PLUGIN_SYSTEM_PATH` at a
+directory that does not exist would leave it with no plugins at all. The bundle-relative paths are
+constants in `src/local_strom.rs` that the bundle script must match; a unit test checks that it
+does.
 
 **No local state.** Flows are found by derived id, sources by the gateway's name prefix. The
 exceptions are two pidfiles: the running `up`, so `down` can ask it to stop before sweeping, and a

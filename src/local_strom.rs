@@ -201,29 +201,32 @@ fn tail_of_log(path: &Path) -> String {
 }
 
 /// The self-contained macOS app ships the gateway and Strom side by side, with the
-/// GStreamer that Strom links against under `Frameworks`:
+/// GStreamer that Strom links against where Apple's bundle layout puts each kind of
+/// code, since `codesign` accepts nested code only there:
 ///
 /// ```text
 /// Open Live Ingest.app/Contents/
 ///     MacOS/open-live-ingest
 ///     MacOS/strom
-///     Frameworks/                                  GStreamer and GLib libraries
-///     Frameworks/gstreamer-1.0/                    GStreamer plugins
-///     Frameworks/gstreamer-1.0/gst-plugin-scanner  the plugin scanner
+///     Frameworks/                  GStreamer and GLib libraries
+///     PlugIns/gstreamer/           GStreamer plugins
+///     Helpers/gst-plugin-scanner   the plugin scanner
 /// ```
 ///
+/// No directory in those places may have a dot in its name: `codesign` takes such a
+/// directory for a nested bundle and rejects the app.
+///
 /// The paths below are relative to `Contents`, the parent of the directory holding
-/// the executables. The script that builds the bundle (OL-57b) must put the files
-/// exactly there; change both together.
+/// the executables. `.github/scripts/build-macos-app.sh` puts the files exactly
+/// there (`PLUGIN_DIR_REL`, `SCANNER_REL`); a test below keeps the two in step.
 ///
 /// A `strom` next to the gateway counts as bundled only when this directory exists
 /// relative to it. That is what tells the app apart from a plain install such as
 /// `install.sh`'s, which puts both executables in `/usr/local/bin` or `~/.local/bin`
 /// with no GStreamer of their own.
-pub const BUNDLE_PLUGIN_DIR: &str = "Frameworks/gstreamer-1.0";
-/// See [`BUNDLE_PLUGIN_DIR`]. GStreamer only loads plugin files by their library
-/// suffix, so the scanner can sit in the plugin directory.
-pub const BUNDLE_PLUGIN_SCANNER: &str = "Frameworks/gstreamer-1.0/gst-plugin-scanner";
+pub const BUNDLE_PLUGIN_DIR: &str = "PlugIns/gstreamer";
+/// See [`BUNDLE_PLUGIN_DIR`]. An executable, so it sits with the bundle's helper tools.
+pub const BUNDLE_PLUGIN_SCANNER: &str = "Helpers/gst-plugin-scanner";
 /// The GStreamer registry of a bundled Strom, kept in the managed Strom's data
 /// directory so it never shares a registry with another GStreamer on the machine.
 pub const BUNDLE_REGISTRY_FILE: &str = "gstreamer-registry.bin";
@@ -718,8 +721,8 @@ mod tests {
             },
         };
         let env: std::collections::HashMap<_, _> = strom.gst_env(&data_dir).into_iter().collect();
-        let plugins = contents.join("Frameworks/gstreamer-1.0");
-        let scanner = contents.join("Frameworks/gstreamer-1.0/gst-plugin-scanner");
+        let plugins = contents.join("PlugIns/gstreamer");
+        let scanner = contents.join("Helpers/gst-plugin-scanner");
         let registry = data_dir.join("gstreamer-registry.bin");
         for (key, want) in [
             ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.as_os_str()),
@@ -856,5 +859,45 @@ mod tests {
         assert!(data_dir(&cfg).ends_with("strom-data"));
         cfg.strom.data_dir = Some("/tmp/somewhere".to_string());
         assert_eq!(data_dir(&cfg), PathBuf::from("/tmp/somewhere"));
+    }
+
+    /// The value of `NAME="..."` in the script that builds the macOS app.
+    fn app_script_value(name: &str) -> &'static str {
+        let script = include_str!("../.github/scripts/build-macos-app.sh");
+        let prefix = format!("{name}=\"");
+        let line = script
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("build-macos-app.sh sets no {name}"));
+        let value = &line[prefix.len()..];
+        &value[..value.find('"').expect("closing quote")]
+    }
+
+    #[test]
+    fn the_app_script_puts_plugins_and_scanner_where_we_look() {
+        assert_eq!(app_script_value("PLUGIN_DIR_REL"), BUNDLE_PLUGIN_DIR);
+        assert_eq!(app_script_value("SCANNER_REL"), BUNDLE_PLUGIN_SCANNER);
+    }
+
+    /// `codesign` accepts nested code only in a bundle's code locations, and takes a
+    /// directory there whose name has a dot (such as `gstreamer-1.0`) for a nested
+    /// bundle, which rejects the whole app.
+    #[test]
+    fn the_bundle_layout_is_one_codesign_accepts() {
+        for (path, location) in [
+            (BUNDLE_PLUGIN_DIR, "PlugIns"),
+            (BUNDLE_PLUGIN_SCANNER, "Helpers"),
+        ] {
+            let parts: Vec<&str> = path.split('/').collect();
+            assert_eq!(parts[0], location, "{path}");
+            let dirs = if path == BUNDLE_PLUGIN_DIR {
+                &parts[..]
+            } else {
+                &parts[..parts.len() - 1]
+            };
+            for dir in dirs {
+                assert!(!dir.contains('.'), "{path}: directory {dir:?} has a dot");
+            }
+        }
     }
 }
