@@ -409,6 +409,7 @@ mod tests {
             .to_string()
             .contains("/nonexistent/strom"));
         assert!(locate_binary("definitely-not-a-real-binary-xyz").is_err());
+        #[cfg(unix)]
         assert!(locate_binary("sh")
             .expect("sh is on PATH")
             .path
