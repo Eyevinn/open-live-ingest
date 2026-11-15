@@ -2,11 +2,18 @@ name: Release
 
 # Pushing a tag such as v0.3.0 builds one static binary per platform and attaches
 # them to a GitHub release. The manual trigger builds the same artifacts without
-# publishing anything, to try the workflow out.
+# publishing anything, to try the workflow out. A pull request that changes this
+# workflow or the macOS app script runs it too, so the change is proven before it
+# merges; like a manual run from a branch, it publishes nothing (`release` runs only
+# on a tag ref).
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/scripts/build-macos-app.sh
 
 env:
   CARGO_TERM_COLOR: always
@@ -101,12 +108,13 @@ jobs:
   # never names a Strom version itself.
   #
   # The DMG is not signed yet, so it never reaches a release. It is uploaded as a
-  # workflow artifact only on a manual run from a branch: the upload step is gated on
-  # workflow_dispatch AND a non-tag ref. `release` runs on any tag ref, a manual run
-  # from a tag included, and downloads every artifact of the run, so a DMG uploaded on
-  # a tag ref could be published (e.g. by a re-run of `release`). On a tag ref this
-  # job builds and checks the DMG but uploads nothing. `release` does not wait for
-  # this job, so its tarballs, SHA256SUMS and attestations are what they were.
+  # workflow artifact only on a manual run from a branch or a pull request run: the
+  # upload step is gated on workflow_dispatch or pull_request AND a non-tag ref.
+  # `release` runs on any tag ref, a manual run from a tag included, and downloads
+  # every artifact of the run, so a DMG uploaded on a tag ref could be published
+  # (e.g. by a re-run of `release`). On a tag ref this job builds and checks the DMG
+  # but uploads nothing. `release` does not wait for this job, so its tarballs,
+  # SHA256SUMS and attestations are what they were.
   macos-app:
     needs: build
     runs-on: macos-latest
@@ -179,7 +187,7 @@ jobs:
           fi
 
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && github.ref_type != 'tag'
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && github.ref_type != 'tag'
         with:
           name: ${{ env.DMG }}
           path: ${{ env.DMG }}
