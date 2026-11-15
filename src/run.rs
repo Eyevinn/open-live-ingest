@@ -35,6 +35,16 @@ const TICK: Duration = Duration::from_secs(10);
 /// revision per write, so one quiet poll must not flap the verdict.
 const QUIET_TOLERANCE: u32 = 3;
 
+/// `println!` that ignores a failed write instead of panicking. Teardown prints with
+/// it: on Windows it runs while the console is closing, logging off or shutting down,
+/// when Microsoft documents that console I/O may not work reliably.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 /// The local Strom, adopted or started, and a client for it. Held for as long as the
 /// command runs: dropping it stops a Strom we started.
 async fn connect_strom(cfg: &Config) -> Result<(LocalStrom, StromClient)> {
@@ -506,7 +516,7 @@ pub async fn up(
         Err(err) => (Err(err), Stop::Interrupt),
     };
 
-    println!("\nStopping.");
+    say!("\nStopping.");
     match stop {
         Stop::Interrupt => {
             // Studio hears first, so the inputs vanishing next is read as a stop, not a fault.
@@ -1107,14 +1117,17 @@ enum Stop {
 }
 
 /// How long teardown may take when Windows is ending the process, leaving a second
-/// of the five Windows allows for stopping the managed Strom.
+/// of the five Windows allows for stopping the managed Strom. That second is enough
+/// only because `LocalStrom`'s drop ends a managed Strom at once on Windows
+/// (`Child::kill`, i.e. TerminateProcess) before it waits, rather than giving it
+/// `STOP_TIMEOUT` to exit by itself.
 const ENDING_TEARDOWN: Duration = Duration::from_secs(4);
 
 /// Removes one flow and says so. Returns whether it is gone.
 async fn remove_flow_reported(strom: &StromClient, l: &Live) -> bool {
     match remove_flow(strom, &l.flow_id).await {
         Ok(()) => {
-            println!("  {} — flow stopped and removed", l.input.name);
+            say!("  {} — flow stopped and removed", l.input.name);
             true
         }
         Err(err) => {
@@ -1128,7 +1141,7 @@ async fn remove_flow_reported(strom: &StromClient, l: &Live) -> bool {
 async fn remove_source_reported(client: &OpenLiveClient, id: &str, l: &Live) -> bool {
     let gone = remove_source(client, id, &l.input.name).await;
     if gone {
-        println!("  {} — source removed from Open Live", l.input.name);
+        say!("  {} — source removed from Open Live", l.input.name);
     }
     gone
 }
@@ -1294,7 +1307,7 @@ async fn remove_source(client: &OpenLiveClient, id: &str, name: &str) -> bool {
         Ok(()) => true,
         Err(err) => {
             match err.downcast_ref::<Refused>() {
-                Some(refused) => println!("  {}", kept_message(name, refused)),
+                Some(refused) => say!("  {}", kept_message(name, refused)),
                 None => {
                     warn!(source = %name, err = %format_args!("{err:#}"), "could not remove the source")
                 }
@@ -1333,7 +1346,7 @@ async fn sweep_sources(
         .filter(|s| s.name.starts_with(&prefix) && !skip.contains(&s.id))
     {
         if remove_source(client, &source.id, &source.name).await {
-            println!("  {} — source removed from Open Live", source.name);
+            say!("  {} — source removed from Open Live", source.name);
             removed += 1;
         }
     }
