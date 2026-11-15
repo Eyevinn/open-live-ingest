@@ -9,6 +9,7 @@
 use crate::config::{self, Config};
 use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -33,7 +34,14 @@ impl Drop for LocalStrom {
         };
         let pid = child.id();
         info!(pid, "stopping the Strom we started");
+        // Unix: SIGTERM, then the wait below gives it time to exit cleanly. Windows
+        // has no SIGTERM, so it is ended hard (TerminateProcess) through the handle we
+        // hold. That is fine here: the teardown has already removed the flows and the
+        // Open Live sources by the time this runs.
+        #[cfg(not(windows))]
         signal_term(pid);
+        #[cfg(windows)]
+        let _ = child.kill();
         let deadline = Instant::now() + STOP_TIMEOUT;
         loop {
             match child.try_wait() {
@@ -84,7 +92,7 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         );
     }
 
-    let binary = locate_binary(&cfg.strom.binary)?;
+    let strom = locate_binary(&cfg.strom.binary)?;
     let port = port_of(&cfg.strom.url).with_context(|| {
         format!(
             "strom.url {:?} names no port, so there is nothing to start a Strom on",
@@ -103,10 +111,11 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         "Starting Strom on port {port} (logging to {}).",
         log_path.display()
     );
-    let mut command = Command::new(&binary);
+    let mut command = Command::new(&strom.path);
     command
         .args(["--headless", "--port", &port.to_string(), "--data-dir"])
         .arg(&data_dir)
+        .envs(strom.gst_env(&data_dir))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -118,9 +127,15 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
     let child = command
         .spawn()
-        .with_context(|| format!("starting {}", binary.display()))?;
+        .with_context(|| format!("starting {}", strom.path.display()))?;
 
     // Recorded so a `down` after a hard kill can still stop it. Written before the
     // readiness wait, so a failure there cannot leak a running Strom either.
@@ -182,60 +197,252 @@ fn tail_of_log(path: &Path) -> String {
     out
 }
 
+/// The self-contained macOS app ships the gateway and Strom side by side, with the
+/// GStreamer that Strom links against under `Frameworks`:
+///
+/// ```text
+/// Open Live Ingest.app/Contents/
+///     MacOS/open-live-ingest
+///     MacOS/strom
+///     Frameworks/                                  GStreamer and GLib libraries
+///     Frameworks/gstreamer-1.0/                    GStreamer plugins
+///     Frameworks/gstreamer-1.0/gst-plugin-scanner  the plugin scanner
+/// ```
+///
+/// The paths below are relative to `Contents`, the parent of the directory holding
+/// the executables. The script that builds the bundle (OL-57b) must put the files
+/// exactly there; change both together.
+///
+/// A `strom` next to the gateway counts as bundled only when this directory exists
+/// relative to it. That is what tells the app apart from a plain install such as
+/// `install.sh`'s, which puts both executables in `/usr/local/bin` or `~/.local/bin`
+/// with no GStreamer of their own.
+pub const BUNDLE_PLUGIN_DIR: &str = "Frameworks/gstreamer-1.0";
+/// See [`BUNDLE_PLUGIN_DIR`]. GStreamer only loads plugin files by their library
+/// suffix, so the scanner can sit in the plugin directory.
+pub const BUNDLE_PLUGIN_SCANNER: &str = "Frameworks/gstreamer-1.0/gst-plugin-scanner";
+/// The GStreamer registry of a bundled Strom, kept in the managed Strom's data
+/// directory so it never shares a registry with another GStreamer on the machine.
+pub const BUNDLE_REGISTRY_FILE: &str = "gstreamer-registry.bin";
+
 #[cfg(not(windows))]
 const INSTALL_HINT: &str =
     "Install Strom, or set [strom] binary to its path:\n    curl -sSL https://raw.githubusercontent.com/Eyevinn/strom/main/install.sh | bash";
+// install.ps1 (#42) is not on main yet, so the hint leads with the MSI; #42 adds
+// its `irm ... | iex` line here.
 #[cfg(windows)]
-const INSTALL_HINT: &str = "Install Strom with install.ps1, or with the Strom MSI from https://github.com/Eyevinn/strom/releases,\nor set [strom] binary to the path of strom.exe:\n    irm https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/install.ps1 | iex";
+const INSTALL_HINT: &str = "Install Strom with the Strom MSI from https://github.com/Eyevinn/strom/releases,\nor set [strom] binary to the path of strom.exe.";
 
-/// An explicit path, or a name on `PATH`. On Windows also `<name>.exe` on `PATH`,
-/// and then where the Strom MSI installs, which a console opened before the
-/// install does not yet have on its `PATH`.
-pub fn locate_binary(configured: &str) -> Result<PathBuf> {
+/// Where the Strom MSI puts `strom.exe`, relative to `%ProgramFiles%` (Eyevinn/strom
+/// `installer/windows/Product.wxs`: ProgramFiles64Folder\Strom\bin).
+const MSI_STROM: [&str; 3] = ["Strom", "bin", "strom.exe"];
+
+/// Where the Strom to start was found, which decides how it is started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StromOrigin {
+    /// `strom.binary` names a path.
+    Configured,
+    /// Next to the gateway's own executable, inside the app bundle: the parent of
+    /// that directory (`contents`, the bundle's `Contents`) holds
+    /// [`BUNDLE_PLUGIN_DIR`]. Runs with the bundle's GStreamer only.
+    Bundled { contents: PathBuf },
+    /// Next to the gateway's own executable, but with no bundle around it, as after
+    /// `install.sh`. Brings its own GStreamer, like a Strom on `PATH`.
+    Beside,
+    /// Found on `PATH`.
+    Path,
+    /// In the Strom MSI's install folder, `%ProgramFiles%\Strom\bin` (Windows), for a
+    /// console opened before the MSI added that folder to the system `PATH`. That
+    /// Strom finds its own GStreamer under `Strom\gstreamer`.
+    Installed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedStrom {
+    pub path: PathBuf,
+    pub origin: StromOrigin,
+}
+
+impl LocatedStrom {
+    /// Why this Strom was chosen, for the log and the setup check.
+    pub fn reason(&self) -> &'static str {
+        match self.origin {
+            StromOrigin::Configured => "the path set in [strom] binary",
+            StromOrigin::Bundled { .. } => "the one bundled with open-live-ingest",
+            StromOrigin::Beside => "the one next to open-live-ingest",
+            StromOrigin::Path => "found on PATH",
+            StromOrigin::Installed => "the Strom MSI's install folder",
+        }
+    }
+
+    /// The GStreamer environment for starting this Strom. Empty unless it is the
+    /// bundled one: a Strom on `PATH`, set explicitly, or next to the gateway outside
+    /// a bundle brings its own GStreamer.
+    /// For the bundled one, plugins and the scanner come from the bundle only, and
+    /// the registry lives in `data_dir`, so a Homebrew GStreamer is never mixed in.
+    pub fn gst_env(&self, data_dir: &Path) -> Vec<(&'static str, OsString)> {
+        let StromOrigin::Bundled { contents } = &self.origin else {
+            return Vec::new();
+        };
+        let plugins = contents.join(BUNDLE_PLUGIN_DIR).into_os_string();
+        let scanner = contents.join(BUNDLE_PLUGIN_SCANNER).into_os_string();
+        let registry = data_dir.join(BUNDLE_REGISTRY_FILE).into_os_string();
+        vec![
+            ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.clone()),
+            ("GST_PLUGIN_SYSTEM_PATH", plugins),
+            ("GST_PLUGIN_PATH_1_0", OsString::new()),
+            ("GST_PLUGIN_PATH", OsString::new()),
+            ("GST_PLUGIN_SCANNER_1_0", scanner.clone()),
+            ("GST_PLUGIN_SCANNER", scanner),
+            ("GST_REGISTRY_1_0", registry.clone()),
+            ("GST_REGISTRY", registry),
+        ]
+    }
+}
+
+/// The Strom to start: an explicit setting, else one next to this executable, else
+/// one on `PATH`, else (Windows) the one the Strom MSI installed.
+pub fn locate_binary(configured: &str) -> Result<LocatedStrom> {
+    let exe_dir = own_exe_dir();
+    let program_files = if cfg!(windows) {
+        std::env::var_os("ProgramFiles")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    } else {
+        None
+    };
+    let located = resolve_binary(
+        configured,
+        exe_dir.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+        program_files.as_deref(),
+    )?;
+    info!(path = %located.path.display(), reason = located.reason(), "chose the Strom to start");
+    Ok(located)
+}
+
+/// The directory of the running executable with symlinks resolved, so a
+/// `/usr/local/bin` link into the app still finds the Strom in the app.
+fn own_exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    exe.parent().map(Path::to_path_buf)
+}
+
+/// The lookup order, kept free of the process environment so it can be tested.
+/// A path in `configured` always wins and is never looked up elsewhere. Only the
+/// default name looks next to the executable before `PATH`; any other name is a
+/// deliberate choice and is looked up on `PATH` alone. A Strom found next to the
+/// executable is [`StromOrigin::Bundled`] only when the bundle layout is there
+/// (see [`bundle_contents`]), and [`StromOrigin::Beside`] otherwise.
+///
+/// Order: explicit path > next to the executable > `PATH` > the Strom MSI's folder
+/// under `program_files` (passed only on Windows, and only for the default name).
+/// On Windows a value containing `\` is a path too, and a name without an extension
+/// is looked up as `<name>.exe` only (see [`file_name`]).
+fn resolve_binary(
+    configured: &str,
+    exe_dir: Option<&Path>,
+    path_var: Option<&OsStr>,
+    program_files: Option<&Path>,
+) -> Result<LocatedStrom> {
     let candidate = Path::new(configured);
     let is_path = configured.contains('/') || (cfg!(windows) && configured.contains('\\'));
     if candidate.is_absolute() || is_path {
         if candidate.is_file() {
-            return Ok(candidate.to_path_buf());
+            return Ok(LocatedStrom {
+                path: candidate.to_path_buf(),
+                origin: StromOrigin::Configured,
+            });
         }
         bail!("no Strom executable at {configured}.\n\n{INSTALL_HINT}");
     }
-    let names = file_names(configured);
-    let on_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
-        .find(|full| full.is_file());
-    if let Some(found) = on_path {
-        return Ok(found);
+    let file = file_name(configured);
+    if is_default_name(configured) {
+        if let Some(dir) = exe_dir {
+            let beside = dir.join(&file);
+            if is_executable(&beside) {
+                let origin = match bundle_contents(dir) {
+                    Some(contents) => StromOrigin::Bundled { contents },
+                    None => StromOrigin::Beside,
+                };
+                return Ok(LocatedStrom {
+                    path: beside,
+                    origin,
+                });
+            }
+        }
     }
-    #[cfg(windows)]
-    if let Some(found) = msi_install(configured) {
-        return Ok(found);
+    let on_path = std::env::split_paths(path_var.unwrap_or_default())
+        .map(|dir| dir.join(&file))
+        .find(|full| full.is_file());
+    if let Some(path) = on_path {
+        return Ok(LocatedStrom {
+            path,
+            origin: StromOrigin::Path,
+        });
+    }
+    if is_default_name(configured) {
+        if let Some(program_files) = program_files {
+            let installed: PathBuf = MSI_STROM
+                .iter()
+                .fold(program_files.to_path_buf(), |p, part| p.join(part));
+            if installed.is_file() {
+                return Ok(LocatedStrom {
+                    path: installed,
+                    origin: StromOrigin::Installed,
+                });
+            }
+        }
     }
     bail!("could not find {configured:?} on PATH.\n\n{INSTALL_HINT}")
 }
 
-/// The file names a command name stands for: on Windows `<name>.exe` first.
-fn file_names(name: &str) -> Vec<String> {
-    if cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe") {
-        vec![format!("{name}.exe"), name.to_string()]
+/// Whether `configured` is Strom's own name, the only one looked up next to the
+/// executable and in the MSI folder. On Windows also `strom.exe`, in any case, as
+/// Windows file names are case-insensitive.
+fn is_default_name(configured: &str) -> bool {
+    if cfg!(windows) {
+        configured.eq_ignore_ascii_case(config::DEFAULT_STROM_BINARY)
+            || configured.eq_ignore_ascii_case(&format!("{}.exe", config::DEFAULT_STROM_BINARY))
     } else {
-        vec![name.to_string()]
+        configured == config::DEFAULT_STROM_BINARY
     }
 }
 
-/// `%ProgramFiles%\Strom\bin\strom.exe`, where the Strom MSI installs, when the
-/// configured name is Strom's own.
-#[cfg(windows)]
-fn msi_install(configured: &str) -> Option<PathBuf> {
-    let name = configured.to_ascii_lowercase();
-    if name != "strom" && name != "strom.exe" {
-        return None;
+/// The file a command name stands for. On Windows a name without an extension is
+/// `<name>.exe` only: Windows never runs an extensionless file as a command, so a
+/// bare `strom` (a shell script in a Git-for-Windows dir, say) must not shadow a
+/// `strom.exe` later on `PATH` or next to the executable.
+fn file_name(name: &str) -> String {
+    if cfg!(windows) && Path::new(name).extension().is_none() {
+        format!("{name}{}", std::env::consts::EXE_SUFFIX)
+    } else {
+        name.to_string()
     }
-    let full = PathBuf::from(std::env::var_os("ProgramFiles")?)
-        .join("Strom")
-        .join("bin")
-        .join("strom.exe");
-    full.is_file().then_some(full)
+}
+
+/// The bundle's `Contents` directory when `exe_dir` sits inside the app bundle,
+/// that is when its parent holds [`BUNDLE_PLUGIN_DIR`]. None for a plain directory
+/// such as `/usr/local/bin`, where pointing GStreamer at a plugin directory that does
+/// not exist would leave Strom with no plugins at all.
+fn bundle_contents(exe_dir: &Path) -> Option<PathBuf> {
+    let contents = exe_dir.parent()?;
+    contents
+        .join(BUNDLE_PLUGIN_DIR)
+        .is_dir()
+        .then(|| contents.to_path_buf())
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Beside our own settings by default, so a managed Strom never writes into an
@@ -287,7 +494,19 @@ fn signal_term(pid: u32) {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows has no SIGTERM, so a Strom known only by its pid is ended hard, with its
+/// child processes. This is only used after the flows are gone (`down` removes them
+/// first), so nothing is left half torn down. CTRL_BREAK_EVENT is not used because it
+/// has not been checked that Strom shuts down cleanly on it.
+#[cfg(windows)]
+fn signal_term(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .output();
+}
+
+#[cfg(not(any(unix, windows)))]
 fn signal_term(_pid: u32) {}
 
 #[cfg(test)]
@@ -311,14 +530,215 @@ mod tests {
             .contains("/nonexistent/strom"));
         assert!(locate_binary("definitely-not-a-real-binary-xyz").is_err());
         #[cfg(unix)]
-        assert!(locate_binary("sh").expect("sh is on PATH").ends_with("sh"));
+        assert!(locate_binary("sh")
+            .expect("sh is on PATH")
+            .path
+            .ends_with("sh"));
+    }
+
+    /// A fresh directory per test, removed again when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("oli-local-strom-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        /// An executable file at `rel` plus the platform's executable suffix (`.exe`
+        /// on Windows, where an extensionless `strom` is never picked), with its
+        /// directories.
+        fn exe(&self, rel: &str) -> PathBuf {
+            let path = self
+                .0
+                .join(format!("{rel}{}", std::env::consts::EXE_SUFFIX));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            path
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn an_explicit_path_wins_then_the_strom_next_to_us_then_path() {
+        let scratch = Scratch::new("order");
+        let contents = scratch.0.join("App.app/Contents");
+        let macos = contents.join("MacOS");
+        std::fs::create_dir_all(contents.join(BUNDLE_PLUGIN_DIR)).unwrap();
+        let bundled = scratch.exe("App.app/Contents/MacOS/strom");
+        let on_path = scratch.exe("bin/strom");
+        let explicit = scratch.exe("elsewhere/strom");
+        let path_var = std::env::join_paths([scratch.0.join("bin")]).unwrap();
+
+        // An explicit path wins over a strom next to the executable.
+        let got = resolve_binary(
+            explicit.to_str().unwrap(),
+            Some(&macos),
+            Some(&path_var),
+            None,
+        )
+        .unwrap();
+        assert_eq!(got.path, explicit);
+        assert_eq!(got.origin, StromOrigin::Configured);
+
+        // The default name finds the strom next to the executable before PATH.
+        let got = resolve_binary("strom", Some(&macos), Some(&path_var), None).unwrap();
+        assert_eq!(got.path, bundled);
+        assert_eq!(
+            got.origin,
+            StromOrigin::Bundled {
+                contents: contents.clone()
+            }
+        );
+
+        // With nothing next to the executable, PATH.
+        let empty_dir = scratch.0.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        let got = resolve_binary("strom", Some(&empty_dir), Some(&path_var), None).unwrap();
+        assert_eq!(got.path, on_path);
+        assert_eq!(got.origin, StromOrigin::Path);
+        let got = resolve_binary("strom", None, Some(&path_var), None).unwrap();
+        assert_eq!(got.origin, StromOrigin::Path);
+
+        // A missing explicit path still errors, and is not rescued by the bundle.
+        let missing = scratch.0.join("nowhere/strom");
+        let err = resolve_binary(
+            missing.to_str().unwrap(),
+            Some(&macos),
+            Some(&path_var),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(missing.to_str().unwrap()), "{err}");
+
+        // Nothing anywhere is an error naming the binary.
+        assert!(resolve_binary("strom", Some(&empty_dir), None, None).is_err());
+    }
+
+    /// Any name other than the default is a deliberate choice, looked up on PATH only.
+    #[test]
+    fn a_non_default_name_is_not_looked_up_next_to_us() {
+        let scratch = Scratch::new("name");
+        let macos = scratch.0.join("MacOS");
+        scratch.exe("MacOS/strom-dev");
+        let on_path = scratch.exe("bin/strom-dev");
+        let path_var = std::env::join_paths([scratch.0.join("bin")]).unwrap();
+        let got = resolve_binary("strom-dev", Some(&macos), Some(&path_var), None).unwrap();
+        assert_eq!(got.path, on_path);
+        assert_eq!(got.origin, StromOrigin::Path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_strom_next_to_us_that_is_not_executable_is_skipped() {
+        let scratch = Scratch::new("noexec");
+        let macos = scratch.0.join("MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("strom"), "").unwrap();
+        let on_path = scratch.exe("bin/strom");
+        let path_var = std::env::join_paths([scratch.0.join("bin")]).unwrap();
+        let got = resolve_binary("strom", Some(&macos), Some(&path_var), None).unwrap();
+        assert_eq!(got.path, on_path);
+    }
+
+    /// `install.sh` puts the gateway and Strom side by side in a plain `bin`
+    /// directory. That Strom is still preferred, but it is not bundled: it must keep
+    /// its own GStreamer, so it gets no GST_* environment.
+    #[test]
+    fn a_strom_next_to_us_in_a_plain_bin_dir_is_not_bundled() {
+        let scratch = Scratch::new("plainbin");
+        let bin = scratch.0.join("usr/local/bin");
+        let beside = scratch.exe("usr/local/bin/strom");
+        scratch.exe("usr/local/bin/open-live-ingest");
+        assert!(!scratch.0.join("usr/local").join(BUNDLE_PLUGIN_DIR).exists());
+
+        let got = resolve_binary("strom", Some(&bin), None, None).unwrap();
+        assert_eq!(got.path, beside);
+        assert_eq!(got.origin, StromOrigin::Beside);
+        assert_eq!(got.reason(), "the one next to open-live-ingest");
+        let env = got.gst_env(&scratch.0.join("strom-data"));
+        assert!(env.is_empty(), "{env:?}");
+
+        // A MacOS directory without the bundle's plugin directory is not a bundle either.
+        let macos = scratch.0.join("Broken.app/Contents/MacOS");
+        scratch.exe("Broken.app/Contents/MacOS/strom");
+        let got = resolve_binary("strom", Some(&macos), None, None).unwrap();
+        assert_eq!(got.origin, StromOrigin::Beside);
+        assert!(got.gst_env(&scratch.0.join("strom-data")).is_empty());
+    }
+
+    #[test]
+    fn only_a_bundled_strom_gets_the_bundles_gstreamer() {
+        let data_dir = PathBuf::from("/data/strom-data");
+        let macos = PathBuf::from("/Applications/Open Live Ingest.app/Contents/MacOS");
+        let contents = PathBuf::from("/Applications/Open Live Ingest.app/Contents");
+
+        for origin in [
+            StromOrigin::Configured,
+            StromOrigin::Path,
+            StromOrigin::Beside,
+            StromOrigin::Installed,
+        ] {
+            let strom = LocatedStrom {
+                path: PathBuf::from("/usr/local/bin/strom"),
+                origin,
+            };
+            assert!(strom.gst_env(&data_dir).is_empty());
+        }
+
+        let strom = LocatedStrom {
+            path: macos.join("strom"),
+            origin: StromOrigin::Bundled {
+                contents: contents.clone(),
+            },
+        };
+        let env: std::collections::HashMap<_, _> = strom.gst_env(&data_dir).into_iter().collect();
+        let plugins = contents.join("Frameworks/gstreamer-1.0");
+        let scanner = contents.join("Frameworks/gstreamer-1.0/gst-plugin-scanner");
+        let registry = data_dir.join("gstreamer-registry.bin");
+        for (key, want) in [
+            ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.as_os_str()),
+            ("GST_PLUGIN_SYSTEM_PATH", plugins.as_os_str()),
+            ("GST_PLUGIN_PATH_1_0", OsStr::new("")),
+            ("GST_PLUGIN_PATH", OsStr::new("")),
+            ("GST_PLUGIN_SCANNER_1_0", scanner.as_os_str()),
+            ("GST_PLUGIN_SCANNER", scanner.as_os_str()),
+            ("GST_REGISTRY_1_0", registry.as_os_str()),
+            ("GST_REGISTRY", registry.as_os_str()),
+        ] {
+            assert_eq!(env.get(key).map(OsString::as_os_str), Some(want), "{key}");
+        }
+        assert_eq!(env.len(), 8);
+        for key in ["GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SCANNER_1_0"] {
+            assert!(Path::new(&env[key]).starts_with(&contents), "{key}");
+        }
+        assert!(Path::new(&env["GST_REGISTRY_1_0"]).starts_with(&data_dir));
     }
 
     #[cfg(windows)]
     #[test]
     fn on_windows_a_name_on_path_is_found_with_its_exe_extension() {
         let found = locate_binary("cmd").expect("cmd.exe is on PATH");
-        let file = found.file_name().unwrap().to_string_lossy().to_lowercase();
+        let file = found
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_lowercase();
         assert_eq!(file, "cmd.exe");
     }
 
@@ -327,7 +747,9 @@ mod tests {
     #[test]
     fn on_windows_a_value_with_a_backslash_is_a_path() {
         assert_eq!(
-            locate_binary(r"src\main.rs").expect("cargo test runs in the crate root"),
+            locate_binary(r"src\main.rs")
+                .expect("cargo test runs in the crate root")
+                .path,
             PathBuf::from(r"src\main.rs")
         );
         let err = locate_binary(r"no-such-dir\cmd").unwrap_err().to_string();
@@ -335,6 +757,81 @@ mod tests {
             err.contains(r"no Strom executable at no-such-dir\cmd"),
             "{err}"
         );
+    }
+
+    /// The MSI folder is the last resort: after PATH, only for Strom's own name, and
+    /// never reported as found on PATH. `locate_binary` passes it only on Windows;
+    /// injected here, so every OS runs this.
+    #[test]
+    fn the_msi_folder_is_tried_only_after_path_misses() {
+        let scratch = Scratch::new("msi");
+        let program_files = scratch.0.join("Program Files");
+        let installed = program_files.join("Strom").join("bin").join("strom.exe");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&installed, "").unwrap();
+        let on_path = scratch.exe("bin/strom");
+        let path_var = std::env::join_paths([scratch.0.join("bin")]).unwrap();
+        let empty_dir = scratch.0.join("empty");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+
+        let got = resolve_binary(
+            "strom",
+            Some(&empty_dir),
+            Some(&path_var),
+            Some(&program_files),
+        )
+        .unwrap();
+        assert_eq!(got.path, on_path);
+        assert_eq!(got.origin, StromOrigin::Path);
+
+        let got = resolve_binary("strom", Some(&empty_dir), None, Some(&program_files)).unwrap();
+        assert_eq!(got.path, installed);
+        assert_eq!(got.origin, StromOrigin::Installed);
+        assert_ne!(got.reason(), "found on PATH");
+        assert!(got.gst_env(&scratch.0.join("strom-data")).is_empty());
+
+        // Another name is a deliberate choice and never resolves to the MSI's Strom.
+        assert!(resolve_binary("strom-dev", Some(&empty_dir), None, Some(&program_files)).is_err());
+        // Without a Program Files folder (every OS but Windows), nothing.
+        assert!(resolve_binary("strom", Some(&empty_dir), None, None).is_err());
+    }
+
+    /// The Windows zip/installer layout: `strom.exe` next to `open-live-ingest.exe`.
+    /// A bare `strom` there is not a command on Windows and is never picked.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_strom_exe_next_to_us_is_found_and_a_bare_strom_is_not() {
+        let scratch = Scratch::new("winbeside");
+        let app = scratch.0.join("app");
+        let beside = scratch.exe("app/strom");
+        assert!(beside.ends_with("strom.exe"));
+        for name in ["strom", "strom.exe", "STROM.EXE"] {
+            let got = resolve_binary(name, Some(&app), None, None).unwrap();
+            assert_eq!(got.path, app.join("strom.exe"), "{name}");
+            assert_eq!(got.origin, StromOrigin::Beside, "{name}");
+        }
+
+        let bare_dir = scratch.0.join("bare");
+        std::fs::create_dir_all(&bare_dir).unwrap();
+        std::fs::write(bare_dir.join("strom"), "").unwrap();
+        let path_var = std::env::join_paths([&bare_dir]).unwrap();
+        assert!(resolve_binary("strom", Some(&bare_dir), Some(&path_var), None).is_err());
+    }
+
+    /// With `PATH=C:\tools;C:\Program Files\Strom\bin` and an extensionless
+    /// `C:\tools\strom`, the real `strom.exe` later on PATH is the one chosen.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_strom_exe_later_on_path_beats_a_bare_strom_earlier() {
+        let scratch = Scratch::new("winpath");
+        let tools = scratch.0.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("strom"), "#!/bin/sh\n").unwrap();
+        let real = scratch.exe("strom-bin/strom");
+        let path_var = std::env::join_paths([tools, scratch.0.join("strom-bin")]).unwrap();
+        let got = resolve_binary("strom", None, Some(&path_var), None).unwrap();
+        assert_eq!(got.path, real);
+        assert_eq!(got.origin, StromOrigin::Path);
     }
 
     #[test]
