@@ -414,7 +414,10 @@ impl Default for Log {
 /// Where per-user files live. Per-user because this is run by an operator, not root.
 pub fn user_dir() -> PathBuf {
     let base = if cfg!(windows) {
-        std::env::var_os("APPDATA").map(PathBuf::from)
+        // An empty APPDATA counts as unset, rather than giving a relative directory.
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
     } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
