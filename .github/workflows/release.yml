@@ -2,11 +2,18 @@ name: Release
 
 # Pushing a tag such as v0.3.0 builds one static binary per platform and attaches
 # them to a GitHub release. The manual trigger builds the same artifacts without
-# publishing anything, to try the workflow out.
+# publishing anything, to try the workflow out. A pull request that changes this
+# workflow or the macOS app script runs it too, so the change is proven before it
+# merges; like a manual run from a branch, it publishes nothing (`release` runs only
+# on a tag ref).
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/scripts/build-macos-app.sh
 
 env:
   CARGO_TERM_COLOR: always
@@ -94,3 +101,94 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes
+
+  # Open Live Ingest.app for Apple silicon in a drag-to-install DMG, built from the
+  # aarch64-apple-darwin binary of `build` by .github/scripts/build-macos-app.sh. The
+  # script bundles the Strom the strom-types tag in Cargo.toml names, so the workflow
+  # never names a Strom version itself.
+  #
+  # The DMG is not signed yet, so it never reaches a release. It is uploaded as a
+  # workflow artifact only on a manual run from a branch or a pull request run: the
+  # upload step is gated on workflow_dispatch or pull_request AND a non-tag ref.
+  # `release` runs on any tag ref, a manual run from a tag included, and downloads
+  # every artifact of the run, so a DMG uploaded on a tag ref could be published
+  # (e.g. by a re-run of `release`). On a tag ref this job builds and checks the DMG
+  # but uploads nothing. `release` does not wait for this job, so its tarballs,
+  # SHA256SUMS and attestations are what they were.
+  macos-app:
+    needs: build
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      TARGET: aarch64-apple-darwin
+      DMG: open-live-ingest-macos-aarch64.dmg
+      APP: Open Live Ingest.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ env.TARGET }}.tar.gz
+          path: tarball
+      - name: Unpack the gateway
+        run: tar xzf "tarball/$BIN-$TARGET.tar.gz" -C tarball
+
+      # The GStreamer the bundle carries, plugins included; see the script's header.
+      - name: Install GStreamer
+        run: brew install gstreamer
+
+      # dmg-root becomes the DMG's volume: the app and an /Applications link.
+      - name: Build the app bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/build-macos-app.sh "tarball/$BIN-$TARGET/$BIN" dmg-root
+          ln -s /Applications dmg-root/Applications
+
+      # Signing placeholder (#27, needs the Apple secrets of #25). It goes here, before
+      # the DMG is made: set MACOS_SIGN_IDENTITY on the step above (after importing the
+      # Developer ID certificate into a temporary keychain) so the script signs the
+      # bundle with the hardened runtime, then sign the DMG below, notarize it with
+      # notarytool, staple it, and only then hand it to `release` with SHA256SUMS and
+      # an attestation. Until then nothing here is published.
+
+      # hdiutil on hosted runners sometimes fails with "Resource busy"; retry it.
+      - name: Build the DMG
+        run: |
+          for attempt in 1 2 3; do
+            hdiutil create -volname "Open Live Ingest" -srcfolder dmg-root \
+              -fs HFS+ -format UDZO -ov "$DMG" && exit 0
+            echo "hdiutil create failed (attempt $attempt)"
+            if (( attempt < 3 )); then sleep 10; fi
+          done
+          exit 1
+
+      # AC2, on the app as the DMG carries it, mounted away from the build path: no
+      # Mach-O load command or rpath names /opt/homebrew or /usr/local (the script's
+      # check covers MacOS/strom, MacOS/open-live-ingest and every bundled dylib), and
+      # the bundled Strom reports 0.8.1 or later.
+      - name: Check the DMG
+        run: |
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
+          test -d "$mnt/$APP" || { echo "$APP is missing from the DMG"; exit 1; }
+          test "$(readlink "$mnt/Applications")" = /Applications \
+            || { echo "the DMG has no /Applications link"; exit 1; }
+          .github/scripts/build-macos-app.sh --check "$mnt/$APP"
+          otool -L "$mnt/$APP/Contents/MacOS/strom"
+          out="$("$mnt/$APP/Contents/MacOS/strom" --version)"
+          echo "bundled Strom: $out"
+          version="$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$out" | head -n 1)"
+          IFS=. read -r major minor patch <<<"$version"
+          if [[ -z "$version" ]] || (( major == 0 && (minor < 8 || (minor == 8 && patch < 1)) )); then
+            echo "the bundled Strom must be 0.8.1 or later (got '$out')"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && github.ref_type != 'tag'
+        with:
+          name: ${{ env.DMG }}
+          path: ${{ env.DMG }}
+          if-no-files-found: error
