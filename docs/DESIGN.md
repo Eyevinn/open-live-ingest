@@ -157,7 +157,18 @@ redirect lands on the machine running the CLI.
 
 **`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
 SIGHUP does not: a closed SSH session must not take a venue off air. A deliberate stop stops, an
-accident does not. This replaced an earlier daemon model in which flows were meant to outlive the
+accident does not. On Windows, Ctrl-C and Ctrl-Break stop the same way, and so do closing the
+console window, logoff and shutdown. Windows ends the process about five seconds after those three,
+so their teardown removes flows and sources concurrently under a four-second deadline, names what
+it could not remove for the next `up` or `down` to sweep, and then ends the managed Strom at once
+(TerminateProcess) rather than waiting for it. Two limits apply to those three events. First,
+"Strom last" is only the order `up` follows: a managed Strom shares the console, and Windows sends
+close, logoff and shutdown to every process attached to it (a separate process group only scopes
+Ctrl-C and Ctrl-Break), so Strom may already be ending while the flows are removed. Those removals
+then fail and are logged; the Open Live sources, which are what make a later `up` hit a 409, are
+removed independently of Strom. Second, Windows does not deliver logoff and shutdown to a console
+process that has loaded `user32.dll` or `gdi32.dll`, so those two are verified by hand on Windows,
+not assumed. This replaced an earlier daemon model in which flows were meant to outlive the
 agent and be reconciled forever from a config file. Carrying both models meant drift detection,
 per-input supervisor tasks, a persisted state file, and a control API that the command line never
 used. The daemon is a different product; if it is ever wanted, it should be built as one.

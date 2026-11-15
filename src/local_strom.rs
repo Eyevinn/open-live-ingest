@@ -62,7 +62,10 @@ impl Drop for LocalStrom {
             }
         }
         std::fs::remove_file(config::strom_pidfile()).ok();
-        println!("  strom — stopped");
+        // Not `println!`: this also runs while Windows closes the console, when a write
+        // to it can fail, and a panic here would skip the rest of `up`'s cleanup.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), "  strom — stopped");
     }
 }
 
