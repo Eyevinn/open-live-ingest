@@ -413,7 +413,12 @@ impl Default for Log {
 
 /// Where per-user files live. Per-user because this is run by an operator, not root.
 pub fn user_dir() -> PathBuf {
-    let base = if cfg!(target_os = "macos") {
+    let base = if cfg!(windows) {
+        // An empty APPDATA counts as unset, rather than giving a relative directory.
+        std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
     } else {
@@ -478,8 +483,9 @@ fn with_env_overrides(mut cfg: Config) -> Result<Config> {
 }
 
 /// Writes the file: validated first, via a temporary file and a rename so an
-/// interrupted save cannot leave half a file, and mode 0600 because it holds the
-/// Open Live credential and any SRT passphrase.
+/// interrupted save cannot leave half a file, and readable by the user only (mode
+/// 0600, or on Windows an ACL of the user, SYSTEM and Administrators) because it
+/// holds the Open Live credential and any SRT passphrase.
 pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     validate(cfg)?;
     if let Some(parent) = path.parent() {
@@ -494,8 +500,57 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
             .context("restricting settings permissions")?;
     }
+    #[cfg(windows)]
+    if let Err(err) = restrict_to_user(&tmp) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(err.context("restricting settings permissions"));
+    }
     std::fs::rename(&tmp, path).context("replacing the settings file")?;
     Ok(())
+}
+
+/// Replaces the file's ACL with full control for the current user, SYSTEM and
+/// Administrators, inheritance removed. By SID, so it works in any locale.
+#[cfg(windows)]
+fn restrict_to_user(path: &Path) -> Result<()> {
+    use std::process::Command;
+    let whoami = Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .context("running whoami to find the current user's SID")?;
+    if !whoami.status.success() {
+        bail!("whoami /user failed ({})", whoami.status);
+    }
+    let sid = sid_from_whoami(&String::from_utf8_lossy(&whoami.stdout))
+        .context("reading the current user's SID from whoami")?;
+    let icacls = Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(format!("*{sid}:F"))
+        .args(["*S-1-5-18:F", "*S-1-5-32-544:F"])
+        .output()
+        .context("running icacls")?;
+    if !icacls.status.success() {
+        bail!(
+            "icacls failed ({}): {}",
+            icacls.status,
+            String::from_utf8_lossy(&icacls.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The SID in `whoami /user /fo csv /nh` output, a line such as
+/// `"host\user","S-1-5-21-..."`. The SID is the last field; the name may hold commas.
+#[cfg(any(windows, test))]
+fn sid_from_whoami(output: &str) -> Option<String> {
+    let line = output.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let sid = line.rsplit(',').next()?.trim().trim_matches('"');
+    let valid = sid.starts_with("S-1-")
+        && sid[2..]
+            .split('-')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+    valid.then(|| sid.to_string())
 }
 
 /// Rejects settings that would otherwise fail confusingly at runtime.
@@ -906,7 +961,47 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "group and other must have no access");
         }
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("icacls")
+                .arg(&path)
+                .output()
+                .expect("icacls runs");
+            assert!(out.status.success());
+            let listing = String::from_utf8_lossy(&out.stdout);
+            let aces: Vec<&str> = listing.lines().filter(|l| l.contains(":(")).collect();
+            assert_eq!(
+                aces.len(),
+                3,
+                "user, SYSTEM and Administrators only:\n{listing}"
+            );
+            assert!(
+                aces.iter().all(|ace| !ace.contains("(I)")),
+                "no inherited entries:\n{listing}"
+            );
+        }
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_sid_is_the_last_field_of_whoami_output() {
+        assert_eq!(
+            sid_from_whoami(
+                "\"host\\op, venue\",\"S-1-5-21-1004336348-1177238915-682003330-1001\"\r\n"
+            )
+            .as_deref(),
+            Some("S-1-5-21-1004336348-1177238915-682003330-1001")
+        );
+        assert_eq!(sid_from_whoami(""), None);
+        assert_eq!(sid_from_whoami("\"host\\op\",\"not-a-sid\""), None);
+        assert_eq!(sid_from_whoami("\"host\\op\",\"S-1-\""), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn user_files_live_under_appdata() {
+        let appdata = std::env::var_os("APPDATA").expect("APPDATA is set on Windows");
+        assert_eq!(user_dir(), PathBuf::from(appdata).join("open-live-ingest"));
     }
 
     #[test]
