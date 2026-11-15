@@ -157,7 +157,7 @@ check_bundle() {
     done <<<"$list"
     [[ $bad -eq 0 ]] || die "the bundle still references build-host libraries"
     say "OK: none of the $checked Mach-O files in the bundle references /opt/homebrew or /usr/local"
-    codesign --verify --strict --verbose=2 "$app" || die "codesign does not accept $app"
+    codesign --verify --deep --strict --verbose=2 "$app" || die "codesign does not accept $app"
     say "OK: codesign --verify --strict accepts the bundle"
 }
 
