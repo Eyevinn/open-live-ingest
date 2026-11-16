@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements of the two executables that run as the app: Contents/MacOS/open-live-ingest
+  and Contents/MacOS/strom. build-macos-app.sh signs them with these and the hardened
+  runtime; gst-plugin-scanner (which only loads plugins to list them) gets none.
+
+  com.apple.security.device.camera       Strom opens the cameras (GStreamer's
+                                          avfvideosrc). Under the hardened runtime a
+                                          process without it cannot use a camera at all.
+  com.apple.security.device.audio-input  The same for microphones and audio interfaces
+                                          (osxaudiosrc).
+
+  No hardened-runtime exception is granted. Library validation stays on: every library
+  and plugin Strom and the scanner load lives in the bundle and is signed with the same
+  identity as the executables, so a Developer ID build loads them as they are. Add an
+  exception only when a signed build shows it is needed, with the reason here.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
