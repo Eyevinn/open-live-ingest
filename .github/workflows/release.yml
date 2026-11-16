@@ -1,11 +1,14 @@
 name: Release
 
 # Pushing a tag such as v0.3.0 builds one static binary per platform and attaches
-# them to a GitHub release. The manual trigger builds the same artifacts without
-# publishing anything, to try the workflow out. A pull request that changes this
-# workflow or the macOS app script runs it too, so the change is proven before it
-# merges; like a manual run from a branch, it publishes nothing (`release` runs only
-# on a tag ref).
+# them to a GitHub release, with SHA256SUMS and build-provenance attestations
+# (`release`). When the Apple secrets (#25) exist and the macOS DMG was notarized,
+# `release-macos` then adds the DMG to that release, rewrites SHA256SUMS to cover it
+# and attests it; otherwise it is skipped and the release is the tarballs only. The
+# manual trigger builds the same artifacts without publishing anything, to try the
+# workflow out. A pull request that changes this workflow or the macOS app script
+# runs it too, so the change is proven before it merges; like a manual run from a
+# branch, it publishes nothing (`release` and `release-macos` run only on a tag ref).
 on:
   push:
     tags: ["v*"]
@@ -19,6 +22,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   BIN: open-live-ingest
+  DMG: open-live-ingest-macos-aarch64.dmg
+  # The artifact name of a notarized DMG on a tag ref; only `release-macos` reads it.
+  NOTARIZED_DMG_ARTIFACT: notarized-macos-dmg
 
 jobs:
   build:
@@ -84,12 +90,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Only the tarballs of `build`. Any other artifact of the run (the DMGs of
+      # macos-app) is never downloaded here, so a re-run of this job cannot publish it.
       - uses: actions/download-artifact@v4
         with:
+          pattern: ${{ env.BIN }}-*.tar.gz
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+        run: cd dist && sha256sum -- *.tar.gz > SHA256SUMS
       # Signed build provenance for each tarball, checked with `gh attestation verify`.
       - uses: actions/attest-build-provenance@v2
         with:
@@ -121,22 +130,31 @@ jobs:
   # Developer ID certificate and all three APPLE_NOTARY_* secrets are there; otherwise
   # those steps are skipped. Secrets are read only through step env, never echoed.
   #
-  # The DMG never reaches a release yet (#27). It is uploaded as a workflow artifact
-  # only on a manual run from a branch or a pull request run: the upload step is gated
-  # on workflow_dispatch or pull_request AND a non-tag ref. `release` runs on any tag
-  # ref, a manual run from a tag included, and downloads every artifact of the run, so
-  # a DMG uploaded on a tag ref could be published (e.g. by a re-run of `release`). On
-  # a tag ref this job builds, signs and checks the DMG but uploads nothing. `release`
-  # does not wait for this job, so its tarballs, SHA256SUMS and attestations are what
-  # they were.
+  # Only a notarized DMG reaches a release. The job output `notarized` is "true" only
+  # when "Check the notarization" ran and passed, which needs the Developer ID
+  # certificate and the notary key and means notarizing and stapling succeeded; it is
+  # "false" on every other run (ad hoc signing, no secrets, any of those steps skipped).
+  # Two uploads, each under its own artifact name:
+  #   - ${DMG}: a manual run from a branch or a pull request run (workflow_dispatch or
+  #     pull_request AND a non-tag ref), whatever the signing, to try the DMG out.
+  #   - ${NOTARIZED_DMG_ARTIFACT}: a tag ref with notarized == "true", for `release-macos`.
+  # On a tag ref an ad hoc DMG is uploaded under neither name, so nothing can publish
+  # it. `release` downloads only the `build` tarballs by name pattern and never sees a
+  # DMG, and `release-macos` runs only when notarized == "true".
+  #
+  # `release` does not wait for this job, and `release-macos` (which waits for both)
+  # only adds to the release `release` created. A failure here or in `release-macos`
+  # therefore never holds up or fails the tarballs, SHA256SUMS and attestations; it
+  # leaves a release without the DMG, which a re-run of the failed jobs completes.
   macos-app:
     needs: build
     runs-on: macos-latest
     permissions:
       contents: read
+    outputs:
+      notarized: ${{ steps.notarization.outputs.notarized == 'true' }}
     env:
       TARGET: aarch64-apple-darwin
-      DMG: open-live-ingest-macos-aarch64.dmg
       APP: Open Live Ingest.app
       # "true" or "false"; secrets cannot be read in `if:` directly.
       HAS_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID_P12 != '' }}
@@ -330,17 +348,29 @@ jobs:
           fi
           echo "OK: the bundled Strom runs under the hardened runtime and loads the bundle's GStreamer"
 
+      # The last line is what sets the job output `notarized`: it is reached only when
+      # notarizing, stapling and both checks here succeeded.
       - name: Check the notarization
+        id: notarization
         if: env.HAS_DEVELOPER_ID == 'true' && env.HAS_NOTARY_KEY == 'true'
         run: |
           set -euo pipefail
           xcrun stapler validate "$DMG"
           spctl -a -vvv -t install "$DMG"
+          echo "notarized=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         if: (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && github.ref_type != 'tag'
         with:
           name: ${{ env.DMG }}
+          path: ${{ env.DMG }}
+          if-no-files-found: error
+
+      - name: Upload the notarized DMG for the release
+        if: github.ref_type == 'tag' && steps.notarization.outputs.notarized == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NOTARIZED_DMG_ARTIFACT }}
           path: ${{ env.DMG }}
           if-no-files-found: error
 
@@ -354,3 +384,47 @@ jobs:
           else
             echo "No temporary keychain to delete"
           fi
+
+  # Adds the notarized DMG to the release `release` created: the DMG itself, a
+  # SHA256SUMS that covers the release's tarballs and the DMG (replacing the one
+  # `release` uploaded), and a build-provenance attestation for the DMG, checked with
+  # `gh attestation verify open-live-ingest-macos-aarch64.dmg --repo Eyevinn/open-live-ingest`.
+  # Skipped, not failed, when macos-app did not notarize (no Apple secrets) or failed,
+  # or when `release` failed. The attestation is made before anything is uploaded, so
+  # a DMG on a release always has one. Safe to re-run: it checksums the tarballs as
+  # published and uploads with --clobber. --clobber replaces SHA256SUMS by deleting
+  # and re-uploading it, so for a moment right after a release the file is missing.
+  release-macos:
+    if: github.ref_type == 'tag' && needs.macos-app.outputs.notarized == 'true'
+    needs: [release, macos-app]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.NOTARIZED_DMG_ARTIFACT }}
+          path: dist
+      - name: Checksums for the tarballs and the DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -s "dist/$DMG" || { echo "the notarized artifact holds no $DMG"; exit 1; }
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --dir dist
+          cd dist
+          sha256sum -- *.tar.gz "$DMG" > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/${{ env.DMG }}
+      - name: Add the DMG to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload "$TAG" "dist/$DMG" dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber
