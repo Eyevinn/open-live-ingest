@@ -1,14 +1,15 @@
 name: Release
 
-# Pushing a tag such as v0.3.0 builds one static binary per platform and attaches
-# them to a GitHub release, with SHA256SUMS and build-provenance attestations
-# (`release`). When the Apple secrets (#25) exist and the macOS DMG was notarized,
-# `release-macos` then adds the DMG to that release, rewrites SHA256SUMS to cover it
-# and attests it; otherwise it is skipped and the release is the tarballs only. The
-# manual trigger builds the same artifacts without publishing anything, to try the
-# workflow out. A pull request that changes this workflow or the macOS app script
-# runs it too, so the change is proven before it merges; like a manual run from a
-# branch, it publishes nothing (`release` and `release-macos` run only on a tag ref).
+# Pushing a tag such as v0.3.0 builds one binary per platform (a tarball each, a
+# zip for Windows) and attaches them to a GitHub release, with SHA256SUMS and
+# build-provenance attestations (`release`). When the Apple secrets (#25) exist and
+# the macOS DMG was notarized, `release-macos` then adds the DMG to that release,
+# rewrites SHA256SUMS to cover it and attests it; otherwise it is skipped and the
+# release is the archives only. The manual trigger builds the same artifacts and
+# SHA256SUMS without publishing anything, to try the workflow out. A pull request
+# that changes this workflow or the macOS app script runs it too, so the change is
+# proven before it merges; like a manual run from a branch, it publishes nothing
+# (`release` and `release-macos` run only on a tag ref).
 on:
   push:
     tags: ["v*"]
@@ -36,7 +37,12 @@ jobs:
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
           - { os: macos-latest,     target: aarch64-apple-darwin }
           - { os: macos-15-intel,   target: x86_64-apple-darwin }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc }
     runs-on: ${{ matrix.os }}
+    # Git Bash on Windows, so every step is the same script on every runner.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -66,14 +72,21 @@ jobs:
       - run: cargo build --release --locked --target ${{ matrix.target }}
 
       # No version in the asset name, so releases/latest/download/<asset> is a stable
-      # URL. The tag names the version; so does the binary.
+      # URL. The tag names the version; so does the binary. Windows gets a zip (7-Zip
+      # is preinstalled on the runner), the rest a tarball, same folder layout.
       - name: Package
         run: |
           name="$BIN-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/$BIN" LICENSE-MIT LICENSE-APACHE README.md gateway.toml.example "$name/"
-          tar czf "$name.tar.gz" "$name"
-          echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          case "${{ matrix.target }}" in *-windows-*) exe=.exe ;; *) exe= ;; esac
+          cp "target/${{ matrix.target }}/release/$BIN$exe" LICENSE-MIT LICENSE-APACHE README.md gateway.toml.example "$name/"
+          if [ -n "$exe" ]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -81,28 +94,67 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  # Runs on the manual trigger too, so a dry run shows the SHA256SUMS a release
+  # would carry. It needs no write permission; publishing stays in `release`.
+  checksums:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # The archives of `build` only, by name pattern, never a DMG of macos-app.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.BIN }}-*.tar.gz
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.BIN }}-*.zip
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [build, checksums]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      # Only the tarballs of `build`. Any other artifact of the run (the DMGs of
-      # macos-app) is never downloaded here, so a re-run of this job cannot publish it.
+      # Only the archives of `build` and the SHA256SUMS of `checksums`, each by name.
+      # Any other artifact of the run (the DMGs of macos-app) is never downloaded here,
+      # so a re-run of this job cannot publish it.
       - uses: actions/download-artifact@v4
         with:
           pattern: ${{ env.BIN }}-*.tar.gz
           path: dist
           merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum -- *.tar.gz > SHA256SUMS
-      # Signed build provenance for each tarball, checked with `gh attestation verify`.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.BIN }}-*.zip
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: SHA256SUMS
+          path: dist
+      - name: Verify the checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+      # Signed build provenance for each archive, checked with `gh attestation verify`.
       - uses: actions/attest-build-provenance@v2
         with:
-          subject-path: dist/*.tar.gz
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -139,7 +191,7 @@ jobs:
   #     pull_request AND a non-tag ref), whatever the signing, to try the DMG out.
   #   - ${NOTARIZED_DMG_ARTIFACT}: a tag ref with notarized == "true", for `release-macos`.
   # On a tag ref an ad hoc DMG is uploaded under neither name, so nothing can publish
-  # it. `release` downloads only the `build` tarballs by name pattern and never sees a
+  # it. `release` downloads only the `build` archives by name pattern and never sees a
   # DMG, and `release-macos` runs only when notarized == "true".
   #
   # `release` does not wait for this job, and `release-macos` (which waits for both)
@@ -386,12 +438,12 @@ jobs:
           fi
 
   # Adds the notarized DMG to the release `release` created: the DMG itself, a
-  # SHA256SUMS that covers the release's tarballs and the DMG (replacing the one
-  # `release` uploaded), and a build-provenance attestation for the DMG, checked with
+  # SHA256SUMS that covers the release's tarballs, the Windows zip and the DMG
+  # (replacing the one `release` uploaded), and a build-provenance attestation for the DMG, checked with
   # `gh attestation verify open-live-ingest-macos-aarch64.dmg --repo Eyevinn/open-live-ingest`.
   # Skipped, not failed, when macos-app did not notarize (no Apple secrets) or failed,
   # or when `release` failed. The attestation is made before anything is uploaded, so
-  # a DMG on a release always has one. Safe to re-run: it checksums the tarballs as
+  # a DMG on a release always has one. Safe to re-run: it checksums the archives as
   # published and uploads with --clobber. --clobber replaces SHA256SUMS by deleting
   # and re-uploading it, so for a moment right after a release the file is missing.
   release-macos:
@@ -407,16 +459,16 @@ jobs:
         with:
           name: ${{ env.NOTARIZED_DMG_ARTIFACT }}
           path: dist
-      - name: Checksums for the tarballs and the DMG
+      - name: Checksums for the archives and the DMG
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           test -s "dist/$DMG" || { echo "the notarized artifact holds no $DMG"; exit 1; }
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --dir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip' --dir dist
           cd dist
-          sha256sum -- *.tar.gz "$DMG" > SHA256SUMS
+          sha256sum -- *.tar.gz *.zip "$DMG" > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@v2
         with:

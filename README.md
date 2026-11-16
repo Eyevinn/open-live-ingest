@@ -206,9 +206,10 @@ code signing. The binary is unsigned, so SmartScreen or Defender may warn before
 Other ways in:
 
 - **By hand.** Each [release](https://github.com/Eyevinn/open-live-ingest/releases) carries a
-  static binary for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), plus `SHA256SUMS`
-  and a signed build provenance you can check with `gh attestation verify`. The asset names do
-  not carry a version, so `releases/latest/download/open-live-ingest-<target>.tar.gz` is stable.
+  static binary for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), a zip for Windows
+  (x86_64), plus `SHA256SUMS` and a signed build provenance you can check with
+  `gh attestation verify`. The asset names do not carry a version, so
+  `releases/latest/download/open-live-ingest-<target>.tar.gz` (`.zip` on Windows) is stable.
 - **Rust users.** `cargo binstall open-live-ingest` fetches the same tarball. `cargo build
   --release` builds from source with Rust 1.97.1, pinned in `rust-toolchain.toml`.
 
@@ -235,11 +236,11 @@ Bump `version` in `Cargo.toml`, commit, then tag and push:
 git tag v0.5.0 && git push origin v0.5.0
 ```
 
-The release workflow refuses a tag that does not match `Cargo.toml`, builds the four binaries,
+The release workflow refuses a tag that does not match `Cargo.toml`, builds the five binaries,
 and publishes them with a checksum file, build provenance, and generated notes. When the
 `strom-types` pin moves, move `STROM_VERSION` in `install.sh` and `$StromVersion` in `install.ps1`
 with it; a test checks they agree. Run the workflow by hand from the
-Actions tab to build the artifacts without publishing.
+Actions tab to build the artifacts and `SHA256SUMS` without publishing.
 
 The `Strom pin` workflow checks Strom's latest stable release daily and, when it differs from
 the pin, opens one PR that moves both pins and the Requirements line to it
