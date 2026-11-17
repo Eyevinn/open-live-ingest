@@ -507,12 +507,12 @@ EFP sequence-validation rule for ingest designs does not apply, as this epic add
 | `objc2`, `objc2-foundation`, `objc2-app-kit` | app, macOS | Direct use of crates already in the tree through tao/wry; no new crate. AVFoundation status call via `msg_send!` on the class by name, no `objc2-av-foundation` |
 | `windows` | app, Windows | Already in the tree through tao/wry; direct use for the subclass, mutex and shutdown block reason. Same version as the lockfile resolves |
 | `serde`, `serde_json`, `tokio`, `tracing`, `tracing-subscriber`, `anyhow` | app | Already used by the gateway |
-| `sha2`, `getrandom` | library | Decided in #75 with its own justification |
+| `sha2`, `getrandom` | library | **Added** in #75 for PKCE (S256 challenge, random verifier and state): `sha2` 0.11 is the one new crate (its `digest` 0.11 stack is already in the tree through `sha1`); `getrandom` 0.4 was already in the tree |
 | keychain access | library | Decided in #76 (`keyring` vs own FFI) |
 | `tauri`, `tauri-build`, `tauri-cli`, any `tauri-plugin-*` | — | **Not added** (ADR-001) |
 | `tracing-appender` | — | Not added: own rotation, §7 |
 | `rfd` (dialogs) | — | Not added: the quit question is in-window HTML |
-| `open` / `opener` | — | Not added: `open` / `explorer` via `std::process::Command`, as #75 does for the browser |
+| `open` / `opener` | — | Not added: `open` / `rundll32 url.dll,FileProtocolHandler` / `xdg-open` via `std::process::Command`, as `osc::open_browser` (#75) does |
 | `winres` / `embed-resource` | — | Not added: §11.2 icons |
 | npm, Node, a bundler, a UI framework | — | Not added: three static files |
 

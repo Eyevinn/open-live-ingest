@@ -15,7 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 anyhow = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
@@ -32,6 +32,12 @@ uuid = { version = "1", features = ["v5"] }
 # stack reqwest already uses.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# PKCE for the OSC browser sign-in: SHA-256 for the S256 code challenge, and the OS
+# random source for the code verifier and the state. Crypto is not reimplemented.
+# Both are already in the tree (tungstenite pulls in sha1 on the same digest 0.11
+# stack, rand and uuid pull in getrandom 0.4), so only the sha2 crate itself is new.
+sha2 = { version = "0.11", default-features = false }
+getrandom = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # Signal 0 liveness checks and SIGTERM for `down`. Windows uses tasklist and
