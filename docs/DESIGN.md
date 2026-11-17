@@ -69,12 +69,24 @@ One flow per input, so one camera failing cannot disturb another.
 
 ```
   builtin.local_input ── video_out ──> builtin.videoenc ── encoded_out ──> builtin.mpegtssrt_output
+          └──────────── audio_out (only when an audio source is paired) ──> audio_in_0
 ```
 
-Video only for devices: a webcam's microphone is a separate device on its own clock and drifts
-against the video over a long show. Embedded audio means SDI, and the audio track count follows the
-source, because declaring a track the flow never delivers stalls the pipeline on a pad that never
-produces. The test pattern carries a tone so a link can be commissioned end to end.
+**Audio is paired, not assumed.** A camera sends video only unless an audio source is paired with
+it (`up --audio "<camera>=<audio>"`, or `audio` on the camera's `[[input]]` entry). A paired source
+is a second device in the same `builtin.local_input` block (`stream_mode` `audio_video` with its own
+`audio_device`), and its raw audio goes straight to the uplink, which encodes it. Pairing is
+explicit because a desk usually has several microphones and only the operator knows which one
+belongs to which camera; one audio source goes with one camera, and a run that pairs it twice is
+refused before anything starts. Audio embedded in an SDI signal is not carried yet. The audio
+track count follows the flow, because declaring a track the flow never delivers stalls the
+pipeline on a pad that never produces. The test pattern carries a tone so a link can be
+commissioned end to end.
+
+**Drift is unmeasured.** A separate audio device runs on its own clock, so its audio may drift
+against the camera's video over a long show. How far it drifts in practice has not been measured
+yet (#64 AC3: a 60-minute camera plus USB microphone run). Until it has, treat a paired source as
+fine for a short segment and check lip sync on a long one.
 
 **Flow ids are derived, not stored.** A UUIDv5 over `gateway id + input id`, where the input id is
 derived from Strom's device id. A flow is ours if and only if its id is the one we would derive for

@@ -20,11 +20,12 @@ use crate::openlive::{
 use crate::strom::{self as strom_api, StromClient};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 use strom_types::api::SrtCallerStats;
+use strom_types::discovery::DeviceResponse;
 use strom_types::FlowId;
 use tracing::{info, warn};
 
@@ -209,19 +210,15 @@ fn choose_ports(
 pub async fn devices(cfg: Config, json: bool) -> Result<()> {
     // Started only to ask, if started at all; dropped again on the way out.
     let (_local, strom) = connect_strom(&cfg).await?;
-    let mut all = strom
-        .devices()
+    let video = strom
+        .video_devices()
         .await
         .context("asking Strom what capture devices it can see")?;
-    all.sort_by(|a, b| a.name.cmp(&b.name));
-    let report: Vec<DeviceReport> = all
-        .iter()
-        .map(|d| DeviceReport {
-            name: d.name.clone(),
-            id: d.id.clone(),
-            virtual_: devices::is_probably_virtual(d),
-        })
-        .collect();
+    let audio = strom
+        .audio_devices()
+        .await
+        .context("asking Strom what audio sources it can see")?;
+    let report = device_report(video, audio);
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -230,34 +227,80 @@ pub async fn devices(cfg: Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Video sources first, then audio sources, each sorted by name.
+fn device_report(
+    mut video: Vec<DeviceResponse>,
+    mut audio: Vec<DeviceResponse>,
+) -> Vec<DeviceReport> {
+    video.sort_by(|a, b| a.name.cmp(&b.name));
+    audio.sort_by(|a, b| a.name.cmp(&b.name));
+    let video = video.iter().map(|d| DeviceReport {
+        name: d.name.clone(),
+        id: d.id.clone(),
+        kind: DeviceKind::Video,
+        virtual_: devices::is_probably_virtual(d),
+    });
+    let audio = audio.iter().map(|d| DeviceReport {
+        name: d.name.clone(),
+        id: d.id.clone(),
+        kind: DeviceKind::Audio,
+        // `up` only ever skips cameras; an audio source is used when it is named.
+        virtual_: false,
+    });
+    video.chain(audio).collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum DeviceKind {
+    Video,
+    Audio,
+}
+
 /// One capture device, as `devices` reports it.
 #[derive(Debug, Serialize)]
 struct DeviceReport {
     name: String,
     id: String,
+    kind: DeviceKind,
     /// Skipped by `up` unless `--all`: it produces nothing on its own.
     #[serde(rename = "virtual")]
     virtual_: bool,
 }
 
 fn render_devices(all: &[DeviceReport]) -> String {
-    if all.is_empty() {
-        return "Strom reports no video sources on this machine.\n".to_string();
+    let (video, audio): (Vec<&DeviceReport>, Vec<&DeviceReport>) =
+        all.iter().partition(|d| d.kind == DeviceKind::Video);
+    let mut out = if video.is_empty() {
+        "Strom reports no video sources on this machine.\n".to_string()
+    } else {
+        let mut out = format!("{:<30} {:<24} NOTE\n", "DEVICE", "ID");
+        for device in &video {
+            let note = if device.virtual_ {
+                "virtual, skipped unless --all"
+            } else {
+                ""
+            };
+            out += &format!(
+                "{:<30} {:<24} {note}\n",
+                truncate(&device.name, 30),
+                truncate(&device.id, 24)
+            );
+        }
+        out += "\n`up` starts all of these except the virtual ones; `up --devices \"FaceTime\"` picks by name or id.\n";
+        out
+    };
+    if !audio.is_empty() {
+        out += &format!("\n{:<30} ID\n", "AUDIO SOURCE");
+        for device in &audio {
+            out += &format!(
+                "{:<30} {}\n",
+                truncate(&device.name, 30),
+                truncate(&device.id, 24)
+            );
+        }
+        out += "\nNo audio is sent unless paired: `up --audio \"FaceTime=USB Microphone\"` sends one with a camera.\n";
     }
-    let mut out = format!("{:<30} {:<24} NOTE\n", "DEVICE", "ID");
-    for device in all {
-        let note = if device.virtual_ {
-            "virtual, skipped unless --all"
-        } else {
-            ""
-        };
-        out += &format!(
-            "{:<30} {:<24} {note}\n",
-            truncate(&device.name, 30),
-            truncate(&device.id, 24)
-        );
-    }
-    out += "\n`up` starts all of these except the virtual ones; `up --devices \"FaceTime\"` picks by name or id.\n";
     out
 }
 
@@ -380,8 +423,12 @@ pub async fn up(
     cfg: Config,
     include_virtual: bool,
     selection: Option<String>,
+    audio_pairings: Vec<devices::AudioPairing>,
     test_pattern: bool,
 ) -> Result<()> {
+    if test_pattern && !audio_pairings.is_empty() {
+        bail!("--audio pairs an audio source with a camera, and --test streams no camera; the test pattern carries its own tone");
+    }
     let gateway_id = cfg.gateway.resolved_id();
     let source_gateway_id = source_gateway_id(&cfg)?;
     let (local_strom, strom) = connect_strom(&cfg).await?;
@@ -399,7 +446,7 @@ pub async fn up(
         Vec::new()
     } else {
         let all = strom
-            .devices()
+            .video_devices()
             .await
             .context("asking Strom what capture devices it can see")?;
         devices::choose(all, include_virtual, selection.as_deref())?
@@ -408,9 +455,29 @@ pub async fn up(
         bail!("Strom reports no capture devices. Virtual ones are skipped unless --all; --test streams a test pattern instead.");
     }
 
+    // Resolved and checked here, before any port is asked for or any flow exists.
+    let pairings = if !audio_pairings.is_empty() || test_pattern {
+        audio_pairings
+    } else {
+        let (pairings, absent) = devices::settings_pairings(&cfg.inputs, &chosen);
+        for device in absent {
+            warn!("[[input]] pairs audio with {device:?}, which is not among this run's cameras; skipped");
+        }
+        pairings
+    };
+    let audio = if pairings.is_empty() {
+        BTreeMap::new()
+    } else {
+        let sources = strom
+            .audio_devices()
+            .await
+            .context("asking Strom what audio sources it can see")?;
+        devices::pair_audio(&chosen, &sources, &pairings)?
+    };
+
     // Without somewhere to send there is no point starting: the feeds would go nowhere.
     let cloud = resolve_cloud(&cfg, open_live.as_ref()).await?;
-    let inputs = devices::inputs_for(
+    let mut inputs = devices::inputs_for(
         &chosen,
         test_pattern,
         &cfg.gateway.name,
@@ -419,6 +486,7 @@ pub async fn up(
         &cloud.host,
         &cloud.ports,
     )?;
+    devices::attach_audio(&mut inputs, &audio);
 
     // Each input costs an encoder and its share of the uplink, which is easy to
     // overlook when one command starts all of them.
@@ -432,7 +500,6 @@ pub async fn up(
 
     // When the range is Open Live's, so is the port inside it: register first and
     // take the port Open Live wrote into the source, then build the flows to it.
-    let mut inputs = inputs;
     let mut registered = match (&open_live, cloud.port_source) {
         (Some(client), PortSource::OpenLive) => {
             assign_ports_from_open_live(
@@ -2022,24 +2089,43 @@ mod tests {
         assert_eq!(last, None);
     }
 
+    fn discovered(id: &str, name: &str, audio: bool) -> DeviceResponse {
+        use strom_types::discovery::DeviceCategory;
+        DeviceResponse {
+            id: id.to_string(),
+            name: name.to_string(),
+            device_class: if audio {
+                "Audio/Source"
+            } else {
+                "Video/Source"
+            }
+            .to_string(),
+            category: if audio {
+                DeviceCategory::AudioSource
+            } else {
+                DeviceCategory::VideoSource
+            },
+            provider: "test".to_string(),
+            properties: Default::default(),
+            first_seen_secs_ago: 0,
+            last_seen_secs_ago: 0,
+        }
+    }
+
     #[test]
     fn devices_render_as_a_table_and_as_json() {
-        let all = vec![
-            DeviceReport {
-                name: "DeckLink SDI".to_string(),
-                id: "decklink-0".to_string(),
-                virtual_: false,
-            },
-            DeviceReport {
-                name: "OBS Virtual Camera".to_string(),
-                id: "obs-0".to_string(),
-                virtual_: true,
-            },
-        ];
+        let all = device_report(
+            vec![
+                discovered("obs-0", "OBS Virtual Camera", false),
+                discovered("decklink-0", "DeckLink SDI", false),
+            ],
+            Vec::new(),
+        );
         let text = render_devices(&all);
         assert!(text.starts_with("DEVICE"));
         assert!(text.contains("OBS Virtual Camera"));
         assert!(text.contains("virtual, skipped unless --all"));
+        assert!(!text.contains("AUDIO SOURCE"));
         assert_eq!(
             render_devices(&[]),
             "Strom reports no video sources on this machine.\n"
@@ -2048,8 +2134,51 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&all).unwrap()).unwrap();
         assert_eq!(v[0]["id"], "decklink-0");
+        assert_eq!(v[0]["kind"], "video");
         assert_eq!(v[0]["virtual"], false);
         assert_eq!(v[1]["virtual"], true);
+    }
+
+    /// #64 AC2: audio sources are listed too, after the cameras and marked as audio.
+    #[test]
+    fn devices_list_audio_sources_after_the_cameras() {
+        let all = device_report(
+            vec![discovered("dev-cam", "FaceTime HD Camera", false)],
+            vec![
+                discovered("dev-usb", "USB Microphone", true),
+                discovered("dev-loop", "Loopback Audio", true),
+            ],
+        );
+        let text = render_devices(&all);
+        let audio_at = text.find("AUDIO SOURCE").expect("an audio section");
+        assert!(text.find("FaceTime HD Camera").unwrap() < audio_at);
+        assert!(text[audio_at..].contains("USB Microphone"));
+        assert!(text[audio_at..].contains("dev-usb"));
+        assert!(text.contains("--audio"));
+
+        let v: serde_json::Value = serde_json::to_value(&all).unwrap();
+        let kinds: Vec<(&str, &str)> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| (d["id"].as_str().unwrap(), d["kind"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("dev-cam", "video"),
+                ("dev-loop", "audio"),
+                ("dev-usb", "audio")
+            ]
+        );
+        assert_eq!(v[1]["virtual"], false);
+
+        let only_audio = render_devices(&device_report(
+            Vec::new(),
+            vec![discovered("dev-usb", "USB Microphone", true)],
+        ));
+        assert!(only_audio.starts_with("Strom reports no video sources"));
+        assert!(only_audio.contains("USB Microphone"));
     }
 
     const CLOUD: RangeInclusive<u16> = 47110..=47129;

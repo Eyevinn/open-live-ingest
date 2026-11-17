@@ -29,12 +29,13 @@ sequence, with what success and each failure look like. It works for a person an
 ```bash
 open-live-ingest                  # same as `up`
 open-live-ingest up --devices "FaceTime,DeckLink"   # only these, by name fragment or id
+open-live-ingest up --audio "FaceTime=USB Microphone"  # send an audio source with a camera
 open-live-ingest up --all         # include virtual devices, skipped by default
 open-live-ingest up --test        # a test pattern and tone, to commission the link
 open-live-ingest up --reconfigure # ask for every setting again
 open-live-ingest status           # what is running, from Strom and Open Live directly
 open-live-ingest down             # stop and remove the flows and sources
-open-live-ingest devices          # what Strom can see
+open-live-ingest devices          # the cameras and audio sources Strom can see
 open-live-ingest setup            # ask for settings without starting anything
 open-live-ingest check            # validate the settings file
 ```
