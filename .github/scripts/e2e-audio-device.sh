@@ -112,37 +112,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- credentials and instance ------------------------------------------------------
-
-[[ -n "${OSC_ACCESS_TOKEN:-}" ]] \
-    || fail "missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud personal access token for the workspace that owns the Open Live instance '$instance') is not set"
-mask "$OSC_ACCESS_TOKEN"
-
-service_token() {
-    curl -fsS -X POST https://token.svc.prod.osaas.io/servicetoken \
-        -H "x-pat-jwt: Bearer $OSC_ACCESS_TOKEN" -H 'content-type: application/json' \
-        -d '{"serviceId":"eyevinn-open-live"}' | jq -r '.token // empty'
-}
-
-say "Resolving the Open Live instance '$instance' in the token's workspace"
-sat="$(service_token)" || true
-[[ -n "$sat" ]] || fail "missing capability: OSC_ACCESS_TOKEN was refused by the OSC token service (expired, or not a personal access token)"
-mask "$sat"
-api_url="$(curl -fsS -H "x-pat-jwt: Bearer $OSC_ACCESS_TOKEN" https://catalog.svc.prod.osaas.io/mysubscriptions \
-    | jq -r '.[] | select(.serviceId == "eyevinn-open-live") | .apiUrl' | head -n 1)"
-[[ -n "$api_url" ]] || fail "missing capability: the OSC_ACCESS_TOKEN workspace has no Open Live subscription"
-open_live_url="$(curl -fsS -H "x-jwt: Bearer $sat" "$api_url" \
-    | jq -r --arg n "$instance" '.[] | select(.name == $n) | .url' | head -n 1)"
-[[ -n "$open_live_url" ]] || fail "missing capability: the OSC_ACCESS_TOKEN workspace has no Open Live instance named '$instance'"
-open_live_url="${open_live_url%/}"
-mask "$open_live_url"
-mask "${open_live_url#https://}"
-
-ol_get() { curl -fsS -H "Authorization: Bearer $sat" "$open_live_url$1"; }
-our_source_ids() {
-    ol_get /api/v1/sources | jq -r --arg p "$gateway_name — " '.[] | select(.name | startswith($p)) | .id'
-}
-
 # --- system packages ----------------------------------------------------------------
 
 say "Installing GStreamer, PulseAudio and the v4l2loopback module"
@@ -238,6 +207,38 @@ echo "::endgroup::"
 [[ -n "$seen_camera" ]] || fail "Strom $strom_tag does not list the virtual camera '$camera_name' as a video source"
 [[ -n "$seen_mic" ]] || fail "Strom $strom_tag does not list the virtual microphone '$mic_name' as an audio source"
 pass "Strom $strom_tag lists '$seen_camera' (video_source) and '$seen_mic' (audio_source)"
+
+# --- credentials and instance (after the local devices, so a run without the
+# secret still proves the runner side) ------------------------------------------------------
+
+[[ -n "${OSC_ACCESS_TOKEN:-}" ]] \
+    || fail "missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud personal access token for the workspace that owns the Open Live instance '$instance') is not set"
+mask "$OSC_ACCESS_TOKEN"
+
+service_token() {
+    curl -fsS -X POST https://token.svc.prod.osaas.io/servicetoken \
+        -H "x-pat-jwt: Bearer $OSC_ACCESS_TOKEN" -H 'content-type: application/json' \
+        -d '{"serviceId":"eyevinn-open-live"}' | jq -r '.token // empty'
+}
+
+say "Resolving the Open Live instance '$instance' in the token's workspace"
+sat="$(service_token)" || true
+[[ -n "$sat" ]] || fail "missing capability: OSC_ACCESS_TOKEN was refused by the OSC token service (expired, or not a personal access token)"
+mask "$sat"
+api_url="$(curl -fsS -H "x-pat-jwt: Bearer $OSC_ACCESS_TOKEN" https://catalog.svc.prod.osaas.io/mysubscriptions \
+    | jq -r '.[] | select(.serviceId == "eyevinn-open-live") | .apiUrl' | head -n 1)"
+[[ -n "$api_url" ]] || fail "missing capability: the OSC_ACCESS_TOKEN workspace has no Open Live subscription"
+open_live_url="$(curl -fsS -H "x-jwt: Bearer $sat" "$api_url" \
+    | jq -r --arg n "$instance" '.[] | select(.name == $n) | .url' | head -n 1)"
+[[ -n "$open_live_url" ]] || fail "missing capability: the OSC_ACCESS_TOKEN workspace has no Open Live instance named '$instance'"
+open_live_url="${open_live_url%/}"
+mask "$open_live_url"
+mask "${open_live_url#https://}"
+
+ol_get() { curl -fsS -H "Authorization: Bearer $sat" "$open_live_url$1"; }
+our_source_ids() {
+    ol_get /api/v1/sources | jq -r --arg p "$gateway_name — " '.[] | select(.name | startswith($p)) | .id'
+}
 
 # --- 4. up --audio ------------------------------------------------------------------------
 
