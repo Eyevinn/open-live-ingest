@@ -6,14 +6,22 @@
 //!
 //! - [`devices`]: the video and audio sources Strom can see, as `devices --json`.
 //! - [`instances`]: the Open Live instances in an Open Source Cloud workspace, the
-//!   list `setup` offers to pick from. [`check_self_hosted`] checks an address and key
-//!   for one that is not on Open Source Cloud.
+//!   list `setup` offers to pick from, and [`workspace`] with the workspace's name as
+//!   well. [`check_self_hosted`] checks an address and key for one that is not on
+//!   Open Source Cloud.
+//! - [`osc_sign_in`]: a browser sign-in, kept in the keychain, and the workspace the
+//!   person picked. Signing in again is also how to change workspace.
 //! - [`validate`]: every check `setup --non-interactive` makes, each failure reported
 //!   as a [`Problem`] instead of stopping at the first.
 //! - [`load`] and [`save`]: the settings file the CLI reads, in the same format, through
 //!   the same code.
 //! - [`keep_osc_sign_in`], [`keep_osc_token`] and [`forget_osc_credential`]: the Open
 //!   Source Cloud credential in the OS keychain, with only a marker in the settings.
+//!
+//! Every call that needs Open Source Cloud takes an [`OscCredential`] from the app: a
+//! token in hand, or the keychain the sign-in is kept in. None of them reads
+//! `OSC_ACCESS_TOKEN` or the OSC CLI's `~/.osc/token`. [`validate_with`] and
+//! [`crate::session::Session::start_with`] take one too, for going live with it.
 //!
 //! The CLI's `setup` calls these too, and keeps only its prompts.
 
@@ -27,12 +35,13 @@ use crate::openlive::{OpenLiveClient, ServerInfo};
 use crate::osc;
 use crate::run::{self, DeviceKind, DeviceReport};
 use crate::strom::{Reachability, StromClient};
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use crate::config::Problem;
+pub use crate::credential::OscCredential;
 pub use crate::osc::Instance;
 
 /// What `--config` defaults to in the CLI: `OLI_CONFIG` when set, then the per-user file.
@@ -56,19 +65,96 @@ pub async fn devices(settings: &Config, events: &Events) -> Result<Devices> {
     Ok(Devices { video, audio })
 }
 
-/// The Open Live instances in the workspace `credential` belongs to: an Open Source
-/// Cloud personal access token, `OSC_ACCESS_TOKEN`, or the OSC CLI's login. An empty
-/// list is not an error; the instance may live in another workspace, so a caller
-/// should still let an address be typed in.
-pub async fn instances(credential: &str) -> Result<Vec<Instance>> {
-    let credential = credential.trim();
-    if credential.is_empty() {
-        bail!("no Open Source Cloud credential");
-    }
-    if osc::inspect(credential).is_some_and(|i| i.is_expired()) {
-        bail!("that Open Source Cloud token has expired; sign in again");
-    }
-    osc::open_live_instances(credential).await
+/// An Open Source Cloud workspace as a credential sees it: every credential is bound
+/// to exactly one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Workspace {
+    /// The workspace, from the token's `tenantId` claim. None for a token that does
+    /// not say.
+    pub id: Option<String>,
+    /// Its Open Live instances.
+    pub instances: Vec<Instance>,
+}
+
+/// The Open Live instances in the workspace `credential` belongs to: a token in hand
+/// (a personal access token, or the access token of a sign-in just made), or the
+/// sign-in kept in a keychain, renewed if need be. An empty list is not an error; the
+/// instance may live in another workspace, so a caller should still let an address
+/// be typed in.
+pub async fn instances(credential: impl Into<OscCredential>) -> Result<Vec<Instance>> {
+    Ok(workspace(credential).await?.instances)
+}
+
+/// The workspace `credential` belongs to and its Open Live instances, for "Sending to
+/// <instance> (<workspace>)" and the instance picker.
+///
+/// Open Source Cloud has no API listing the workspaces a person belongs to
+/// (docs/research/OSC_BROWSER_SIGN_IN.md): the workspace is picked on its consent page
+/// at sign-in, so this is the only one there is to show. [`osc_sign_in`] changes it.
+pub async fn workspace(credential: impl Into<OscCredential>) -> Result<Workspace> {
+    workspace_at(&osc::Endpoints::production(), &credential.into()).await
+}
+
+async fn workspace_at(endpoints: &osc::Endpoints, credential: &OscCredential) -> Result<Workspace> {
+    let token = credential.access_token_at(&endpoints.connect).await?;
+    let id = osc::inspect(&token).and_then(|i| i.workspace);
+    let instances = osc::open_live_instances_at(endpoints, &token)
+        .await
+        .with_context(|| match &id {
+            Some(id) => format!("listing the Open Live instances in workspace {id}"),
+            None => "listing the Open Live instances in the workspace".to_string(),
+        })?;
+    Ok(Workspace { id, instances })
+}
+
+/// Only the workspace `credential` belongs to, without listing anything: the token's
+/// `tenantId`. Asks Open Source Cloud nothing unless a kept sign-in has to be renewed.
+pub async fn workspace_id(credential: impl Into<OscCredential>) -> Result<Option<String>> {
+    let token = credential.into().access_token().await?;
+    Ok(osc::inspect(&token).and_then(|i| i.workspace))
+}
+
+/// Signs in to Open Source Cloud in the browser, keeps the sign-in in `keychain` with
+/// the settings pointing at it (as [`keep_osc_sign_in`] does), and returns the
+/// workspace the person picked, with its Open Live instances. `open` shows the
+/// sign-in page: [`osc::open_browser`], or that and the address in the window, for
+/// when no browser opens.
+///
+/// **Changing workspace is signing in again.** Open Source Cloud has no API listing a
+/// person's workspaces and binds every token to one (#74,
+/// docs/research/OSC_BROWSER_SIGN_IN.md), so the person picks the workspace on its
+/// consent page, and the new sign-in replaces the kept one. `open_live.url` is left
+/// alone: when it is not among the returned instances, it is in the other workspace,
+/// and the person picks an instance again.
+///
+/// A sign-in that fails, is declined or times out keeps nothing: the keychain and the
+/// settings stay as they were. Save the settings afterwards.
+pub async fn osc_sign_in(
+    settings: &mut Config,
+    keychain: &dyn SecretStore,
+    open: impl FnOnce(&str) -> Result<()>,
+) -> Result<Workspace> {
+    osc_sign_in_at(
+        &osc::Endpoints::production(),
+        osc::SIGN_IN_TIMEOUT,
+        settings,
+        keychain,
+        open,
+    )
+    .await
+}
+
+async fn osc_sign_in_at(
+    endpoints: &osc::Endpoints,
+    wait: std::time::Duration,
+    settings: &mut Config,
+    keychain: &dyn SecretStore,
+    open: impl FnOnce(&str) -> Result<()>,
+) -> Result<Workspace> {
+    let signed_in = osc::sign_in(&endpoints.connect, wait, open).await?;
+    keep_osc_sign_in(settings, keychain, &signed_in)?;
+    // The access token in hand serves for the list; nothing needs renewing yet.
+    workspace_at(endpoints, &OscCredential::from(&signed_in)).await
 }
 
 /// Checks an Open Live that is not on Open Source Cloud: the address, and that it
@@ -111,8 +197,23 @@ pub async fn check_self_hosted(url: &str, api_key: Option<&str>) -> Result<(), P
 /// Open Live, the heartbeat and Strom are contacted, so this takes as long as the
 /// slowest of them answers.
 pub async fn validate(settings: &Config) -> Vec<Problem> {
+    validate_as(settings, None).await
+}
+
+/// [`validate`], for going live with `credential`, the Open Source Cloud credential
+/// the app holds, as [`crate::session::Session::start_with`] does: Open Live is
+/// checked with it, and no token is looked for in the settings, `OSC_ACCESS_TOKEN`
+/// or `~/.osc/token`.
+pub async fn validate_with(settings: &Config, credential: &OscCredential) -> Vec<Problem> {
+    validate_as(settings, Some(credential)).await
+}
+
+async fn validate_as(settings: &Config, credential: Option<&OscCredential>) -> Vec<Problem> {
     let cfg = settings;
-    let mut found = config::problems(cfg);
+    let mut found = match credential {
+        Some(_) => config::problems_with(cfg, true),
+        None => config::problems(cfg),
+    };
     let reported =
         |found: &[Problem], setting: &str| found.iter().any(|p| p.setting == Some(setting));
 
@@ -146,9 +247,14 @@ pub async fn validate(settings: &Config) -> Vec<Problem> {
         let url = cfg.open_live.url.as_deref().unwrap_or_default().trim();
         // A keychain sign-in is renewed as it is used, so it is checked by using it,
         // in check_open_live below.
+        let in_hand = match credential {
+            Some(OscCredential::Token(token)) => Some((token.trim().to_string(), "the app")),
+            Some(OscCredential::Keychain(_)) => None,
+            None if cfg.open_live.uses_keychain() => None,
+            None => osc_credential(cfg).map(|(token, source, _)| (token, source)),
+        };
         let expired = cfg.open_live.auth_mode == AuthMode::Osc
-            && !cfg.open_live.uses_keychain()
-            && osc_credential(cfg).is_some_and(|(token, source, _)| {
+            && in_hand.is_some_and(|(token, source)| {
                 let expired = osc::inspect(&token).is_some_and(|i| i.is_expired());
                 if expired {
                     found.push(Problem::new(
@@ -161,7 +267,7 @@ pub async fn validate(settings: &Config) -> Vec<Problem> {
         if expired {
             ports_known = false;
         } else {
-            match check_open_live(cfg).await {
+            match check_open_live_as(cfg, credential).await {
                 Ok(info) => published = info.and_then(|i| i.srt_ports),
                 Err(err) => {
                     ports_known = false;
@@ -386,7 +492,17 @@ pub fn osc_credential(settings: &Config) -> Option<(String, &'static str, bool)>
 /// Confirms the address and credential work, returning what Open Live says about
 /// its cloud Strom: its host and the SRT ports it has leased.
 pub async fn check_open_live(settings: &Config) -> Result<Option<ServerInfo>> {
-    let client = OpenLiveClient::from_settings(&settings.open_live)?;
+    check_open_live_as(settings, None).await
+}
+
+async fn check_open_live_as(
+    settings: &Config,
+    credential: Option<&OscCredential>,
+) -> Result<Option<ServerInfo>> {
+    let client = match credential {
+        Some(credential) => OpenLiveClient::with_osc_credential(&settings.open_live, credential)?,
+        None => OpenLiveClient::from_settings(&settings.open_live)?,
+    };
     // Listing sources exercises the credential; server-info alone might not.
     client.list_sources().await?;
     client.server_info().await
@@ -403,6 +519,152 @@ pub async fn probe_strom(settings: &Config) -> Reachability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credential::StoredCredential;
+    use crate::keychain::MemoryKeychain;
+    use crate::osc::fake;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// `{"tenantId":"eyevinnlab","patId":"x"}`: a console token, which never expires.
+    const PAT: &str = "h.eyJ0ZW5hbnRJZCI6ImV5ZXZpbm5sYWIiLCJwYXRJZCI6IngifQ.s";
+
+    fn kept(keychain: &MemoryKeychain) -> Option<StoredCredential> {
+        crate::credential::load(keychain).unwrap()
+    }
+
+    /// The workspace shown is the token's `tenantId`, whether the token is in hand or
+    /// kept in the keychain (#65 AC4). Nothing is asked of the platform for either.
+    #[tokio::test]
+    async fn the_workspace_is_read_from_the_credentials_tenant_id() {
+        assert_eq!(
+            workspace_id(PAT).await.unwrap().as_deref(),
+            Some("eyevinnlab")
+        );
+
+        let keychain = Arc::new(MemoryKeychain::new());
+        let mut settings = Config::default();
+        keep_osc_token(&mut settings, keychain.as_ref(), PAT).unwrap();
+        let from_keychain = OscCredential::Keychain(keychain.clone());
+        assert_eq!(
+            workspace_id(&from_keychain).await.unwrap().as_deref(),
+            Some("eyevinnlab")
+        );
+
+        forget_osc_credential(&mut settings, keychain.as_ref()).unwrap();
+        let err = workspace_id(&from_keychain).await.unwrap_err();
+        assert!(err.to_string().contains("sign in"), "{err:#}");
+        assert!(workspace_id("  ").await.is_err());
+        assert!(!format!("{:?}", OscCredential::from(PAT)).contains(PAT));
+        // A JWT whose `exp` is 1970.
+        let err = workspace_id("e30.eyJleHAiOjF9.sig").await.unwrap_err();
+        assert!(err.to_string().contains("expired"), "{err:#}");
+    }
+
+    /// A kept sign-in is renewed first, the renewed refresh token is kept, and the
+    /// list is asked for with the new access token.
+    #[tokio::test]
+    async fn the_workspace_of_a_kept_sign_in_is_listed_with_a_renewed_token() {
+        let osc = fake::osc(true, None).await;
+        let keychain = Arc::new(MemoryKeychain::new());
+        crate::credential::keep(
+            keychain.as_ref(),
+            &StoredCredential::SignIn {
+                refresh_token: fake::REFRESH.into(),
+                client_id: "registered-id".into(),
+            },
+        )
+        .unwrap();
+
+        let found = workspace_at(&osc.endpoints(), &OscCredential::Keychain(keychain.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            found,
+            Workspace {
+                id: Some(fake::WORKSPACE.into()),
+                instances: vec![Instance {
+                    name: "venue".into(),
+                    url: "https://venue.example.osaas.io".into(),
+                }],
+            }
+        );
+        assert!(matches!(
+            kept(&keychain),
+            Some(StoredCredential::SignIn { refresh_token, .. }) if refresh_token == fake::RENEWED
+        ));
+        assert_eq!(
+            osc.seen.lock().unwrap().catalog_tokens,
+            vec![format!("Bearer {}", fake::ACCESS)]
+        );
+    }
+
+    /// Signing in (or in again, to change workspace) replaces the kept credential,
+    /// points the settings at the keychain with no token in them, and returns the
+    /// workspace picked on the consent page with its instances.
+    #[tokio::test]
+    async fn a_sign_in_is_kept_and_returns_the_workspace_picked_in_the_browser() {
+        let osc = fake::osc(true, None).await;
+        let keychain = MemoryKeychain::new();
+        let mut settings = Config::default();
+        settings.open_live.url = Some("https://old.example.osaas.io".into());
+        keep_osc_token(&mut settings, &keychain, PAT).unwrap();
+
+        let (open, _) = fake::browser(osc.seen.clone(), "code=the-code");
+        let found = osc_sign_in_at(
+            &osc.endpoints(),
+            Duration::from_secs(10),
+            &mut settings,
+            &keychain,
+            open,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(found.id.as_deref(), Some(fake::WORKSPACE));
+        assert_eq!(found.instances.len(), 1);
+        assert_eq!(
+            kept(&keychain),
+            Some(StoredCredential::SignIn {
+                refresh_token: fake::REFRESH.into(),
+                client_id: "registered-id".into(),
+            }),
+            "the new sign-in replaces the old workspace's"
+        );
+        assert!(settings.open_live.uses_keychain());
+        assert_eq!(settings.open_live.api_key, None);
+        assert_eq!(
+            settings.open_live.url.as_deref(),
+            Some("https://old.example.osaas.io"),
+            "the instance is the person's to pick again"
+        );
+    }
+
+    /// Declining on the consent page leaves the workspace that was signed in to.
+    #[tokio::test]
+    async fn a_declined_sign_in_keeps_the_credential_there_was() {
+        let osc = fake::osc(true, None).await;
+        let keychain = MemoryKeychain::new();
+        let mut settings = Config::default();
+        keep_osc_token(&mut settings, &keychain, PAT).unwrap();
+        let before = settings.clone();
+
+        let (open, _) = fake::browser(osc.seen.clone(), "error=access_denied");
+        let err = osc_sign_in_at(
+            &osc.endpoints(),
+            Duration::from_secs(10),
+            &mut settings,
+            &keychain,
+            open,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("access_denied"), "{err:#}");
+        assert_eq!(kept(&keychain), StoredCredential::from_token(PAT).ok());
+        assert_eq!(
+            toml::to_string(&settings).unwrap(),
+            toml::to_string(&before).unwrap()
+        );
+    }
 
     #[test]
     fn an_osaas_address_implies_the_token_exchange_and_lookalikes_do_not() {

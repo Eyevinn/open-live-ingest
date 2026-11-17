@@ -17,7 +17,7 @@
 //! carried by a personal access token.
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::net::Ipv4Addr;
@@ -47,7 +47,7 @@ const CLIENT_NAME: &str = "Open Live Ingest";
 /// any port the listener gets.
 const REGISTERED_REDIRECT_URI: &str = "http://127.0.0.1/callback";
 /// How long the person has to finish signing in in the browser.
-const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long one connection to the loopback listener may take to send its request.
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_MAX_HEAD: usize = 16 * 1024;
@@ -163,7 +163,7 @@ pub async fn browser_login_with(open: impl FnOnce(&str) -> Result<()>) -> Result
     sign_in(CONNECT_URL, SIGN_IN_TIMEOUT, open).await
 }
 
-async fn sign_in(
+pub(crate) async fn sign_in(
     base: &str,
     wait: Duration,
     open: impl FnOnce(&str) -> Result<()>,
@@ -684,15 +684,42 @@ pub fn now() -> Duration {
 
 /// An Open Live instance as the platform lists it. The record also carries the
 /// instance's own secrets, so only the name and address are ever decoded.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Instance {
     pub name: String,
     pub url: String,
 }
 
+/// Where Open Source Cloud answers: its OAuth server, the catalog of a workspace's
+/// subscriptions, and the exchange for service tokens. Production unless a test
+/// points them at a fake.
+#[derive(Debug, Clone)]
+pub(crate) struct Endpoints {
+    pub connect: String,
+    pub catalog: String,
+    pub token_exchange: String,
+}
+
+impl Endpoints {
+    pub(crate) fn production() -> Self {
+        Endpoints {
+            connect: CONNECT_URL.to_string(),
+            catalog: CATALOG_URL.to_string(),
+            token_exchange: crate::openlive::TOKEN_EXCHANGE_URL.to_string(),
+        }
+    }
+}
+
 /// The Open Live instances in the token's workspace, the same way `osc list` finds
 /// them: the catalog says where the service's API is, and a service token lists it.
 pub async fn open_live_instances(token: &str) -> Result<Vec<Instance>> {
+    open_live_instances_at(&Endpoints::production(), token).await
+}
+
+pub(crate) async fn open_live_instances_at(
+    endpoints: &Endpoints,
+    token: &str,
+) -> Result<Vec<Instance>> {
     #[derive(Deserialize)]
     struct Subscription {
         #[serde(rename = "serviceId")]
@@ -705,7 +732,7 @@ pub async fn open_live_instances(token: &str) -> Result<Vec<Instance>> {
         .build()
         .context("building HTTP client")?;
     let res = http
-        .get(CATALOG_URL)
+        .get(&endpoints.catalog)
         .header("x-pat-jwt", format!("Bearer {token}"))
         .send()
         .await
@@ -721,7 +748,8 @@ pub async fn open_live_instances(token: &str) -> Result<Vec<Instance>> {
         .map(|s| s.api_url)
         .context("this workspace has no Open Live subscription")?;
 
-    let service_token = crate::openlive::service_token(&http, token).await?;
+    let service_token =
+        crate::openlive::service_token_at(&http, &endpoints.token_exchange, token).await?;
     let res = http
         .get(&api_url)
         .header("x-jwt", format!("Bearer {service_token}"))
@@ -735,6 +763,276 @@ pub async fn open_live_instances(token: &str) -> Result<Vec<Instance>> {
         );
     }
     res.json().await.context("decoding instances")
+}
+
+/// A fake Open Source Cloud: `/api/connect` registration, and a token endpoint that
+/// checks the code, the redirect and the PKCE verifier against what the fake browser
+/// saw on the authorize page, or renews [`REFRESH`] and [`RENEWED`]; and the catalog,
+/// service-token exchange and instance list, which take only [`ACCESS`].
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    pub const CODE: &str = "the-code";
+    /// A token for the workspace [`WORKSPACE`]: `{"tenantId":"venue-ws"}`.
+    pub const ACCESS: &str = "h.eyJ0ZW5hbnRJZCI6InZlbnVlLXdzIn0.s";
+    pub const WORKSPACE: &str = "venue-ws";
+    pub const REFRESH: &str = "refresh-secret";
+    /// What a refresh returns in place of the refresh token it was given.
+    pub const RENEWED: &str = "refresh-renewed";
+    const SERVICE_TOKEN: &str = "service-token";
+
+    #[derive(Default)]
+    pub struct Seen {
+        pub registrations: Vec<serde_json::Value>,
+        pub authorize: Vec<(String, String)>,
+        pub token_forms: Vec<Vec<(String, String)>>,
+        /// The token each catalog request presented.
+        pub catalog_tokens: Vec<String>,
+    }
+
+    impl Seen {
+        pub fn param(&self, key: &str) -> Option<String> {
+            self.authorize
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    pub struct Osc {
+        pub base: String,
+        pub seen: Arc<Mutex<Seen>>,
+    }
+
+    impl Osc {
+        /// Every Open Source Cloud endpoint, on this fake.
+        pub fn endpoints(&self) -> Endpoints {
+            Endpoints {
+                connect: self.base.clone(),
+                catalog: format!("{}/mysubscriptions", self.base),
+                token_exchange: format!("{}/servicetoken", self.base),
+            }
+        }
+    }
+
+    /// `register` false answers registration with HTTP 500; `token_error` answers
+    /// the token request with that OAuth error.
+    pub async fn osc(register: bool, token_error: Option<&'static str>) -> Osc {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let shared = seen.clone();
+        let base_for_answers = base.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen = shared.clone();
+                let base = base_for_answers.clone();
+                tokio::spawn(answer(stream, seen, base, register, token_error));
+            }
+        });
+        Osc { base, seen }
+    }
+
+    async fn answer(
+        mut stream: TcpStream,
+        seen: Arc<Mutex<Seen>>,
+        base: String,
+        register: bool,
+        token_error: Option<&'static str>,
+    ) {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        let (head, body) = loop {
+            let n = stream.read(&mut buf).await.unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&raw[..end]).to_string();
+            let length = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            while raw.len() < end + 4 + length {
+                let n = stream.read(&mut buf).await.unwrap();
+                raw.extend_from_slice(&buf[..n]);
+            }
+            break (head, raw[end + 4..end + 4 + length].to_vec());
+        };
+        let request_line = head.lines().next().unwrap_or_default().to_string();
+        let header = |name: &str| {
+            head.lines().skip(1).find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| v.trim().to_string())
+            })
+        };
+        let bearer = |name: &str, token: &str| header(name) == Some(format!("Bearer {token}"));
+        let unauthorized = ("401 Unauthorized", "{}".to_string());
+        let (status, reply) = if request_line.starts_with("POST /api/connect/register ") {
+            seen.lock()
+                .unwrap()
+                .registrations
+                .push(serde_json::from_slice(&body).unwrap());
+            if register {
+                (
+                    "201 Created",
+                    r#"{"client_id":"registered-id","token_endpoint_auth_method":"none"}"#
+                        .to_string(),
+                )
+            } else {
+                ("500 Internal Server Error", "{}".to_string())
+            }
+        } else if request_line.starts_with("POST /api/connect/token ") {
+            let form: Vec<(String, String)> =
+                reqwest::Url::parse(&format!("http://x/?{}", String::from_utf8_lossy(&body)))
+                    .unwrap()
+                    .query_pairs()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+            let mut seen = seen.lock().unwrap();
+            let get = |key: &str| form.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+            let pkce_ok =
+                get("code_verifier").map(|v| code_challenge(&v)) == seen.param("code_challenge");
+            let valid = get("grant_type").as_deref() == Some("authorization_code")
+                && get("code").as_deref() == Some(CODE)
+                && get("redirect_uri") == seen.param("redirect_uri")
+                && get("client_id") == seen.param("client_id")
+                && get("client_secret").is_none()
+                && pkce_ok;
+            seen.token_forms.push(form.clone());
+            let refresh = get("grant_type").as_deref() == Some("refresh_token");
+            if refresh && token_error.is_none() {
+                match get("refresh_token").as_deref() {
+                    Some(REFRESH | RENEWED) => (
+                        "200 OK",
+                        format!(
+                            r#"{{"access_token":"{ACCESS}","refresh_token":"{RENEWED}","token_type":"Bearer","expires_in":3600}}"#
+                        ),
+                    ),
+                    _ => (
+                        "400 Bad Request",
+                        r#"{"error":"invalid_grant"}"#.to_string(),
+                    ),
+                }
+            } else {
+                match (token_error, valid) {
+                    (None, true) => (
+                        "200 OK",
+                        format!(
+                            r#"{{"access_token":"{ACCESS}","refresh_token":"{REFRESH}","token_type":"Bearer","expires_in":3600,"scope":"claudeai"}}"#
+                        ),
+                    ),
+                    (Some(error), _) => (
+                        "400 Bad Request",
+                        format!(
+                            r#"{{"error":"{error}","error_description":"code {CODE} for {ACCESS}"}}"#
+                        ),
+                    ),
+                    (None, false) => (
+                        "400 Bad Request",
+                        r#"{"error":"invalid_request"}"#.to_string(),
+                    ),
+                }
+            }
+        } else if request_line.starts_with("GET /mysubscriptions ") {
+            let presented = header("x-pat-jwt").unwrap_or_default();
+            seen.lock().unwrap().catalog_tokens.push(presented);
+            if bearer("x-pat-jwt", ACCESS) {
+                (
+                    "200 OK",
+                    format!(
+                        r#"[{{"serviceId":"another-service","apiUrl":"{base}/nope"}},{{"serviceId":"{}","apiUrl":"{base}/instances"}}]"#,
+                        crate::openlive::OPEN_LIVE_SERVICE_ID
+                    ),
+                )
+            } else {
+                unauthorized
+            }
+        } else if request_line.starts_with("POST /servicetoken ") {
+            if bearer("x-pat-jwt", ACCESS) {
+                (
+                    "200 OK",
+                    format!(
+                        r#"{{"token":"{SERVICE_TOKEN}","expiry":{}}}"#,
+                        now().as_secs() + 3600
+                    ),
+                )
+            } else {
+                unauthorized
+            }
+        } else if request_line.starts_with("GET /instances ") {
+            if bearer("x-jwt", SERVICE_TOKEN) {
+                (
+                    "200 OK",
+                    r#"[{"name":"venue","url":"https://venue.example.osaas.io","StromAccessToken":"secret"}]"#
+                        .to_string(),
+                )
+            } else {
+                unauthorized
+            }
+        } else {
+            ("404 Not Found", "{}".to_string())
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+            reply.len()
+        );
+        stream.write_all(response.as_bytes()).await.ok();
+    }
+
+    /// A browser on the authorize page: records what it was given, then, as the
+    /// person finishes, loads a favicon and a stale tab's redirect before the real
+    /// one, and reports the HTTP status of each.
+    pub fn browser(
+        seen: Arc<Mutex<Seen>>,
+        outcome: &'static str,
+    ) -> (
+        impl FnOnce(&str) -> Result<()>,
+        tokio::sync::oneshot::Receiver<Vec<u16>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let open = move |url: &str| -> Result<()> {
+            let url = reqwest::Url::parse(url)?;
+            assert_eq!(url.path(), "/api/connect/authorize");
+            let params: Vec<(String, String)> = url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect();
+            seen.lock().unwrap().authorize = params;
+            let (redirect, state) = {
+                let seen = seen.lock().unwrap();
+                (
+                    seen.param("redirect_uri").unwrap(),
+                    seen.param("state").unwrap(),
+                )
+            };
+            tokio::spawn(async move {
+                let http = reqwest::Client::new();
+                let base = redirect.trim_end_matches("/callback").to_string();
+                let mut statuses = Vec::new();
+                for url in [
+                    format!("{base}/favicon.ico"),
+                    format!("{redirect}?code=stale&state=not-this-one"),
+                    format!("{redirect}?{outcome}&state={state}"),
+                ] {
+                    let res = http.get(&url).send().await.unwrap();
+                    statuses.push(res.status().as_u16());
+                }
+                tx.send(statuses).ok();
+            });
+            Ok(())
+        };
+        (open, rx)
+    }
 }
 
 #[cfg(test)]
@@ -875,191 +1173,6 @@ mod tests {
             Callback::Refused("unrecognised error".into()),
             "an error is only repeated when it is a plain OAuth code"
         );
-    }
-
-    /// A fake OSC `/api/connect`: registration, and a token endpoint that checks the
-    /// code, the redirect and the PKCE verifier against what the fake browser saw on
-    /// the authorize page.
-    mod fake {
-        use super::super::*;
-        use std::sync::{Arc, Mutex};
-
-        pub const CODE: &str = "the-code";
-        pub const ACCESS: &str = "access-secret";
-        pub const REFRESH: &str = "refresh-secret";
-
-        #[derive(Default)]
-        pub struct Seen {
-            pub registrations: Vec<serde_json::Value>,
-            pub authorize: Vec<(String, String)>,
-            pub token_forms: Vec<Vec<(String, String)>>,
-        }
-
-        impl Seen {
-            pub fn param(&self, key: &str) -> Option<String> {
-                self.authorize
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.clone())
-            }
-        }
-
-        pub struct Osc {
-            pub base: String,
-            pub seen: Arc<Mutex<Seen>>,
-        }
-
-        /// `register` false answers registration with HTTP 500; `token_error` answers
-        /// the token request with that OAuth error.
-        pub async fn osc(register: bool, token_error: Option<&'static str>) -> Osc {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let base = format!("http://{}", listener.local_addr().unwrap());
-            let seen = Arc::new(Mutex::new(Seen::default()));
-            let shared = seen.clone();
-            tokio::spawn(async move {
-                loop {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let seen = shared.clone();
-                    tokio::spawn(answer(stream, seen, register, token_error));
-                }
-            });
-            Osc { base, seen }
-        }
-
-        async fn answer(
-            mut stream: TcpStream,
-            seen: Arc<Mutex<Seen>>,
-            register: bool,
-            token_error: Option<&'static str>,
-        ) {
-            let mut raw = Vec::new();
-            let mut buf = [0u8; 4096];
-            let (head, body) = loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                raw.extend_from_slice(&buf[..n]);
-                let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
-                    continue;
-                };
-                let head = String::from_utf8_lossy(&raw[..end]).to_string();
-                let length = head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    })
-                    .unwrap_or(0);
-                while raw.len() < end + 4 + length {
-                    let n = stream.read(&mut buf).await.unwrap();
-                    raw.extend_from_slice(&buf[..n]);
-                }
-                break (head, raw[end + 4..end + 4 + length].to_vec());
-            };
-            let request_line = head.lines().next().unwrap_or_default().to_string();
-            let (status, reply) = if request_line.starts_with("POST /api/connect/register ") {
-                seen.lock()
-                    .unwrap()
-                    .registrations
-                    .push(serde_json::from_slice(&body).unwrap());
-                if register {
-                    (
-                        "201 Created",
-                        r#"{"client_id":"registered-id","token_endpoint_auth_method":"none"}"#
-                            .to_string(),
-                    )
-                } else {
-                    ("500 Internal Server Error", "{}".to_string())
-                }
-            } else if request_line.starts_with("POST /api/connect/token ") {
-                let form: Vec<(String, String)> =
-                    reqwest::Url::parse(&format!("http://x/?{}", String::from_utf8_lossy(&body)))
-                        .unwrap()
-                        .query_pairs()
-                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                        .collect();
-                let mut seen = seen.lock().unwrap();
-                let get = |key: &str| form.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
-                let pkce_ok = get("code_verifier").map(|v| code_challenge(&v))
-                    == seen.param("code_challenge");
-                let valid = get("grant_type").as_deref() == Some("authorization_code")
-                    && get("code").as_deref() == Some(CODE)
-                    && get("redirect_uri") == seen.param("redirect_uri")
-                    && get("client_id") == seen.param("client_id")
-                    && get("client_secret").is_none()
-                    && pkce_ok;
-                seen.token_forms.push(form.clone());
-                match (token_error, valid) {
-                    (None, true) => (
-                        "200 OK",
-                        format!(
-                            r#"{{"access_token":"{ACCESS}","refresh_token":"{REFRESH}","token_type":"Bearer","expires_in":3600,"scope":"claudeai"}}"#
-                        ),
-                    ),
-                    (Some(error), _) => (
-                        "400 Bad Request",
-                        format!(
-                            r#"{{"error":"{error}","error_description":"code {CODE} for {ACCESS}"}}"#
-                        ),
-                    ),
-                    (None, false) => (
-                        "400 Bad Request",
-                        r#"{"error":"invalid_request"}"#.to_string(),
-                    ),
-                }
-            } else {
-                ("404 Not Found", "{}".to_string())
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
-                reply.len()
-            );
-            stream.write_all(response.as_bytes()).await.ok();
-        }
-
-        /// A browser on the authorize page: records what it was given, then, as the
-        /// person finishes, loads a favicon and a stale tab's redirect before the real
-        /// one, and reports the HTTP status of each.
-        pub fn browser(
-            seen: Arc<Mutex<Seen>>,
-            outcome: &'static str,
-        ) -> (
-            impl FnOnce(&str) -> Result<()>,
-            tokio::sync::oneshot::Receiver<Vec<u16>>,
-        ) {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let open = move |url: &str| -> Result<()> {
-                let url = reqwest::Url::parse(url)?;
-                assert_eq!(url.path(), "/api/connect/authorize");
-                let params: Vec<(String, String)> = url
-                    .query_pairs()
-                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                    .collect();
-                seen.lock().unwrap().authorize = params;
-                let (redirect, state) = {
-                    let seen = seen.lock().unwrap();
-                    (
-                        seen.param("redirect_uri").unwrap(),
-                        seen.param("state").unwrap(),
-                    )
-                };
-                tokio::spawn(async move {
-                    let http = reqwest::Client::new();
-                    let base = redirect.trim_end_matches("/callback").to_string();
-                    let mut statuses = Vec::new();
-                    for url in [
-                        format!("{base}/favicon.ico"),
-                        format!("{redirect}?code=stale&state=not-this-one"),
-                        format!("{redirect}?{outcome}&state={state}"),
-                    ] {
-                        let res = http.get(&url).send().await.unwrap();
-                        statuses.push(res.status().as_u16());
-                    }
-                    tx.send(statuses).ok();
-                });
-                Ok(())
-            };
-            (open, rx)
-        }
     }
 
     #[tokio::test]

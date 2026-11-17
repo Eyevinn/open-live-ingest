@@ -14,6 +14,7 @@
 //! its caller resolves: the CLI on Ctrl-C or SIGTERM, an app on its Stop button.
 
 use crate::config::{self, format_ports, mask_passphrase, Config, UplinkMode, Video};
+use crate::credential::OscCredential;
 use crate::devices;
 use crate::flow::{self, Input};
 use crate::gateway::{Event, Events, InputState as State, InputStats, SummaryRow, UplinkStats};
@@ -22,6 +23,7 @@ use crate::local_strom::{self, LocalStrom};
 use crate::openlive::{
     drifted, listener_port, OpenLiveClient, Refused, ServerInfo, Source, SourcePayload,
 };
+use crate::session::Inputs;
 use crate::strom::{self as strom_api, StromClient};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -52,11 +54,19 @@ async fn connect_strom(cfg: &Config, events: &Events) -> Result<(LocalStrom, Str
     ))
 }
 
-fn open_live_client(cfg: &Config) -> Result<Option<OpenLiveClient>> {
+/// The Open Live client `up` registers with: with the app's Open Source Cloud
+/// credential when one is given, otherwise with the one the settings point at.
+fn open_live_client(
+    cfg: &Config,
+    credential: Option<&OscCredential>,
+) -> Result<Option<OpenLiveClient>> {
     if !cfg.open_live.register {
         return Ok(None);
     }
-    Ok(Some(OpenLiveClient::from_settings(&cfg.open_live)?))
+    Ok(Some(match credential {
+        Some(credential) => OpenLiveClient::with_osc_credential(&cfg.open_live, credential)?,
+        None => OpenLiveClient::from_settings(&cfg.open_live)?,
+    }))
 }
 
 /// Before going live: a credential that cannot be renewed and ends during the
@@ -429,16 +439,21 @@ fn stats_of(live: &[Live]) -> Event {
 
 /// Brings every chosen device up and keeps it registered until `stop` resolves, then
 /// removes what it started. `stop` says why it is stopping, which decides how long
-/// the teardown may take.
+/// the teardown may take. `credential`, when given, is the Open Source Cloud
+/// credential to register with instead of the one the settings point at.
 pub async fn up(
     cfg: Config,
-    include_virtual: bool,
-    selection: Option<String>,
-    audio_pairings: Vec<devices::AudioPairing>,
-    test_pattern: bool,
+    credential: Option<OscCredential>,
+    inputs: Inputs,
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
+    let Inputs {
+        include_virtual,
+        selection,
+        audio: audio_pairings,
+        test_pattern,
+    } = inputs;
     if test_pattern && !audio_pairings.is_empty() {
         bail!("--audio pairs an audio source with a camera, and --test streams no camera; the test pattern carries its own tone");
     }
@@ -454,7 +469,7 @@ pub async fn up(
         warn!("{warning}");
         events.emit(Event::Warning { message: warning });
     }
-    let open_live = open_live_client(&cfg)?;
+    let open_live = open_live_client(&cfg, credential.as_ref())?;
     warn_of_sign_in_end(open_live.as_ref(), events);
 
     let chosen = if test_pattern {
@@ -1596,7 +1611,7 @@ pub async fn down(cfg: &Config, events: &Events) -> Result<()> {
             error: err.to_string(),
         }),
     }
-    if let Some(client) = open_live_client(cfg)? {
+    if let Some(client) = open_live_client(cfg, None)? {
         removed += sweep_sources(&client, &cfg.gateway.name, &BTreeSet::new(), events).await;
     }
     local_strom::stop_recorded(events);
@@ -1686,7 +1701,7 @@ pub async fn status(cfg: &Config) -> Result<StatusReport> {
             pid: None,
         },
     };
-    let open_live = open_live_client(cfg)?;
+    let open_live = open_live_client(cfg, None)?;
     // Warnings while working out the uplink are the log's, not the report's.
     let (uplink, uplink_error) =
         match resolve_cloud(cfg, open_live.as_ref(), &Events::discard()).await {

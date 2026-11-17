@@ -119,6 +119,84 @@ impl StoredCredential {
     }
 }
 
+/// The Open Source Cloud credential an app hands the library, in place of what the
+/// command line reads (`open_live.api_key`, `OSC_ACCESS_TOKEN`, `~/.osc/token`).
+///
+/// `Debug` shows no token.
+#[derive(Clone)]
+pub enum OscCredential {
+    /// A token in hand: a pasted personal access token, or the access token of a
+    /// sign-in just made ([`osc::Credential::access_token`]). Used as it is.
+    Token(String),
+    /// What [`keep`] stored in this keychain: a sign-in, renewed from its refresh
+    /// token as it is used, or a kept personal access token.
+    Keychain(Arc<dyn SecretStore>),
+}
+
+impl fmt::Debug for OscCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OscCredential::Token(_) => f.write_str("Token(<redacted>)"),
+            OscCredential::Keychain(_) => f.write_str("Keychain"),
+        }
+    }
+}
+
+impl From<&str> for OscCredential {
+    fn from(token: &str) -> Self {
+        OscCredential::Token(token.to_string())
+    }
+}
+
+impl From<String> for OscCredential {
+    fn from(token: String) -> Self {
+        OscCredential::Token(token)
+    }
+}
+
+impl From<&osc::Credential> for OscCredential {
+    fn from(sign_in: &osc::Credential) -> Self {
+        OscCredential::Token(sign_in.access_token.clone())
+    }
+}
+
+impl From<&OscCredential> for OscCredential {
+    fn from(credential: &OscCredential) -> Self {
+        credential.clone()
+    }
+}
+
+impl OscCredential {
+    /// An access token to present to Open Source Cloud now: a token in hand,
+    /// trimmed, refused when blank or expired; or the keychain's, renewed when it
+    /// is a sign-in near expiry, with the new refresh token written back.
+    pub async fn access_token(&self) -> Result<String> {
+        self.access_token_at(osc::CONNECT_URL).await
+    }
+
+    /// [`access_token`](Self::access_token), renewing against the OAuth server at
+    /// `base`.
+    pub(crate) async fn access_token_at(&self, base: &str) -> Result<String> {
+        match self {
+            OscCredential::Token(token) => {
+                let token = token.trim();
+                if token.is_empty() {
+                    bail!("no Open Source Cloud credential");
+                }
+                if osc::inspect(token).is_some_and(|i| i.is_expired()) {
+                    bail!("that Open Source Cloud token has expired; sign in again");
+                }
+                Ok(token.to_string())
+            }
+            OscCredential::Keychain(store) => {
+                KeptCredential::with(store.clone(), base, Arc::new(|| osc::now().as_secs()))?
+                    .access_token()
+                    .await
+            }
+        }
+    }
+}
+
 /// Keeps `credential` in `store`, replacing what was there.
 pub fn keep(store: &dyn SecretStore, credential: &StoredCredential) -> Result<()> {
     let json = serde_json::to_string(credential).context("encoding the credential")?;

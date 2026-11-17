@@ -5,7 +5,7 @@
 //! request bodies are never dumped because the source address carries the passphrase.
 
 use crate::config::{self, mask_passphrase, port_range, AuthMode};
-use crate::credential::KeptCredential;
+use crate::credential::{KeptCredential, OscCredential};
 use crate::keychain::{OsKeychain, SecretStore};
 use crate::osc;
 use anyhow::{bail, Context, Result};
@@ -17,7 +17,7 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const TOKEN_EXCHANGE_URL: &str = "https://token.svc.prod.osaas.io/servicetoken";
+pub(crate) const TOKEN_EXCHANGE_URL: &str = "https://token.svc.prod.osaas.io/servicetoken";
 pub const OPEN_LIVE_SERVICE_ID: &str = "eyevinn-open-live";
 /// Refresh this long before expiry, so a token never dies mid-request.
 const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
@@ -267,6 +267,45 @@ impl OpenLiveClient {
                 api_key,
                 settings.uses_keychain().then_some(keychain),
             )?,
+        })
+    }
+
+    /// A client for the Open Live in the settings, with `credential` from the app in
+    /// place of any the settings or the command line would supply: a token in hand,
+    /// or the sign-in in a keychain, renewed as it is used. Nothing is read from
+    /// `open_live.api_key`, `OSC_ACCESS_TOKEN` or `~/.osc/token`. A self-hosted Open
+    /// Live (`auth_mode = "direct"`) takes its key from the settings as ever, and
+    /// `credential` is not used.
+    pub fn with_osc_credential(
+        settings: &config::OpenLive,
+        credential: &OscCredential,
+    ) -> Result<Self> {
+        let url = settings.url.as_deref().context("open_live.url is unset")?;
+        if settings.auth_mode != AuthMode::Osc {
+            return Self::new(url, settings.auth_mode, settings.api_key.as_deref());
+        }
+        let pat = match credential {
+            OscCredential::Token(token) => {
+                let token = token.trim();
+                if token.is_empty() {
+                    bail!("no Open Source Cloud credential");
+                }
+                OscToken::Configured(token.to_string())
+            }
+            OscCredential::Keychain(store) => {
+                OscToken::Keychain(Box::new(KeptCredential::new(store.clone())?))
+            }
+        };
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .context("building HTTP client")?,
+            base_url: url.trim_end_matches('/').to_string(),
+            auth: Auth::Osc {
+                pat,
+                cache: Mutex::new(None),
+            },
         })
     }
 
@@ -623,12 +662,29 @@ async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken>
 
 /// A one-off service token for Open Live, for setup to list instances with.
 pub async fn service_token(http: &reqwest::Client, pat: &str) -> Result<String> {
-    let res = post_service_token(http, pat).await?;
+    service_token_at(http, TOKEN_EXCHANGE_URL, pat).await
+}
+
+/// [`service_token`], from the exchange at `url`.
+pub(crate) async fn service_token_at(
+    http: &reqwest::Client,
+    url: &str,
+    pat: &str,
+) -> Result<String> {
+    let res = post_service_token_at(http, url, pat).await?;
     Ok(decode_service_token(res).await?.token)
 }
 
 async fn post_service_token(http: &reqwest::Client, pat: &str) -> Result<reqwest::Response> {
-    http.post(TOKEN_EXCHANGE_URL)
+    post_service_token_at(http, TOKEN_EXCHANGE_URL, pat).await
+}
+
+async fn post_service_token_at(
+    http: &reqwest::Client,
+    url: &str,
+    pat: &str,
+) -> Result<reqwest::Response> {
+    http.post(url)
         .header("x-pat-jwt", format!("Bearer {pat}"))
         .header("accept", "application/json")
         .json(&serde_json::json!({ "serviceId": OPEN_LIVE_SERVICE_ID }))
@@ -694,6 +750,51 @@ mod tests {
             .block_on(OscToken::Configured("pat".into()).read())
             .unwrap();
         assert_eq!(pat, "pat");
+    }
+
+    /// The app's credential replaces whatever the settings point at, marker or not,
+    /// and never falls back to the CLI's login; a self-hosted Open Live keeps its key.
+    #[test]
+    fn the_apps_credential_is_used_in_place_of_the_settings() {
+        use crate::keychain::MemoryKeychain;
+
+        let mut settings = config::OpenLive {
+            url: Some("https://venue.osaas.io".into()),
+            auth_mode: AuthMode::Osc,
+            api_key: Some("pat-in-the-file".into()),
+            ..Default::default()
+        };
+        let token = OpenLiveClient::with_osc_credential(&settings, &" app-token ".into()).unwrap();
+        assert!(
+            matches!(&token.auth, Auth::Osc { pat: OscToken::Configured(t), .. } if t == "app-token"),
+            "the app's token wins over the file's"
+        );
+
+        let keychain: Arc<dyn SecretStore> = Arc::new(MemoryKeychain::new());
+        let kept =
+            OpenLiveClient::with_osc_credential(&settings, &OscCredential::Keychain(keychain))
+                .unwrap();
+        assert!(
+            matches!(
+                &kept.auth,
+                Auth::Osc {
+                    pat: OscToken::Keychain(_),
+                    ..
+                }
+            ),
+            "the keychain is used without the marker in the settings"
+        );
+
+        assert!(OpenLiveClient::with_osc_credential(&settings, &"  ".into()).is_err());
+
+        settings.url = Some("http://127.0.0.1:3000".into());
+        settings.auth_mode = AuthMode::Direct;
+        settings.api_key = Some("self-hosted-key".into());
+        let direct = OpenLiveClient::with_osc_credential(&settings, &"app-token".into()).unwrap();
+        assert!(
+            matches!(&direct.auth, Auth::Direct(Some(k)) if k == "self-hosted-key"),
+            "a self-hosted Open Live takes no OSC credential"
+        );
     }
 
     /// The keychain is used when the settings point at it and no token in the file
