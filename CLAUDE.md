@@ -11,6 +11,10 @@ media pipeline; Strom does the media.
 - `src/flow.rs`: the flow template and flow ownership by derived id.
 - `src/strom.rs`, `src/openlive.rs`: the two HTTP clients.
 - `src/heartbeat.rs`: the status heartbeat to Open Live, one outbound WebSocket.
+- `src/osc.rs`: Open Source Cloud sign-in, token refresh, the workspace's instances.
+- `src/keychain.rs`: the OS keychain behind a trait (macOS Keychain, Windows Credential Manager;
+  an in-memory store for tests and Linux).
+- `src/credential.rs`: the OSC credential kept in the keychain, refreshed during a session.
 - `src/devices.rs`: from Strom's device list to inputs with names and ports.
 - `src/run.rs`: `up`, `down`, `status`, `devices`.
 - `src/setup.rs`: interactive setup. Binary only: it prompts on the terminal.
@@ -48,8 +52,8 @@ media pipeline; Strom does the media.
 - Open Live being unreachable must never disturb the feed: a warning and a retry on the next tick,
   never a stopped or restarted flow.
 - `up` owns what it started. Ctrl-C and SIGTERM remove the flows and sources; SIGHUP does not.
-- No local state beyond the settings file and two pidfiles (the running `up`, and a Strom it
-  started). Flows are recognised by derived id, sources by the gateway's name prefix.
+- No local state beyond the settings file, two pidfiles (the running `up`, and a Strom it
+  started), and the one keychain entry an app sign-in keeps the OSC credential in. Flows are recognised by derived id, sources by the gateway's name prefix.
 - A Strom already listening is adopted and never stopped. Only a Strom the gateway started is
   stopped, on the way out.
 

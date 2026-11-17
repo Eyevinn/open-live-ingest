@@ -39,6 +39,8 @@ url = "https://my-instance.eyevinn-open-live.auto.prod-se.osaas.io"
 #         `npx @osaas/cli login` (~/.osc/token, valid for an hour) is used. Set
 #         api_key to a personal access token for a show or a machine with no
 #         browser; it takes precedence. Setup lists the workspace's instances.
+#         After a sign-in from the app, the credential is in the OS keychain and
+#         this section holds only `credential = "keychain"`, no token.
 # direct: api_key is sent as the bearer token as-is, for a self-hosted Open Live
 #         with a static API_KEY, or none at all.
 auth_mode = "osc"

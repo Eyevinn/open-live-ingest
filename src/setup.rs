@@ -302,6 +302,7 @@ fn needs_setup(cfg: &Config, osc_login: bool) -> bool {
     cfg.open_live.url.is_none()
         || (cfg.open_live.auth_mode == AuthMode::Osc
             && cfg.open_live.api_key.is_none()
+            && cfg.open_live.credential.is_none()
             && !osc_login)
 }
 
@@ -734,6 +735,7 @@ async fn osc_authenticate(cfg: &mut Config) -> Result<String> {
             0 => match osc::env_token() {
                 Some(token) => {
                     cfg.open_live.api_key = None;
+                    cfg.open_live.credential = None;
                     token
                 }
                 None => {
@@ -753,6 +755,7 @@ async fn osc_authenticate(cfg: &mut Config) -> Result<String> {
                 match osc::login_token() {
                     Some(token) => {
                         cfg.open_live.api_key = None;
+                        cfg.open_live.credential = None;
                         if osc::env_token().is_some() {
                             warn(format!(
                                 "{} is also set, and takes precedence over the login when the gateway runs",

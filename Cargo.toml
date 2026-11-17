@@ -44,6 +44,18 @@ getrandom = "0.4"
 # taskkill instead, so this is Unix only.
 libc = "0.2"
 
+# The OSC credential in the OS keychain (src/keychain.rs). Own code over the platform
+# APIs rather than the `keyring` crate: on macOS this crate's safe generic-password
+# calls are what `keyring` itself uses, minus `keyring` and `log`; on Windows the
+# Credential Manager calls come from the windows-sys already in the tree (through
+# tokio, mio, socket2, console), where `keyring` 3 would add a second windows-sys,
+# its windows-targets and byteorder. Linux has no keychain here and needs nothing.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", default-features = false, features = ["OSX_10_14"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
 # `cargo binstall open-live-ingest` fetches the release tarball instead of compiling.
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"

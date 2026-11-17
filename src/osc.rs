@@ -5,7 +5,8 @@
 //! natively, for an app: OAuth 2.0 authorization code with PKCE (S256) and a loopback
 //! redirect to `127.0.0.1` (RFC 8252), against OSC's `/api/connect` endpoints, and
 //! keeps the refresh token. See docs/research/OSC_BROWSER_SIGN_IN.md for what OSC
-//! offers. The resulting [`Credential`] is handed to the caller and stored nowhere.
+//! offers. The resulting [`Credential`] is handed to the caller; `credential.rs` keeps
+//! it in the OS keychain and [`refresh`]es it during a session.
 //!
 //! The command line still has `npx @osaas/cli login`, which signs in the same way and
 //! saves only the access token to `~/.osc/token`, mode 0600. That token is exchanged
@@ -392,6 +393,120 @@ async fn exchange_code(
     redirect_uri: &str,
     verifier: &str,
 ) -> Result<Credential> {
+    let grant = token_request(
+        http,
+        base,
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("client_id", client_id),
+            ("code_verifier", verifier),
+        ],
+    )
+    .await
+    .map_err(|err| match err {
+        TokenError::Refused { status, error } => {
+            anyhow!("the Open Source Cloud sign-in could not be completed: HTTP {status} ({error})")
+        }
+        TokenError::Unavailable(err) => err.context("completing the Open Source Cloud sign-in"),
+    })?;
+    let expires_at = grant
+        .expires_in
+        .map(|secs| now().as_secs() + secs)
+        .or_else(|| inspect(&grant.access_token)?.expires_at);
+    debug!("signed in to Open Source Cloud");
+    Ok(Credential {
+        access_token: grant.access_token,
+        refresh_token: grant.refresh_token,
+        expires_at,
+        client_id: client_id.to_string(),
+    })
+}
+
+/// What a token request yields: the access token, its successor's means, and how long
+/// it lasts as the server said it (seconds from now), not yet turned into a time.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Grant {
+    pub access_token: String,
+    /// A refresh returns a new one, which replaces the one it was made with.
+    pub refresh_token: Option<String>,
+    pub expires_in: Option<u64>,
+}
+
+impl fmt::Debug for Grant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Grant")
+            .field("access_token", &"<redacted>")
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+/// Why a token request failed, split by what to do about it.
+#[derive(Debug)]
+pub enum TokenError {
+    /// The server refused the grant: `invalid_grant` (expired, revoked or already
+    /// used) or `403 access_denied` (a suspended workspace), or any other 4xx. Trying
+    /// again with the same grant will not help; the person has to sign in again.
+    Refused {
+        status: reqwest::StatusCode,
+        /// The OAuth error code only, never the body around it.
+        error: String,
+    },
+    /// The server could not be reached, answered 5xx (a `503` while it checks the
+    /// workspace), or answered something unreadable. Worth trying again later.
+    Unavailable(anyhow::Error),
+}
+
+impl fmt::Display for TokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TokenError::Refused { status, error } => {
+                write!(
+                    f,
+                    "Open Source Cloud refused the token request: HTTP {status} ({error})"
+                )
+            }
+            TokenError::Unavailable(err) => write!(f, "{err:#}"),
+        }
+    }
+}
+
+impl std::error::Error for TokenError {}
+
+/// Renews an access token from a refresh token (`grant_type=refresh_token`). OSC
+/// needs no client id or secret for it, and answers with a new pair: the refresh
+/// token in the result replaces `refresh_token`, which may stop working.
+pub async fn refresh(
+    http: &reqwest::Client,
+    base: &str,
+    refresh_token: &str,
+) -> Result<Grant, TokenError> {
+    let grant = token_request(
+        http,
+        base,
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ],
+    )
+    .await?;
+    debug!("refreshed the Open Source Cloud sign-in");
+    Ok(grant)
+}
+
+/// One `POST /api/connect/token`. Errors carry the status and the OAuth error code,
+/// never the body: it can repeat the grant.
+async fn token_request(
+    http: &reqwest::Client,
+    base: &str,
+    form: &[(&str, &str)],
+) -> Result<Grant, TokenError> {
     #[derive(Deserialize)]
     struct Tokens {
         access_token: String,
@@ -405,40 +520,37 @@ async fn exchange_code(
     let res = http
         .post(format!("{base}/api/connect/token"))
         .header("accept", "application/json")
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", redirect_uri),
-            ("client_id", client_id),
-            ("code_verifier", verifier),
-        ])
+        .form(form)
         .send()
         .await
-        .context("POST sign-in token")?;
+        .map_err(|err| TokenError::Unavailable(anyhow!(err).context("POST token")))?;
     let status = res.status();
+    if status.is_server_error() {
+        return Err(TokenError::Unavailable(anyhow!(
+            "the Open Source Cloud token endpoint answered HTTP {status}"
+        )));
+    }
     if !status.is_success() {
-        // The error code only: the rest of the body is not ours to repeat.
         let error = res
             .json::<OauthError>()
             .await
             .map(|e| error_code(&e.error))
             .unwrap_or_else(|_| "no error code".to_string());
-        bail!("the Open Source Cloud sign-in could not be completed: HTTP {status} ({error})");
+        return Err(TokenError::Refused { status, error });
     }
-    let tokens: Tokens = res.json().await.context("decoding sign-in tokens")?;
+    let tokens: Tokens = res
+        .json()
+        .await
+        .map_err(|err| TokenError::Unavailable(anyhow!(err).context("decoding tokens")))?;
     if tokens.access_token.is_empty() {
-        bail!("the Open Source Cloud sign-in returned no access token");
+        return Err(TokenError::Unavailable(anyhow!(
+            "Open Source Cloud returned no access token"
+        )));
     }
-    let expires_at = tokens
-        .expires_in
-        .map(|secs| now().as_secs() + secs)
-        .or_else(|| inspect(&tokens.access_token)?.expires_at);
-    debug!("signed in to Open Source Cloud");
-    Ok(Credential {
+    Ok(Grant {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token.filter(|t| !t.is_empty()),
-        expires_at,
-        client_id: client_id.to_string(),
+        expires_in: tokens.expires_in,
     })
 }
 

@@ -4,11 +4,14 @@
 //! The credential must never reach the logs: errors are built from status codes, and
 //! request bodies are never dumped because the source address carries the passphrase.
 
-use crate::config::{mask_passphrase, port_range, AuthMode};
+use crate::config::{self, mask_passphrase, port_range, AuthMode};
+use crate::credential::KeptCredential;
+use crate::keychain::{OsKeychain, SecretStore};
 use crate::osc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -235,8 +238,52 @@ impl OpenLiveClient {
                 .build()
                 .context("building HTTP client")?,
             base_url: base_url.trim_end_matches('/').to_string(),
-            auth: Auth::new(auth_mode, api_key.filter(|k| !k.trim().is_empty()))?,
+            auth: Auth::new(auth_mode, api_key.filter(|k| !k.trim().is_empty()), None)?,
         })
+    }
+
+    /// A client for the Open Live in the settings, with its credential as `up` uses
+    /// it: from the OS keychain when the settings say so (`open_live.credential`).
+    pub fn from_settings(settings: &config::OpenLive) -> Result<Self> {
+        Self::from_settings_with(settings, Arc::new(OsKeychain::default()))
+    }
+
+    /// [`from_settings`](Self::from_settings), with `keychain` standing in for the OS
+    /// keychain.
+    pub fn from_settings_with(
+        settings: &config::OpenLive,
+        keychain: Arc<dyn SecretStore>,
+    ) -> Result<Self> {
+        let url = settings.url.as_deref().context("open_live.url is unset")?;
+        let api_key = settings.api_key.as_deref().filter(|k| !k.trim().is_empty());
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .context("building HTTP client")?,
+            base_url: url.trim_end_matches('/').to_string(),
+            auth: Auth::new(
+                settings.auth_mode,
+                api_key,
+                settings.uses_keychain().then_some(keychain),
+            )?,
+        })
+    }
+
+    /// When the Open Source Cloud credential in use stops working with no way to
+    /// renew it, if that falls within `within` from now: Unix seconds. None for a
+    /// sign-in that refreshes, a token that does not expire that soon, and a
+    /// self-hosted Open Live. A caller about to go live warns with it (#65 AC2).
+    pub fn osc_sign_in_ends_within(&self, within: Duration) -> Option<u64> {
+        let Auth::Osc { pat, .. } = &self.auth else {
+            return None;
+        };
+        let end = match pat {
+            OscToken::Keychain(kept) => return kept.ends_within(within),
+            OscToken::Configured(token) => osc::inspect(token)?.expires_at?,
+            OscToken::CliLogin => osc::inspect(&osc::saved_token()?)?.expires_at?,
+        };
+        (end <= osc::now().as_secs() + within.as_secs()).then_some(end)
     }
 
     /// The cloud Strom's hostname and SRT ports, so a venue needs only the Open Live
@@ -428,15 +475,26 @@ enum Auth {
 
 /// Where the OSC personal access token comes from. A configured one wins, so a
 /// deployment tool that injects a key is not overridden by whoever logged in on the
-/// box; otherwise the OSC CLI's login is read afresh at each exchange, so logging in
-/// again renews a running gateway.
+/// box; then the OS keychain, when the settings say a sign-in from the app is kept
+/// there; otherwise the OSC CLI's login is read afresh at each exchange, so logging
+/// in again renews a running gateway.
 pub enum OscToken {
     Configured(String),
+    /// A sign-in kept in the OS keychain, refreshed as it nears expiry.
+    Keychain(Box<KeptCredential>),
     CliLogin,
 }
 
 impl OscToken {
-    pub fn resolve(configured: Option<&str>) -> Result<Self> {
+    pub fn resolve(
+        configured: Option<&str>,
+        keychain: Option<Arc<dyn SecretStore>>,
+    ) -> Result<Self> {
+        if let Some(store) =
+            keychain.filter(|_| configured.map(str::trim).is_none_or(str::is_empty))
+        {
+            return Ok(OscToken::Keychain(Box::new(KeptCredential::new(store)?)));
+        }
         Self::resolve_with(configured, osc::saved_token().is_some())
     }
 
@@ -453,9 +511,10 @@ impl OscToken {
         )
     }
 
-    fn read(&self) -> Result<String> {
+    async fn read(&self) -> Result<String> {
         match self {
             OscToken::Configured(key) => Ok(key.clone()),
+            OscToken::Keychain(kept) => kept.access_token().await,
             OscToken::CliLogin => {
                 let token = osc::saved_token().with_context(|| {
                     format!(
@@ -481,6 +540,7 @@ impl OscToken {
     fn rejected_hint(&self) -> String {
         match self {
             OscToken::Configured(_) => "check open_live.api_key".to_string(),
+            OscToken::Keychain(_) => crate::credential::SIGN_IN_AGAIN.to_string(),
             OscToken::CliLogin => format!(
                 "the OSC CLI login has probably expired; run `{}` again",
                 osc::LOGIN_COMMAND
@@ -503,11 +563,15 @@ struct ServiceTokenResponse {
 }
 
 impl Auth {
-    fn new(mode: AuthMode, key: Option<&str>) -> Result<Self> {
+    fn new(
+        mode: AuthMode,
+        key: Option<&str>,
+        keychain: Option<Arc<dyn SecretStore>>,
+    ) -> Result<Self> {
         Ok(match mode {
             AuthMode::Direct => Auth::Direct(key.map(str::to_string)),
             AuthMode::Osc => Auth::Osc {
-                pat: OscToken::resolve(key)?,
+                pat: OscToken::resolve(key, keychain)?,
                 cache: Mutex::new(None),
             },
         })
@@ -541,10 +605,14 @@ fn is_expiring(cached: &CachedToken) -> bool {
 }
 
 async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken> {
-    let token = pat.read()?;
+    let token = pat.read().await?;
     let res = post_service_token(http, &token).await?;
     let status = res.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        // Refused before it expired, so revoked: the next try refreshes first.
+        if let OscToken::Keychain(kept) = pat {
+            kept.discard_access().await;
+        }
         bail!(
             "OSC token exchange failed with HTTP {status}; {}",
             pat.rejected_hint()
@@ -597,10 +665,13 @@ mod tests {
     #[test]
     fn direct_mode_sends_the_key_as_is_or_nothing() {
         assert_eq!(
-            bearer_of(&Auth::new(AuthMode::Direct, Some("k")).unwrap()).as_deref(),
+            bearer_of(&Auth::new(AuthMode::Direct, Some("k"), None).unwrap()).as_deref(),
             Some("k")
         );
-        assert_eq!(bearer_of(&Auth::new(AuthMode::Direct, None).unwrap()), None);
+        assert_eq!(
+            bearer_of(&Auth::new(AuthMode::Direct, None, None).unwrap()),
+            None
+        );
     }
 
     /// A key in the settings or the environment is deliberate and wins; the CLI login
@@ -617,7 +688,94 @@ mod tests {
             Ok(OscToken::CliLogin)
         ));
         assert!(OscToken::resolve_with(None, false).is_err());
-        assert_eq!(OscToken::Configured("pat".into()).read().unwrap(), "pat");
+        let pat = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(OscToken::Configured("pat".into()).read())
+            .unwrap();
+        assert_eq!(pat, "pat");
+    }
+
+    /// The keychain is used when the settings point at it and no token in the file
+    /// overrides it, and only a credential that cannot be renewed and ends soon is
+    /// worth warning about before going live (#65 AC2).
+    #[test]
+    fn the_keychain_credential_is_used_when_marked_and_warned_about_only_if_it_ends() {
+        use crate::config::CredentialStore;
+        use crate::credential::{self, StoredCredential, SESSION_HORIZON};
+        use crate::keychain::MemoryKeychain;
+
+        let keychain = Arc::new(MemoryKeychain::new());
+        let mut settings = config::OpenLive {
+            url: Some("https://venue.osaas.io".into()),
+            auth_mode: AuthMode::Osc,
+            credential: Some(CredentialStore::Keychain),
+            ..Default::default()
+        };
+        let client =
+            |s: &config::OpenLive| OpenLiveClient::from_settings_with(s, keychain.clone()).unwrap();
+        let is_keychain = |c: &OpenLiveClient| {
+            matches!(
+                &c.auth,
+                Auth::Osc {
+                    pat: OscToken::Keychain(_),
+                    ..
+                }
+            )
+        };
+
+        credential::keep(
+            keychain.as_ref(),
+            &StoredCredential::SignIn {
+                refresh_token: "r".into(),
+                client_id: "c".into(),
+            },
+        )
+        .unwrap();
+        let signed_in = client(&settings);
+        assert!(is_keychain(&signed_in));
+        assert_eq!(signed_in.osc_sign_in_ends_within(SESSION_HORIZON), None);
+
+        let in_an_hour = osc::now().as_secs() + 3600;
+        credential::keep(
+            keychain.as_ref(),
+            &StoredCredential::Token {
+                token: "t".into(),
+                expires_at: Some(in_an_hour),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            signed_in.osc_sign_in_ends_within(SESSION_HORIZON),
+            Some(in_an_hour)
+        );
+        assert_eq!(
+            signed_in.osc_sign_in_ends_within(Duration::from_secs(60)),
+            None
+        );
+
+        settings.api_key = Some("pat".into());
+        let configured = client(&settings);
+        assert!(!is_keychain(&configured), "a token in the settings wins");
+        assert_eq!(configured.osc_sign_in_ends_within(SESSION_HORIZON), None);
+
+        // {"tenantId":"ludde","exp":1788956652}: long past, so it is reported.
+        settings.api_key = Some(
+            "h.eyJ0ZW5hbnRJZCI6Imx1ZGRlIiwiZXhwIjoxNzg4OTU2NjUyLCJpYXQiOjE3ODg5NTMwNTJ9.s".into(),
+        );
+        assert_eq!(
+            client(&settings).osc_sign_in_ends_within(SESSION_HORIZON),
+            Some(1788956652)
+        );
+
+        let direct = config::OpenLive {
+            url: Some("http://127.0.0.1:3000".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            client(&direct).osc_sign_in_ends_within(SESSION_HORIZON),
+            None
+        );
     }
 
     /// A token inside the refresh buffer must count as expiring, or a request can go

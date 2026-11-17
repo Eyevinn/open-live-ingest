@@ -266,7 +266,8 @@ fn render(event: &Event) -> Option<String> {
         Event::Registered { .. }
         | Event::ConnectWarning { .. }
         | Event::InputFailed { .. }
-        | Event::Warning { .. } => return None,
+        | Event::Warning { .. }
+        | Event::OscSignInEnds { .. } => return None,
     })
 }
 

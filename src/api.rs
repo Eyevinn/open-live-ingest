@@ -12,12 +12,16 @@
 //!   as a [`Problem`] instead of stopping at the first.
 //! - [`load`] and [`save`]: the settings file the CLI reads, in the same format, through
 //!   the same code.
+//! - [`keep_osc_sign_in`], [`keep_osc_token`] and [`forget_osc_credential`]: the Open
+//!   Source Cloud credential in the OS keychain, with only a marker in the settings.
 //!
 //! The CLI's `setup` calls these too, and keeps only its prompts.
 
-use crate::config::{self, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE};
+use crate::config::{self, AuthMode, Config, CredentialStore, UplinkMode, SUGGESTED_PORT_RANGE};
+use crate::credential::{self, StoredCredential};
 use crate::gateway::Events;
 use crate::heartbeat;
+use crate::keychain::SecretStore;
 use crate::local_strom;
 use crate::openlive::{OpenLiveClient, ServerInfo};
 use crate::osc;
@@ -140,7 +144,10 @@ pub async fn validate(settings: &Config) -> Vec<Problem> {
         ports_known = false;
     } else {
         let url = cfg.open_live.url.as_deref().unwrap_or_default().trim();
+        // A keychain sign-in is renewed as it is used, so it is checked by using it,
+        // in check_open_live below.
         let expired = cfg.open_live.auth_mode == AuthMode::Osc
+            && !cfg.open_live.uses_keychain()
             && osc_credential(cfg).is_some_and(|(token, source, _)| {
                 let expired = osc::inspect(&token).is_some_and(|i| i.is_expired());
                 if expired {
@@ -284,6 +291,49 @@ impl fmt::Display for SaveError {
 
 impl std::error::Error for SaveError {}
 
+/// Keeps a browser sign-in ([`osc::browser_login`]) in `keychain`, and points the
+/// settings at it: `open_live.credential = "keychain"`, osc mode, and no token in
+/// `open_live.api_key` (#65 AC3). What is kept is the refresh token, which `up`
+/// renews the access token from for as long as a show runs. Save the settings
+/// afterwards; nothing is written to the file here.
+pub fn keep_osc_sign_in(
+    settings: &mut Config,
+    keychain: &dyn SecretStore,
+    sign_in: &osc::Credential,
+) -> Result<()> {
+    keep_in_keychain(settings, keychain, &StoredCredential::from_sign_in(sign_in))
+}
+
+/// Keeps a pasted personal access token in `keychain`, the settings pointing at it
+/// as after a sign-in: the token-paste fallback, with nothing secret in the file.
+pub fn keep_osc_token(
+    settings: &mut Config,
+    keychain: &dyn SecretStore,
+    token: &str,
+) -> Result<()> {
+    keep_in_keychain(settings, keychain, &StoredCredential::from_token(token)?)
+}
+
+fn keep_in_keychain(
+    settings: &mut Config,
+    keychain: &dyn SecretStore,
+    kept: &StoredCredential,
+) -> Result<()> {
+    credential::keep(keychain, kept)?;
+    settings.open_live.auth_mode = AuthMode::Osc;
+    settings.open_live.credential = Some(CredentialStore::Keychain);
+    settings.open_live.api_key = None;
+    Ok(())
+}
+
+/// Removes the Open Source Cloud credential from `keychain` and the marker from the
+/// settings. Save the settings afterwards.
+pub fn forget_osc_credential(settings: &mut Config, keychain: &dyn SecretStore) -> Result<()> {
+    credential::forget(keychain)?;
+    settings.open_live.credential = None;
+    Ok(())
+}
+
 /// Which kind of credential an Open Live address implies. An Open Source Cloud
 /// instance sits behind a proxy that rejects a personal access token presented
 /// directly, so it needs the exchange; anything else takes a static key. Inferring it
@@ -330,11 +380,7 @@ pub fn osc_credential(settings: &Config) -> Option<(String, &'static str, bool)>
 /// Confirms the address and credential work, returning what Open Live says about
 /// its cloud Strom: its host and the SRT ports it has leased.
 pub async fn check_open_live(settings: &Config) -> Result<Option<ServerInfo>> {
-    let client = OpenLiveClient::new(
-        settings.open_live.url.as_deref().unwrap_or_default(),
-        settings.open_live.auth_mode,
-        settings.open_live.api_key.as_deref(),
-    )?;
+    let client = OpenLiveClient::from_settings(&settings.open_live)?;
     // Listing sources exercises the credential; server-info alone might not.
     client.list_sources().await?;
     client.server_info().await

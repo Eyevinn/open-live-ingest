@@ -228,6 +228,70 @@ fn settings_saved_through_the_api_are_what_the_cli_reads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// #65 AC3: after a sign-in from the app, the secret is in the keychain and the
+/// settings file holds only the marker; a later pasted token replaces it the same
+/// way, and forgetting removes both.
+#[test]
+fn a_sign_in_kept_in_the_keychain_leaves_no_token_in_the_settings_file() {
+    use open_live_ingest::config::CredentialStore;
+    use open_live_ingest::credential::{self, StoredCredential};
+    use open_live_ingest::keychain::MemoryKeychain;
+    use open_live_ingest::osc::Credential;
+
+    let dir = scratch("keychain");
+    let path = dir.join("gateway.toml");
+    let keychain = MemoryKeychain::new();
+    let mut cfg = settings(
+        "http://127.0.0.1:8080",
+        "https://venue.eyevinn-open-live.auto.prod-se.osaas.io",
+    );
+    cfg.open_live.api_key = Some("an-older-pasted-token".to_string());
+    cfg.uplink.port_range = Some("47110-47129".to_string());
+
+    let sign_in = Credential {
+        access_token: "access-secret".to_string(),
+        refresh_token: Some("refresh-secret".to_string()),
+        expires_at: Some(1_800_003_600),
+        client_id: "registered-id".to_string(),
+    };
+    api::keep_osc_sign_in(&mut cfg, &keychain, &sign_in).unwrap();
+    api::save_to(&path, &cfg).expect("saves");
+
+    let raw = std::fs::read_to_string(&path).unwrap();
+    for secret in [
+        "access-secret",
+        "refresh-secret",
+        "an-older-pasted-token",
+        "api_key",
+    ] {
+        assert!(!raw.contains(secret), "{secret} is in the file:\n{raw}");
+    }
+    assert!(raw.contains("credential = \"keychain\""), "{raw}");
+    assert!(raw.contains("auth_mode = \"osc\""), "{raw}");
+    assert_eq!(
+        credential::load(&keychain).unwrap(),
+        Some(StoredCredential::SignIn {
+            refresh_token: "refresh-secret".to_string(),
+            client_id: "registered-id".to_string(),
+        })
+    );
+
+    api::keep_osc_token(&mut cfg, &keychain, "  pasted-pat \n").unwrap();
+    assert_eq!(
+        credential::load(&keychain).unwrap(),
+        Some(StoredCredential::Token {
+            token: "pasted-pat".to_string(),
+            expires_at: None,
+        })
+    );
+    assert_eq!(cfg.open_live.credential, Some(CredentialStore::Keychain));
+
+    api::forget_osc_credential(&mut cfg, &keychain).unwrap();
+    assert_eq!(credential::load(&keychain).unwrap(), None);
+    assert_eq!(cfg.open_live.credential, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Invalid settings never reach the file, and the caller hears every problem.
 #[test]
 fn invalid_settings_are_refused_with_every_problem_and_nothing_written() {
