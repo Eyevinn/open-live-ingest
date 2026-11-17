@@ -230,8 +230,10 @@ label  = "Stage left"            # optional: the source is "<gateway.name> — <
   needs.
 
 **OSC credential.** In the OS keychain, not in the file, with the marker #76 defines (#65 AC3). The
-app never writes `open_live.api_key` for an OSC sign-in. A personal access token pasted under
-Advanced goes to the keychain too.
+app never writes `open_live.api_key` for an OSC sign-in. After a browser sign-in the stored
+credential is OSC's refresh token (30 days, renewed at each refresh; #74,
+[research](../research/OSC_BROWSER_SIGN_IN.md)), and the one-hour access token is refreshed from it
+during a session. A personal access token pasted under Advanced goes to the keychain too.
 
 **Nothing else is stored.** No window size, no "last tab", no recent list. The webview runs
 non-persistent (`with_incognito(true)`); on Windows its user-data folder is
@@ -316,7 +318,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `state` | — | the full view model (where-to-send, rows, live flag, Advanced values) | `load` |
 | `osc_sign_in` | — | `{workspace, instances[]}` | `osc::browser_login` (#75), keychain (#76), `instances` (#77) |
 | `osc_paste_token` | `{token}` | `{workspace, instances[]}` | keychain (#76), `instances` |
-| `osc_workspaces` | — | `workspaces[]` | `workspaces` if #74 finds a list API (#77), else re-sign-in |
+| `osc_workspaces` | — | `{workspace, instances[]}` | No list API exists (#74, [research](../research/OSC_BROWSER_SIGN_IN.md)): a new `osc::browser_login`, where the workspace is picked on the OSC consent page (#77) |
 | `choose_instance` | `{url}` | view model | `save` |
 | `self_hosted` | `{url, api_key}` | view model | `check_self_hosted` (#73), `save` |
 | `devices` | `{show_all}` | `{video[], audio[]}` | `devices` (#73, audio from #69) |
@@ -583,6 +585,13 @@ go (AC1b). Expected: the camera with sound as a source in Studio, no terminal op
     works when WebView2 is present but is not tested.
 14. **Should the app keep running Strom after Stop for a faster next Go live?** No. It stops the
     Strom it started, as `up` does, so no camera stays open with nothing supervising it.
+15. **Does OSC offer a browser sign-in the app can use, and can it be refreshed (#74, #65 AC0)?**
+    Yes. Authorization code + PKCE with a loopback redirect, the CLI's flow, and
+    `/api/connect/token` returns a refresh token and accepts `grant_type=refresh_token`. The app
+    registers its own public client id (dynamic client registration, no secret) so the consent page
+    names Open Live Ingest, with `cli` as the fallback. There is no API listing a user's workspaces:
+    the workspace is picked on the consent page and changing it is a new sign-in. Sources and the
+    optional request to the OSC team: [`docs/research/OSC_BROWSER_SIGN_IN.md`](../research/OSC_BROWSER_SIGN_IN.md).
 
 ## 16. Risks
 
