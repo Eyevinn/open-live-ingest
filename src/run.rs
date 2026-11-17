@@ -507,75 +507,32 @@ pub async fn up(
         total_mbps: inputs.len() as f64 * cfg.video.bitrate_kbps as f64 / 1000.0,
     });
 
-    // When the range is Open Live's, so is the port inside it: register first and
-    // take the port Open Live wrote into the source, then build the flows to it.
-    let mut registered = match (&open_live, cloud.port_source) {
-        (Some(client), PortSource::OpenLive) => {
-            assign_ports_from_open_live(
-                client,
-                &mut inputs,
-                &cloud.ports,
-                source_gateway_id.as_deref(),
-                events,
-            )
-            .await?
-        }
-        _ => HashMap::new(),
-    };
-
-    // When the ports are the settings', nothing stops a source from an earlier run
-    // still holding one, and Open Live refuses every registration on it.
-    if let (Some(client), PortSource::Settings) = (&open_live, cloud.port_source) {
-        free_held_ports(
-            client,
-            &inputs,
-            &cfg.gateway.name,
-            source_gateway_id.as_deref(),
-            events,
-        )
-        .await?;
-    }
-
-    clear_conflicting_flows(&strom, &gateway_id, &inputs, events).await?;
-
-    let mut live = Vec::new();
-    for input in inputs {
-        let flow_id = flow::flow_id(&gateway_id, &input.id);
-        let (source_id, connect_warning) = match registered.remove(&input.id) {
-            Some(r) => (Some(r.source_id), r.warning),
-            None => (None, None),
-        };
-        match start(
-            &strom,
-            &flow_id,
-            &flow::build(&gateway_id, &input, &cfg.video),
-        )
-        .await
-        {
-            Ok(()) => live.push(Live {
-                input,
-                flow_id,
-                state: State::Starting,
-                shown: None,
-                last_bytes: None,
-                quiet_polls: 0,
-                source_id,
-                connect_warning,
-                uplink: None,
-            }),
-            // One camera failing must not stop the rest of the venue coming up.
-            Err(err) => {
-                warn!(input = %input.name, err = %format_args!("{err:#}"), "could not start this input");
-                events.emit(Event::InputFailed {
-                    input: input.name.clone(),
-                    reason: format!("{err:#}"),
-                });
+    // From here on sources may be registered with Open Live before any flow runs.
+    // A startup that fails after that removes them again before returning the
+    // error, so a failed start leaves nothing behind (what `Event::Failed`
+    // promises). Flows need nothing extra: `start` removes one that does not come up.
+    let mut registered = HashMap::new();
+    let started = start_inputs(
+        &cfg,
+        &strom,
+        open_live.as_ref(),
+        &cloud,
+        &gateway_id,
+        source_gateway_id.as_deref(),
+        inputs,
+        &mut registered,
+        events,
+    )
+    .await;
+    let mut live = match started {
+        Ok(live) => live,
+        Err(err) => {
+            if let Some(client) = &open_live {
+                remove_registered(client, &registered, events).await;
             }
+            return Err(err);
         }
-    }
-    if live.is_empty() {
-        bail!("no input could be started");
-    }
+    };
 
     events.emit(summary(&live));
     if let Err(err) = write_pidfile() {
@@ -641,6 +598,114 @@ pub async fn up(
     outcome
 }
 
+/// Registers the inputs (when the ports are Open Live's), clears what stands in their
+/// way, and starts a flow for each. Every source registered on the way is recorded
+/// in `registered` as soon as it exists, so that the caller can remove them all
+/// again when this fails, part way through or with no input started.
+#[allow(clippy::too_many_arguments)]
+async fn start_inputs(
+    cfg: &Config,
+    strom: &StromClient,
+    open_live: Option<&OpenLiveClient>,
+    cloud: &Cloud,
+    gateway_id: &str,
+    source_gateway_id: Option<&str>,
+    mut inputs: Vec<Input>,
+    registered: &mut HashMap<String, Registered>,
+    events: &Events,
+) -> Result<Vec<Live>> {
+    // When the range is Open Live's, so is the port inside it: register first and
+    // take the port Open Live wrote into the source, then build the flows to it.
+    if let (Some(client), PortSource::OpenLive) = (open_live, cloud.port_source) {
+        assign_ports_from_open_live(
+            client,
+            &mut inputs,
+            &cloud.ports,
+            source_gateway_id,
+            registered,
+            events,
+        )
+        .await?;
+    }
+
+    // When the ports are the settings', nothing stops a source from an earlier run
+    // still holding one, and Open Live refuses every registration on it.
+    if let (Some(client), PortSource::Settings) = (open_live, cloud.port_source) {
+        free_held_ports(
+            client,
+            &inputs,
+            &cfg.gateway.name,
+            source_gateway_id,
+            events,
+        )
+        .await?;
+    }
+
+    clear_conflicting_flows(strom, gateway_id, &inputs, events).await?;
+
+    let mut live = Vec::new();
+    for input in inputs {
+        let flow_id = flow::flow_id(gateway_id, &input.id);
+        // Looked up, not taken: until startup has succeeded, `registered` is what a
+        // failure removes again.
+        let (source_id, connect_warning) = match registered.get(&input.id) {
+            Some(r) => (Some(r.source_id.clone()), r.warning.clone()),
+            None => (None, None),
+        };
+        match start(
+            strom,
+            &flow_id,
+            &flow::build(gateway_id, &input, &cfg.video),
+        )
+        .await
+        {
+            Ok(()) => live.push(Live {
+                input,
+                flow_id,
+                state: State::Starting,
+                shown: None,
+                last_bytes: None,
+                quiet_polls: 0,
+                source_id,
+                connect_warning,
+                uplink: None,
+            }),
+            // One camera failing must not stop the rest of the venue coming up.
+            Err(err) => {
+                warn!(input = %input.name, err = %format_args!("{err:#}"), "could not start this input");
+                events.emit(Event::InputFailed {
+                    input: input.name.clone(),
+                    reason: format!("{err:#}"),
+                });
+            }
+        }
+    }
+    if live.is_empty() {
+        bail!("no input could be started");
+    }
+    Ok(live)
+}
+
+/// Removes the sources a failed startup registered, and says so for each. Open Live
+/// refusing (a source of an earlier run held by an active production) is reported as
+/// `SourceKept`, as at teardown; anything else as a warning. `down` finds the rest
+/// by name prefix.
+async fn remove_registered(
+    client: &OpenLiveClient,
+    registered: &HashMap<String, Registered>,
+    events: &Events,
+) {
+    let mut sources: Vec<&Registered> = registered.values().collect();
+    sources.sort_by(|a, b| a.input.cmp(&b.input));
+    for r in sources {
+        if remove_source(client, &r.source_id, &r.input, events).await {
+            events.emit(Event::SourceRemoved {
+                input: r.input.clone(),
+            });
+        }
+    }
+}
+
 /// What to do about an input's port given the source Open Live already holds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PortPlan {
@@ -674,20 +739,21 @@ fn plan_port(existing: Option<&Source>, ports: &BTreeSet<u16>) -> PortPlan {
 /// party that sees every source and output has to hand the ports out. An input
 /// registers with port 0, which means "assign one", and takes the port Open Live
 /// wrote into the source. A source left by an earlier run keeps its port, so the
-/// cloud side stays stable across restarts. Returns what each input registered as,
-/// by input id.
+/// cloud side stays stable across restarts. Records what each input registered as,
+/// by input id, in `ids`, each as soon as it exists: on an error part way through,
+/// `ids` holds every source registered before it.
 async fn assign_ports_from_open_live(
     client: &OpenLiveClient,
     inputs: &mut [Input],
     ports: &BTreeSet<u16>,
     gateway_id: Option<&str>,
+    ids: &mut HashMap<String, Registered>,
     events: &Events,
-) -> Result<HashMap<String, Registered>> {
+) -> Result<()> {
     let sources = client
         .list_sources()
         .await
         .context("listing Open Live's sources to assign ports")?;
-    let mut ids = HashMap::new();
     for input in inputs.iter_mut() {
         let existing = sources.iter().find(|s| s.name == input.name);
         let mut warning = None;
@@ -697,7 +763,14 @@ async fn assign_ports_from_open_live(
                     note_connect_warning(&input.name, stored, &mut warning, false, events);
                 }
                 input.endpoint.port = port;
-                ids.insert(input.id.clone(), Registered { source_id, warning });
+                ids.insert(
+                    input.id.clone(),
+                    Registered {
+                        input: input.name.clone(),
+                        source_id,
+                        warning,
+                    },
+                );
                 continue;
             }
             PortPlan::Create => {
@@ -746,6 +819,14 @@ async fn assign_ports_from_open_live(
                 (source_id, patched.address)
             }
         };
+        ids.insert(
+            input.id.clone(),
+            Registered {
+                input: input.name.clone(),
+                source_id,
+                warning,
+            },
+        );
         let port = listener_port(&address).with_context(|| {
             format!(
                 "Open Live stored {} for {:?}, which names no listener port; is it running a version that assigns ports?",
@@ -754,14 +835,15 @@ async fn assign_ports_from_open_live(
             )
         })?;
         input.endpoint.port = port;
-        ids.insert(input.id.clone(), Registered { source_id, warning });
     }
-    Ok(ids)
+    Ok(())
 }
 
 /// What registering an input with Open Live left behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Registered {
+    /// The input's name, which is also the source's.
+    input: String,
     source_id: String,
     /// The `connect.warning` already logged for it, if any.
     warning: Option<String>,

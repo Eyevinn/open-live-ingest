@@ -87,7 +87,8 @@ pub enum Event {
     Stopped,
     /// A session ended on an error, before it ran or as it ran, for `reason`: the
     /// same text the CLI prints after `Error:`. Anything it had started has been
-    /// removed again. Its last event.
+    /// removed again, flows and the Open Live sources it registered, except after a
+    /// panic (see `session`'s caveats). Its last event.
     Failed { reason: String },
 }
 
