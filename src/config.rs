@@ -28,6 +28,21 @@ pub struct Config {
     pub video: Video,
     pub capture: Capture,
     pub log: Log,
+    /// `[[input]]`: settings for one input, by device.
+    #[serde(rename = "input", skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputSettings>,
+}
+
+/// One `[[input]]` entry. Today it pairs an audio source with a camera; `up --audio`
+/// replaces these for that run.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InputSettings {
+    /// The camera, by Strom device id or name fragment, as `--devices` takes it.
+    pub device: String,
+    /// An audio source to send with it, by Strom device id or name fragment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -632,6 +647,26 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
         }
     }
 
+    // The same check `up` makes against the resolved devices, made early on the text
+    // so the settings file is refused before anything starts.
+    let mut paired: Vec<(&str, &str)> = Vec::new();
+    for entry in &cfg.inputs {
+        let device = entry.device.trim();
+        if device.is_empty() {
+            bail!("an [[input]] entry has no device");
+        }
+        let Some(audio) = entry.audio.as_deref().map(str::trim) else {
+            continue;
+        };
+        if audio.is_empty() {
+            bail!("the [[input]] entry for {device:?} has an empty audio; remove the line for no audio");
+        }
+        if let Some((other, _)) = paired.iter().find(|(_, a)| a.eq_ignore_ascii_case(audio)) {
+            bail!("audio source {audio:?} is paired with both {other:?} and {device:?} in [[input]]; one audio source goes with one camera");
+        }
+        paired.push((device, audio));
+    }
+
     if cfg.open_live.register {
         if cfg
             .open_live
@@ -783,6 +818,46 @@ mod tests {
     #[test]
     fn the_defaults_plus_an_open_live_url_validate() {
         validate(&valid()).expect("should validate");
+    }
+
+    #[test]
+    fn input_entries_pair_audio_and_one_audio_source_is_not_paired_twice() {
+        let mut cfg: Config = toml::from_str(
+            "[[input]]\ndevice = \"FaceTime\"\naudio = \"USB Microphone\"\n\n[[input]]\ndevice = \"DeckLink\"\n",
+        )
+        .expect("parses");
+        assert_eq!(
+            cfg.inputs,
+            [
+                InputSettings {
+                    device: "FaceTime".to_string(),
+                    audio: Some("USB Microphone".to_string()),
+                },
+                InputSettings {
+                    device: "DeckLink".to_string(),
+                    audio: None,
+                },
+            ]
+        );
+        cfg.gateway = valid().gateway;
+        cfg.open_live = valid().open_live;
+        validate(&cfg).expect("should validate");
+
+        cfg.inputs[1].audio = Some("usb microphone".to_string());
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("paired with both"), "{err}");
+
+        cfg.inputs[1].audio = Some(" ".to_string());
+        assert!(validate(&cfg).is_err());
+
+        assert!(toml::from_str::<Config>("[[input]]\ndevice = \"x\"\nmic = \"y\"\n").is_err());
+    }
+
+    /// A file without `[[input]]` is written back without one.
+    #[test]
+    fn no_input_entries_write_no_input_section() {
+        let text = toml::to_string_pretty(&valid()).unwrap();
+        assert!(!text.contains("input"), "{text}");
     }
 
     /// The shipped example is the first thing an operator copies, so it must load.

@@ -148,16 +148,20 @@ Success adds one line under `Open Live`:
 open-live-ingest devices --json
 ```
 
-Success: exit 0 and a JSON array, one object per device Strom can see:
+Success: exit 0 and a JSON array, one object per device Strom can see, cameras first and then audio
+sources:
 
 ```json
 [
-  { "name": "DeckLink SDI (1)", "id": "decklink-0", "virtual": false },
-  { "name": "OBS Virtual Camera", "id": "obs-0", "virtual": true }
+  { "name": "DeckLink SDI (1)", "id": "decklink-0", "kind": "video", "virtual": false },
+  { "name": "OBS Virtual Camera", "id": "obs-0", "kind": "video", "virtual": true },
+  { "name": "USB Microphone", "id": "dev-5e1a0c3f9b2d7e41", "kind": "audio", "virtual": false }
 ]
 ```
 
-`virtual: true` devices are skipped by `up` unless `--all`. An empty array means no capture device
+`virtual: true` devices are skipped by `up` unless `--all`. Audio sources are sent only when paired
+with a camera: `up --audio "DeckLink=USB Microphone"` (repeat for more cameras), or an `[[input]]`
+entry in the settings with `device` and `audio`. One audio source goes with one camera. An empty array means no capture device
 is connected or recognised; `up --test` streams a test pattern and tone instead, to commission the
 link before cameras arrive.
 

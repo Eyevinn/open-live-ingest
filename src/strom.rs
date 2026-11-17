@@ -71,9 +71,19 @@ impl StromClient {
     }
 
     /// Video sources, as Strom's discovery sees them.
-    pub async fn devices(&self) -> Result<Vec<DeviceResponse>> {
+    pub async fn video_devices(&self) -> Result<Vec<DeviceResponse>> {
+        self.devices_in("video_source").await
+    }
+
+    /// Audio sources (microphones, line inputs), as Strom's discovery sees them.
+    pub async fn audio_devices(&self) -> Result<Vec<DeviceResponse>> {
+        self.devices_in("audio_source").await
+    }
+
+    /// `category` is one of the names Strom's discovery route accepts.
+    async fn devices_in(&self, category: &str) -> Result<Vec<DeviceResponse>> {
         let res = self
-            .get("/api/discovery/devices?category=video_source")
+            .get(&format!("/api/discovery/devices?category={category}"))
             .send()
             .await
             .context("GET devices")?;
@@ -323,5 +333,16 @@ mod tests {
         }]))
         .unwrap();
         assert_eq!(devices[0].name, "FaceTime HD Camera");
+
+        let audio: Vec<DeviceResponse> = serde_json::from_value(json!([{
+            "id": "dev-5e1a0c3f9b2d7e41", "name": "USB Audio Device",
+            "device_class": "Audio/Source", "category": "audiosource", "provider": "avfprovider",
+            "properties": {}, "first_seen_secs_ago": 1, "last_seen_secs_ago": 1
+        }]))
+        .unwrap();
+        assert_eq!(
+            audio[0].category,
+            strom_types::discovery::DeviceCategory::AudioSource
+        );
     }
 }

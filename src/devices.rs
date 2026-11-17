@@ -1,10 +1,11 @@
 //! From the devices Strom can see to the inputs the gateway streams: filtering,
 //! selection, naming, and port allocation.
 
-use crate::config::{format_ports, Capture, Uplink};
+use crate::config::{format_ports, Capture, InputSettings, Uplink};
 use crate::flow::{self, Input, Source};
 use anyhow::{bail, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 use strom_types::discovery::DeviceResponse;
 
 /// Devices that exist but produce nothing unless another application is running.
@@ -51,34 +52,149 @@ pub fn choose(
         .map(str::trim)
         .filter(|w| !w.is_empty())
     {
-        let needle = wanted.to_lowercase();
-        let matches: Vec<&DeviceResponse> = devices
-            .iter()
-            .filter(|d| {
-                d.id.eq_ignore_ascii_case(wanted) || d.name.to_lowercase().contains(&needle)
-            })
-            .collect();
-        match matches.as_slice() {
-            [device] => chosen.push((*device).clone()),
-            [] => {
-                bail!("no device matches {wanted:?}. Run `open-live-ingest devices` to see them.")
-            }
-            // Starting the wrong camera is worse than asking again with a longer name.
-            several => bail!(
-                "{wanted:?} matches {} devices ({}). Use a longer name or an id.",
-                several.len(),
-                several
-                    .iter()
-                    .map(|d| d.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
+        chosen.push(find_one(&devices, wanted, ("device", "devices"))?.clone());
     }
     if chosen.is_empty() {
         bail!("--devices selected nothing");
     }
     Ok(chosen)
+}
+
+/// The one device `wanted` names, by id or name fragment. `what` names the list in
+/// the error, singular and plural.
+fn find_one<'a>(
+    devices: &'a [DeviceResponse],
+    wanted: &str,
+    (what, whats): (&str, &str),
+) -> Result<&'a DeviceResponse> {
+    let matches = matching(devices, wanted);
+    match matches.as_slice() {
+        [device] => Ok(device),
+        [] => bail!("no {what} matches {wanted:?}. Run `open-live-ingest devices` to see them."),
+        // Starting the wrong camera is worse than asking again with a longer name.
+        several => bail!(
+            "{wanted:?} matches {} {whats} ({}). Use a longer name or an id.",
+            several.len(),
+            several
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn matching<'a>(devices: &'a [DeviceResponse], wanted: &str) -> Vec<&'a DeviceResponse> {
+    let needle = wanted.to_lowercase();
+    devices
+        .iter()
+        .filter(|d| d.id.eq_ignore_ascii_case(wanted) || d.name.to_lowercase().contains(&needle))
+        .collect()
+}
+
+/// An audio source to send with a camera, each named by id or name fragment as
+/// `--devices` names cameras. Written `<camera>=<audio>` on the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioPairing {
+    pub camera: String,
+    pub audio: String,
+}
+
+impl FromStr for AudioPairing {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (camera, audio) = s
+            .split_once('=')
+            .map(|(c, a)| (c.trim(), a.trim()))
+            .filter(|(c, a)| !c.is_empty() && !a.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "expected <camera>=<audio source>, e.g. \"FaceTime=USB Microphone\", got {s:?}"
+                )
+            })?;
+        Ok(Self {
+            camera: camera.to_string(),
+            audio: audio.to_string(),
+        })
+    }
+}
+
+/// The settings' `[[input]]` entries that pair audio with one of this run's cameras.
+/// Entries for a camera not in this run (unplugged, or left out by `--devices`) are
+/// returned separately so the caller can say so; they are not an error, because the
+/// settings outlive any one run.
+pub fn settings_pairings(
+    entries: &[InputSettings],
+    cameras: &[DeviceResponse],
+) -> (Vec<AudioPairing>, Vec<String>) {
+    let mut pairings = Vec::new();
+    let mut absent = Vec::new();
+    for entry in entries {
+        let Some(audio) = entry
+            .audio
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        else {
+            continue;
+        };
+        if matching(cameras, entry.device.trim()).is_empty() {
+            absent.push(entry.device.clone());
+            continue;
+        }
+        pairings.push(AudioPairing {
+            camera: entry.device.trim().to_string(),
+            audio: audio.to_string(),
+        });
+    }
+    (pairings, absent)
+}
+
+/// Resolves pairings against this run's cameras and the audio sources Strom reports,
+/// to camera id -> audio source id. Refused before any flow starts: one audio source
+/// on two cameras (the same sound on two sources is a mistake, and two flows would
+/// open one device), and two audio sources on one camera (a feed carries one track).
+pub fn pair_audio(
+    cameras: &[DeviceResponse],
+    audio_sources: &[DeviceResponse],
+    pairings: &[AudioPairing],
+) -> Result<BTreeMap<String, String>> {
+    let mut by_camera: BTreeMap<String, String> = BTreeMap::new();
+    // audio id -> (audio name, camera name), for the error message.
+    let mut by_audio: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for pairing in pairings {
+        let camera = find_one(
+            cameras,
+            &pairing.camera,
+            ("camera in this run", "cameras in this run"),
+        )?;
+        let audio = find_one(
+            audio_sources,
+            &pairing.audio,
+            ("audio source", "audio sources"),
+        )?;
+        if let Some(existing) = by_camera.get(&camera.id) {
+            if *existing == audio.id {
+                continue;
+            }
+            let other = by_audio.get(existing).map_or(existing.as_str(), |(n, _)| n);
+            bail!(
+                "{:?} is paired with two audio sources ({other:?} and {:?}). A camera carries one.",
+                camera.name,
+                audio.name
+            );
+        }
+        if let Some((audio_name, other_camera)) = by_audio.get(&audio.id) {
+            bail!(
+                "{audio_name:?} is already paired with {other_camera:?}, so it cannot also go with {:?}. Pick another audio source.",
+                camera.name
+            );
+        }
+        by_camera.insert(camera.id.clone(), audio.id.clone());
+        by_audio.insert(audio.id.clone(), (audio.name.clone(), camera.name.clone()));
+    }
+    Ok(by_camera)
 }
 
 /// The prefix every source and flow of this gateway carries, so an operator can tell
@@ -136,6 +252,7 @@ pub fn inputs_for(
             name: format!("{prefix}{}", device.name),
             source: Source::Device {
                 device_id: device.id.clone(),
+                audio_device: None,
                 resolution: capture.video_resolution.clone(),
                 framerate: capture.video_framerate.clone(),
             },
@@ -143,6 +260,21 @@ pub fn inputs_for(
         });
     }
     Ok(inputs)
+}
+
+/// Gives each camera input the audio source paired with it. `audio` maps a camera's
+/// device id to an audio source id, as [`pair_audio`] returns it.
+pub fn attach_audio(inputs: &mut [Input], audio: &BTreeMap<String, String>) {
+    for input in inputs {
+        if let Source::Device {
+            device_id,
+            audio_device,
+            ..
+        } = &mut input.source
+        {
+            *audio_device = audio.get(device_id.as_str()).cloned();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +383,158 @@ mod tests {
             .all(|i| i.name.starts_with(&name_prefix("Venue A"))));
         assert_eq!(inputs[0].id, flow::TEST_INPUT_ID);
         assert_eq!(inputs[1].id, "dev-d3");
+    }
+
+    fn audio(id: &str, name: &str) -> DeviceResponse {
+        DeviceResponse {
+            device_class: "Audio/Source".to_string(),
+            category: strom_types::discovery::DeviceCategory::AudioSource,
+            ..device(id, name)
+        }
+    }
+
+    fn mics() -> Vec<DeviceResponse> {
+        vec![
+            audio("m1", "USB Microphone"),
+            audio("m2", "MacBook Pro Microphone"),
+            audio("m3", "Scarlett 2i2 USB"),
+        ]
+    }
+
+    fn pairing(s: &str) -> AudioPairing {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_pairing_is_camera_equals_audio() {
+        assert_eq!(
+            pairing(" FaceTime = USB Microphone "),
+            AudioPairing {
+                camera: "FaceTime".to_string(),
+                audio: "USB Microphone".to_string()
+            }
+        );
+        for bad in ["FaceTime", "=USB", "FaceTime=", " = ", ""] {
+            let err = bad.parse::<AudioPairing>().unwrap_err();
+            assert!(err.contains("<camera>=<audio source>"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn pairings_resolve_to_ids_by_name_fragment_or_id() {
+        let cameras = choose(devices(), false, None).unwrap();
+        let paired = pair_audio(
+            &cameras,
+            &mics(),
+            &[pairing("facetime=usb microphone"), pairing("d3=m3")],
+        )
+        .unwrap();
+        assert_eq!(paired.get("d2").map(String::as_str), Some("m1"));
+        assert_eq!(paired.get("d3").map(String::as_str), Some("m3"));
+        assert_eq!(paired.len(), 2);
+
+        let mut inputs = inputs_for(
+            &cameras,
+            false,
+            "V",
+            &Uplink::default(),
+            &Capture::default(),
+            "cloud",
+            &(9000..=9001).collect(),
+        )
+        .unwrap();
+        attach_audio(&mut inputs, &paired);
+        let audio_of: Vec<Option<&str>> = inputs
+            .iter()
+            .map(|i| match &i.source {
+                Source::Device { audio_device, .. } => audio_device.as_deref(),
+                Source::Test { .. } => None,
+            })
+            .collect();
+        assert_eq!(audio_of, [Some("m3"), Some("m1")]);
+    }
+
+    /// #64 AC5: refused with a clear error, before any flow starts.
+    #[test]
+    fn one_audio_source_on_two_cameras_is_refused() {
+        let cameras = choose(devices(), false, None).unwrap();
+        let err = pair_audio(
+            &cameras,
+            &mics(),
+            &[pairing("FaceTime=USB Microphone"), pairing("DeckLink=m1")],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("\"USB Microphone\" is already paired with \"FaceTime HD Camera\""),
+            "{err}"
+        );
+        assert!(err.contains("\"DeckLink Mini Recorder\""), "{err}");
+    }
+
+    #[test]
+    fn two_audio_sources_on_one_camera_are_refused_but_a_repeat_is_not() {
+        let cameras = choose(devices(), false, None).unwrap();
+        let err = pair_audio(
+            &cameras,
+            &mics(),
+            &[
+                pairing("FaceTime=USB Microphone"),
+                pairing("FaceTime=Scarlett"),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("paired with two audio sources"), "{err}");
+
+        let same_twice = pair_audio(
+            &cameras,
+            &mics(),
+            &[pairing("FaceTime=USB Microphone"), pairing("d2=m1")],
+        )
+        .unwrap();
+        assert_eq!(same_twice.len(), 1);
+    }
+
+    #[test]
+    fn a_pairing_must_name_exactly_one_camera_of_this_run_and_one_audio_source() {
+        let cameras = choose(devices(), false, Some("FaceTime")).unwrap();
+        let err = pair_audio(&cameras, &mics(), &[pairing("DeckLink=m1")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no camera in this run matches"), "{err}");
+        let err = pair_audio(&cameras, &mics(), &[pairing("FaceTime=Microphone")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches 2 audio sources"), "{err}");
+        let err = pair_audio(&cameras, &mics(), &[pairing("FaceTime=Rode")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no audio source matches"), "{err}");
+    }
+
+    /// The settings outlive a run: an entry for a camera not in it is set aside, not
+    /// an error, and an entry without audio pairs nothing.
+    #[test]
+    fn settings_entries_pair_only_this_runs_cameras() {
+        let cameras = choose(devices(), false, Some("FaceTime")).unwrap();
+        let entries = [
+            InputSettings {
+                device: "FaceTime".to_string(),
+                audio: Some("USB Microphone".to_string()),
+            },
+            InputSettings {
+                device: "DeckLink".to_string(),
+                audio: Some("Scarlett".to_string()),
+            },
+            InputSettings {
+                device: "d2".to_string(),
+                audio: None,
+            },
+        ];
+        let (pairings, absent) = settings_pairings(&entries, &cameras);
+        assert_eq!(pairings, [pairing("FaceTime=USB Microphone")]);
+        assert_eq!(absent, ["DeckLink"]);
     }
 
     /// Better a clear error than two inputs fighting over one port.

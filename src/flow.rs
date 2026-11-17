@@ -2,8 +2,10 @@
 //!
 //! ```text
 //!   builtin.local_input ── video_out ──> builtin.videoenc ── encoded_out ──> builtin.mpegtssrt_output
-//!   (or videotestsrc/audiotestsrc)                                           audio_in_0 <── test tone
+//!   (or videotestsrc/audiotestsrc)  ── audio_out ─────────────────────────────> audio_in_0
 //! ```
+//!
+//! Audio reaches the uplink only from a paired audio device or the test tone.
 //!
 //! The flow's structure is typed through `strom-types`. Block definition ids and
 //! property names are still Strom's strings: they live in each block's builder in
@@ -52,11 +54,12 @@ pub fn device_input_id(device_id: &str) -> String {
 /// What an input captures.
 #[derive(Debug, Clone)]
 pub enum Source {
-    /// A device Strom can see, by its discovery id. Video only: a webcam's
-    /// microphone is a separate device on its own clock and drifts against the
-    /// video over a long show. Embedded audio means SDI.
+    /// A device Strom can see, by its discovery id, and optionally an audio source
+    /// paired with it (also a discovery id). The audio device runs on its own clock;
+    /// see docs/DESIGN.md on drift.
     Device {
         device_id: String,
+        audio_device: Option<String>,
         resolution: Option<String>,
         framerate: Option<String>,
     },
@@ -84,13 +87,26 @@ pub fn build(gateway_id: &str, input: &Input, video: &Video) -> Flow {
     let has_audio = match &input.source {
         Source::Device {
             device_id,
+            audio_device,
             resolution,
             framerate,
         } => {
+            let audio_device = audio_device.as_deref().filter(|a| !a.is_empty());
             let mut properties = props([
-                ("stream_mode", "video".into()),
+                (
+                    "stream_mode",
+                    if audio_device.is_some() {
+                        "audio_video"
+                    } else {
+                        "video"
+                    }
+                    .into(),
+                ),
                 ("video_device", device_id.as_str().into()),
             ]);
+            if let Some(audio) = audio_device {
+                properties.insert("audio_device".into(), audio.into());
+            }
             if let Some(res) = resolution.as_deref().filter(|r| !r.is_empty()) {
                 properties.insert("video_resolution".into(), res.into());
             }
@@ -105,7 +121,10 @@ pub fn build(gateway_id: &str, input: &Input, video: &Video) -> Flow {
                 0.0,
             ));
             links.push(link(BLOCK_CAPTURE, "video_out", BLOCK_ENCODER, "video_in"));
-            false
+            if audio_device.is_some() {
+                links.push(link(BLOCK_CAPTURE, "audio_out", BLOCK_UPLINK, "audio_in_0"));
+            }
+            audio_device.is_some()
         }
         // Raw elements: Strom has no test-source block. The capsfilters are not
         // optional; without them the sources negotiate 320x240 and 44.1 kHz mono.
@@ -306,6 +325,7 @@ mod tests {
     fn device(resolution: Option<&str>, framerate: Option<&str>) -> Source {
         Source::Device {
             device_id: "dev-abc".to_string(),
+            audio_device: None,
             resolution: resolution.map(str::to_string),
             framerate: framerate.map(str::to_string),
         }
@@ -375,6 +395,71 @@ mod tests {
         assert_eq!(block_of(&flow, "capture").block_definition_id, LOCAL_INPUT);
         assert_eq!(flow.id, flow_id("gw", "dev-abc"));
         assert_eq!(flow.name, "Venue A — Cam");
+    }
+
+    #[test]
+    fn a_device_flow_without_audio_asks_for_video_only() {
+        let flow = build("gw", &input(device(None, None)), &Video::default());
+        let capture = block_of(&flow, "capture");
+        assert_eq!(text(capture, "stream_mode").as_deref(), Some("video"));
+        assert!(text(capture, "audio_device").is_none());
+    }
+
+    fn with_audio(audio: &str) -> Source {
+        Source::Device {
+            device_id: "dev-abc".to_string(),
+            audio_device: Some(audio.to_string()),
+            resolution: None,
+            framerate: None,
+        }
+    }
+
+    /// A paired audio device rides in the same local-input block and goes straight
+    /// to the uplink, which encodes it; the track is declared because it is delivered.
+    #[test]
+    fn a_paired_audio_device_is_captured_and_linked_to_the_uplink() {
+        let flow = build("gw", &input(with_audio("dev-mic")), &Video::default());
+        let capture = block_of(&flow, "capture");
+        assert_eq!(text(capture, "stream_mode").as_deref(), Some("audio_video"));
+        assert_eq!(text(capture, "audio_device").as_deref(), Some("dev-mic"));
+        assert_eq!(text(capture, "video_device").as_deref(), Some("dev-abc"));
+        let links = links_of(&flow);
+        assert!(links.contains(&("capture:video_out".into(), "encoder:video_in".into())));
+        assert!(links.contains(&("capture:audio_out".into(), "uplink:audio_in_0".into())));
+        assert!(links.contains(&("encoder:encoded_out".into(), "uplink:video_in".into())));
+        assert_eq!(links.len(), 3);
+        assert_eq!(number(block_of(&flow, "uplink"), "num_audio_tracks"), 1);
+        assert_eq!(number(block_of(&flow, "uplink"), "num_video_tracks"), 1);
+
+        // The flow id follows the camera alone, so pairing a microphone does not
+        // orphan the flow an earlier run left.
+        assert_eq!(flow.id, flow_id("gw", "dev-abc"));
+        assert!(is_ours(&flow, "gw"));
+        assert_eq!(capture_device_of(&flow), Some("dev-abc"));
+
+        // What Strom receives: plain strings, under the block's own property names.
+        let json = serde_json::to_value(&flow).unwrap();
+        let capture_json = json["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["id"] == "capture")
+            .unwrap();
+        assert_eq!(capture_json["block_definition_id"], LOCAL_INPUT);
+        assert_eq!(capture_json["properties"]["stream_mode"], "audio_video");
+        assert_eq!(capture_json["properties"]["audio_device"], "dev-mic");
+    }
+
+    /// An empty audio id is no audio, not a request for the OS default microphone.
+    #[test]
+    fn an_empty_audio_device_leaves_the_flow_video_only() {
+        let flow = build("gw", &input(with_audio("")), &Video::default());
+        assert_eq!(
+            text(block_of(&flow, "capture"), "stream_mode").as_deref(),
+            Some("video")
+        );
+        assert_eq!(number(block_of(&flow, "uplink"), "num_audio_tracks"), 0);
+        assert_eq!(links_of(&flow).len(), 2);
     }
 
     /// The default is "whatever the device offers": a requested format the device

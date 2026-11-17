@@ -54,6 +54,13 @@ enum Command {
         #[arg(long)]
         devices: Option<String>,
 
+        /// Send an audio source with a camera, both by id or name fragment, e.g.
+        /// `--audio "FaceTime=USB Microphone"`. Repeat for more cameras. One audio
+        /// source goes with one camera. Replaces the settings' [[input]] audio for
+        /// this run.
+        #[arg(long = "audio", value_name = "CAMERA=AUDIO")]
+        audio: Vec<devices::AudioPairing>,
+
         /// Stream a test pattern and tone instead of any device, to commission the
         /// link before the cameras arrive.
         #[arg(long)]
@@ -103,6 +110,7 @@ async fn main() -> Result<()> {
     let command = cli.command.unwrap_or(Command::Up {
         all: false,
         devices: None,
+        audio: Vec::new(),
         test: false,
         reconfigure: false,
     });
@@ -130,6 +138,7 @@ async fn main() -> Result<()> {
         Command::Up {
             all,
             devices,
+            audio,
             test,
             reconfigure,
         } => {
@@ -138,7 +147,7 @@ async fn main() -> Result<()> {
                 setup::report_saved(&path);
             }
             config::validate(&cfg)?;
-            run::up(cfg, all, devices, test).await
+            run::up(cfg, all, devices, audio, test).await
         }
         Command::Down => {
             config::validate(&cfg)?;
@@ -199,6 +208,32 @@ mod tests {
                 "{secret} must not be a flag"
             );
         }
+    }
+
+    #[test]
+    fn up_takes_repeated_audio_pairings_and_refuses_a_malformed_one() {
+        let cli = Cli::try_parse_from([
+            "open-live-ingest",
+            "up",
+            "--audio",
+            "FaceTime=USB Microphone",
+            "--audio",
+            "DeckLink=dev-5e1a",
+        ])
+        .expect("parses");
+        let Some(Command::Up { audio, .. }) = cli.command else {
+            panic!("not up");
+        };
+        assert_eq!(
+            audio,
+            [
+                "FaceTime=USB Microphone".parse().unwrap(),
+                "DeckLink=dev-5e1a"
+                    .parse::<devices::AudioPairing>()
+                    .unwrap(),
+            ]
+        );
+        assert!(Cli::try_parse_from(["open-live-ingest", "up", "--audio", "FaceTime"]).is_err());
     }
 
     #[test]
