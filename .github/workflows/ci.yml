@@ -30,3 +30,100 @@ jobs:
         run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+
+  # The session AC2 test (`start_events_and_stop_against_a_real_strom`, #[ignore]d so
+  # `cargo test` above stays GStreamer-free) against a real Strom: the release binary
+  # of the strom-types tag pinned in Cargo.toml, so a pin bump moves this job with it.
+  # The test fails unless Strom negotiates H.264 and AAC into the muxer and MPEG-TS
+  # into the SRT sink, hence the full plugin set (x264enc, avenc_aac, mpegtsmux,
+  # srtsink). Mesa plus a surfaceless EGL setup is what keeps Strom's GL probe from
+  # segfaulting at startup on a GPU-less runner (#87, #88).
+  real-strom:
+    runs-on: ubuntu-latest
+    env:
+      STROM_PORT: "8080"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install the GStreamer runtime and plugins
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+            libgstreamer-plugins-bad1.0-0 libgstreamer-gl1.0-0 \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            gstreamer1.0-tools libcairo2 \
+            libegl1 libegl-mesa0 libgles2 libgl1-mesa-dri
+
+      - name: Download Strom at the strom-types pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The same pin Cargo.toml, build.rs and build-macos-app.sh use.
+          tag="$(sed -n 's/^strom-types = .*tag = "\([^"]*\)".*/\1/p' Cargo.toml)"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "cannot read the strom-types tag from Cargo.toml (got '$tag')"; exit 1; }
+          asset="strom-$tag-linux-x86_64"
+          echo "Strom $tag ($asset), from the strom-types pin in Cargo.toml"
+          release="$RUNNER_TEMP/strom-release.json"
+          curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Eyevinn/strom/releases/tags/$tag" -o "$release"
+          url="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .browser_download_url' "$release")"
+          digest="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .digest // empty' "$release")"
+          [[ -n "$url" ]] || { echo "Strom $tag has no asset $asset"; exit 1; }
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          curl -fsSL -o "$bin/strom" "$url"
+          if [[ "$digest" == sha256:* ]]; then
+            got="$(sha256sum "$bin/strom" | awk '{print $1}')"
+            [[ "sha256:$got" == "$digest" ]] \
+              || { echo "$asset: SHA-256 $got does not match the release ($digest)"; exit 1; }
+          fi
+          chmod +x "$bin/strom"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      # Built before Strom starts so the compile does not eat into the test's timeouts.
+      - name: Build the session test
+        run: cargo test --test session --no-run
+
+      - name: Start Strom
+        env:
+          GST_GL_PLATFORM: egl
+          GST_GL_WINDOW: surfaceless
+          EGL_PLATFORM: surfaceless
+        run: |
+          set -euo pipefail
+          data="$RUNNER_TEMP/strom"
+          mkdir -p "$data"
+          log="$RUNNER_TEMP/strom.log"
+          strom --version || true
+          nohup strom --headless --port "$STROM_PORT" --data-dir "$data" >"$log" 2>&1 &
+          strom_pid=$!
+          echo "$strom_pid" > "$RUNNER_TEMP/strom.pid"
+          ready=false
+          for _ in $(seq 1 90); do
+            if ! kill -0 "$strom_pid" 2>/dev/null; then echo "Strom exited"; cat "$log"; exit 1; fi
+            if curl -fsS -m 5 "http://127.0.0.1:$STROM_PORT/api/version" >/dev/null 2>&1; then ready=true; break; fi
+            sleep 1
+          done
+          $ready || { echo "Strom did not answer within 90s"; cat "$log"; exit 1; }
+          echo "Strom version API: $(curl -fsS -m 5 "http://127.0.0.1:$STROM_PORT/api/version")"
+          devices="$(curl -fsS -m 60 "http://127.0.0.1:$STROM_PORT/api/discovery/devices?category=video_source")" \
+            || { echo "device discovery failed"; cat "$log"; exit 1; }
+          echo "Strom device discovery: $devices"
+
+      - name: Run the session test against Strom
+        run: OLI_TEST_STROM_URL="http://127.0.0.1:$STROM_PORT" cargo test --test session -- --ignored < /dev/null
+
+      - name: Strom log (tail)
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/strom.pid" ]]; then kill "$(cat "$RUNNER_TEMP/strom.pid")" 2>/dev/null || true; fi
+          if [[ -f "$RUNNER_TEMP/strom.log" ]]; then tail -n 200 "$RUNNER_TEMP/strom.log"; else echo "no strom.log"; fi
