@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -78,14 +81,14 @@ jobs:
           url="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .browser_download_url' "$release")"
           digest="$(jq -r --arg n "$asset" '.assets[] | select(.name == $n) | .digest // empty' "$release")"
           [[ -n "$url" ]] || { echo "Strom $tag has no asset $asset"; exit 1; }
+          [[ "$digest" == sha256:* ]] || { echo "GitHub records no SHA-256 digest for $asset"; exit 1; }
           bin="$RUNNER_TEMP/bin"
           mkdir -p "$bin"
           curl -fsSL -o "$bin/strom" "$url"
-          if [[ "$digest" == sha256:* ]]; then
-            got="$(sha256sum "$bin/strom" | awk '{print $1}')"
-            [[ "sha256:$got" == "$digest" ]] \
-              || { echo "$asset: SHA-256 $got does not match the release ($digest)"; exit 1; }
-          fi
+          got="$(sha256sum "$bin/strom" | awk '{print $1}')"
+          [[ "sha256:$got" == "$digest" ]] \
+            || { echo "$asset: SHA-256 $got does not match the release ($digest)"; exit 1; }
+          echo "SHA-256 OK: $got"
           chmod +x "$bin/strom"
           echo "$bin" >> "$GITHUB_PATH"
 
