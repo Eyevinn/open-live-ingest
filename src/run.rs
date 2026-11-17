@@ -16,7 +16,7 @@
 use crate::config::{self, format_ports, mask_passphrase, Config, UplinkMode, Video};
 use crate::devices;
 use crate::flow::{self, Input};
-use crate::gateway::{Event, Events, InputState as State, SummaryRow};
+use crate::gateway::{Event, Events, InputState as State, InputStats, SummaryRow, UplinkStats};
 use crate::heartbeat::{self, Heartbeat};
 use crate::local_strom::{self, LocalStrom};
 use crate::openlive::{
@@ -397,6 +397,28 @@ fn snapshot_of(live: &[Live], host: &str, strom_version: Option<&str>) -> heartb
     }
 }
 
+/// Each input's state and uplink, for [`Event::Stats`]: the states and SRT samples
+/// [`snapshot_of`] hands the heartbeat, with the uplink converted the same way.
+fn stats_of(live: &[Live]) -> Event {
+    Event::Stats {
+        inputs: live
+            .iter()
+            .map(|l| InputStats {
+                input: l.input.name.clone(),
+                state: l.state.clone(),
+                uplink: l.uplink.as_ref().map(|sample| {
+                    let uplink = heartbeat::Uplink::from_srt(sample);
+                    UplinkStats {
+                        bitrate_kbps: uplink.bitrate_kbps,
+                        rtt_ms: uplink.rtt_ms,
+                        dropped: uplink.dropped,
+                    }
+                }),
+            })
+            .collect(),
+    }
+}
+
 /// Brings every chosen device up and keeps it registered until `stop` resolves, then
 /// removes what it started. `stop` says why it is stopping, which decides how long
 /// the teardown may take.
@@ -679,6 +701,9 @@ async fn assign_ports_from_open_live(
                 continue;
             }
             PortPlan::Create => {
+                events.emit(Event::Registering {
+                    input: input.name.clone(),
+                });
                 input.endpoint.port = 0;
                 let payload = SourcePayload::new(
                     &input.name,
@@ -700,6 +725,9 @@ async fn assign_ports_from_open_live(
                 (created.id, created.address)
             }
             PortPlan::Reassign { source_id } => {
+                events.emit(Event::Registering {
+                    input: input.name.clone(),
+                });
                 input.endpoint.port = 0;
                 let payload = SourcePayload::new(
                     &input.name,
@@ -1018,6 +1046,7 @@ async fn run_until_stopped(
                         l.shown = Some(l.state.clone());
                     }
                 }
+                events.emit(stats_of(live));
             }
             stop = &mut stop => return Ok(stop),
         }
@@ -1133,6 +1162,9 @@ async fn reconcile_sources(
                 l.source_id = Some(stored.id.clone());
             }
             None => {
+                events.emit(Event::Registering {
+                    input: l.input.name.clone(),
+                });
                 let created = client.create_source(&desired).await?;
                 info!(input = %l.input.name, source_id = %created.id, "registered the source with Open Live");
                 events.emit(Event::Registered {
@@ -1245,7 +1277,8 @@ async fn teardown_within(
     deadline: tokio::time::Instant,
     events: &Events,
 ) {
-    type Job<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>>;
+    // Send, so that `up` can run on a spawned task (`session::Session::start`).
+    type Job<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
     // What each job removes, and the source id when it is a source.
     let mut what: Vec<(String, Option<String>)> = Vec::new();
     let mut jobs: Vec<Job> = Vec::new();
@@ -2410,6 +2443,40 @@ mod tests {
         );
         assert_eq!(snapshot.inputs[1].uplink, None);
         assert_eq!(snapshot.inputs[2].source_id, None);
+    }
+
+    /// The stats event carries the numbers the heartbeat sends, per input, with the
+    /// loop's own state rather than the heartbeat's coarser flow state.
+    #[test]
+    fn the_stats_event_carries_the_heartbeats_uplink_numbers() {
+        let sample: SrtCallerStats = serde_json::from_value(serde_json::json!({
+            "send_rate_mbps": 6.2, "rtt_ms": 18.0, "bytes_sent": 1000,
+            "packets_sent_dropped": 3
+        }))
+        .unwrap();
+        let live = vec![
+            live("A", State::OnAir, Some("src-a"), Some(sample)),
+            live("B", State::Waiting, None, None),
+        ];
+        let heartbeat = snapshot_of(&live, "venue-box", None);
+        let Event::Stats { inputs } = stats_of(&live) else {
+            panic!("not stats");
+        };
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].input, "Venue — A");
+        assert_eq!(inputs[0].state, State::OnAir);
+        let sent = heartbeat.inputs[0].uplink.as_ref().unwrap();
+        assert_eq!(
+            inputs[0].uplink,
+            Some(UplinkStats {
+                bitrate_kbps: sent.bitrate_kbps,
+                rtt_ms: sent.rtt_ms,
+                dropped: sent.dropped,
+            })
+        );
+        assert_eq!(inputs[0].uplink.unwrap().dropped, 3);
+        assert_eq!(inputs[1].state, State::Waiting);
+        assert_eq!(inputs[1].uplink, None);
     }
 
     #[test]

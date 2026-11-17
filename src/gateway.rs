@@ -41,6 +41,8 @@ pub enum Event {
     /// A Strom flow was removed before starting: one of ours left by an earlier run,
     /// or someone else's holding one of the cameras.
     ConflictingFlowRemoved { name: String, ours: bool },
+    /// An input's source is being created in Open Live, or given a new port there.
+    Registering { input: String },
     /// An input's source was created in Open Live.
     Registered { input: String, source_id: String },
     /// Open Live registered an input's source but warns that its address may not
@@ -57,6 +59,9 @@ pub enum Event {
     Input { input: String, state: InputState },
     /// Something the operator may need to act on, that stops nothing.
     Warning { message: String },
+    /// Every tick while running: each input's state and uplink, from the same data
+    /// the heartbeat sends to Open Live.
+    Stats { inputs: Vec<InputStats> },
 
     /// `up` is stopping and removing what it started.
     Stopping,
@@ -76,6 +81,14 @@ pub enum Event {
     StromUnreachable { url: String, error: String },
     /// `down` found nothing of this gateway's to remove.
     NothingToRemove,
+
+    /// A session ([`crate::session`]) stopped and removed what it started. Its last
+    /// event.
+    Stopped,
+    /// A session ended on an error, before it ran or as it ran, for `reason`: the
+    /// same text the CLI prints after `Error:`. Anything it had started has been
+    /// removed again. Its last event.
+    Failed { reason: String },
 }
 
 /// One started input, as the start summary lists it.
@@ -85,6 +98,24 @@ pub struct SummaryRow {
     pub port: u16,
     /// The address registered with Open Live, passphrase masked.
     pub address: String,
+}
+
+/// One input in a [`Event::Stats`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputStats {
+    pub input: String,
+    pub state: InputState,
+    /// None while nothing is receiving the uplink.
+    pub uplink: Option<UplinkStats>,
+}
+
+/// The uplink of one input, as the heartbeat reports it (`heartbeat::Uplink`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UplinkStats {
+    pub bitrate_kbps: u64,
+    pub rtt_ms: f64,
+    /// Packets dropped before transmission.
+    pub dropped: u64,
 }
 
 /// What the last poll found out about an input.
