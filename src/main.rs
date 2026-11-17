@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use open_live_ingest::gateway::{Event, Events};
 use open_live_ingest::run::{self, Stop};
+use open_live_ingest::session::{Inputs, Session};
 use open_live_ingest::{config, devices};
 use std::path::PathBuf;
 
@@ -145,7 +146,16 @@ async fn main() -> Result<()> {
                 setup::report_saved(&path);
             }
             config::validate(&cfg)?;
-            run::up(cfg, all, devices, audio, test, &reporter(), stop_signal()).await
+            up(
+                cfg,
+                Inputs {
+                    include_virtual: all,
+                    selection: devices,
+                    audio,
+                    test_pattern: test,
+                },
+            )
+            .await
         }
         Command::Down => {
             config::validate(&cfg)?;
@@ -171,6 +181,39 @@ async fn main() -> Result<()> {
                 print!("{}", run::render_devices(&report));
             }
             Ok(())
+        }
+    }
+}
+
+/// `up`: a session, its events printed as they arrive, stopped on Ctrl-C or SIGTERM
+/// (or, on Windows, the console closing). Returns how the session ended, so the exit
+/// code is the one `up` has always had.
+async fn up(cfg: config::Config, inputs: Inputs) -> Result<()> {
+    let (mut session, mut events) = Session::start(cfg, inputs);
+    let print = reporter();
+    // The signal handlers go in once the inputs are up, as they did when `up` polled
+    // them from its loop: until then a Ctrl-C ends the process the default way.
+    let mut stop: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Stop>>>> = None;
+    let mut stopping = false;
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => {
+                    if matches!(event, Event::Summary { .. }) && stop.is_none() && !stopping {
+                        stop = Some(Box::pin(stop_signal()));
+                    }
+                    print.emit(event);
+                }
+                // The session has ended and every event it emitted is printed.
+                None => return session.wait().await,
+            },
+            why = async { stop.as_mut().expect("guarded").await }, if stop.is_some() => {
+                // Polled no more: further signals are swallowed by the handlers,
+                // which stay installed, as before.
+                stop = None;
+                stopping = true;
+                session.request_stop(why);
+            }
         }
     }
 }
@@ -263,11 +306,16 @@ fn render(event: &Event) -> Option<String> {
             format!("Strom at {url} is not reachable ({error}); leaving its flows alone.\n")
         }
         Event::NothingToRemove => "Nothing of ours left to remove.\n".to_string(),
-        Event::Registered { .. }
+        // A failure is printed once, as `Error:` when `up` returns it.
+        Event::Registering { .. }
+        | Event::Registered { .. }
         | Event::ConnectWarning { .. }
         | Event::InputFailed { .. }
         | Event::Warning { .. }
-        | Event::OscSignInEnds { .. } => return None,
+        | Event::OscSignInEnds { .. }
+        | Event::Stats { .. }
+        | Event::Stopped
+        | Event::Failed { .. } => return None,
     })
 }
 
@@ -561,9 +609,17 @@ mod tests {
                 input: "x".to_string(),
                 warning: "srt-listener-unsupported".to_string(),
             },
+            Event::Registering {
+                input: "x".to_string(),
+            },
             Event::Registered {
                 input: "x".to_string(),
                 source_id: "s".to_string(),
+            },
+            Event::Stats { inputs: Vec::new() },
+            Event::Stopped,
+            Event::Failed {
+                reason: "y".to_string(),
             },
         ] {
             assert_eq!(render(&event), None, "{event:?}");
