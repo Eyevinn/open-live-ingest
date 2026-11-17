@@ -451,15 +451,17 @@ impl fmt::Debug for Grant {
 #[derive(Debug)]
 pub enum TokenError {
     /// The server refused the grant: `invalid_grant` (expired, revoked or already
-    /// used) or `403 access_denied` (a suspended workspace), or any other 4xx. Trying
-    /// again with the same grant will not help; the person has to sign in again.
+    /// used) or `403 access_denied` (a suspended workspace), or any other 4xx but
+    /// `408` and `429`. Trying again with the same grant will not help; the person has
+    /// to sign in again.
     Refused {
         status: reqwest::StatusCode,
         /// The OAuth error code only, never the body around it.
         error: String,
     },
     /// The server could not be reached, answered 5xx (a `503` while it checks the
-    /// workspace), or answered something unreadable. Worth trying again later.
+    /// workspace), `408 Request Timeout` or `429 Too Many Requests`, or answered
+    /// something unreadable. Worth trying again later.
     Unavailable(anyhow::Error),
 }
 
@@ -525,7 +527,11 @@ async fn token_request(
         .await
         .map_err(|err| TokenError::Unavailable(anyhow!(err).context("POST token")))?;
     let status = res.status();
-    if status.is_server_error() {
+    // A timeout or a rate limit says nothing about the grant: it may work later.
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
         return Err(TokenError::Unavailable(anyhow!(
             "the Open Source Cloud token endpoint answered HTTP {status}"
         )));

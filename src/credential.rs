@@ -157,18 +157,37 @@ struct Access {
     expires_at: u64,
 }
 
+/// A refresh token OSC issued that could not be written to the keychain (locked
+/// after sleep, say). OSC retired the one before it, which the keychain still holds,
+/// so this is the only copy that still works until a write succeeds.
+struct Unsaved {
+    /// The retired refresh token the keychain still holds.
+    stale: String,
+    refresh_token: String,
+    client_id: String,
+}
+
+/// What [`KeptCredential`] holds in memory, behind one lock.
+#[derive(Default)]
+struct State {
+    access: Option<Access>,
+    unsaved: Option<Unsaved>,
+}
+
 /// The credential in the keychain, as a source of access tokens for as long as the
 /// gateway runs. The current access token is held in memory only.
 ///
 /// The keychain is read again before each refresh, so a refresh done by another
 /// process on the same machine (the app and a CLI `status`, say) is picked up rather
-/// than undone.
+/// than undone. A renewed refresh token the keychain would not take is held in
+/// memory, used while the keychain still holds the one it replaced, and written
+/// again on each call until the keychain takes it.
 pub struct KeptCredential {
     store: Arc<dyn SecretStore>,
     base: String,
     http: reqwest::Client,
     clock: Clock,
-    current: Mutex<Option<Access>>,
+    state: Mutex<State>,
 }
 
 impl fmt::Debug for KeptCredential {
@@ -194,28 +213,39 @@ impl KeptCredential {
                 .build()
                 .context("building HTTP client")?,
             clock,
-            current: Mutex::new(None),
+            state: Mutex::new(State::default()),
         })
     }
 
     /// An access token with at least [`REFRESH_MARGIN`] left, refreshed when needed,
     /// with the new refresh token written back to the keychain.
     ///
-    /// When OSC cannot be reached or answers 5xx, the current access token is used for
-    /// as long as it is still valid, and the refresh is tried again on the next call.
-    /// A refused refresh (`invalid_grant`, `403`) fails with [`SIGN_IN_AGAIN`].
+    /// When OSC cannot be reached or answers 5xx, 408 or 429, the current access
+    /// token is used for as long as it is still valid, and the refresh is tried again
+    /// on the next call. A refused refresh (`invalid_grant`, `403`) does the same, and
+    /// fails with [`SIGN_IN_AGAIN`] once the current access token has expired.
     pub async fn access_token(&self) -> Result<String> {
+        let mut state = self.state.lock().await;
+        // After the lock: another caller's refresh may have taken a while.
         let now = (self.clock)();
-        let mut current = self.current.lock().await;
-        if let Some(access) = current.as_ref().filter(|a| fresh(a.expires_at, now)) {
+        self.save_unsaved(&mut state.unsaved);
+        if let Some(access) = state.access.as_ref().filter(|a| fresh(a.expires_at, now)) {
             return Ok(access.token.clone());
         }
-        let stored = load(self.store.as_ref())?.with_context(|| {
-            format!("there is no Open Source Cloud credential in the keychain; {SIGN_IN_AGAIN}")
-        })?;
-        let ends = stored.ends_at();
-        let (refresh_token, client_id) = match stored {
-            StoredCredential::Token { token, .. } => {
+        let stored = match load(self.store.as_ref()) {
+            Ok(stored) => stored,
+            // The keychain cannot be read, but the newest refresh token is in hand.
+            Err(err) if state.unsaved.is_some() => {
+                warn!(err = %format_args!("{err:#}"), "could not read the Open Source Cloud sign-in from the keychain; renewing with the one held in memory");
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        // The refresh token to use, its client, and the refresh token the keychain
+        // holds: the same one, unless the newest could not be written back.
+        let ends = stored.as_ref().and_then(StoredCredential::ends_at);
+        let (refresh_token, client_id, in_keychain) = match (stored, &state.unsaved) {
+            (Some(StoredCredential::Token { token, .. }), _) => {
                 if ends.is_some_and(|end| end <= now) {
                     bail!(
                         "the Open Source Cloud token in the keychain has expired; {SIGN_IN_AGAIN}"
@@ -223,46 +253,77 @@ impl KeptCredential {
                 }
                 return Ok(token);
             }
-            StoredCredential::SignIn {
-                refresh_token,
-                client_id,
-            } => (refresh_token, client_id),
+            (Some(StoredCredential::SignIn { refresh_token, .. }), Some(unsaved))
+                if refresh_token == unsaved.stale =>
+            {
+                (
+                    unsaved.refresh_token.clone(),
+                    unsaved.client_id.clone(),
+                    refresh_token,
+                )
+            }
+            (
+                Some(StoredCredential::SignIn {
+                    refresh_token,
+                    client_id,
+                }),
+                _,
+            ) => (refresh_token.clone(), client_id, refresh_token),
+            (None, Some(unsaved)) => (
+                unsaved.refresh_token.clone(),
+                unsaved.client_id.clone(),
+                unsaved.stale.clone(),
+            ),
+            (None, None) => {
+                bail!("there is no Open Source Cloud credential in the keychain; {SIGN_IN_AGAIN}")
+            }
         };
 
-        let grant = match osc::refresh(&self.http, &self.base, &refresh_token).await {
-            Ok(grant) => grant,
+        let (grant, in_keychain) = match osc::refresh(&self.http, &self.base, &refresh_token).await
+        {
+            Ok(grant) => (grant, in_keychain),
             Err(TokenError::Refused { status, error }) => {
                 // Another process may have refreshed in between and so retired this
                 // refresh token; if so, the keychain holds its successor.
-                match self.reread_after_refused(&refresh_token).await? {
-                    Some(grant) => grant,
+                match self
+                    .reread_after_refused(&[&refresh_token, &in_keychain])
+                    .await?
+                {
+                    Some(renewed) => renewed,
                     None => {
-                        *current = None;
-                        bail!("Open Source Cloud refused to renew the sign-in (HTTP {status}, {error}); {SIGN_IN_AGAIN}");
+                        let reason = format!(
+                                "Open Source Cloud refused to renew the sign-in (HTTP {status}, {error})"
+                            );
+                        return serve_until_expiry(&mut state.access, now, &reason)
+                            .ok_or_else(|| anyhow!("{reason}; {SIGN_IN_AGAIN}"));
                     }
                 }
             }
             Err(TokenError::Unavailable(err)) => {
-                if let Some(access) = current.as_ref().filter(|a| a.expires_at > now) {
-                    warn!(
-                        err = %format_args!("{err:#}"),
-                        "could not renew the Open Source Cloud sign-in; the current one lasts another {} s and the renewal is retried",
-                        access.expires_at - now
-                    );
-                    return Ok(access.token.clone());
-                }
-                return Err(err.context("renewing the Open Source Cloud sign-in"));
+                let reason = format!("could not renew the Open Source Cloud sign-in: {err:#}");
+                return serve_until_expiry(&mut state.access, now, &reason)
+                    .ok_or_else(|| err.context("renewing the Open Source Cloud sign-in"));
             }
         };
 
         if let Some(next) = &grant.refresh_token {
             let renewed = StoredCredential::SignIn {
                 refresh_token: next.clone(),
-                client_id,
+                client_id: client_id.clone(),
             };
-            // The access token in hand still works; only the next refresh needs this.
-            if let Err(err) = keep(self.store.as_ref(), &renewed) {
-                warn!(err = %format_args!("{err:#}"), "could not store the renewed Open Source Cloud sign-in");
+            match keep(self.store.as_ref(), &renewed) {
+                Ok(()) => state.unsaved = None,
+                Err(err) => {
+                    // OSC has retired the refresh token the keychain holds: the next
+                    // refresh needs this one, so it is held here and written again on
+                    // the next call.
+                    warn!(err = %format_args!("{err:#}"), "could not store the renewed Open Source Cloud sign-in; holding it in memory and retrying");
+                    state.unsaved = Some(Unsaved {
+                        stale: in_keychain,
+                        refresh_token: next.clone(),
+                        client_id,
+                    });
+                }
             }
         }
         let expires_at = expiry(&grant, now);
@@ -270,34 +331,67 @@ impl KeptCredential {
             "the Open Source Cloud sign-in is renewed for {} s",
             expires_at.saturating_sub(now)
         );
-        *current = Some(Access {
+        state.access = Some(Access {
             token: grant.access_token.clone(),
             expires_at,
         });
         Ok(grant.access_token)
     }
 
-    /// After a refused refresh: if the keychain now holds another refresh token, a
-    /// refresh with that one.
-    async fn reread_after_refused(&self, refused: &str) -> Result<Option<osc::Grant>> {
-        match load(self.store.as_ref())? {
-            Some(StoredCredential::SignIn { refresh_token, .. }) if refresh_token != refused => {
-                match osc::refresh(&self.http, &self.base, &refresh_token).await {
-                    Ok(grant) => Ok(Some(grant)),
-                    Err(TokenError::Refused { .. }) => Ok(None),
-                    Err(TokenError::Unavailable(err)) => {
-                        Err(err.context("renewing the Open Source Cloud sign-in"))
+    /// Writes a refresh token held in memory to the keychain, if the keychain still
+    /// holds the one it replaced. When the keychain holds anything else, another
+    /// process or a new sign-in has replaced it, and the keychain wins.
+    fn save_unsaved(&self, unsaved: &mut Option<Unsaved>) {
+        let Some(pending) = unsaved.as_ref() else {
+            return;
+        };
+        match load(self.store.as_ref()) {
+            Ok(Some(StoredCredential::SignIn { refresh_token, .. }))
+                if refresh_token == pending.stale =>
+            {
+                let renewed = StoredCredential::SignIn {
+                    refresh_token: pending.refresh_token.clone(),
+                    client_id: pending.client_id.clone(),
+                };
+                match keep(self.store.as_ref(), &renewed) {
+                    Ok(()) => {
+                        debug!("the renewed Open Source Cloud sign-in is now in the keychain");
+                        *unsaved = None;
+                    }
+                    Err(err) => {
+                        debug!(err = %format_args!("{err:#}"), "the renewed Open Source Cloud sign-in still cannot be stored")
                     }
                 }
             }
-            _ => Ok(None),
+            Ok(_) => *unsaved = None,
+            // Unreadable for now: try again on the next call.
+            Err(_) => {}
+        }
+    }
+
+    /// After a refused refresh: if the keychain now holds a refresh token other than
+    /// those `tried` (or known stale), a refresh with that one, and that token.
+    async fn reread_after_refused(&self, tried: &[&str]) -> Result<Option<(osc::Grant, String)>> {
+        let Ok(Some(StoredCredential::SignIn { refresh_token, .. })) = load(self.store.as_ref())
+        else {
+            return Ok(None);
+        };
+        if tried.contains(&refresh_token.as_str()) {
+            return Ok(None);
+        }
+        match osc::refresh(&self.http, &self.base, &refresh_token).await {
+            Ok(grant) => Ok(Some((grant, refresh_token))),
+            Err(TokenError::Refused { .. }) => Ok(None),
+            Err(TokenError::Unavailable(err)) => {
+                Err(err.context("renewing the Open Source Cloud sign-in"))
+            }
         }
     }
 
     /// Drops the access token in hand, so the next call refreshes. For when a service
     /// refused it although it had not expired: revoked, say.
     pub async fn discard_access(&self) {
-        *self.current.lock().await = None;
+        self.state.lock().await.access = None;
     }
 
     /// When the credential stops working with no way to renew it, if that is within
@@ -306,6 +400,25 @@ impl KeptCredential {
     pub fn ends_within(&self, within: Duration) -> Option<u64> {
         let end = load(self.store.as_ref()).ok()??.ends_at()?;
         (end <= (self.clock)() + within.as_secs()).then_some(end)
+    }
+}
+
+/// The access token in hand, while it has not expired, after a renewal failed for
+/// `reason`: logged, and the renewal is tried again on the next call. None once it
+/// has expired, which also drops it.
+fn serve_until_expiry(access: &mut Option<Access>, now: u64, reason: &str) -> Option<String> {
+    match access.as_ref().filter(|a| a.expires_at > now) {
+        Some(a) => {
+            warn!(
+                "{reason}; the current sign-in lasts another {} s and the renewal is retried",
+                a.expires_at - now
+            );
+            Some(a.token.clone())
+        }
+        None => {
+            *access = None;
+            None
+        }
     }
 }
 
@@ -358,6 +471,8 @@ mod tests {
         Ok,
         Refuse,
         Unavailable,
+        /// Answers with this status line and an empty JSON body.
+        Status(&'static str),
     }
 
     impl FakeOsc {
@@ -434,6 +549,7 @@ mod tests {
             server.presented.push(presented.clone());
             match server.mode {
                 Mode::Unavailable => ("503 Service Unavailable", "{}".to_string()),
+                Mode::Status(status) => (status, "{}".to_string()),
                 Mode::Refuse => (
                     "400 Bad Request",
                     format!(r#"{{"error":"invalid_grant","error_description":"{presented}"}}"#),
@@ -474,6 +590,10 @@ mod tests {
     }
 
     fn signed_in(store: &MemoryKeychain, refresh: &str) {
+        signed_in_to(store, refresh)
+    }
+
+    fn signed_in_to(store: &dyn SecretStore, refresh: &str) {
         keep(
             store,
             &StoredCredential::SignIn {
@@ -577,6 +697,148 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("refresh-0"), "{err}");
+    }
+
+    /// OSC rate-limits or times out the refresh: like a 503, it says nothing about
+    /// the sign-in, so the access token in hand is used while it lasts.
+    #[tokio::test]
+    async fn a_rate_limited_or_timed_out_refresh_is_waited_out_on_the_current_token() {
+        for status in ["429 Too Many Requests", "408 Request Timeout"] {
+            let osc = FakeOsc::start("refresh-0").await;
+            let store = Arc::new(MemoryKeychain::new());
+            signed_in(&store, "refresh-0");
+            let (time, clock) = fake_clock();
+            let kept = KeptCredential::with(store.clone(), &osc.base, clock).unwrap();
+            assert_eq!(kept.access_token().await.unwrap(), "access-1");
+
+            osc.set_mode(Mode::Status(status));
+            assert!(matches!(
+                osc::refresh(&kept.http, &osc.base, "refresh-1").await,
+                Err(TokenError::Unavailable(_))
+            ));
+            time.store(START + 3600 - 120, Ordering::SeqCst);
+            assert_eq!(kept.access_token().await.unwrap(), "access-1", "{status}");
+
+            osc.set_mode(Mode::Ok);
+            assert_eq!(kept.access_token().await.unwrap(), "access-2", "{status}");
+        }
+    }
+
+    /// A refused refresh while the access token in hand still has a few minutes:
+    /// those minutes are used, and only then is the session over.
+    #[tokio::test]
+    async fn a_refused_refresh_keeps_the_current_token_until_it_expires() {
+        let osc = FakeOsc::start("refresh-0").await;
+        let store = Arc::new(MemoryKeychain::new());
+        signed_in(&store, "refresh-0");
+        let (time, clock) = fake_clock();
+        let kept = KeptCredential::with(store.clone(), &osc.base, clock).unwrap();
+        assert_eq!(kept.access_token().await.unwrap(), "access-1");
+
+        osc.set_mode(Mode::Refuse);
+        time.store(START + 3600 - 120, Ordering::SeqCst);
+        assert_eq!(kept.access_token().await.unwrap(), "access-1");
+
+        time.store(START + 3600, Ordering::SeqCst);
+        let err = format!("{:#}", kept.access_token().await.unwrap_err());
+        assert!(
+            err.contains("invalid_grant") && err.contains("sign in"),
+            "{err}"
+        );
+    }
+
+    /// A keychain that takes the first write (the sign-in) and refuses every later
+    /// one until healed: locked after sleep, or an access prompt denied.
+    struct LockingStore {
+        inner: MemoryKeychain,
+        writes: AtomicU64,
+        healed: std::sync::atomic::AtomicBool,
+    }
+
+    impl LockingStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryKeychain::new(),
+                writes: AtomicU64::new(0),
+                healed: Default::default(),
+            }
+        }
+    }
+
+    impl SecretStore for LockingStore {
+        fn get(&self, account: &str) -> Result<Option<String>> {
+            self.inner.get(account)
+        }
+        fn set(&self, account: &str, secret: &str) -> Result<()> {
+            if self.writes.fetch_add(1, Ordering::SeqCst) > 0 && !self.healed.load(Ordering::SeqCst)
+            {
+                bail!("the keychain is locked (OSStatus -25308)");
+            }
+            self.inner.set(account, secret)
+        }
+        fn delete(&self, account: &str) -> Result<()> {
+            self.inner.delete(account)
+        }
+    }
+
+    /// The keychain refuses to store each rotated refresh token. The newest is held
+    /// in memory, so the session survives refresh after refresh, and it reaches the
+    /// keychain as soon as the keychain takes writes again.
+    #[tokio::test]
+    async fn a_session_survives_refreshes_the_keychain_cannot_store() {
+        let osc = FakeOsc::start("refresh-0").await;
+        let store = Arc::new(LockingStore::new());
+        signed_in_to(store.as_ref(), "refresh-0");
+        let (time, clock) = fake_clock();
+        let kept = KeptCredential::with(store.clone(), &osc.base, clock).unwrap();
+
+        for minute in 0..=3 * 60 {
+            time.store(START + minute * 60, Ordering::SeqCst);
+            kept.access_token()
+                .await
+                .unwrap_or_else(|err| panic!("minute {minute}: {err:#}"));
+        }
+        assert_eq!(
+            osc.presented(),
+            vec!["refresh-0", "refresh-1", "refresh-2", "refresh-3"],
+            "each refresh used the token the one before returned, not the keychain's"
+        );
+        assert_eq!(
+            stored_refresh(store.as_ref()).as_deref(),
+            Some("refresh-0"),
+            "the keychain took none of them"
+        );
+
+        store.healed.store(true, Ordering::SeqCst);
+        assert_eq!(kept.access_token().await.unwrap(), "access-4");
+        assert_eq!(
+            stored_refresh(store.as_ref()).as_deref(),
+            Some("refresh-4"),
+            "the next call writes the newest refresh token"
+        );
+    }
+
+    /// While a renewed refresh token waits in memory, a new sign-in replaces the
+    /// keychain entry: the keychain wins, and the one in memory is not written over it.
+    #[tokio::test]
+    async fn a_new_sign_in_wins_over_a_refresh_token_held_in_memory() {
+        let osc = FakeOsc::start("refresh-0").await;
+        let store = Arc::new(LockingStore::new());
+        signed_in_to(store.as_ref(), "refresh-0");
+        let (time, clock) = fake_clock();
+        let kept = KeptCredential::with(store.clone(), &osc.base, clock).unwrap();
+        assert_eq!(kept.access_token().await.unwrap(), "access-1");
+        assert_eq!(stored_refresh(store.as_ref()).as_deref(), Some("refresh-0"));
+
+        // The app signs in again; its refresh token is good at OSC.
+        signed_in(&store.inner, "fresh-sign-in");
+        osc.state.lock().unwrap().valid.push("fresh-sign-in".into());
+        store.healed.store(true, Ordering::SeqCst);
+
+        time.store(START + 3600 - 120, Ordering::SeqCst);
+        assert_eq!(kept.access_token().await.unwrap(), "access-2");
+        assert_eq!(osc.presented(), vec!["refresh-0", "fresh-sign-in"]);
+        assert_eq!(stored_refresh(store.as_ref()).as_deref(), Some("refresh-2"));
     }
 
     /// The keychain as two processes share it: the first read returns what this
