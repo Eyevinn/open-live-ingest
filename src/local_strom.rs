@@ -32,6 +32,11 @@ impl Drop for LocalStrom {
         let LocalStrom::Managed { child, .. } = self else {
             return;
         };
+        // Already exited and reaped: its pid may belong to another process by now.
+        if let Ok(Some(_)) = child.try_wait() {
+            std::fs::remove_file(config::strom_pidfile()).ok();
+            return;
+        }
         let pid = child.id();
         info!(pid, "stopping the Strom we started");
         // Unix: SIGTERM, then the wait below gives it time to exit cleanly. Windows
@@ -148,14 +153,25 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
     }
     std::fs::write(&pidfile, child.id().to_string()).ok();
 
-    let managed = LocalStrom::Managed { child, log_path };
-    wait_until_ready(&client, &managed).await?;
+    let mut managed = LocalStrom::Managed { child, log_path };
+    wait_until_ready(&client, &mut managed).await?;
     Ok(managed)
 }
 
-async fn wait_until_ready(client: &StromClient, strom: &LocalStrom) -> Result<()> {
+async fn wait_until_ready(client: &StromClient, strom: &mut LocalStrom) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
+        if let LocalStrom::Managed { child, log_path } = &mut *strom {
+            if let Some(status) = child
+                .try_wait()
+                .context("checking on the Strom we started")?
+            {
+                bail!(
+                    "Strom exited during startup ({status}).{}",
+                    tail_of_log(log_path)
+                );
+            }
+        }
         match client.probe().await {
             Reachability::Ok { video_sources } => {
                 println!("  Strom is up; it can see {video_sources} video source(s).");
@@ -584,6 +600,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_managed_strom_that_exits_during_startup_is_reported_at_once() {
+        let scratch = Scratch::new("early-exit");
+        let strom = scratch.exe("strom");
+        std::fs::write(
+            &strom,
+            "#!/bin/sh\necho 'dyld: Library not loaded'\nexit 1\n",
+        )
+        .unwrap();
+        let log_path = scratch.0.join("strom.log");
+        let log = std::fs::File::create(&log_path).unwrap();
+        let child = Command::new(&strom)
+            .stdout(Stdio::from(log))
+            .spawn()
+            .unwrap();
+        // A port nothing listens on, so the probe stays unreachable.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = StromClient::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
+        // Not dropped: `Drop` would remove the user's real Strom pidfile.
+        let mut managed = std::mem::ManuallyDrop::new(LocalStrom::Managed { child, log_path });
+
+        let started = Instant::now();
+        let err = wait_until_ready(&client, &mut managed)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{err}");
+        assert!(err.contains("Strom exited during startup"), "{err}");
+        assert!(err.contains("exit status: 1"), "{err}");
+        assert!(err.contains("dyld: Library not loaded"), "{err}");
     }
 
     #[test]
