@@ -633,16 +633,17 @@ pub fn problems(cfg: &Config) -> Vec<Problem> {
     problems_with(cfg, crate::osc::saved_token().is_some())
 }
 
-fn problems_with(cfg: &Config, osc_login: bool) -> Vec<Problem> {
+pub(crate) fn problems_with(cfg: &Config, osc_login: bool) -> Vec<Problem> {
     check(cfg, osc_login)
         .into_iter()
         .map(|(setting, err)| Problem::new(setting, format!("{err:#}")))
         .collect()
 }
 
-/// `osc_login` says whether the OSC CLI has a saved login, which stands in for
-/// `open_live.api_key` in osc mode. Passed in so the check itself stays pure.
-fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
+/// `osc_login` says whether the OSC CLI has a saved login, or the app passes an Open
+/// Source Cloud credential of its own; either stands in for `open_live.api_key` in
+/// osc mode. Passed in so the check itself stays pure.
+pub(crate) fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
     match check(cfg, osc_login).into_iter().next() {
         Some((_, err)) => Err(err),
         None => Ok(()),

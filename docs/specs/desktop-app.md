@@ -316,9 +316,9 @@ unknown command or bad arguments is an error reply, never a panic.
 | `cmd` | `args` | `ok` | Library call |
 |---|---|---|---|
 | `state` | — | the full view model (where-to-send, rows, live flag, Advanced values) | `load` |
-| `osc_sign_in` | — | `{workspace, instances[]}` | `osc::browser_login` (#75), keychain (#76), `instances` (#77) |
-| `osc_paste_token` | `{token}` | `{workspace, instances[]}` | keychain (#76), `instances` |
-| `osc_workspaces` | — | `{workspace, instances[]}` | No list API exists (#74, [research](../research/OSC_BROWSER_SIGN_IN.md)): a new `osc::browser_login`, where the workspace is picked on the OSC consent page (#77) |
+| `osc_sign_in` | — | `{workspace, instances[]}` | `api::osc_sign_in` (#77): `osc::browser_login` (#75), kept in the keychain (#76), then `api::workspace` |
+| `osc_paste_token` | `{token}` | `{workspace, instances[]}` | `api::keep_osc_token` (#76), `api::workspace(OscCredential::Keychain)` (#77) |
+| `osc_workspaces` | — | `{workspace, instances[]}` | No list API exists (#74, [research](../research/OSC_BROWSER_SIGN_IN.md)): `api::osc_sign_in` again, where the workspace is picked on the OSC consent page and the new sign-in replaces the kept one (#77) |
 | `choose_instance` | `{url}` | view model | `save` |
 | `self_hosted` | `{url, api_key}` | view model | `check_self_hosted` (#73), `save` |
 | `devices` | `{show_all}` | `{video[], audio[]}` | `devices` (#73, audio from #69) |

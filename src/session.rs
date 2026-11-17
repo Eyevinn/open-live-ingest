@@ -38,6 +38,7 @@
 //!   instead: events for nobody are discarded.
 
 use crate::config::{self, Config};
+use crate::credential::OscCredential;
 use crate::devices::AudioPairing;
 use crate::gateway::{Event, Events};
 use crate::run::{self, Stop};
@@ -92,6 +93,27 @@ impl Session {
     /// the same way, in the background, as long as the runtime keeps running (see
     /// the module documentation's caveats).
     pub fn start(settings: Config, inputs: Inputs) -> (SessionHandle, Receiver) {
+        Self::start_inner(settings, None, inputs)
+    }
+
+    /// [`start`](Self::start), registering with `credential`, the Open Source Cloud
+    /// credential the app holds, rather than the one the settings point at: a token
+    /// in hand, or the sign-in in a keychain, renewed for as long as the session
+    /// runs. `open_live.api_key`, `OSC_ACCESS_TOKEN` and `~/.osc/token` are not read.
+    /// A self-hosted Open Live keeps using the key in the settings.
+    pub fn start_with(
+        settings: Config,
+        inputs: Inputs,
+        credential: OscCredential,
+    ) -> (SessionHandle, Receiver) {
+        Self::start_inner(settings, Some(credential), inputs)
+    }
+
+    fn start_inner(
+        settings: Config,
+        credential: Option<OscCredential>,
+        inputs: Inputs,
+    ) -> (SessionHandle, Receiver) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel::<Stop>();
         let last = tx.clone();
@@ -103,7 +125,7 @@ impl Session {
             // A dropped handle is a stop too: the session must not outlive its owner
             // with flows and sources nobody can remove.
             let stop = async move { stop_rx.await.unwrap_or(Stop::Interrupt) };
-            let outcome = run(settings, inputs, &events, stop).await;
+            let outcome = run(settings, credential, inputs, &events, stop).await;
             events.emit(match &outcome {
                 Ok(()) => Event::Stopped,
                 Err(err) => Event::Failed {
@@ -138,21 +160,17 @@ impl Session {
 
 async fn run(
     settings: Config,
+    credential: Option<OscCredential>,
     inputs: Inputs,
     events: &Events,
     stop: impl std::future::Future<Output = Stop> + Send,
 ) -> Result<()> {
-    config::validate(&settings)?;
-    run::up(
-        settings,
-        inputs.include_virtual,
-        inputs.selection,
-        inputs.audio,
-        inputs.test_pattern,
-        events,
-        stop,
-    )
-    .await
+    match credential {
+        // The app's credential stands in for one in the settings or a CLI login.
+        Some(_) => config::validate_with(&settings, true)?,
+        None => config::validate(&settings)?,
+    }
+    run::up(settings, credential, inputs, events, stop).await
 }
 
 /// A running session. See [`Session::start`].
@@ -224,6 +242,33 @@ mod tests {
         };
         assert_eq!(reason, &format!("{err:#}"));
         assert!(reason.contains("uplink.passphrase"), "{reason}");
+    }
+
+    /// With the app's credential, settings for an Open Source Cloud instance need no
+    /// token of their own and no keychain marker: the session gets past the
+    /// settings to the next step, here a Strom that is not there.
+    #[tokio::test]
+    async fn the_apps_credential_stands_in_for_a_token_in_the_settings() {
+        let mut settings = Config::default();
+        settings.open_live.url = Some("https://venue.example.osaas.io".to_string());
+        settings.open_live.auth_mode = config::AuthMode::Osc;
+        settings.strom.url = "http://127.0.0.1:9".to_string();
+        settings.strom.manage = false;
+        let (handle, mut events) = Session::start_with(
+            settings,
+            Inputs::test_pattern(),
+            OscCredential::from("app-token"),
+        );
+        let mut seen = Vec::new();
+        while let Some(event) = events.recv().await {
+            seen.push(event);
+        }
+        assert!(handle.wait().await.is_err());
+        let Some(Event::Failed { reason }) = seen.last() else {
+            panic!("no Failed event last: {seen:?}");
+        };
+        assert!(!reason.contains("no OSC token"), "{reason}");
+        assert!(reason.contains("Strom"), "{reason}");
     }
 
     /// Test pattern and audio cannot go together; the session says so rather than
