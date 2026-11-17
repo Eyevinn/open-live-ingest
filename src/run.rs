@@ -56,16 +56,24 @@ fn open_live_client(cfg: &Config) -> Result<Option<OpenLiveClient>> {
     if !cfg.open_live.register {
         return Ok(None);
     }
-    let url = cfg
-        .open_live
-        .url
-        .as_deref()
-        .context("open_live.url is unset")?;
-    Ok(Some(OpenLiveClient::new(
-        url,
-        cfg.open_live.auth_mode,
-        cfg.open_live.api_key.as_deref(),
-    )?))
+    Ok(Some(OpenLiveClient::from_settings(&cfg.open_live)?))
+}
+
+/// Before going live: a credential that cannot be renewed and ends during the
+/// session is said now, while signing in again is still easy (#65 AC2).
+fn warn_of_sign_in_end(open_live: Option<&OpenLiveClient>, events: &Events) {
+    let Some(at) =
+        open_live.and_then(|c| c.osc_sign_in_ends_within(crate::credential::SESSION_HORIZON))
+    else {
+        return;
+    };
+    let left = Duration::from_secs(at.saturating_sub(crate::osc::now().as_secs()));
+    warn!(
+        "the Open Source Cloud credential ends in {} minute(s) and the gateway cannot renew it itself; after that Open Live refuses this gateway's requests, though the feeds keep running. To avoid it, {}",
+        left.as_secs() / 60,
+        crate::credential::SIGN_IN_AGAIN
+    );
+    events.emit(Event::OscSignInEnds { at });
 }
 
 /// The gateway id to tag registered sources with, so Open Live's forget-gateway
@@ -447,6 +455,7 @@ pub async fn up(
         events.emit(Event::Warning { message: warning });
     }
     let open_live = open_live_client(&cfg)?;
+    warn_of_sign_in_end(open_live.as_ref(), events);
 
     let chosen = if test_pattern {
         Vec::new()

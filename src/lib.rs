@@ -13,10 +13,12 @@
 
 pub mod api;
 pub mod config;
+pub mod credential;
 pub mod devices;
 pub mod flow;
 pub mod gateway;
 pub mod heartbeat;
+pub mod keychain;
 pub mod local_strom;
 pub mod openlive;
 pub mod osc;

@@ -312,6 +312,7 @@ fn render(event: &Event) -> Option<String> {
         | Event::ConnectWarning { .. }
         | Event::InputFailed { .. }
         | Event::Warning { .. }
+        | Event::OscSignInEnds { .. }
         | Event::Stats { .. }
         | Event::Stopped
         | Event::Failed { .. } => return None,

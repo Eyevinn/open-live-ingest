@@ -167,6 +167,23 @@ deployment tool that injects one must not be overridden by whoever last signed i
 typed address and a pasted token remain the way in on a machine with no browser, since the login's
 redirect lands on the machine running the CLI.
 
+**An app sign-in is kept in the OS keychain and renewed during the show.** The app signs in natively
+(`osc::browser_login`) and keeps OSC's refresh token, not the one-hour access token, in the macOS
+Keychain or the Windows Credential Manager; the settings file gets only `open_live.credential =
+"keychain"`, so the file never holds that secret and stays safe to copy between machines. A pasted
+personal access token goes to the keychain the same way. While running, the access token is renewed
+from the refresh token five minutes before it expires and the new refresh token is written back, so a
+show of any length runs on one sign-in; the keychain is read again before each refresh so two
+processes sharing the entry do not undo each other. A token endpoint that is down is waited out on the
+access token in hand; a refused refresh means signing in again. A credential that cannot be renewed
+and ends within twelve hours is announced before going live (`Event::OscSignInEnds`), when signing in
+again is still easy, rather than discovered when Open Live starts refusing mid-show. The keychain is
+reached through a trait, so the refresh logic is tested against an in-memory store and a fake token
+endpoint on a fake clock; the platform calls are own code (`security-framework`'s generic-password
+calls on macOS, Credential Manager through the `windows-sys` already in the tree), which costs four
+crates on macOS and none on Windows, where the `keyring` crate would cost five on each. The CLI keeps
+`OSC_ACCESS_TOKEN` and `~/.osc/token`; a token in `open_live.api_key` still wins over the keychain.
+
 **`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
 SIGHUP does not: a closed SSH session must not take a venue off air. A deliberate stop stops, an
 accident does not. On Windows, Ctrl-C and Ctrl-Break stop the same way, and so do closing the
@@ -229,7 +246,8 @@ macOS, so a release is also checked by hand on macOS 27 (README, "Releasing").
 **No local state.** Flows are found by derived id, sources by the gateway's name prefix. The
 exceptions are two pidfiles: the running `up`, so `down` can ask it to stop before sweeping, and a
 Strom the gateway started, so `down` can stop it after a hard kill. Both pids are checked against
-the process name before they are signalled, because pids are reused after a reboot.
+the process name before they are signalled, because pids are reused after a reboot. A sign-in from
+the app adds one entry in the OS keychain (below).
 
 **One loop.** Every ten seconds, sequentially over all inputs: make sure the flow exists and runs,
 read its SRT statistics, then list the Open Live sources once and create or patch what differs. No

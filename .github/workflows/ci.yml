@@ -12,12 +12,13 @@ jobs:
   # No system dependencies: the gateway drives Strom over HTTP rather than linking
   # GStreamer, so one job per OS covers everything. The toolchain comes from
   # rust-toolchain.toml, so CI tests the version the repo pins. Formatting does not
-  # depend on the OS, so it is checked on Ubuntu only.
+  # depend on the OS, so it is checked on Ubuntu only. macOS and Windows each build
+  # their own keychain code (src/keychain.rs), so both run here, not only at release.
   build:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

@@ -118,6 +118,11 @@ pub struct OpenLive {
     /// Bearer token or OSC personal access token, depending on `auth_mode`. In osc
     /// mode it can stay unset, and the login saved by `npx @osaas/cli login` is used.
     pub api_key: Option<String>,
+    /// Where the Open Source Cloud credential is kept when it is not `api_key`:
+    /// `"keychain"` after a sign-in from the app, which stores it in the OS keychain
+    /// (`credential.rs`). Only a marker; the file never holds that secret. A token in
+    /// `api_key` still wins over it.
+    pub credential: Option<CredentialStore>,
     /// Register a source per input. Off for a box that only streams to a Strom.
     pub register: bool,
     /// This gateway's id in Open Live, from `POST /api/v1/gateways`. With its token
@@ -135,10 +140,33 @@ impl Default for OpenLive {
             url: None,
             auth_mode: AuthMode::Direct,
             api_key: None,
+            credential: None,
             register: true,
             gateway_id: None,
             gateway_token: None,
         }
+    }
+}
+
+/// Where a credential kept outside the settings file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialStore {
+    /// The OS keychain: the macOS Keychain, the Windows Credential Manager.
+    Keychain,
+}
+
+impl OpenLive {
+    /// Whether the Open Source Cloud credential comes from the keychain: the marker
+    /// is set and no token in `api_key` takes precedence over it.
+    pub fn uses_keychain(&self) -> bool {
+        self.auth_mode == AuthMode::Osc
+            && self.credential == Some(CredentialStore::Keychain)
+            && self
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
     }
 }
 
@@ -773,6 +801,7 @@ fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
         // The OSC CLI's saved login serves in place of a token in the file.
         if cfg.open_live.auth_mode == AuthMode::Osc
             && !osc_login
+            && cfg.open_live.credential.is_none()
             && cfg
                 .open_live
                 .api_key
@@ -788,6 +817,15 @@ fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
                 ),
             ));
         }
+    }
+    // A sign-in is for an Open Source Cloud instance; a direct one would never use it.
+    if cfg.open_live.credential.is_some() && cfg.open_live.auth_mode != AuthMode::Osc {
+        found.push((
+            "open_live.credential",
+            anyhow!(
+                "open_live.credential keeps an Open Source Cloud sign-in, but open_live.auth_mode is \"direct\", which does not use one"
+            ),
+        ));
     }
     // An id without its token, or the reverse, is a half-finished provisioning step;
     // it is refused here rather than warned about on every retry during the show.
@@ -989,6 +1027,34 @@ mod tests {
         validate_with(&cfg, true).expect("osc with a CLI login should validate");
         cfg.open_live.api_key = Some("pat".to_string());
         validate_with(&cfg, false).expect("osc with a token should validate");
+    }
+
+    /// #65 AC3: after a sign-in from the app the file says only where the credential
+    /// is. That marker stands in for a token, reads back as written, and makes no
+    /// sense for a self-hosted Open Live.
+    #[test]
+    fn the_keychain_marker_stands_in_for_a_token_in_osc_mode_only() {
+        let mut cfg = valid();
+        cfg.open_live.auth_mode = AuthMode::Osc;
+        cfg.open_live.credential = Some(CredentialStore::Keychain);
+        validate_with(&cfg, false).expect("the keychain counts as a credential");
+        assert!(cfg.open_live.uses_keychain());
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("credential = \"keychain\""), "{text}");
+        assert!(!text.contains("api_key"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.open_live.credential, Some(CredentialStore::Keychain));
+
+        cfg.open_live.api_key = Some("pat".to_string());
+        assert!(!cfg.open_live.uses_keychain(), "a token in the file wins");
+
+        cfg.open_live.api_key = None;
+        cfg.open_live.auth_mode = AuthMode::Direct;
+        let found = problems_with(&cfg, false);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].setting, Some("open_live.credential"));
+        assert!(toml::from_str::<Config>("[open_live]\ncredential = \"file\"\n").is_err());
     }
 
     /// The heartbeat is optional, but half of its credential is a mistake.

@@ -57,6 +57,11 @@ pub enum Event {
     HeartbeatStarted { gateway_id: String },
     /// An input's state changed, as the last poll found it.
     Input { input: String, state: InputState },
+    /// The Open Source Cloud credential cannot be renewed and stops working at `at`
+    /// (Unix seconds), within the session about to start or already past. Sent before
+    /// going live. After that time Open Live refuses the gateway's requests while the
+    /// feeds keep running: sign in again, or use a personal access token instead.
+    OscSignInEnds { at: u64 },
     /// Something the operator may need to act on, that stops nothing.
     Warning { message: String },
     /// Every tick while running: each input's state and uplink, from the same data
