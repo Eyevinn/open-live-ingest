@@ -354,9 +354,15 @@ pub fn infer_auth_mode(url: &str) -> AuthMode {
     }
 }
 
-/// The Open Source Cloud credential the running gateway would use, in its order of
-/// preference: the token in the settings, `OSC_ACCESS_TOKEN`, then the OSC CLI's
-/// login. Returns the token, where it came from, and whether it is the login.
+/// The Open Source Cloud credential found outside the OS keychain, in the order the
+/// running gateway tries those sources: the token in the settings,
+/// `OSC_ACCESS_TOKEN`, then the OSC CLI's login. Returns the token, where it came
+/// from, and whether it is the login.
+///
+/// This knows nothing of the keychain. When the settings carry the keychain marker
+/// ([`crate::config::OpenLive::uses_keychain`]) and no token, the running gateway
+/// uses the keychain credential, renewed as it goes, instead of anything returned
+/// here; check the marker first, as [`validate`] does.
 pub fn osc_credential(settings: &Config) -> Option<(String, &'static str, bool)> {
     if let Some(token) = settings
         .open_live

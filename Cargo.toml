@@ -50,6 +50,9 @@ libc = "0.2"
 # Credential Manager calls come from the windows-sys already in the tree (through
 # tokio, mio, socket2, console), where `keyring` 3 would add a second windows-sys,
 # its windows-targets and byteorder. Linux has no keychain here and needs nothing.
+# security-framework 3.7's own manifest marks it "looking-for-maintainer"; it is
+# still the crate `keyring`, rustls-native-certs and native-tls depend on, and the
+# few calls used here are easy to move should it be abandoned.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = { version = "3.7", default-features = false, features = ["OSX_10_14"] }
 
