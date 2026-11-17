@@ -13,7 +13,29 @@
 //! `Stats` event with every input's uplink. Stopping brings `Stopping`, then
 //! `FlowRemoved` / `SourceRemoved` / `SourceKept` per input and `StromStopped` for a
 //! Strom the session started. The last event is always [`Event::Stopped`] or
-//! [`Event::Failed`]; after it the receiver yields `None`.
+//! [`Event::Failed`]; after it the receiver yields `None`. A session that fails to
+//! start removes what it had registered before [`Event::Failed`]: the sources it
+//! created in Open Live are reported with `SourceRemoved` (or `SourceKept`).
+//!
+//! # Caveats
+//!
+//! - **A panic.** Should the session's task panic, it ends without its teardown: the
+//!   flows and sources it had started stay until the next `up` or `down`, which find
+//!   them by derived id and name prefix. The receiver still ends with
+//!   [`Event::Failed`] (reason "the session ended abnormally: …"), and
+//!   [`SessionHandle::wait`] returns the same error.
+//! - **The runtime shutting down.** The session, and the teardown a dropped handle
+//!   starts, run on the Tokio runtime [`Session::start`] was called on. If that
+//!   runtime shuts down first (the app returns from `main`, or drops its runtime),
+//!   the task is cancelled wherever it is, and flows and sources are left as after a
+//!   panic, with no terminal event: the receiver just yields `None`. An app that
+//!   wants a clean stop awaits [`SessionHandle::stop`] (or [`SessionHandle::wait`]
+//!   after [`SessionHandle::request_stop`]) before its runtime goes away.
+//! - **An unbounded channel.** Events are queued for the receiver without limit, so
+//!   emitting never blocks the session on a slow consumer. A consumer that stops
+//!   reading but keeps the receiver lets the queue grow by roughly one `Stats` event
+//!   per tick (every 10 s) for as long as the session runs. Drop the receiver
+//!   instead: events for nobody are discarded.
 
 use crate::config::{self, Config};
 use crate::devices::AudioPairing;
@@ -24,7 +46,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Where a session's events arrive. Unbounded, so emitting never blocks the
-/// session; a session emits a handful of events per input per tick.
+/// session; a session emits a handful of events per input per tick. Keep reading it,
+/// or drop it: see the module documentation's caveats.
 pub type Receiver = mpsc::UnboundedReceiver<Event>;
 
 /// Which inputs a session streams: the choices `up` takes as flags.
@@ -66,11 +89,13 @@ impl Session {
     /// reads stdin, prints, or handles a signal. Startup is not interrupted: a stop
     /// asked for while it runs is acted on as soon as the inputs are up, so whatever
     /// was started is always removed again. Dropping the handle stops the session in
-    /// the same way, in the background.
+    /// the same way, in the background, as long as the runtime keeps running (see
+    /// the module documentation's caveats).
     pub fn start(settings: Config, inputs: Inputs) -> (SessionHandle, Receiver) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel::<Stop>();
-        let task = tokio::spawn(async move {
+        let last = tx.clone();
+        let session = tokio::spawn(async move {
             let events = Events::new(move |event| {
                 // Nobody listening any more is not the session's problem.
                 let _ = tx.send(event);
@@ -86,6 +111,20 @@ impl Session {
                 },
             });
             outcome
+        });
+        // Watches the session so that a panic in it still ends the events with
+        // `Failed`: the panicking task has dropped its sender without a last event.
+        let task = tokio::spawn(async move {
+            match session.await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let err = anyhow!("the session ended abnormally: {err}");
+                    let _ = last.send(Event::Failed {
+                        reason: format!("{err:#}"),
+                    });
+                    Err(err)
+                }
+            }
         });
         (
             SessionHandle {
@@ -153,6 +192,7 @@ impl SessionHandle {
     pub async fn wait(self) -> Result<()> {
         match self.task.await {
             Ok(outcome) => outcome,
+            // Only when the runtime is shutting down: the watcher itself never panics.
             Err(err) => Err(anyhow!("the session ended abnormally: {err}")),
         }
     }
