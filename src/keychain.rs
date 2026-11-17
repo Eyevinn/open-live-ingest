@@ -285,6 +285,30 @@ mod tests {
         assert!(store.set("osc", &"x".repeat(4000)).is_err());
     }
 
+    /// Runs against the real login keychain on the macOS CI leg, under a service name
+    /// of its own so it never touches a real entry. Skipped outside CI, where writing
+    /// to the login keychain could put up a prompt.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_keychain_round_trips_an_entry() {
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+        let store =
+            OsKeychain::with_service(&format!("open-live-ingest-test-{}", std::process::id()));
+        store.delete("osc").unwrap();
+        assert_eq!(
+            store.get("osc").unwrap(),
+            None,
+            "errSecItemNotFound is None"
+        );
+        store.set("osc", r#"{"kind":"token","token":"t"}"#).unwrap();
+        store.set("osc", "replaced").unwrap();
+        assert_eq!(store.get("osc").unwrap().as_deref(), Some("replaced"));
+        store.delete("osc").unwrap();
+        assert_eq!(store.get("osc").unwrap(), None);
+    }
+
     #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn elsewhere_the_os_keychain_says_it_is_unavailable() {
