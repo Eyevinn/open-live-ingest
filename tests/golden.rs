@@ -666,6 +666,7 @@ fn up_status_and_down_print_as_before() {
     assert_golden(&scratch.stdout(&["down"]), DOWN_AGAIN);
 }
 
+#[cfg(unix)]
 const UP_THEN_STOP: &str = "\
 Bringing up 1 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 6 Mbps in total.
 
