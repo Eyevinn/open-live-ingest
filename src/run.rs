@@ -255,7 +255,7 @@ pub enum DeviceKind {
 }
 
 /// One capture device, as `devices` reports it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceReport {
     pub name: String,
     pub id: String,

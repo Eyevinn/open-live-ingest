@@ -10,6 +10,7 @@
 //! reported as [`gateway::Event`]s; `run::up` stops when a future its caller passes
 //! resolves. `tests/library_boundary.rs` keeps it that way.
 
+pub mod api;
 pub mod config;
 pub mod devices;
 pub mod flow;

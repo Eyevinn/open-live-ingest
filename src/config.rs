@@ -3,7 +3,7 @@
 //! Section and property names mirror the Strom blocks they end up on, so a value in
 //! the file can be traced to the block it configures.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -568,22 +568,81 @@ fn sid_from_whoami(output: &str) -> Option<String> {
     valid.then(|| sid.to_string())
 }
 
-/// Rejects settings that would otherwise fail confusingly at runtime.
+/// Rejects settings that would otherwise fail confusingly at runtime. The error is
+/// the first of [`problems`], unchanged.
 pub fn validate(cfg: &Config) -> Result<()> {
     validate_with(cfg, crate::osc::saved_token().is_some())
+}
+
+/// One thing wrong with the settings, in words an operator can act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    /// The settings key or section it concerns, as written in the file, e.g.
+    /// `uplink.public_host` or `open_live`. None when it concerns no one setting.
+    pub setting: Option<&'static str>,
+    /// One line, shown as is.
+    pub message: String,
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Problem {
+    pub fn new(setting: impl Into<Option<&'static str>>, message: impl Into<String>) -> Self {
+        Problem {
+            setting: setting.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Every check [`validate`] makes, each failure reported instead of only the first.
+/// Checks the settings alone; nothing is contacted.
+pub fn problems(cfg: &Config) -> Vec<Problem> {
+    problems_with(cfg, crate::osc::saved_token().is_some())
+}
+
+fn problems_with(cfg: &Config, osc_login: bool) -> Vec<Problem> {
+    check(cfg, osc_login)
+        .into_iter()
+        .map(|(setting, err)| Problem::new(setting, format!("{err:#}")))
+        .collect()
 }
 
 /// `osc_login` says whether the OSC CLI has a saved login, which stands in for
 /// `open_live.api_key` in osc mode. Passed in so the check itself stays pure.
 fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
+    match check(cfg, osc_login).into_iter().next() {
+        Some((_, err)) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// The checks, in the order `validate` has always made them, each failure with the
+/// setting it concerns.
+fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
+    let mut found: Vec<(&'static str, anyhow::Error)> = Vec::new();
     if !cfg.strom.url.starts_with("http://") && !cfg.strom.url.starts_with("https://") {
-        bail!(
-            "strom.url must be an http or https URL, got {:?}",
-            cfg.strom.url
-        );
+        found.push((
+            "strom.url",
+            anyhow!(
+                "strom.url must be an http or https URL, got {:?}",
+                cfg.strom.url
+            ),
+        ));
     }
 
-    let local_ports = cfg.uplink.local_ports()?;
+    // None when the range does not parse, which is reported here and nowhere else.
+    let local_ports = match cfg.uplink.local_ports() {
+        Ok(ports) => Some(ports),
+        Err(err) => {
+            found.push(("uplink.port_range", err));
+            None
+        }
+    };
     if cfg.uplink.mode == UplinkMode::Listener {
         if cfg
             .uplink
@@ -592,36 +651,51 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            bail!(
-                "uplink.mode is \"listener\", where the cloud dials this machine, so \
-                 uplink.public_host must be its address as the cloud sees it"
-            );
+            found.push((
+                "uplink.public_host",
+                anyhow!(
+                    "uplink.mode is \"listener\", where the cloud dials this machine, so \
+                     uplink.public_host must be its address as the cloud sees it"
+                ),
+            ));
         }
         // In caller mode the ports are the cloud Strom's and Open Live publishes them;
         // here they are this machine's own, and nobody else can know them.
-        if local_ports.is_none() {
-            bail!(
-                "uplink.mode is \"listener\", where this machine listens, so \
-                 uplink.port_range must name its own SRT ports"
-            );
+        if matches!(local_ports, Some(None)) {
+            found.push((
+                "uplink.port_range",
+                anyhow!(
+                    "uplink.mode is \"listener\", where this machine listens, so \
+                     uplink.port_range must name its own SRT ports"
+                ),
+            ));
         }
     }
     if let Some(len) = cfg.uplink.pbkeylen {
         if !matches!(len, 16 | 24 | 32) {
-            bail!("uplink.pbkeylen must be 16, 24, or 32, got {len}");
+            found.push((
+                "uplink.pbkeylen",
+                anyhow!("uplink.pbkeylen must be 16, 24, or 32, got {len}"),
+            ));
         }
     }
     if let Some(passphrase) = cfg.uplink.passphrase.as_deref().filter(|p| !p.is_empty()) {
         // libsrt's own limits, and the value travels unescaped inside two URIs.
         let n = passphrase.chars().count();
         if !(10..=79).contains(&n) {
-            bail!("uplink.passphrase must be 10 to 79 characters, got {n}");
+            found.push((
+                "uplink.passphrase",
+                anyhow!("uplink.passphrase must be 10 to 79 characters, got {n}"),
+            ));
         }
         if !passphrase
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.~!*".contains(c))
         {
-            bail!("uplink.passphrase may only contain letters, digits, and - _ . ~ ! *");
+            found.push((
+                "uplink.passphrase",
+                anyhow!("uplink.passphrase may only contain letters, digits, and - _ . ~ ! *"),
+            ));
         }
     }
 
@@ -631,7 +705,9 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
         .as_deref()
         .filter(|r| !r.is_empty())
     {
-        parse_resolution(res)?;
+        if let Err(err) = parse_resolution(res) {
+            found.push(("capture.video_resolution", err));
+        }
     }
     if let Some(rate) = cfg
         .capture
@@ -643,7 +719,10 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
             n.parse::<u32>().is_ok() && d.parse::<u32>().is_ok_and(|d| d > 0)
         });
         if !ok {
-            bail!("capture.video_framerate must be N/D, e.g. 25/1, got {rate:?}");
+            found.push((
+                "capture.video_framerate",
+                anyhow!("capture.video_framerate must be N/D, e.g. 25/1, got {rate:?}"),
+            ));
         }
     }
 
@@ -653,16 +732,25 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
     for entry in &cfg.inputs {
         let device = entry.device.trim();
         if device.is_empty() {
-            bail!("an [[input]] entry has no device");
+            found.push(("input", anyhow!("an [[input]] entry has no device")));
+            continue;
         }
         let Some(audio) = entry.audio.as_deref().map(str::trim) else {
             continue;
         };
         if audio.is_empty() {
-            bail!("the [[input]] entry for {device:?} has an empty audio; remove the line for no audio");
+            found.push((
+                "input",
+                anyhow!("the [[input]] entry for {device:?} has an empty audio; remove the line for no audio"),
+            ));
+            continue;
         }
         if let Some((other, _)) = paired.iter().find(|(_, a)| a.eq_ignore_ascii_case(audio)) {
-            bail!("audio source {audio:?} is paired with both {other:?} and {device:?} in [[input]]; one audio source goes with one camera");
+            found.push((
+                "input",
+                anyhow!("audio source {audio:?} is paired with both {other:?} and {device:?} in [[input]]; one audio source goes with one camera"),
+            ));
+            continue;
         }
         paired.push((device, audio));
     }
@@ -675,7 +763,10 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            bail!("open_live.register is on but open_live.url is unset");
+            found.push((
+                "open_live.url",
+                anyhow!("open_live.register is on but open_live.url is unset"),
+            ));
         }
         // Only osc mode needs a credential: a self-hosted Open Live with API_KEY
         // unset leaves /api/v1 open, which is the normal local development case.
@@ -689,16 +780,21 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
                 .map(str::trim)
                 .is_none_or(str::is_empty)
         {
-            bail!(
-                "open_live.auth_mode is \"osc\" but there is no OSC token: log in with `{}`, or set open_live.api_key",
-                crate::osc::LOGIN_COMMAND
-            );
+            found.push((
+                "open_live.api_key",
+                anyhow!(
+                    "open_live.auth_mode is \"osc\" but there is no OSC token: log in with `{}`, or set open_live.api_key",
+                    crate::osc::LOGIN_COMMAND
+                ),
+            ));
         }
     }
     // An id without its token, or the reverse, is a half-finished provisioning step;
     // it is refused here rather than warned about on every retry during the show.
-    crate::heartbeat::Target::from_config(&cfg.open_live)?;
-    Ok(())
+    if let Err(err) = crate::heartbeat::Target::from_config(&cfg.open_live) {
+        found.push(("open_live.gateway_id", err));
+    }
+    found
 }
 
 /// Splits a `WxH` string.
@@ -949,6 +1045,55 @@ mod tests {
         assert!(validate(&cfg).is_err());
         cfg.capture.video_framerate = Some("25/1".to_string());
         validate(&cfg).expect("a well-formed format should validate");
+    }
+
+    /// An app shows everything wrong at once; the CLI's `check` still reports the
+    /// first, worded as before.
+    #[test]
+    fn problems_lists_every_failure_and_validate_reports_the_first() {
+        assert_eq!(problems_with(&valid(), false), []);
+
+        let mut cfg = valid();
+        cfg.strom.url = "127.0.0.1:8080".to_string();
+        cfg.uplink.mode = UplinkMode::Listener;
+        cfg.uplink.port_range = Some("9100-9000".to_string());
+        cfg.uplink.passphrase = Some("short&".to_string());
+        cfg.capture.video_framerate = Some("25".to_string());
+        cfg.open_live.url = None;
+        cfg.open_live.gateway_id = Some("gw-1".to_string());
+        cfg.inputs = vec![
+            InputSettings {
+                device: "FaceTime".to_string(),
+                audio: Some("USB Microphone".to_string()),
+            },
+            InputSettings {
+                device: "DeckLink".to_string(),
+                audio: Some("usb microphone".to_string()),
+            },
+        ];
+        let found = problems_with(&cfg, false);
+        let settings: Vec<Option<&str>> = found.iter().map(|p| p.setting).collect();
+        assert_eq!(
+            settings,
+            [
+                Some("strom.url"),
+                Some("uplink.port_range"),
+                Some("uplink.public_host"),
+                Some("uplink.passphrase"),
+                Some("uplink.passphrase"),
+                Some("capture.video_framerate"),
+                Some("input"),
+                Some("open_live.url"),
+                Some("open_live.gateway_id"),
+            ],
+            "{found:#?}"
+        );
+        // A range that does not parse is not also called missing.
+        assert!(found[1].message.contains("9100-9000"), "{}", found[1]);
+        assert_eq!(
+            validate_with(&cfg, false).unwrap_err().to_string(),
+            found[0].message
+        );
     }
 
     #[test]
