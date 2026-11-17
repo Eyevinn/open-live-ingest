@@ -11,10 +11,15 @@
   com.apple.security.device.audio-input  The same for microphones and audio interfaces
                                           (osxaudiosrc).
 
-  No hardened-runtime exception is granted. Library validation stays on: every library
-  and plugin Strom and the scanner load lives in the bundle and is signed with the same
-  identity as the executables, so a Developer ID build loads them as they are. Add an
-  exception only when a signed build shows it is needed, with the reason here.
+  This file grants no hardened-runtime exception, so a Developer ID build keeps library
+  validation on: every library and plugin Strom and the scanner load lives in the bundle
+  and is signed with the same Team ID as the executables. An ad hoc build has no Team ID,
+  and macOS 27 then refuses to map the bundled libraries into strom ("different Team
+  IDs", #66). For an ad hoc build only, build-macos-app.sh therefore signs strom,
+  open-live-ingest and gst-plugin-scanner with this file plus
+  com.apple.security.cs.disable-library-validation (the scanner with that key alone),
+  and its bundle check refuses that key on any other signature. Add an exception here
+  only when a Developer ID build shows it is needed, with the reason.
 -->
 <plist version="1.0">
 <dict>

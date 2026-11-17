@@ -47,10 +47,15 @@
 # script (camera and microphone; the file says why each one is there). By default the
 # signature is ad hoc, which Apple silicon requires to load the code at all: the bundle
 # runs on the build Mac and exercises the hardened runtime, but it cannot be
-# notarized. Set MACOS_SIGN_IDENTITY (a "Developer ID Application: ..." identity, or
-# its SHA-1 hash, in a keychain the caller has unlocked) to sign with it instead, with
-# a secure timestamp, ready for notarization; MACOS_SIGN_KEYCHAIN names that keychain
-# when it is not in the search list. MACOS_ENTITLEMENTS overrides the entitlements
+# notarized. An ad hoc signature has no Team ID, and macOS 27 refuses to map the
+# bundled libraries into an ad hoc signed process under library validation (#66), so
+# an ad hoc build adds com.apple.security.cs.disable-library-validation to strom,
+# open-live-ingest and gst-plugin-scanner; --check requires it there on an ad hoc
+# bundle and refuses it on any other. Set MACOS_SIGN_IDENTITY (a "Developer ID
+# Application: ..." identity, or its SHA-1 hash, in a keychain the caller has
+# unlocked) to sign with it instead, with a secure timestamp, ready for notarization,
+# and no hardened-runtime exception; MACOS_SIGN_KEYCHAIN names that keychain when it
+# is not in the search list. MACOS_ENTITLEMENTS overrides the entitlements
 # file. Signing the DMG, notarizing and stapling is left to the caller.
 #
 # Other environment knobs:
@@ -78,6 +83,8 @@ SCANNER_REL="Helpers/gst-plugin-scanner"
 # The nested-code locations of a bundle (see the layout above).
 NESTED_CODE_DIRS="Frameworks PlugIns Helpers MacOS"
 FORBIDDEN_RE='/opt/homebrew|/usr/local'
+# Granted to the executables of an ad hoc build only (see the header).
+LIBRARY_VALIDATION_KEY="com.apple.security.cs.disable-library-validation"
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "==> $*" >&2; }
@@ -121,7 +128,7 @@ rpaths_of() {
 # it fails closed: a missing tool, an otool that fails, a file that cannot be read or
 # a bundle without its executables or plugins is an error, never a pass.
 check_bundle() {
-    local app="${1%/}" f d tool req key bad=0 checked=0 list load_cmds rpaths hits dotted sig ents
+    local app="${1%/}" f d tool req key bad=0 checked=0 list load_cmds rpaths hits dotted sig ents adhoc
     [[ -d "$app/Contents" ]] || die "$app is not an app bundle"
     for tool in file otool find awk sed grep codesign; do
         command -v "$tool" >/dev/null 2>&1 || die "$tool not found (the check needs it)"
@@ -179,6 +186,20 @@ check_bundle() {
         done
     done
     say "OK: strom and open-live-ingest carry the camera and microphone entitlements"
+    for req in MacOS/open-live-ingest MacOS/strom "$SCANNER_REL"; do
+        sig="$(codesign -d --verbose=2 "$app/Contents/$req" 2>&1)" \
+            || die "Contents/$req is not signed: $sig"
+        ents="$(codesign -d --entitlements - --xml "$app/Contents/$req" 2>/dev/null)" \
+            || die "cannot read the entitlements of Contents/$req"
+        adhoc=false
+        if grep -qx 'Signature=adhoc' <<<"$sig"; then adhoc=true; fi
+        if grep -qF "<key>$LIBRARY_VALIDATION_KEY</key><true/>" <<<"$(tr -d ' \t\n' <<<"$ents")"; then
+            $adhoc || die "Contents/$req is not signed ad hoc but carries $LIBRARY_VALIDATION_KEY"
+        elif $adhoc; then
+            die "Contents/$req is signed ad hoc but lacks $LIBRARY_VALIDATION_KEY"
+        fi
+    done
+    say "OK: $LIBRARY_VALIDATION_KEY is on the executables if and only if they are signed ad hoc"
     codesign --verify --deep --strict --verbose=2 "$app" || die "codesign does not accept $app"
     say "OK: codesign --verify --strict accepts the bundle"
 }
@@ -454,6 +475,7 @@ done <"$origins"
 entitlements="${MACOS_ENTITLEMENTS:-$root/.github/scripts/open-live-ingest.entitlements}"
 [[ -f "$entitlements" ]] || die "no entitlements file at $entitlements"
 plutil -lint "$entitlements" >/dev/null || die "$entitlements is not a valid plist"
+scanner_sign_args=()
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
     say "Signing with the Developer ID identity (hardened runtime, secure timestamp)"
     sign_args=(--timestamp --sign "$MACOS_SIGN_IDENTITY")
@@ -462,6 +484,29 @@ else
     say "MACOS_SIGN_IDENTITY not set: signing AD HOC (hardened runtime, no timestamp)."
     say "An ad hoc signed app cannot be notarized, and Gatekeeper rejects it once downloaded."
     sign_args=(--sign -)
+    say "Ad hoc: strom, open-live-ingest and gst-plugin-scanner get $LIBRARY_VALIDATION_KEY."
+    plistbuddy=/usr/libexec/PlistBuddy
+    [[ -x "$plistbuddy" ]] || die "$plistbuddy not found"
+    adhoc_entitlements="$work/adhoc.entitlements"
+    cp "$entitlements" "$adhoc_entitlements"
+    "$plistbuddy" -c "Delete :$LIBRARY_VALIDATION_KEY" "$adhoc_entitlements" >/dev/null 2>&1 || true
+    "$plistbuddy" -c "Add :$LIBRARY_VALIDATION_KEY bool true" "$adhoc_entitlements" >/dev/null \
+        || die "cannot add $LIBRARY_VALIDATION_KEY to $adhoc_entitlements"
+    plutil -convert xml1 "$adhoc_entitlements" || die "$adhoc_entitlements is not a valid plist"
+    entitlements="$adhoc_entitlements"
+    scanner_entitlements="$work/adhoc-scanner.entitlements"
+    cat >"$scanner_entitlements" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>$LIBRARY_VALIDATION_KEY</key>
+    <true/>
+</dict>
+</plist>
+EOF
+    plutil -lint "$scanner_entitlements" >/dev/null || die "$scanner_entitlements is not a valid plist"
+    scanner_sign_args=(--entitlements "$scanner_entitlements")
 fi
 sign() { codesign --force --options runtime "${sign_args[@]}" "$@" </dev/null; }
 while IFS= read -r entry; do
@@ -469,7 +514,7 @@ while IFS= read -r entry; do
     case "$file" in "$contents/MacOS/"* | "$contents/$SCANNER_REL") continue ;; esac
     sign "$file"
 done <"$origins"
-sign "$contents/$SCANNER_REL"
+sign "${scanner_sign_args[@]+"${scanner_sign_args[@]}"}" "$contents/$SCANNER_REL"
 sign --entitlements "$entitlements" "$contents/MacOS/strom"
 sign --entitlements "$entitlements" "$app"
 

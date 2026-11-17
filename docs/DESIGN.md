@@ -205,8 +205,14 @@ has no Developer ID certificate and with that certificate when it has. The ad ho
 the same hardened-runtime rules the notarized one will, on every pull request that touches the
 build, and the workflow starts the bundled Strom from the DMG to prove it still loads its GStreamer.
 Only `strom` and `open-live-ingest` carry entitlements, camera and microphone, because Strom opens
-the devices. No hardened-runtime exception is granted: every library and plugin is in the bundle and
-signed with the same identity, so library validation can stay on.
+the devices. A Developer ID build gets no hardened-runtime exception: every library and plugin is in
+the bundle and signed with the same Team ID, so library validation stays on. An ad hoc signature has
+no Team ID, and macOS 27 refuses to map the bundled libraries into an ad hoc signed `strom` under
+library validation (#66), so an ad hoc build alone adds
+`com.apple.security.cs.disable-library-validation` to `strom`, `open-live-ingest` and
+`gst-plugin-scanner`. The bundle script's check requires it on an ad hoc bundle and refuses it on
+any other, so the exception cannot reach a notarized build. The CI start check runs on an older
+macOS, so a release is also checked by hand on macOS 27 (README, "Releasing").
 
 **No local state.** Flows are found by derived id, sources by the gateway's name prefix. The
 exceptions are two pidfiles: the running `up`, so `down` can ask it to stop before sweeping, and a

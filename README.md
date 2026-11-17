@@ -267,9 +267,22 @@ cargo build --release --target aarch64-apple-darwin
 .github/scripts/build-macos-app.sh --check "dist/Open Live Ingest.app"   # the check step on its own
 ```
 
-Without `MACOS_SIGN_IDENTITY` the bundle is signed ad hoc, which is enough to run it on that Mac.
-With it set to a Developer ID identity, everything is signed with the hardened runtime, ready to
-notarize. The script's header lists the other knobs.
+Without `MACOS_SIGN_IDENTITY` the bundle is signed ad hoc, which is enough to run it on that Mac;
+its executables then carry `com.apple.security.cs.disable-library-validation`, which macOS 27 needs
+to load the bundled GStreamer into an ad hoc signed Strom. With it set to a Developer ID identity,
+everything is signed with the hardened runtime and no such exception, ready to notarize. The
+script's header lists the other knobs.
+
+Before a release, check the DMG on macOS 27 by hand: the workflow's start check runs on an older
+macOS runner. On an Apple silicon Mac with macOS 27, install the DMG from the release run and run:
+
+```bash
+"/Applications/Open Live Ingest.app/Contents/MacOS/strom" --version
+"/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest" up --test
+```
+
+Both must start without a `dyld` error, and `up --test` must reach "Strom is up" (then Ctrl-C).
+If it stops after "Starting Strom", the error is in the `strom.log` it names.
 
 ## License
 
