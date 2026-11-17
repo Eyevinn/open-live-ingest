@@ -12,18 +12,18 @@
 //! `--non-interactive` then runs the same checks without a terminal and refuses on
 //! anything missing. That is how a script or an agent sets a box up.
 
-use crate::config::{
-    format_port_range, format_ports, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE,
-};
-use crate::heartbeat;
-use crate::local_strom;
-use crate::openlive::{OpenLiveClient, ServerInfo};
-use crate::osc;
-use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
 use console::{style, Emoji, Style};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
+use open_live_ingest::config::{
+    format_port_range, format_ports, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE,
+};
+use open_live_ingest::heartbeat;
+use open_live_ingest::local_strom;
+use open_live_ingest::openlive::{OpenLiveClient, ServerInfo};
+use open_live_ingest::osc;
+use open_live_ingest::strom::{Reachability, StromClient};
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -343,7 +343,7 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     let default_name = Some(cfg.gateway.name.trim())
         .filter(|n| !n.is_empty())
         .map(str::to_string)
-        .or_else(crate::config::hostname)
+        .or_else(open_live_ingest::config::hostname)
         .unwrap_or_else(|| "gateway".to_string());
     cfg.gateway.name = ask("Name for this gateway", Some(&default_name)).await?;
 
@@ -552,7 +552,8 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
 
     section("Gateway");
     if cfg.gateway.name.trim().is_empty() {
-        cfg.gateway.name = crate::config::hostname().unwrap_or_else(|| "gateway".to_string());
+        cfg.gateway.name =
+            open_live_ingest::config::hostname().unwrap_or_else(|| "gateway".to_string());
     }
     good(format!("gateway name {}", style(&cfg.gateway.name).bold()));
 

@@ -8,10 +8,15 @@
 //! derived ids and sources by the gateway's name prefix, so both commands behave the
 //! same whether `up` is running, finished, or was killed outright. The pidfile is only
 //! there so `down` can ask a running `up` to stop first.
+//!
+//! Nothing here prints, reads the terminal, or handles a signal. Progress goes out as
+//! [`Event`]s, reports come back as values, and `up` is told when to stop by a future
+//! its caller resolves: the CLI on Ctrl-C or SIGTERM, an app on its Stop button.
 
 use crate::config::{self, format_ports, mask_passphrase, Config, UplinkMode, Video};
 use crate::devices;
 use crate::flow::{self, Input};
+use crate::gateway::{Event, Events, InputState as State, SummaryRow};
 use crate::heartbeat::{self, Heartbeat};
 use crate::local_strom::{self, LocalStrom};
 use crate::openlive::{
@@ -22,6 +27,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::future::Future;
 use std::ops::RangeInclusive;
 use std::time::Duration;
 use strom_types::api::SrtCallerStats;
@@ -36,20 +42,10 @@ const TICK: Duration = Duration::from_secs(10);
 /// revision per write, so one quiet poll must not flap the verdict.
 const QUIET_TOLERANCE: u32 = 3;
 
-/// `println!` that ignores a failed write instead of panicking. Teardown prints with
-/// it: on Windows it runs while the console is closing, logging off or shutting down,
-/// when Microsoft documents that console I/O may not work reliably.
-macro_rules! say {
-    ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout(), $($arg)*);
-    }};
-}
-
 /// The local Strom, adopted or started, and a client for it. Held for as long as the
 /// command runs: dropping it stops a Strom we started.
-async fn connect_strom(cfg: &Config) -> Result<(LocalStrom, StromClient)> {
-    let local = local_strom::ensure_running(cfg).await?;
+async fn connect_strom(cfg: &Config, events: &Events) -> Result<(LocalStrom, StromClient)> {
+    let local = local_strom::ensure_running(cfg, events).await?;
     Ok((
         local,
         StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?,
@@ -86,16 +82,6 @@ struct Cloud {
     port_source: PortSource,
 }
 
-impl Cloud {
-    fn describe_ports(&self) -> String {
-        format!(
-            "SRT ports {} from {}",
-            format_ports(&self.ports),
-            self.port_source
-        )
-    }
-}
-
 /// Who chose the port range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortSource {
@@ -119,7 +105,11 @@ impl fmt::Display for PortSource {
 /// or in caller mode its Strom's ports. A configured host together with a configured
 /// range still starts when Open Live is down, as it always has; the sources are
 /// registered once it is back.
-async fn resolve_cloud(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Result<Cloud> {
+async fn resolve_cloud(
+    cfg: &Config,
+    open_live: Option<&OpenLiveClient>,
+    events: &Events,
+) -> Result<Cloud> {
     let configured_host = cfg
         .uplink
         .host
@@ -133,6 +123,9 @@ async fn resolve_cloud(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Resu
             Ok(info) => info,
             Err(err) if configured_host.is_some() && local.is_some() => {
                 warn!(err = %format_args!("{err:#}"), "could not ask Open Live for its server info; using uplink.host and uplink.port_range from the settings");
+                events.emit(Event::Warning {
+                    message: format!("could not ask Open Live for its server info ({err:#}); using uplink.host and uplink.port_range from the settings"),
+                });
                 None
             }
             Err(err) => return Err(err.context("asking Open Live where its Strom is")),
@@ -156,6 +149,7 @@ async fn resolve_cloud(cfg: &Config, open_live: Option<&OpenLiveClient>) -> Resu
         local,
         info.as_ref().and_then(|i| i.srt_ports.clone()),
         info.as_ref().and_then(|i| i.srt_port_state.as_deref()),
+        events,
     )?;
     Ok(Cloud {
         host,
@@ -174,6 +168,7 @@ fn choose_ports(
     local: Option<RangeInclusive<u16>>,
     published: Option<BTreeSet<u16>>,
     lease_status: Option<&str>,
+    events: &Events,
 ) -> Result<(BTreeSet<u16>, PortSource)> {
     let local = local.map(|range| range.collect::<BTreeSet<u16>>());
     match mode {
@@ -188,6 +183,13 @@ fn choose_ports(
                         open_live = %format_ports(&published),
                         "uplink.port_range is ignored: in caller mode the cloud Strom owns its ports, and Open Live publishes its range"
                     );
+                    events.emit(Event::Warning {
+                        message: format!(
+                            "uplink.port_range ({}) is ignored: in caller mode the cloud Strom owns its ports, and Open Live publishes {}",
+                            format_ports(&local),
+                            format_ports(&published)
+                        ),
+                    });
                 }
                 Ok((published, PortSource::OpenLive))
             }
@@ -206,10 +208,11 @@ fn choose_ports(
     }
 }
 
-/// Lists what Strom can see, so an operator can pick before starting anything.
-pub async fn devices(cfg: Config, json: bool) -> Result<()> {
+/// Lists what Strom can see, so an operator can pick before starting anything:
+/// video sources first, then audio sources, each sorted by name.
+pub async fn devices(cfg: &Config, events: &Events) -> Result<Vec<DeviceReport>> {
     // Started only to ask, if started at all; dropped again on the way out.
-    let (_local, strom) = connect_strom(&cfg).await?;
+    let (_local, strom) = connect_strom(cfg, events).await?;
     let video = strom
         .video_devices()
         .await
@@ -218,13 +221,7 @@ pub async fn devices(cfg: Config, json: bool) -> Result<()> {
         .audio_devices()
         .await
         .context("asking Strom what audio sources it can see")?;
-    let report = device_report(video, audio);
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print!("{}", render_devices(&report));
-    }
-    Ok(())
+    Ok(device_report(video, audio))
 }
 
 /// Video sources first, then audio sources, each sorted by name.
@@ -252,23 +249,24 @@ fn device_report(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum DeviceKind {
+pub enum DeviceKind {
     Video,
     Audio,
 }
 
 /// One capture device, as `devices` reports it.
 #[derive(Debug, Serialize)]
-struct DeviceReport {
-    name: String,
-    id: String,
-    kind: DeviceKind,
+pub struct DeviceReport {
+    pub name: String,
+    pub id: String,
+    pub kind: DeviceKind,
     /// Skipped by `up` unless `--all`: it produces nothing on its own.
     #[serde(rename = "virtual")]
-    virtual_: bool,
+    pub virtual_: bool,
 }
 
-fn render_devices(all: &[DeviceReport]) -> String {
+/// The `devices` table, as the CLI prints it.
+pub fn render_devices(all: &[DeviceReport]) -> String {
     let (video, audio): (Vec<&DeviceReport>, Vec<&DeviceReport>) =
         all.iter().partition(|d| d.kind == DeviceKind::Video);
     let mut out = if video.is_empty() {
@@ -320,32 +318,9 @@ struct Live {
     uplink: Option<SrtCallerStats>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum State {
-    /// Start requested, first poll pending.
-    Starting,
-    /// The flow runs but nothing is receiving the uplink. Normal until the source is
-    /// assigned to a production.
-    Waiting,
-    /// Bytes are leaving. Reported to Open Live as `active`.
-    OnAir,
-    /// Strom is not answering. Not evidence that the feed stopped: the source's
-    /// status is left as it was.
-    Unreachable,
-    Failed(String),
-}
-
+// `Unreachable` is not evidence that the feed stopped: the source's status is left
+// as it was.
 impl State {
-    fn describe(&self) -> String {
-        match self {
-            State::Starting => "starting".to_string(),
-            State::Waiting => "waiting for a receiver".to_string(),
-            State::OnAir => "on air, the far end is receiving".to_string(),
-            State::Unreachable => "lost contact with Strom".to_string(),
-            State::Failed(err) => format!("failed: {err}"),
-        }
-    }
-
     /// What Strom would say about the flow, for the heartbeat. `Unreachable` cannot
     /// be confirmed running and is reported as idle: a venue's inputs all dropping to
     /// idle while its heartbeat keeps arriving is a true signal that the box has lost
@@ -353,7 +328,7 @@ impl State {
     fn flow_state(&self) -> heartbeat::FlowState {
         match self {
             State::Starting | State::Waiting | State::OnAir => heartbeat::FlowState::Playing,
-            State::Unreachable | State::Failed(_) => heartbeat::FlowState::Idle,
+            State::Unreachable | State::Failed { .. } => heartbeat::FlowState::Idle,
         }
     }
 }
@@ -369,15 +344,19 @@ struct Reporter {
 impl Reporter {
     /// Starts the heartbeat when the settings name a gateway. `strom_version` is the
     /// one `up` read at startup; an older Strom without the route goes unversioned.
-    fn start(cfg: &Config, strom_version: Option<String>, live: &[Live]) -> Result<Option<Self>> {
+    fn start(
+        cfg: &Config,
+        strom_version: Option<String>,
+        live: &[Live],
+        events: &Events,
+    ) -> Result<Option<Self>> {
         let Some(target) = heartbeat::Target::from_config(&cfg.open_live)? else {
             return Ok(None);
         };
         let host = config::hostname().unwrap_or_else(|| cfg.gateway.resolved_id());
-        println!(
-            "Status is pushed to Open Live as gateway {}.",
-            target.gateway_id
-        );
+        events.emit(Event::HeartbeatStarted {
+            gateway_id: target.gateway_id.clone(),
+        });
         let initial = snapshot_of(live, &host, strom_version.as_deref());
         Ok(Some(Self {
             heartbeat: Heartbeat::start(target, initial),
@@ -418,20 +397,24 @@ fn snapshot_of(live: &[Live], host: &str, strom_version: Option<&str>) -> heartb
     }
 }
 
-/// Brings every chosen device up and keeps it registered until stopped.
+/// Brings every chosen device up and keeps it registered until `stop` resolves, then
+/// removes what it started. `stop` says why it is stopping, which decides how long
+/// the teardown may take.
 pub async fn up(
     cfg: Config,
     include_virtual: bool,
     selection: Option<String>,
     audio_pairings: Vec<devices::AudioPairing>,
     test_pattern: bool,
+    events: &Events,
+    stop: impl Future<Output = Stop>,
 ) -> Result<()> {
     if test_pattern && !audio_pairings.is_empty() {
         bail!("--audio pairs an audio source with a camera, and --test streams no camera; the test pattern carries its own tone");
     }
     let gateway_id = cfg.gateway.resolved_id();
     let source_gateway_id = source_gateway_id(&cfg)?;
-    let (local_strom, strom) = connect_strom(&cfg).await?;
+    let (local_strom, strom) = connect_strom(&cfg, events).await?;
     // Asked once, here, whether or not the heartbeat is on; the heartbeat reuses it.
     // An older Strom without the route is warned about, never refused.
     let strom_version = strom.version().await.ok();
@@ -439,6 +422,7 @@ pub async fn up(
         strom_api::version_warning(strom_api::PINNED_VERSION, strom_version.as_deref())
     {
         warn!("{warning}");
+        events.emit(Event::Warning { message: warning });
     }
     let open_live = open_live_client(&cfg)?;
 
@@ -462,6 +446,9 @@ pub async fn up(
         let (pairings, absent) = devices::settings_pairings(&cfg.inputs, &chosen);
         for device in absent {
             warn!("[[input]] pairs audio with {device:?}, which is not among this run's cameras; skipped");
+            events.emit(Event::Warning {
+                message: format!("[[input]] pairs audio with {device:?}, which is not among this run's cameras; skipped"),
+            });
         }
         pairings
     };
@@ -476,7 +463,7 @@ pub async fn up(
     };
 
     // Without somewhere to send there is no point starting: the feeds would go nowhere.
-    let cloud = resolve_cloud(&cfg, open_live.as_ref()).await?;
+    let cloud = resolve_cloud(&cfg, open_live.as_ref(), events).await?;
     let mut inputs = devices::inputs_for(
         &chosen,
         test_pattern,
@@ -490,13 +477,13 @@ pub async fn up(
 
     // Each input costs an encoder and its share of the uplink, which is easy to
     // overlook when one command starts all of them.
-    println!(
-        "Bringing up {} input(s) to {}, {}, about {:.0} Mbps in total.",
-        inputs.len(),
-        cloud.host,
-        cloud.describe_ports(),
-        inputs.len() as f64 * cfg.video.bitrate_kbps as f64 / 1000.0
-    );
+    events.emit(Event::BringingUp {
+        inputs: inputs.len(),
+        host: cloud.host.clone(),
+        ports: format_ports(&cloud.ports),
+        port_source: cloud.port_source.to_string(),
+        total_mbps: inputs.len() as f64 * cfg.video.bitrate_kbps as f64 / 1000.0,
+    });
 
     // When the range is Open Live's, so is the port inside it: register first and
     // take the port Open Live wrote into the source, then build the flows to it.
@@ -507,6 +494,7 @@ pub async fn up(
                 &mut inputs,
                 &cloud.ports,
                 source_gateway_id.as_deref(),
+                events,
             )
             .await?
         }
@@ -521,11 +509,12 @@ pub async fn up(
             &inputs,
             &cfg.gateway.name,
             source_gateway_id.as_deref(),
+            events,
         )
         .await?;
     }
 
-    clear_conflicting_flows(&strom, &gateway_id, &inputs).await?;
+    clear_conflicting_flows(&strom, &gateway_id, &inputs, events).await?;
 
     let mut live = Vec::new();
     for input in inputs {
@@ -554,7 +543,11 @@ pub async fn up(
             }),
             // One camera failing must not stop the rest of the venue coming up.
             Err(err) => {
-                warn!(input = %input.name, err = %format_args!("{err:#}"), "could not start this input")
+                warn!(input = %input.name, err = %format_args!("{err:#}"), "could not start this input");
+                events.emit(Event::InputFailed {
+                    input: input.name.clone(),
+                    reason: format!("{err:#}"),
+                });
             }
         }
     }
@@ -562,11 +555,16 @@ pub async fn up(
         bail!("no input could be started");
     }
 
-    print_summary(&live);
+    events.emit(summary(&live));
     if let Err(err) = write_pidfile() {
         warn!(err = %format_args!("{err:#}"), "could not write the pidfile; `down` will still find the flows and sources");
+        events.emit(Event::Warning {
+            message: format!(
+                "could not write the pidfile ({err:#}); `down` will still find the flows and sources"
+            ),
+        });
     }
-    let reporter = Reporter::start(&cfg, strom_version, &live)?;
+    let reporter = Reporter::start(&cfg, strom_version, &live, events)?;
 
     let (outcome, stop) = match run_until_stopped(
         &strom,
@@ -576,6 +574,8 @@ pub async fn up(
         source_gateway_id.as_deref(),
         &cfg,
         &mut live,
+        events,
+        stop,
     )
     .await
     {
@@ -583,14 +583,14 @@ pub async fn up(
         Err(err) => (Err(err), Stop::Interrupt),
     };
 
-    say!("\nStopping.");
+    events.emit(Event::Stopping);
     match stop {
         Stop::Interrupt => {
             // Studio hears first, so the inputs vanishing next is read as a stop, not a fault.
             if let Some(reporter) = reporter {
                 reporter.stop().await;
             }
-            teardown(&strom, open_live.as_ref(), &cfg.gateway.name, &live).await;
+            teardown(&strom, open_live.as_ref(), &cfg.gateway.name, &live, events).await;
         }
         Stop::Ending => {
             // Windows ends the process shortly after, so nothing waits on anything else.
@@ -607,7 +607,8 @@ pub async fn up(
                     open_live.as_ref(),
                     &cfg.gateway.name,
                     &live,
-                    deadline
+                    deadline,
+                    events
                 )
             );
         }
@@ -658,6 +659,7 @@ async fn assign_ports_from_open_live(
     inputs: &mut [Input],
     ports: &BTreeSet<u16>,
     gateway_id: Option<&str>,
+    events: &Events,
 ) -> Result<HashMap<String, Registered>> {
     let sources = client
         .list_sources()
@@ -670,7 +672,7 @@ async fn assign_ports_from_open_live(
         let (source_id, address) = match plan_port(existing, ports) {
             PortPlan::Keep { source_id, port } => {
                 if let Some(stored) = existing {
-                    note_connect_warning(&input.name, stored, &mut warning, false);
+                    note_connect_warning(&input.name, stored, &mut warning, false, events);
                 }
                 input.endpoint.port = port;
                 ids.insert(input.id.clone(), Registered { source_id, warning });
@@ -690,7 +692,11 @@ async fn assign_ports_from_open_live(
                     .await
                     .with_context(|| format!("registering {:?} with Open Live", input.name))?;
                 info!(input = %input.name, source_id = %created.id, "registered the source with Open Live");
-                note_connect_warning(&input.name, &created, &mut warning, true);
+                events.emit(Event::Registered {
+                    input: input.name.clone(),
+                    source_id: created.id.clone(),
+                });
+                note_connect_warning(&input.name, &created, &mut warning, true, events);
                 (created.id, created.address)
             }
             PortPlan::Reassign { source_id } => {
@@ -708,7 +714,7 @@ async fn assign_ports_from_open_live(
                     .with_context(|| {
                         format!("asking Open Live for a new port for {:?}", input.name)
                     })?;
-                note_connect_warning(&input.name, &patched, &mut warning, true);
+                note_connect_warning(&input.name, &patched, &mut warning, true, events);
                 (source_id, patched.address)
             }
         };
@@ -745,7 +751,13 @@ fn should_log_warning(current: Option<&str>, last: Option<&str>, written: bool) 
 /// Logs Open Live's `connect.warning` for an input's source when
 /// [`should_log_warning`] says so, and remembers it in `last`. Registration has
 /// already succeeded; the warning is only reported, never an error.
-fn note_connect_warning(input: &str, source: &Source, last: &mut Option<String>, written: bool) {
+fn note_connect_warning(
+    input: &str,
+    source: &Source,
+    last: &mut Option<String>,
+    written: bool,
+    events: &Events,
+) {
     let current = source.connect_warning();
     if should_log_warning(current, last.as_deref(), written) {
         warn!(
@@ -754,6 +766,10 @@ fn note_connect_warning(input: &str, source: &Source, last: &mut Option<String>,
             warning = current.unwrap_or_default(),
             "Open Live registered the source but warns its address may not work against the cloud Strom"
         );
+        events.emit(Event::ConnectWarning {
+            input: input.to_string(),
+            warning: current.unwrap_or_default().to_string(),
+        });
     }
     *last = current.map(str::to_string);
 }
@@ -811,6 +827,7 @@ async fn free_held_ports(
     inputs: &[Input],
     gateway_name: &str,
     gateway_id: Option<&str>,
+    events: &Events,
 ) -> Result<()> {
     let wanted: Vec<(String, u16)> = inputs
         .iter()
@@ -845,10 +862,10 @@ async fn free_held_ports(
     }
     for c in &clashes {
         match client.delete_source(&c.holder_id).await {
-            Ok(()) => println!(
-                "  removed Open Live source {:?}, left over from an earlier run (it held port {})",
-                c.holder_name, c.port
-            ),
+            Ok(()) => events.emit(Event::LeftoverSourceRemoved {
+                name: c.holder_name.clone(),
+                port: c.port,
+            }),
             Err(err) => match err.downcast_ref::<Refused>() {
                 Some(refused) => bail!(
                     "port {} for {:?} is held by the Open Live source {:?}, left over from an earlier run, and Open Live will not remove it: {}. Deactivate that production, then start again.",
@@ -878,6 +895,7 @@ async fn clear_conflicting_flows(
     strom: &StromClient,
     gateway_id: &str,
     inputs: &[Input],
+    events: &Events,
 ) -> Result<()> {
     let devices: Vec<&str> = inputs
         .iter()
@@ -893,12 +911,10 @@ async fn clear_conflicting_flows(
             continue;
         }
         remove_flow(strom, &existing.id).await?;
-        let why = if ours {
-            "left over from an earlier run"
-        } else {
-            "which was holding one of these devices"
-        };
-        println!("  removed Strom flow {:?}, {why}", existing.name);
+        events.emit(Event::ConflictingFlowRemoved {
+            name: existing.name.clone(),
+            ours,
+        });
     }
     Ok(())
 }
@@ -923,21 +939,22 @@ async fn remove_flow(strom: &StromClient, flow_id: &FlowId) -> Result<()> {
     strom.delete_flow(flow_id).await
 }
 
-fn print_summary(live: &[Live]) {
-    println!("\n{:<36} {:<6} REGISTERED ADDRESS", "INPUT", "PORT");
-    for l in live {
-        println!(
-            "{:<36} {:<6} {}",
-            truncate(&l.input.name, 36),
-            l.input.endpoint.port,
-            mask_passphrase(&l.input.endpoint.cloud_uri())
-        );
+/// The inputs that started, with the address each registered, passphrase masked.
+fn summary(live: &[Live]) -> Event {
+    Event::Summary {
+        inputs: live
+            .iter()
+            .map(|l| SummaryRow {
+                name: l.input.name.clone(),
+                port: l.input.endpoint.port,
+                address: mask_passphrase(&l.input.endpoint.cloud_uri()),
+            })
+            .collect(),
     }
-    println!("\nAssign these in Studio and activate the production; they read as inactive until");
-    println!("something is receiving them. Ctrl-C stops and removes them.\n");
 }
 
-fn truncate(s: &str, width: usize) -> String {
+/// `s` cut to `width` characters, an ellipsis marking the cut, for a table column.
+pub fn truncate(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
     }
@@ -946,6 +963,8 @@ fn truncate(s: &str, width: usize) -> String {
 
 /// One tick every few seconds, sequentially over every input: no shared state, no
 /// task per input, and one Open Live list call per tick.
+// Called once, from `up`, with what `up` holds; a struct to carry them buys nothing.
+#[allow(clippy::too_many_arguments)]
 async fn run_until_stopped(
     strom: &StromClient,
     open_live: Option<&OpenLiveClient>,
@@ -954,9 +973,10 @@ async fn run_until_stopped(
     source_gateway_id: Option<&str>,
     cfg: &Config,
     live: &mut [Live],
+    events: &Events,
+    stop: impl Future<Output = Stop>,
 ) -> Result<Stop> {
     let mut ticker = tokio::time::interval(TICK);
-    let stop = stop_signal();
     tokio::pin!(stop);
     loop {
         tokio::select! {
@@ -978,16 +998,23 @@ async fn run_until_stopped(
                     reporter.publish(live);
                 }
                 if let Some(client) = open_live {
-                    if let Err(err) = reconcile_sources(client, live, source_gateway_id).await {
+                    if let Err(err) = reconcile_sources(client, live, source_gateway_id, events).await {
                         // Never fatal: the feeds are already flowing. Retried next tick.
                         warn!(err = %format_args!("{err:#}"), "could not update the Open Live sources, retrying next tick");
+                        events.emit(Event::Warning {
+                            message: format!("could not update the Open Live sources ({err:#}); the feeds are unaffected, retrying next tick"),
+                        });
                     }
                 }
-                // Appended lines rather than a redrawn screen: this is read over SSH,
-                // in tmux, and in a log file after the fact.
+                // Only changes are told, so the CLI appends a line per change rather
+                // than redrawing a screen: it is read over SSH, in tmux, and in a log
+                // file after the fact.
                 for l in live.iter_mut() {
                     if l.shown.as_ref() != Some(&l.state) {
-                        println!("  {} — {}", l.input.name, l.state.describe());
+                        events.emit(Event::Input {
+                            input: l.input.name.clone(),
+                            state: l.state.clone(),
+                        });
                         l.shown = Some(l.state.clone());
                     }
                 }
@@ -1021,7 +1048,9 @@ async fn poll_flow(
         return Ok(if strom.start_flow(&l.flow_id).await? {
             State::Starting
         } else {
-            State::Failed("Strom did not report the flow running after start".to_string())
+            State::Failed {
+                reason: "Strom did not report the flow running after start".to_string(),
+            }
         });
     }
 
@@ -1060,6 +1089,7 @@ async fn reconcile_sources(
     client: &OpenLiveClient,
     live: &mut [Live],
     gateway_id: Option<&str>,
+    events: &Events,
 ) -> Result<()> {
     let sources = client.list_sources().await?;
     for l in live.iter_mut() {
@@ -1084,16 +1114,38 @@ async fn reconcile_sources(
             Some(stored) => {
                 if drifted(stored, &desired) {
                     let patched = client.patch_source(&stored.id, &desired).await?;
-                    note_connect_warning(&l.input.name, &patched, &mut l.connect_warning, true);
+                    note_connect_warning(
+                        &l.input.name,
+                        &patched,
+                        &mut l.connect_warning,
+                        true,
+                        events,
+                    );
                 } else {
-                    note_connect_warning(&l.input.name, stored, &mut l.connect_warning, false);
+                    note_connect_warning(
+                        &l.input.name,
+                        stored,
+                        &mut l.connect_warning,
+                        false,
+                        events,
+                    );
                 }
                 l.source_id = Some(stored.id.clone());
             }
             None => {
                 let created = client.create_source(&desired).await?;
                 info!(input = %l.input.name, source_id = %created.id, "registered the source with Open Live");
-                note_connect_warning(&l.input.name, &created, &mut l.connect_warning, true);
+                events.emit(Event::Registered {
+                    input: l.input.name.clone(),
+                    source_id: created.id.clone(),
+                });
+                note_connect_warning(
+                    &l.input.name,
+                    &created,
+                    &mut l.connect_warning,
+                    true,
+                    events,
+                );
                 l.source_id = Some(created.id);
             }
         }
@@ -1101,85 +1153,15 @@ async fn reconcile_sources(
     Ok(())
 }
 
-/// Resolves on Ctrl-C or SIGTERM. SIGHUP is deliberately swallowed: closing an SSH
-/// session, or a link dropping mid-show, must not tear down a venue's feeds. The
-/// signal streams live for the whole run, so a signal is never lost between polls.
-#[cfg(unix)]
-async fn stop_signal() -> Stop {
-    use tokio::signal::unix::{signal, Signal, SignalKind};
-
-    async fn recv(sig: &mut Option<Signal>) {
-        match sig {
-            Some(s) => {
-                s.recv().await;
-            }
-            None => std::future::pending().await,
-        }
-    }
-
-    let mut interrupt = signal(SignalKind::interrupt()).ok();
-    let mut terminate = signal(SignalKind::terminate()).ok();
-    let mut hangup = signal(SignalKind::hangup()).ok();
-    if interrupt.is_none() && terminate.is_none() {
-        let _ = tokio::signal::ctrl_c().await;
-        return Stop::Interrupt;
-    }
-    loop {
-        tokio::select! {
-            _ = recv(&mut interrupt) => return Stop::Interrupt,
-            _ = recv(&mut terminate) => return Stop::Interrupt,
-            _ = recv(&mut hangup) => info!("ignoring SIGHUP so the feeds survive a closed session"),
-        }
-    }
-}
-
-/// Resolves on Ctrl-C, Ctrl-Break, closing the console window, logoff or shutdown.
-/// The last three come with a deadline: Windows ends the process about five seconds
-/// later whatever it is doing. The streams live for the whole run, as on Unix.
-#[cfg(windows)]
-async fn stop_signal() -> Stop {
-    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
-
-    // Each event has its own stream type; one that could not be registered never fires.
-    macro_rules! recv {
-        ($stream:expr) => {
-            async {
-                match $stream.as_mut() {
-                    Some(s) => {
-                        s.recv().await;
-                    }
-                    None => std::future::pending::<()>().await,
-                }
-            }
-        };
-    }
-
-    let mut interrupt = ctrl_c().ok();
-    let mut brk = ctrl_break().ok();
-    let mut close = ctrl_close().ok();
-    let mut logoff = ctrl_logoff().ok();
-    let mut shutdown = ctrl_shutdown().ok();
-    if interrupt.is_none() && brk.is_none() {
-        let _ = tokio::signal::ctrl_c().await;
-        return Stop::Interrupt;
-    }
-    tokio::select! {
-        _ = recv!(interrupt) => Stop::Interrupt,
-        _ = recv!(brk) => Stop::Interrupt,
-        _ = recv!(close) => Stop::Ending,
-        _ = recv!(logoff) => Stop::Ending,
-        _ = recv!(shutdown) => Stop::Ending,
-    }
-}
-
 /// Why `up` is stopping, which decides how long teardown may take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stop {
-    /// Ctrl-C, Ctrl-Break or SIGTERM: teardown takes as long as it needs.
+pub enum Stop {
+    /// A deliberate stop (Ctrl-C, Ctrl-Break, SIGTERM, a Stop button): teardown takes
+    /// as long as it needs.
     Interrupt,
-    /// The console window closed, or the user is logging off or the machine shutting
-    /// down: Windows ends the process about five seconds later.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// The process is about to be ended from outside (on Windows: the console window
+    /// closed, the user logging off or the machine shutting down, after which Windows
+    /// ends the process about five seconds later): teardown gets [`ENDING_TEARDOWN`].
     Ending,
 }
 
@@ -1188,27 +1170,39 @@ enum Stop {
 /// only because `LocalStrom`'s drop ends a managed Strom at once on Windows
 /// (`Child::kill`, i.e. TerminateProcess) before it waits, rather than giving it
 /// `STOP_TIMEOUT` to exit by itself.
-const ENDING_TEARDOWN: Duration = Duration::from_secs(4);
+pub const ENDING_TEARDOWN: Duration = Duration::from_secs(4);
 
 /// Removes one flow and says so. Returns whether it is gone.
-async fn remove_flow_reported(strom: &StromClient, l: &Live) -> bool {
+async fn remove_flow_reported(strom: &StromClient, l: &Live, events: &Events) -> bool {
     match remove_flow(strom, &l.flow_id).await {
         Ok(()) => {
-            say!("  {} — flow stopped and removed", l.input.name);
+            events.emit(Event::FlowRemoved {
+                input: l.input.name.clone(),
+            });
             true
         }
         Err(err) => {
             warn!(input = %l.input.name, err = %format_args!("{err:#}"), "could not remove the flow");
+            events.emit(Event::Warning {
+                message: format!("could not remove the flow of {} ({err:#})", l.input.name),
+            });
             false
         }
     }
 }
 
 /// Removes one input's Open Live source and says so. Returns whether it is gone.
-async fn remove_source_reported(client: &OpenLiveClient, id: &str, l: &Live) -> bool {
-    let gone = remove_source(client, id, &l.input.name).await;
+async fn remove_source_reported(
+    client: &OpenLiveClient,
+    id: &str,
+    l: &Live,
+    events: &Events,
+) -> bool {
+    let gone = remove_source(client, id, &l.input.name, events).await;
     if gone {
-        say!("  {} — source removed from Open Live", l.input.name);
+        events.emit(Event::SourceRemoved {
+            input: l.input.name.clone(),
+        });
     }
     gone
 }
@@ -1219,14 +1213,15 @@ async fn teardown(
     open_live: Option<&OpenLiveClient>,
     gateway_name: &str,
     live: &[Live],
+    events: &Events,
 ) {
     // Sources Open Live refused to remove, already reported, so the sweep below does
     // not try them again and print the same refusal twice.
     let mut kept = BTreeSet::new();
     for l in live {
-        remove_flow_reported(strom, l).await;
+        remove_flow_reported(strom, l, events).await;
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
-            if !remove_source_reported(client, id, l).await {
+            if !remove_source_reported(client, id, l, events).await {
                 kept.insert(id.clone());
             }
         }
@@ -1235,7 +1230,7 @@ async fn teardown(
     // whose id we never learned. Matched on the name prefix, so sources belonging to
     // another gateway or made by hand are never touched.
     if let Some(client) = open_live {
-        sweep_sources(client, gateway_name, &kept).await;
+        sweep_sources(client, gateway_name, &kept, events).await;
     }
 }
 
@@ -1248,6 +1243,7 @@ async fn teardown_within(
     gateway_name: &str,
     live: &[Live],
     deadline: tokio::time::Instant,
+    events: &Events,
 ) {
     type Job<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>>;
     // What each job removes, and the source id when it is a source.
@@ -1255,10 +1251,10 @@ async fn teardown_within(
     let mut jobs: Vec<Job> = Vec::new();
     for l in live {
         what.push((format!("flow of {}", l.input.name), None));
-        jobs.push(Box::pin(remove_flow_reported(strom, l)));
+        jobs.push(Box::pin(remove_flow_reported(strom, l, events)));
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
             what.push((format!("source of {}", l.input.name), Some(id.clone())));
-            jobs.push(Box::pin(remove_source_reported(client, id, l)));
+            jobs.push(Box::pin(remove_source_reported(client, id, l, events)));
         }
     }
     let mut kept = BTreeSet::new();
@@ -1274,7 +1270,7 @@ async fn teardown_within(
         }
     }
     if let Some(client) = open_live {
-        let sweep = sweep_sources(client, gateway_name, &kept);
+        let sweep = sweep_sources(client, gateway_name, &kept, events);
         if tokio::time::timeout_at(deadline, sweep).await.is_err() {
             left.push("the sweep for other sources of this gateway".to_string());
         }
@@ -1284,6 +1280,12 @@ async fn teardown_within(
             left = %left.join(", "),
             "not removed before Windows ends the process; the next `open-live-ingest up` or `down` removes them"
         );
+        events.emit(Event::Warning {
+            message: format!(
+                "not removed before the process ends: {}; the next `open-live-ingest up` or `down` removes them",
+                left.join(", ")
+            ),
+        });
     }
 }
 
@@ -1369,27 +1371,25 @@ mod teardown_tests {
 /// Deletes one source, and says so plainly when Open Live refuses: a source in an
 /// active production stays, and the operator needs to know which production holds
 /// it and how to clear it. Returns whether the source is gone.
-async fn remove_source(client: &OpenLiveClient, id: &str, name: &str) -> bool {
+async fn remove_source(client: &OpenLiveClient, id: &str, name: &str, events: &Events) -> bool {
     match client.delete_source(id).await {
         Ok(()) => true,
         Err(err) => {
             match err.downcast_ref::<Refused>() {
-                Some(refused) => say!("  {}", kept_message(name, refused)),
+                Some(refused) => events.emit(Event::SourceKept {
+                    input: name.to_string(),
+                    reason: refused.explain(),
+                }),
                 None => {
-                    warn!(source = %name, err = %format_args!("{err:#}"), "could not remove the source")
+                    warn!(source = %name, err = %format_args!("{err:#}"), "could not remove the source");
+                    events.emit(Event::Warning {
+                        message: format!("could not remove the source {name} ({err:#})"),
+                    });
                 }
             }
             false
         }
     }
-}
-
-/// The line for a source Open Live would not remove. Pure, so its wording is tested.
-fn kept_message(name: &str, refused: &Refused) -> String {
-    format!(
-        "{name} stays in Open Live: {}. Deactivate that production, then run `open-live-ingest down`.",
-        refused.explain()
-    )
 }
 
 /// Removes every source carrying this gateway's name prefix, except the ids in
@@ -1398,6 +1398,7 @@ async fn sweep_sources(
     client: &OpenLiveClient,
     gateway_name: &str,
     skip: &BTreeSet<String>,
+    events: &Events,
 ) -> usize {
     let prefix = devices::name_prefix(gateway_name);
     let sources = match client.list_sources().await {
@@ -1412,8 +1413,10 @@ async fn sweep_sources(
         .iter()
         .filter(|s| s.name.starts_with(&prefix) && !skip.contains(&s.id))
     {
-        if remove_source(client, &source.id, &source.name).await {
-            say!("  {} — source removed from Open Live", source.name);
+        if remove_source(client, &source.id, &source.name, events).await {
+            events.emit(Event::SourceRemoved {
+                input: source.name.clone(),
+            });
             removed += 1;
         }
     }
@@ -1421,12 +1424,12 @@ async fn sweep_sources(
 }
 
 /// Stops a running `up` if there is one, then removes whatever is left.
-pub async fn down(cfg: Config) -> Result<()> {
+pub async fn down(cfg: &Config, events: &Events) -> Result<()> {
     let gateway_id = cfg.gateway.resolved_id();
 
     if let Some(pid) = read_pidfile() {
         if is_running_gateway(pid) {
-            println!("Asking the running gateway (pid {pid}) to stop.");
+            events.emit(Event::AskingRunningToStop { pid });
             signal_stop(pid);
             for _ in 0..60 {
                 if !process_alive(pid) {
@@ -1435,7 +1438,7 @@ pub async fn down(cfg: Config) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             if process_alive(pid) {
-                println!("It has not finished stopping; removing what is left anyway.");
+                events.emit(Event::RunningDidNotStop);
             }
         }
         remove_pidfile();
@@ -1448,110 +1451,106 @@ pub async fn down(cfg: Config) -> Result<()> {
             for f in flows.iter().filter(|f| flow::is_ours(f, &gateway_id)) {
                 match remove_flow(&strom, &f.id).await {
                     Ok(()) => {
-                        println!("  {} — flow stopped and removed", f.name);
+                        events.emit(Event::FlowRemoved {
+                            input: f.name.clone(),
+                        });
                         removed += 1;
                     }
                     Err(err) => {
-                        warn!(flow = %f.name, err = %format_args!("{err:#}"), "could not remove the flow")
+                        warn!(flow = %f.name, err = %format_args!("{err:#}"), "could not remove the flow");
+                        events.emit(Event::Warning {
+                            message: format!("could not remove the flow {} ({err:#})", f.name),
+                        });
                     }
                 }
             }
         }
         // Deliberately not fatal: if Strom has gone its flows are already stopped, and
         // the Open Live sources still need removing or they sit in Studio forever.
-        Err(err) => println!(
-            "Strom at {} is not reachable ({err}); leaving its flows alone.",
-            cfg.strom.url
-        ),
+        Err(err) => events.emit(Event::StromUnreachable {
+            url: cfg.strom.url.clone(),
+            error: err.to_string(),
+        }),
     }
-    if let Some(client) = open_live_client(&cfg)? {
-        removed += sweep_sources(&client, &cfg.gateway.name, &BTreeSet::new()).await;
+    if let Some(client) = open_live_client(cfg)? {
+        removed += sweep_sources(&client, &cfg.gateway.name, &BTreeSet::new(), events).await;
     }
-    local_strom::stop_recorded();
+    local_strom::stop_recorded(events);
     if removed == 0 {
-        println!("Nothing of ours left to remove.");
-    }
-    Ok(())
-}
-
-/// Reports what is running, from Strom and Open Live directly.
-pub async fn status(cfg: Config, json: bool) -> Result<()> {
-    let report = gather_status(&cfg).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        print!("{}", render_status(&report));
+        events.emit(Event::NothingToRemove);
     }
     Ok(())
 }
 
 /// Everything `status` reports, gathered once and rendered as text or JSON.
 #[derive(Debug, Serialize)]
-struct StatusReport {
+pub struct StatusReport {
     /// The `up` process, by its pidfile.
-    process: ProcessReport,
+    pub process: ProcessReport,
     /// Where feeds go, or why that could not be worked out.
-    uplink: Option<UplinkReport>,
-    uplink_error: Option<String>,
-    strom: EndpointReport,
+    pub uplink: Option<UplinkReport>,
+    pub uplink_error: Option<String>,
+    pub strom: EndpointReport,
     /// Absent when registration is off.
-    open_live: Option<EndpointReport>,
-    inputs: Vec<InputReport>,
+    pub open_live: Option<EndpointReport>,
+    pub inputs: Vec<InputReport>,
 }
 
 #[derive(Debug, Serialize)]
-struct ProcessReport {
-    running: bool,
-    pid: Option<u32>,
+pub struct ProcessReport {
+    pub running: bool,
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
-struct UplinkReport {
-    host: String,
-    ports: String,
-    port_source: String,
+pub struct UplinkReport {
+    pub host: String,
+    pub ports: String,
+    pub port_source: String,
 }
 
 #[derive(Debug, Serialize)]
-struct EndpointReport {
-    url: String,
-    reachable: bool,
-    error: Option<String>,
+pub struct EndpointReport {
+    pub url: String,
+    pub reachable: bool,
+    pub error: Option<String>,
 }
 
 /// One input, by name: its flow in Strom, that flow's uplink, and its source in
 /// Open Live. Any of the three may be missing; that is what `status` is for.
 #[derive(Debug, Serialize)]
-struct InputReport {
-    name: String,
-    flow: Option<FlowReport>,
-    uplink: Option<UplinkStatsReport>,
-    source: Option<SourceReport>,
+pub struct InputReport {
+    pub name: String,
+    pub flow: Option<FlowReport>,
+    pub uplink: Option<UplinkStatsReport>,
+    pub source: Option<SourceReport>,
 }
 
 #[derive(Debug, Serialize)]
-struct FlowReport {
-    id: String,
-    running: bool,
+pub struct FlowReport {
+    pub id: String,
+    pub running: bool,
 }
 
 #[derive(Debug, Serialize)]
-struct UplinkStatsReport {
-    send_rate_mbps: Option<f64>,
-    rtt_ms: Option<f64>,
-    bytes_sent: Option<u64>,
+pub struct UplinkStatsReport {
+    pub send_rate_mbps: Option<f64>,
+    pub rtt_ms: Option<f64>,
+    pub bytes_sent: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-struct SourceReport {
-    id: String,
-    status: String,
+pub struct SourceReport {
+    pub id: String,
+    pub status: String,
     /// Open Live's `connect.warning`, such as `srt-listener-unsupported`. `null` when
     /// it reports none, or is older than the field.
-    warning: Option<String>,
+    pub warning: Option<String>,
 }
 
-async fn gather_status(cfg: &Config) -> Result<StatusReport> {
+/// Reports what is running, from Strom and Open Live directly. Neither being
+/// reachable is an error: that is part of the report.
+pub async fn status(cfg: &Config) -> Result<StatusReport> {
     let gateway_id = cfg.gateway.resolved_id();
     let process = match read_pidfile() {
         Some(pid) if is_running_gateway(pid) => ProcessReport {
@@ -1564,17 +1563,19 @@ async fn gather_status(cfg: &Config) -> Result<StatusReport> {
         },
     };
     let open_live = open_live_client(cfg)?;
-    let (uplink, uplink_error) = match resolve_cloud(cfg, open_live.as_ref()).await {
-        Ok(cloud) => (
-            Some(UplinkReport {
-                host: cloud.host,
-                ports: format_ports(&cloud.ports),
-                port_source: cloud.port_source.to_string(),
-            }),
-            None,
-        ),
-        Err(err) => (None, Some(format!("{err:#}"))),
-    };
+    // Warnings while working out the uplink are the log's, not the report's.
+    let (uplink, uplink_error) =
+        match resolve_cloud(cfg, open_live.as_ref(), &Events::discard()).await {
+            Ok(cloud) => (
+                Some(UplinkReport {
+                    host: cloud.host,
+                    ports: format_ports(&cloud.ports),
+                    port_source: cloud.port_source.to_string(),
+                }),
+                None,
+            ),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
 
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
     let (flows, strom_report) = match strom.list_flows().await {
@@ -1675,7 +1676,8 @@ async fn gather_status(cfg: &Config) -> Result<StatusReport> {
     })
 }
 
-fn render_status(r: &StatusReport) -> String {
+/// The `status` table, as the CLI prints it.
+pub fn render_status(r: &StatusReport) -> String {
     let mut out = String::new();
     match r.process.pid {
         Some(pid) => out += &format!("Gateway running (pid {pid}).\n"),
@@ -2083,9 +2085,9 @@ mod tests {
         });
         let clear = stored("srt://:47103?mode=listener");
         let mut last = None;
-        note_connect_warning("Venue — Cam", &warned, &mut last, false);
+        note_connect_warning("Venue — Cam", &warned, &mut last, false, &Events::discard());
         assert_eq!(last.as_deref(), Some("srt-listener-unsupported"));
-        note_connect_warning("Venue — Cam", &clear, &mut last, false);
+        note_connect_warning("Venue — Cam", &clear, &mut last, false, &Events::discard());
         assert_eq!(last, None);
     }
 
@@ -2245,13 +2247,21 @@ mod tests {
                 UplinkMode::Caller,
                 Some(LOCAL),
                 Some(cloud()),
-                Some("reserved")
+                Some("reserved"),
+                &Events::discard()
             )
             .unwrap(),
             (cloud(), PortSource::OpenLive)
         );
         assert_eq!(
-            choose_ports(UplinkMode::Caller, None, Some(cloud()), Some("reserved")).unwrap(),
+            choose_ports(
+                UplinkMode::Caller,
+                None,
+                Some(cloud()),
+                Some("reserved"),
+                &Events::discard()
+            )
+            .unwrap(),
             (cloud(), PortSource::OpenLive)
         );
     }
@@ -2261,7 +2271,14 @@ mod tests {
     fn in_caller_mode_the_settings_are_the_fallback_when_nothing_is_published() {
         for status in [None, Some("pending"), Some("unsupported"), Some("disabled")] {
             assert_eq!(
-                choose_ports(UplinkMode::Caller, Some(LOCAL), None, status).unwrap(),
+                choose_ports(
+                    UplinkMode::Caller,
+                    Some(LOCAL),
+                    None,
+                    status,
+                    &Events::discard()
+                )
+                .unwrap(),
                 (local(), PortSource::Settings),
                 "{status:?}"
             );
@@ -2272,16 +2289,22 @@ mod tests {
     /// is simply to wait for Open Live.
     #[test]
     fn in_caller_mode_no_range_at_all_is_an_error_that_names_the_fixes() {
-        let err = choose_ports(UplinkMode::Caller, None, None, None)
+        let err = choose_ports(UplinkMode::Caller, None, None, None, &Events::discard())
             .unwrap_err()
             .to_string();
         assert!(err.contains("uplink.port_range"), "{err}");
         assert!(err.contains("upgrade"), "{err}");
         assert!(!err.contains("waiting"), "{err}");
 
-        let err = choose_ports(UplinkMode::Caller, None, None, Some("pending"))
-            .unwrap_err()
-            .to_string();
+        let err = choose_ports(
+            UplinkMode::Caller,
+            None,
+            None,
+            Some("pending"),
+            &Events::discard(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("uplink.port_range"), "{err}");
         assert!(err.contains("waiting"), "{err}");
         assert!(err.contains("try again"), "{err}");
@@ -2295,14 +2318,21 @@ mod tests {
                 UplinkMode::Listener,
                 Some(LOCAL),
                 Some(cloud()),
-                Some("leased")
+                Some("leased"),
+                &Events::discard()
             )
             .unwrap(),
             (local(), PortSource::Settings)
         );
-        let err = choose_ports(UplinkMode::Listener, None, Some(cloud()), Some("reserved"))
-            .unwrap_err()
-            .to_string();
+        let err = choose_ports(
+            UplinkMode::Listener,
+            None,
+            Some(cloud()),
+            Some("reserved"),
+            &Events::discard(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("uplink.port_range"), "{err}");
     }
 
@@ -2348,7 +2378,14 @@ mod tests {
             live("B", State::Waiting, Some("src-b"), None),
             live("C", State::Starting, None, None),
             live("D", State::Unreachable, Some("src-d"), None),
-            live("E", State::Failed("boom".to_string()), None, None),
+            live(
+                "E",
+                State::Failed {
+                    reason: "boom".to_string(),
+                },
+                None,
+                None,
+            ),
         ];
         let snapshot = snapshot_of(&live, "venue-box", Some("0.7.2"));
         assert_eq!(snapshot.host, "venue-box");
@@ -2436,26 +2473,6 @@ mod tests {
             source_at("s4", "Venue — Camera", 47111, Some("gw-1")),
         ];
         assert!(port_clashes(&wanted, &fine, &prefix, Some("gw-1")).is_empty());
-    }
-
-    /// The line printed when Open Live keeps a source names the production holding
-    /// it and what to do, rather than a bare status.
-    #[test]
-    fn a_kept_source_names_the_production_and_the_way_out() {
-        let refused = Refused {
-            what: "DELETE source".into(),
-            status: reqwest::StatusCode::CONFLICT,
-            reason: Some(r#"Source is in use by active production "Morning Show""#.into()),
-        };
-        assert_eq!(
-            kept_message("Venue — Camera", &refused),
-            r#"Venue — Camera stays in Open Live: Source is in use by active production "Morning Show". Deactivate that production, then run `open-live-ingest down`."#
-        );
-        let bare = Refused {
-            reason: None,
-            ..refused
-        };
-        assert!(kept_message("Venue — Camera", &bare).contains("HTTP 409 Conflict"));
     }
 
     /// `down` finds a running `up` by its command name, so the needle must be what
