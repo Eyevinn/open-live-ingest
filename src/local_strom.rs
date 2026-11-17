@@ -7,6 +7,7 @@
 //! not stay open with nothing supervising it.
 
 use crate::config::{self, Config};
+use crate::gateway::{Event, Events};
 use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
@@ -23,13 +24,17 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum LocalStrom {
     /// Already running. Left alone entirely.
     Adopted,
-    /// Started here, and stopped when this is dropped.
-    Managed { child: Child, log_path: PathBuf },
+    /// Started here, and stopped when this is dropped, which is told to `events`.
+    Managed {
+        child: Child,
+        log_path: PathBuf,
+        events: Events,
+    },
 }
 
 impl Drop for LocalStrom {
     fn drop(&mut self) {
-        let LocalStrom::Managed { child, .. } = self else {
+        let LocalStrom::Managed { child, events, .. } = self else {
             return;
         };
         // Already exited and reaped: its pid may belong to another process by now.
@@ -67,15 +72,12 @@ impl Drop for LocalStrom {
             }
         }
         std::fs::remove_file(config::strom_pidfile()).ok();
-        // Not `println!`: this also runs while Windows closes the console, when a write
-        // to it can fail, and a panic here would skip the rest of `up`'s cleanup.
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout(), "  strom — stopped");
+        events.emit(Event::StromStopped);
     }
 }
 
 /// Returns a usable local Strom, starting one if nothing is listening.
-pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
+pub async fn ensure_running(cfg: &Config, events: &Events) -> Result<LocalStrom> {
     let client = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
     match client.probe().await {
         Reachability::Ok { .. } => {
@@ -115,10 +117,10 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
         .with_context(|| format!("creating {}", log_path.display()))?;
     let log_err = log.try_clone().context("duplicating the log file handle")?;
 
-    println!(
-        "Starting Strom on port {port} (logging to {}).",
-        log_path.display()
-    );
+    events.emit(Event::StromStarting {
+        port,
+        log_path: log_path.clone(),
+    });
     let mut command = Command::new(&strom.path);
     command
         .args(["--headless", "--port", &port.to_string(), "--data-dir"])
@@ -153,15 +155,26 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
     }
     std::fs::write(&pidfile, child.id().to_string()).ok();
 
-    let mut managed = LocalStrom::Managed { child, log_path };
-    wait_until_ready(&client, &mut managed).await?;
+    let mut managed = LocalStrom::Managed {
+        child,
+        log_path,
+        events: events.clone(),
+    };
+    wait_until_ready(&client, &mut managed, events).await?;
     Ok(managed)
 }
 
-async fn wait_until_ready(client: &StromClient, strom: &mut LocalStrom) -> Result<()> {
+async fn wait_until_ready(
+    client: &StromClient,
+    strom: &mut LocalStrom,
+    events: &Events,
+) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        if let LocalStrom::Managed { child, log_path } = &mut *strom {
+        if let LocalStrom::Managed {
+            child, log_path, ..
+        } = &mut *strom
+        {
             if let Some(status) = child
                 .try_wait()
                 .context("checking on the Strom we started")?
@@ -174,7 +187,7 @@ async fn wait_until_ready(client: &StromClient, strom: &mut LocalStrom) -> Resul
         }
         match client.probe().await {
             Reachability::Ok { video_sources } => {
-                println!("  Strom is up; it can see {video_sources} video source(s).");
+                events.emit(Event::StromReady { video_sources });
                 return Ok(());
             }
             // We set no key on the Strom we started, so this is someone else's on the port.
@@ -502,7 +515,7 @@ pub fn port_of(url: &str) -> Option<u16> {
 /// killed hard and left it holding the cameras. Checked against the process name,
 /// because pids are reused after a reboot. An adopted Strom is never recorded, so it
 /// is never stopped.
-pub fn stop_recorded() {
+pub fn stop_recorded(events: &Events) {
     let pidfile = config::strom_pidfile();
     let Some(pid) = std::fs::read_to_string(&pidfile)
         .ok()
@@ -511,7 +524,7 @@ pub fn stop_recorded() {
         return;
     };
     if crate::run::process_named(pid, "strom") {
-        println!("  strom (pid {pid}) — stopping the one an earlier run started");
+        events.emit(Event::StromLeftOverStopping { pid });
         signal_term(pid);
     }
     std::fs::remove_file(&pidfile).ok();
@@ -626,10 +639,14 @@ mod tests {
             .port();
         let client = StromClient::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
         // Not dropped: `Drop` would remove the user's real Strom pidfile.
-        let mut managed = std::mem::ManuallyDrop::new(LocalStrom::Managed { child, log_path });
+        let mut managed = std::mem::ManuallyDrop::new(LocalStrom::Managed {
+            child,
+            log_path,
+            events: Events::discard(),
+        });
 
         let started = Instant::now();
-        let err = wait_until_ready(&client, &mut managed)
+        let err = wait_until_ready(&client, &mut managed, &Events::discard())
             .await
             .unwrap_err()
             .to_string();

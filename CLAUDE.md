@@ -1,15 +1,19 @@
 ## Project Overview
-One crate, one binary. The gateway is a command line tool that drives a Strom instance
-on the same machine and registers sources with Open Live. It owns no media pipeline;
-Strom does the media.
+One crate: a library and a thin CLI binary over it. The gateway is a command line tool that
+drives a Strom instance on the same machine and registers sources with Open Live. It owns no
+media pipeline; Strom does the media.
 
+- `src/lib.rs`: the library. It never prints, reads stdin, calls `std::process::exit` or
+  handles a signal (`tests/library_boundary.rs` checks this); progress is `gateway::Event`s.
+- `src/main.rs`: the CLI. clap, tracing init, signals, rendering events and reports as text.
+- `src/gateway.rs`: the events and the sink they go to.
 - `src/config.rs`: settings, validation, the two SRT URIs of a link.
 - `src/flow.rs`: the flow template and flow ownership by derived id.
 - `src/strom.rs`, `src/openlive.rs`: the two HTTP clients.
 - `src/heartbeat.rs`: the status heartbeat to Open Live, one outbound WebSocket.
 - `src/devices.rs`: from Strom's device list to inputs with names and ports.
 - `src/run.rs`: `up`, `down`, `status`, `devices`.
-- `src/setup.rs`: interactive setup.
+- `src/setup.rs`: interactive setup. Binary only: it prompts on the terminal.
 - `src/local_strom.rs`: adopt a running Strom, or start and later stop a headless one.
 
 ## Language
@@ -59,6 +63,9 @@ Strom does the media.
 - Doc filenames in `docs/` use `UPPER_SNAKE_CASE`. `README.md` stays lowercase.
 
 ## Tests
+- `tests/golden.rs` pins what `devices`, `status`, `up --test` and `down` print, running the
+  binary against a fake Strom and Open Live. Output changes only on purpose, with the expected
+  text changed in the same commit.
 - A regression test must exercise the code it guards and must fail if the fix is reverted.
 - Tests must not require a running Strom or Open Live. The flow builder is pure: assert on the JSON
   it emits.
