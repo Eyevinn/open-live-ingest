@@ -16,14 +16,15 @@ use anyhow::{bail, Context, Result};
 use console::{style, Emoji, Style};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
+use open_live_ingest::api::{self, check_open_live, infer_auth_mode, probe_strom};
 use open_live_ingest::config::{
     format_port_range, format_ports, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE,
 };
 use open_live_ingest::heartbeat;
 use open_live_ingest::local_strom;
-use open_live_ingest::openlive::{OpenLiveClient, ServerInfo};
+use open_live_ingest::openlive::ServerInfo;
 use open_live_ingest::osc;
-use open_live_ingest::strom::{Reachability, StromClient};
+use open_live_ingest::strom::Reachability;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -285,26 +286,6 @@ impl Answers {
 /// `auto` and blank both mean "take what the device offers", stored as unset.
 fn auto_to_none(value: &str) -> Option<String> {
     blank_to_none(value.to_string()).filter(|v| !v.eq_ignore_ascii_case("auto"))
-}
-
-/// Which kind of credential an Open Live address implies. An Open Source Cloud
-/// instance sits behind a proxy that rejects a personal access token presented
-/// directly, so it needs the exchange; anything else takes a static key. Inferring it
-/// spares an operator a question nobody can answer from the words "osc" and "direct".
-pub fn infer_auth_mode(url: &str) -> AuthMode {
-    let host = url
-        .split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    if host == "osaas.io" || host.ends_with(".osaas.io") {
-        AuthMode::Osc
-    } else {
-        AuthMode::Direct
-    }
 }
 
 /// Whether anything still has to be asked for. `osc_login` says whether the OSC CLI
@@ -696,20 +677,14 @@ async fn report_heartbeat(cfg: &Config) -> Result<()> {
 /// The Open Source Cloud credential a headless setup can use, in the order the
 /// running gateway would pick them, and where it came from.
 fn headless_osc_token(cfg: &Config) -> Result<(String, &'static str, bool)> {
-    if let Some(token) = cfg.open_live.api_key.clone() {
-        return Ok((token, "the settings (a personal access token)", false));
+    match api::osc_credential(cfg) {
+        Some(credential) => Ok(credential),
+        None => bail!(
+            "an Open Source Cloud instance needs a credential: set {}, run `{}`, or set OLI_OPEN_LIVE_API_KEY to a personal access token",
+            osc::ENV_TOKEN,
+            osc::LOGIN_COMMAND
+        ),
     }
-    if let Some(token) = osc::env_token() {
-        return Ok((token, osc::ENV_TOKEN, false));
-    }
-    if let Some(token) = osc::login_token() {
-        return Ok((token, "the OSC CLI's saved login", true));
-    }
-    bail!(
-        "an Open Source Cloud instance needs a credential: set {}, run `{}`, or set OLI_OPEN_LIVE_API_KEY to a personal access token",
-        osc::ENV_TOKEN,
-        osc::LOGIN_COMMAND
-    )
 }
 
 /// Says where the settings went, in the same voice as the prompts.
@@ -845,7 +820,7 @@ fn describe_token(token: &str, is_login: bool) {
 /// it. A typed address stays available: the list may be empty, the platform may be
 /// unreachable during setup, or the instance may live in another workspace.
 async fn choose_instance(current: Option<&str>, token: &str) -> Result<String> {
-    match osc::open_live_instances(token).await {
+    match api::instances(token).await {
         Ok(instances) if !instances.is_empty() => {
             let mut options: Vec<Choice> =
                 instances.iter().map(|i| choice(&i.name, &i.url)).collect();
@@ -865,51 +840,9 @@ async fn choose_instance(current: Option<&str>, token: &str) -> Result<String> {
     ask("Open Live URL", current.or(Some("https://"))).await
 }
 
-/// Confirms the address and credential work, returning what Open Live says about
-/// its cloud Strom: its host and the SRT ports it has leased.
-async fn check_open_live(cfg: &Config) -> Result<Option<ServerInfo>> {
-    let client = OpenLiveClient::new(
-        cfg.open_live.url.as_deref().unwrap_or_default(),
-        cfg.open_live.auth_mode,
-        cfg.open_live.api_key.as_deref(),
-    )?;
-    // Listing sources exercises the credential; server-info alone might not.
-    client.list_sources().await?;
-    client.server_info().await
-}
-
-async fn probe_strom(cfg: &Config) -> Reachability {
-    match StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref()) {
-        Ok(client) => client.probe().await,
-        Err(err) => Reachability::Unreachable(err.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_osaas_address_implies_the_token_exchange_and_lookalikes_do_not() {
-        assert_eq!(
-            infer_auth_mode("https://venue.eyevinn-open-live.auto.prod-se.osaas.io"),
-            AuthMode::Osc
-        );
-        assert_eq!(infer_auth_mode("https://osaas.io/"), AuthMode::Osc);
-        assert_eq!(infer_auth_mode("http://127.0.0.1:3000"), AuthMode::Direct);
-        assert_eq!(
-            infer_auth_mode("https://open-live.example.com"),
-            AuthMode::Direct
-        );
-        assert_eq!(
-            infer_auth_mode("https://osaas.io.example.com"),
-            AuthMode::Direct
-        );
-        assert_eq!(
-            infer_auth_mode("https://myosaas.iohost.net"),
-            AuthMode::Direct
-        );
-    }
 
     fn answers() -> Answers {
         Answers {
