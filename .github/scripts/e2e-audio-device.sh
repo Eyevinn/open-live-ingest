@@ -38,7 +38,18 @@
 # release), and OSC_ACCESS_TOKEN, an Open Source Cloud personal access token for the
 # workspace that owns the instance. The token, the service token and the instance
 # address are masked in the log; nothing here prints a response body that can carry
-# them.
+# them. Strom gets neither token: it would seed its own OSC access from
+# OSC_ACCESS_TOKEN, and its API is unauthenticated. It always listens on all
+# interfaces, so on CI the script also drops outside traffic to its port.
+#
+# Without OSC_ACCESS_TOKEN, steps 1-3 still run. The run then fails naming the
+# secret when E2E_REQUIRE_SECRET is `true` (the workflow sets that for a run by
+# hand); otherwise (a pull request run) it ends with a warning naming the secret and
+# exits 0, so the missing secret does not fail unrelated pull requests.
+#
+# Before step 4 it removes any source left on the instance by an earlier run that
+# was killed before its exit trap ran (names starting `oli-e2e-`). Runs on one
+# instance are serialized by the workflow's concurrency group, so none is live.
 
 set -euo pipefail
 
@@ -184,7 +195,16 @@ have="$(sha256sum "$work/$asset" | cut -d' ' -f1)"
 install -m 0755 "$work/$asset" "$work/strom-bin"
 
 mkdir -p "$work/strom"
-"$work/strom-bin" --headless --port "$strom_port" --data-dir "$work/strom" \
+# Strom v0.8.2 binds 0.0.0.0 with no option to change it and its API is
+# unauthenticated: on CI, accept only loopback traffic to its port.
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    for ipt in iptables ip6tables; do
+        sudo "$ipt" -I INPUT -p tcp --dport "$strom_port" ! -i lo -j DROP \
+            || say "could not add the $ipt rule for port $strom_port"
+    done
+fi
+# Neither token goes to Strom: it seeds its default OSC access from OSC_ACCESS_TOKEN.
+env -u OSC_ACCESS_TOKEN -u GH_TOKEN "$work/strom-bin" --headless --port "$strom_port" --data-dir "$work/strom" \
     > "$work/strom/strom.log" 2>&1 &
 pids+=("$!")
 
@@ -211,8 +231,14 @@ pass "Strom $strom_tag lists '$seen_camera' (video_source) and '$seen_mic' (audi
 # --- credentials and instance (after the local devices, so a run without the
 # secret still proves the runner side) ------------------------------------------------------
 
-[[ -n "${OSC_ACCESS_TOKEN:-}" ]] \
-    || fail "missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud personal access token for the workspace that owns the Open Live instance '$instance') is not set"
+if [[ -z "${OSC_ACCESS_TOKEN:-}" ]]; then
+    missing="missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud personal access token for the workspace that owns the Open Live instance '$instance') is not set"
+    [[ "${E2E_REQUIRE_SECRET:-true}" != "true" ]] || fail "$missing"
+    echo "::warning title=e2e audio device::$missing; the device checks above passed, up --audio against '$instance' did not run"
+    record "- SKIPPED: $missing. The device checks above passed; up --audio against '$instance' did not run."
+    say "SKIPPED: $missing"
+    exit 0
+fi
 mask "$OSC_ACCESS_TOKEN"
 
 service_token() {
@@ -239,6 +265,20 @@ ol_get() { curl -fsS -H "Authorization: Bearer $sat" "$open_live_url$1"; }
 our_source_ids() {
     ol_get /api/v1/sources | jq -r --arg p "$gateway_name — " '.[] | select(.name | startswith($p)) | .id'
 }
+
+stale_ids="$(ol_get /api/v1/sources \
+    | jq -r --arg p "$gateway_name — " '.[] | select((.name | startswith("oli-e2e-")) and (.name | startswith($p) | not)) | .id')"
+removed=0
+for id in $stale_ids; do
+    say "removing stale source $id from an earlier e2e run"
+    if curl -fsS -o /dev/null -X DELETE -H "Authorization: Bearer $sat" \
+        "$open_live_url/api/v1/sources/$id"; then
+        removed=$((removed + 1))
+    else
+        say "could not remove stale source $id"
+    fi
+done
+[[ -z "$stale_ids" ]] || note "removed $removed of $(wc -w <<<"$stale_ids") stale oli-e2e- source(s) left by an earlier run"
 
 # --- 4. up --audio ------------------------------------------------------------------------
 
