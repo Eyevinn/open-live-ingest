@@ -18,17 +18,9 @@ fn main() -> ExitCode {
         println!("{}", open_live_ingest_app::version_line());
         return ExitCode::SUCCESS;
     }
-    init_logging();
+    // To app.log (spec, section 7), at the settings' log level.
+    open_live_ingest_app::logs::init(&open_live_ingest::config::default_path());
     run()
-}
-
-fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .init();
 }
 
 #[cfg(any(target_os = "macos", windows))]

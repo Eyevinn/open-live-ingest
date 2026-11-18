@@ -12,16 +12,17 @@
 //! logged, never the arguments, and an error reply never quotes what the page sent.
 
 use crate::go_live::{self, GoLive};
+use crate::logs;
 use crate::messages::Message;
 use crate::what_to_send::{self, DeviceSource};
 use crate::where_to_send::{Opener, WhereToSend, WhereView};
 use open_live_ingest::api::{self, Devices, SaveError};
 use open_live_ingest::keychain::OsKeychain;
-use open_live_ingest::osc;
+use open_live_ingest::{local_strom, osc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tracing::instrument::WithSubscriber;
 
@@ -263,6 +264,10 @@ pub fn parse(raw: &str) -> Result<(u32, Command), Malformed> {
 const NOT_UNDERSTOOD: &str = "The app did not understand that request. Restart the app.";
 const NOT_YET: &str = "This version of Open Live Ingest cannot do that yet.";
 const STOP_FIRST: &str = "Press Stop before changing what or where to send.";
+const NO_APP_LOG: &str = "The app is not writing a log. Restart the app.";
+const NO_STROM_LOG: &str =
+    "There is no Strom log yet. One is written when the app starts Strom itself.";
+const NO_SETTINGS: &str = "The settings file could not be read, so the Strom log cannot be found.";
 const NO_DEVICE_LIST: &str =
     "Could not get the list of cameras from the video engine. Show logs for details.";
 const NOT_SAVED: &str = "Could not save the settings. Show logs for details.";
@@ -282,6 +287,9 @@ pub struct ViewModel {
 /// window evaluates it in the webview on the main thread.
 pub type Deliver = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Shows a log file in Finder or Explorer: [`logs::reveal`], or a fake in tests.
+pub type Reveal = Arc<dyn Fn(&Path) -> anyhow::Result<()> + Send + Sync>;
+
 /// The app core the dispatcher drives. The window owns one and hands it every message.
 ///
 /// A command that answers from what is at hand (`state`, `choose_instance`,
@@ -295,6 +303,8 @@ pub struct Core {
     go_live: Arc<GoLive>,
     deliver: Deliver,
     runtime: tokio::runtime::Runtime,
+    app_log: Option<PathBuf>,
+    reveal: Reveal,
     device_source: Arc<dyn DeviceSource>,
     /// The last device list Strom gave, for the rows and the names in messages.
     listed: Arc<Mutex<Option<Devices>>>,
@@ -351,6 +361,8 @@ impl Core {
             go_live: Arc::new(go_live),
             deliver,
             runtime,
+            app_log: logs::default_path(),
+            reveal: Arc::new(logs::reveal),
             device_source: Arc::new(what_to_send::Strom),
             listed: Arc::default(),
             show_all: false,
@@ -366,6 +378,35 @@ impl Core {
     /// Going live, live or stopping.
     pub fn live(&self) -> bool {
         self.go_live.is_live()
+    }
+
+    /// The core with `app_log` as the app's log and `reveal` to show a log: fakes,
+    /// in tests.
+    pub fn with_logs(mut self, app_log: Option<PathBuf>, reveal: Reveal) -> Self {
+        self.app_log = app_log;
+        self.reveal = reveal;
+        self
+    }
+
+    /// Shows a log in Finder or Explorer: the app's own, or the one a Strom the app
+    /// starts writes. The Help menu's Show logs comes here as well as the page's
+    /// `show_logs`. An error is the one line for the person.
+    pub fn show_log(&self, which: LogFile) -> Result<(), String> {
+        let path = match which {
+            LogFile::App => self.app_log.clone().ok_or(NO_APP_LOG)?,
+            LogFile::Strom => {
+                let settings = api::load_from(&self.settings_file).map_err(|_| NO_SETTINGS)?;
+                local_strom::log_path(&settings)
+            }
+        };
+        if !path.is_file() {
+            return Err(match which {
+                LogFile::App => NO_APP_LOG,
+                LogFile::Strom => NO_STROM_LOG,
+            }
+            .to_string());
+        }
+        (self.reveal)(&path).map_err(|err| format!("Could not show the log: {err:#}"))
     }
 
     /// Lists devices from `source` instead of the local Strom.
@@ -478,6 +519,16 @@ impl Core {
                         Err(err) => failed(id, name, &err, &[]),
                     },
                     None => Reply::error(id, "There is no address for that yet."),
+                };
+                Some((reply, Effect::None))
+            }
+            Command::ShowLogs { which } => {
+                let reply = match self.show_log(which) {
+                    Ok(()) => Reply::ok(id, Value::Null),
+                    Err(message) => {
+                        tracing::warn!(id, cmd = name, "ui command failed: {message}");
+                        Reply::error(id, &message)
+                    }
                 };
                 Some((reply, Effect::None))
             }
@@ -1234,7 +1285,7 @@ mod tests {
     #[test]
     fn commands_not_wired_up_yet_say_so() {
         let (reply, effect) = core()
-            .dispatch(r#"{"id": 5, "cmd": "show_logs", "args": {"which": "app"}}"#)
+            .dispatch(r#"{"id": 5, "cmd": "set_advanced", "args": {"latency_ms": 200}}"#)
             .unwrap();
         assert_eq!(effect, Effect::None);
         assert_eq!(
@@ -1347,6 +1398,95 @@ mod tests {
             .ends_with("?Privacy_Microphone"));
         let empty = testing::Scratch::new("ipc-links-empty");
         assert_eq!(link_url(&empty.settings(), Link::Studio), None);
+    }
+
+    /// A core whose `reveal` records the paths it is asked to show, and fails when
+    /// `fail` is set.
+    fn core_showing_logs(
+        dir: &testing::Scratch,
+        app_log: Option<PathBuf>,
+        fail: bool,
+    ) -> (Core, Arc<Mutex<Vec<PathBuf>>>) {
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let record = shown.clone();
+        let reveal: Reveal = Arc::new(move |path: &Path| {
+            if fail {
+                anyhow::bail!("no file viewer");
+            }
+            record.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        });
+        let core = core_with(dir.settings(), nowhere())
+            .0
+            .with_logs(app_log, reveal);
+        (core, shown)
+    }
+
+    #[test]
+    fn show_logs_reveals_the_app_log() {
+        let dir = testing::Scratch::new("ipc-show-app-log");
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "a line\n").unwrap();
+        let (mut core, shown) = core_showing_logs(&dir, Some(log.clone()), false);
+        let reply = reply_json(
+            &mut core,
+            r#"{"id": 1, "cmd": "show_logs", "args": {"which": "app"}}"#,
+        );
+        assert_eq!(reply, json!({"id": 1, "ok": null}));
+        assert_eq!(*shown.lock().unwrap(), [log]);
+    }
+
+    #[test]
+    fn show_logs_without_an_app_log_says_so() {
+        let dir = testing::Scratch::new("ipc-no-app-log");
+        let missing = dir.path().join("app.log");
+        for app_log in [None, Some(missing)] {
+            let (mut core, shown) = core_showing_logs(&dir, app_log, false);
+            let reply = reply_json(
+                &mut core,
+                r#"{"id": 2, "cmd": "show_logs", "args": {"which": "app"}}"#,
+            );
+            assert_eq!(reply["error"]["message"], NO_APP_LOG);
+            assert!(shown.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Show Strom log reveals `strom.log` in the Strom data folder the settings name,
+    /// once a Strom started by the app has written it.
+    #[test]
+    fn show_strom_log_reveals_the_log_in_stroms_data_folder() {
+        let dir = testing::Scratch::new("ipc-show-strom-log");
+        let data = dir.path().join("strom-data");
+        // A TOML literal string: a Windows path's backslashes stay as they are.
+        let toml = format!("[strom]\ndata_dir = '{}'\n", data.display());
+        std::fs::write(dir.settings(), toml).unwrap();
+        let (mut core, shown) = core_showing_logs(&dir, None, false);
+        let raw = r#"{"id": 3, "cmd": "show_logs", "args": {"which": "strom"}}"#;
+
+        let reply = reply_json(&mut core, raw);
+        assert_eq!(reply["error"]["message"], NO_STROM_LOG);
+
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("strom.log"), "strom\n").unwrap();
+        let reply = reply_json(&mut core, raw);
+        assert_eq!(reply, json!({"id": 3, "ok": null}));
+        assert_eq!(*shown.lock().unwrap(), [data.join("strom.log")]);
+    }
+
+    #[test]
+    fn a_log_that_cannot_be_shown_is_one_line() {
+        let dir = testing::Scratch::new("ipc-show-fails");
+        let log = dir.path().join("app.log");
+        std::fs::write(&log, "a line\n").unwrap();
+        let (mut core, _) = core_showing_logs(&dir, Some(log), true);
+        let reply = reply_json(
+            &mut core,
+            r#"{"id": 4, "cmd": "show_logs", "args": {"which": "app"}}"#,
+        );
+        assert_eq!(
+            reply["error"]["message"],
+            "Could not show the log: no file viewer"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub const REFRESH: &str = "refresh-secret";
 /// What a refresh returns in place of the refresh token it was given.
 pub const RENEWED: &str = "refresh-renewed";
 pub const REGISTERED_ID: &str = "registered-id";
-const SERVICE_TOKEN: &str = "service-token";
+pub const SERVICE_TOKEN: &str = "service-token";
 
 /// What the fake browser does on the consent page: the query it comes back with.
 pub const SIGNED_IN: &str = "code=the-code";
@@ -57,10 +57,10 @@ impl Request {
     }
 }
 
-type Handler = Arc<dyn Fn(&Request) -> (u16, Value) + Send + Sync>;
+pub type Handler = Arc<dyn Fn(&Request) -> (u16, Value) + Send + Sync>;
 
 /// Serves `handler` on a free port of 127.0.0.1; returns `http://127.0.0.1:<port>`.
-fn serve(handler: Handler) -> String {
+pub fn serve(handler: Handler) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
