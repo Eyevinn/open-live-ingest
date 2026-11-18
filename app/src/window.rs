@@ -114,10 +114,8 @@ pub fn run() -> ExitCode {
                 }
             }
             #[cfg(target_os = "macos")]
-            Event::UserEvent(UserEvent::Menu(event)) => {
-                if menu_bar.is_quit(&event) {
-                    request_quit(control_flow);
-                }
+            Event::UserEvent(UserEvent::Menu(event)) if menu_bar.is_quit(&event) => {
+                request_quit(control_flow)
             }
             _ => {}
         }
@@ -179,7 +177,7 @@ mod menu {
             let quit = MenuItem::new(
                 "Quit Open Live Ingest",
                 true,
-                Some(Accelerator::new(Modifiers::SUPER, Code::KeyQ)),
+                Some(Accelerator::new(Modifiers::META, Code::KeyQ)),
             );
             let about = AboutMetadata {
                 name: Some(super::TITLE.to_string()),
