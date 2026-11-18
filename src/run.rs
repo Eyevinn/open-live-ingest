@@ -542,6 +542,8 @@ pub async fn up(
     )?;
     devices::attach_audio(&mut inputs, &audio);
     devices::apply_labels(&mut inputs, &cfg.inputs, &chosen, &cfg.gateway.name);
+    // Sources are found by name: two inputs with one name would share a source.
+    devices::check_unique_names(&inputs)?;
 
     // Each input costs an encoder and its share of the uplink, which is easy to
     // overlook when one command starts all of them.

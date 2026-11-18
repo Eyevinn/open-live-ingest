@@ -678,8 +678,6 @@ pub(crate) fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
     }
 }
 
-/// The checks, in the order `validate` has always made them, each failure with the
-/// setting it concerns.
 /// What is wrong with the `[[input]]` entries alone, each reported. An app saving
 /// its selection checks only these: the rest of the file may still be unfinished.
 pub fn input_problems(inputs: &[InputSettings]) -> Vec<Problem> {
@@ -758,6 +756,8 @@ fn check_inputs(inputs: &[InputSettings]) -> Vec<(&'static str, anyhow::Error)> 
     found
 }
 
+/// The checks, in the order `validate` has always made them, each failure with the
+/// setting it concerns.
 fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
     let mut found: Vec<(&'static str, anyhow::Error)> = Vec::new();
     if !cfg.strom.url.starts_with("http://") && !cfg.strom.url.starts_with("https://") {

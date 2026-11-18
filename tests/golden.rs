@@ -844,13 +844,24 @@ device = "dev-unplugged"
     assert!(strom_state.lock().unwrap().flows.is_empty());
     assert!(ol_state.lock().unwrap().sources.is_empty());
 
-    // A flag picks for this run; the entry's audio and label still follow the device.
+    // A flag picks for this run, here a device without an entry.
     let mut up = Running::start(&scratch, &["up", "--devices", "FaceTime"]);
     assert_golden(up.until("waiting for a receiver"), UP_EVERY_DEVICE);
     up.kill();
     assert_eq!(
         flows_of(&strom_state),
         [("Venue — FaceTime HD Camera".to_string(), false)]
+    );
+    scratch.run(&["down"]);
+
+    // Picked by flags (`--all`, as it is virtual), a device with an entry keeps the
+    // entry's audio and label.
+    let mut up = Running::start(&scratch, &["up", "--all", "--devices", "dev-obs"]);
+    up.until("Stage left — waiting for a receiver");
+    up.kill();
+    assert_eq!(
+        flows_of(&strom_state),
+        [("Venue — Stage left".to_string(), true)]
     );
     scratch.run(&["down"]);
 }

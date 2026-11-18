@@ -208,20 +208,22 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
     }
 }
 
+/// The name a row shows for `device` before any label: the test pattern's, the listed
+/// device's, or for a device that is not listed its id (what [`model`] shows).
+fn row_name(device: &str, devices: Option<&Devices>) -> String {
+    if device.eq_ignore_ascii_case(TEST_PATTERN_DEVICE) {
+        return TEST_PATTERN_NAME.to_string();
+    }
+    devices
+        .and_then(|d| d.video.iter().find(|r| r.id == device))
+        .map_or_else(|| device.to_string(), |r| r.name.clone())
+}
+
 /// The `[[input]]` entries for the ticked rows the page sends: device ids as they are,
-/// no audio for "None", and no label where it is blank or still the device's name, so
+/// no audio for "None", and no label where it is blank or still what the row was
+/// prefilled with (the device's name, or the id of a device that is not connected), so
 /// the source keeps following the device's name.
 pub fn entries(inputs: &[InputArgs], devices: Option<&Devices>) -> Vec<InputSettings> {
-    let name_of = |device: &str| -> Option<String> {
-        if device.eq_ignore_ascii_case(TEST_PATTERN_DEVICE) {
-            return Some(TEST_PATTERN_NAME.to_string());
-        }
-        devices?
-            .video
-            .iter()
-            .find(|d| d.id == device)
-            .map(|d| d.name.clone())
-    };
     let some_trimmed = |value: &Option<String>| {
         value
             .as_deref()
@@ -233,10 +235,10 @@ pub fn entries(inputs: &[InputArgs], devices: Option<&Devices>) -> Vec<InputSett
         .iter()
         .map(|input| {
             let device = input.device.trim().to_string();
-            let name = name_of(&device);
+            let name = row_name(&device, devices);
             InputSettings {
                 audio: some_trimmed(&input.audio),
-                label: some_trimmed(&input.label).filter(|l| Some(l) != name.as_ref()),
+                label: some_trimmed(&input.label).filter(|l| *l != name),
                 device,
             }
         })
@@ -267,10 +269,33 @@ pub fn check(entries: &[InputSettings], devices: Option<&Devices>) -> Result<(),
             ));
         }
     }
-    match config::input_problems(entries).into_iter().next() {
-        Some(problem) => Err(problem.message),
-        None => Ok(()),
+    if let Some(problem) = config::input_problems(entries).into_iter().next() {
+        return Err(problem.message);
     }
+    // The name each input gets in the Studio, as `up` names it: the label, else the
+    // device's name. Two the same would share one Open Live source. A device that is
+    // not connected is skipped by `up`, so its name is only known by its label.
+    let mut names: Vec<(&InputSettings, String)> = Vec::new();
+    for entry in entries {
+        let listed = entry.is_test_pattern()
+            || devices.is_some_and(|d| d.video.iter().any(|r| r.id == entry.device));
+        let studio_name = match entry.label() {
+            Some(label) => label.to_string(),
+            None if listed => row_name(&entry.device, devices),
+            None => continue,
+        };
+        if let Some((first, _)) = names
+            .iter()
+            .find(|(_, n)| n.eq_ignore_ascii_case(&studio_name))
+        {
+            return Err(format!(
+                "{} already goes to the Studio as \"{studio_name}\". Pick another name.",
+                row_name(&first.device, devices)
+            ));
+        }
+        names.push((entry, studio_name));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -478,6 +503,87 @@ pub(crate) mod tests {
         assert_eq!(
             check(&entries(&[input("test", None, None)], None), None),
             Ok(())
+        );
+    }
+
+    /// A saved device that is not connected shows its id as its name and label. Sent
+    /// back unchanged with any other change, it is saved as it was: no label, so the
+    /// camera's own name returns once it is plugged in again.
+    #[test]
+    fn a_not_connected_row_round_trips_without_gaining_a_label() {
+        let saved = settings(
+            "[[input]]\ndevice = \"dev-gone\"\n\n[[input]]\ndevice = \"dev-away\"\nlabel = \"Gone\"\n",
+        );
+        let shown = model(Some(&devices()), &saved, false);
+        let sent: Vec<InputArgs> = shown
+            .video
+            .iter()
+            .filter(|r| r.ticked)
+            .map(|r| input(&r.device, r.audio.as_deref(), Some(&r.label)))
+            .collect();
+        assert_eq!(entries(&sent, Some(&devices())), saved.inputs);
+        // Before Strom has answered too.
+        assert_eq!(
+            entries(&[input("dev-gone", None, Some("dev-gone"))], None),
+            [InputSettings {
+                device: "dev-gone".into(),
+                audio: None,
+                label: None,
+            }]
+        );
+    }
+
+    /// Two inputs cannot go to the Studio under one name: a label may not repeat the
+    /// test pattern's name or the name of another ticked camera that has no label.
+    #[test]
+    fn a_label_that_repeats_another_inputs_name_is_refused() {
+        let listed = devices();
+        let refused = [
+            vec![
+                input("test", None, None),
+                input("dev-cam", None, Some("Test pattern")),
+            ],
+            vec![
+                input("dev-cam", None, None),
+                input("dev-obs", None, Some("facetime hd camera")),
+            ],
+            vec![
+                input("dev-cam", None, Some("OBS Virtual Camera")),
+                input("dev-obs", None, None),
+            ],
+        ];
+        for sent in refused {
+            let err = check(&entries(&sent, Some(&listed)), Some(&listed)).unwrap_err();
+            assert!(err.ends_with("Pick another name."), "{err}");
+        }
+        assert_eq!(
+            check(
+                &entries(
+                    &[
+                        input("dev-cam", None, Some("Test pattern")),
+                        input("dev-obs", None, None),
+                    ],
+                    Some(&listed),
+                ),
+                Some(&listed),
+            ),
+            Ok(()),
+            "the test pattern's name is free when it is not ticked"
+        );
+        let err = check(
+            &entries(
+                &[
+                    input("test", None, None),
+                    input("dev-cam", None, Some("Test pattern")),
+                ],
+                Some(&listed),
+            ),
+            Some(&listed),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "Test pattern already goes to the Studio as \"Test pattern\". Pick another name."
         );
     }
 

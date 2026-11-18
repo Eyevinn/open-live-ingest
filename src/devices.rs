@@ -188,6 +188,22 @@ pub fn apply_labels(
     }
 }
 
+/// Refuses inputs that would share a source name, after [`apply_labels`]. Open Live
+/// sources are found by name, so two inputs with one name would end up sharing a
+/// source and, on the next run, its SRT port. A label equal to another input's device
+/// name, or to "Test pattern", is the usual way to get there.
+pub fn check_unique_names(inputs: &[Input]) -> Result<()> {
+    for (i, input) in inputs.iter().enumerate() {
+        if inputs[..i].iter().any(|other| other.name == input.name) {
+            bail!(
+                "Two inputs would both be named {:?} in Open Live; two sources cannot share a name. Change the label of one in the settings' [[input]] entries.",
+                input.name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// An audio source to send with a camera, each named by id or name fragment as
 /// `--devices` names cameras. Written `<camera>=<audio>` on the command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -721,6 +737,36 @@ mod tests {
         );
         // The flow id follows the device, never the label.
         assert_eq!(inputs[2].id, "dev-d2");
+        check_unique_names(&inputs).expect("three names");
+    }
+
+    /// A label may not take the name another input has: not the test pattern's, and
+    /// not an unlabelled camera's device name.
+    #[test]
+    fn a_label_that_repeats_another_inputs_name_is_refused() {
+        let cameras = choose(devices(), false, None).unwrap();
+        let named = |entries: &[InputSettings]| {
+            let mut inputs = inputs_for(
+                &cameras,
+                true,
+                "V",
+                &Uplink::default(),
+                &Capture::default(),
+                "cloud",
+                &(9000..=9002).collect(),
+            )
+            .unwrap();
+            apply_labels(&mut inputs, entries, &cameras, "V");
+            check_unique_names(&inputs)
+        };
+        for entries in [
+            vec![entry("FaceTime", Some("Test pattern"))],
+            vec![entry("FaceTime", Some("DeckLink Mini Recorder"))],
+        ] {
+            let err = named(&entries).unwrap_err().to_string();
+            assert!(err.contains("cannot share a name"), "{err}");
+        }
+        named(&[entry("FaceTime", Some("Stage left"))]).expect("a name of its own");
     }
 
     /// Better a clear error than two inputs fighting over one port.
