@@ -343,6 +343,10 @@ const ACTIONS = {
   change: { label: "Change", run: () => byId("where-change").click() },
   open_studio: { label: "Open Studio", run: () => call("open_url", { which: "studio" }) },
   open_settings: { label: "Open Settings", run: () => call("open_url", { which: "privacy" }) },
+  open_microphone_settings: {
+    label: "Open Settings",
+    run: () => call("open_url", { which: "privacy_microphone" }),
+  },
   help: { label: "Help", run: () => call("open_url", { which: "help" }) },
   show_logs: { label: "Show logs", run: () => call("show_logs", { which: "app" }) },
   show_strom_log: { label: "Show logs", run: () => call("show_logs", { which: "strom" }) },

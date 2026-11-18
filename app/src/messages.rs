@@ -24,8 +24,10 @@ pub enum Action {
     Change,
     /// Open Studio in the browser.
     OpenStudio,
-    /// Open the privacy settings (macOS camera and microphone access).
+    /// Open the privacy settings for the camera (macOS).
     OpenSettings,
+    /// Open the privacy settings for the microphone (macOS).
+    OpenMicrophoneSettings,
     /// Reveal Strom's log.
     ShowStromLog,
     /// Reveal the app's log.
@@ -49,6 +51,7 @@ impl Action {
             Action::Change => "change",
             Action::OpenStudio => "open_studio",
             Action::OpenSettings => "open_settings",
+            Action::OpenMicrophoneSettings => "open_microphone_settings",
             Action::ShowStromLog => "show_strom_log",
             Action::ShowLogs => "show_logs",
             Action::Advanced => "advanced",
@@ -204,7 +207,10 @@ impl Failure {
                     "Open Live Ingest is not allowed to use the {}. Allow it in System Settings → Privacy & Security, then press Go live.",
                     media.noun()
                 ),
-                Some(OpenSettings),
+                Some(match media {
+                    Media::Camera => OpenSettings,
+                    Media::Microphone => OpenMicrophoneSettings,
+                }),
             ),
             Failure::CameraBusy { camera } => Message::new(
                 format!("{camera} could not be opened. Close other apps that use it, then press Go live."),
@@ -681,7 +687,7 @@ mod tests {
         assert_message(
             Failure::AccessDenied { media: Media::Microphone }.message(),
             "Open Live Ingest is not allowed to use the microphone. Allow it in System Settings → Privacy & Security, then press Go live.",
-            Some(Action::OpenSettings),
+            Some(Action::OpenMicrophoneSettings),
         );
     }
 

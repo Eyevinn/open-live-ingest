@@ -89,8 +89,10 @@ pub enum Link {
     Strom,
     Studio,
     Help,
-    /// macOS System Settings → Privacy & Security, for camera and microphone access.
+    /// macOS System Settings → Privacy & Security → Camera.
     Privacy,
+    /// macOS System Settings → Privacy & Security → Microphone.
+    PrivacyMicrophone,
 }
 
 /// Every command the page can send (section 9.2).
@@ -618,6 +620,10 @@ fn link_url(settings_file: &std::path::Path, which: Link) -> Option<String> {
         Link::Help => Some("https://github.com/Eyevinn/open-live-ingest#readme".to_string()),
         Link::Privacy => Some(
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera".to_string(),
+        ),
+        Link::PrivacyMicrophone => Some(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                .to_string(),
         ),
         Link::Strom | Link::Studio => {
             let settings = open_live_ingest::api::load_from(settings_file).ok()?;
@@ -1335,7 +1341,10 @@ mod tests {
         );
         assert!(link_url(&dir.settings(), Link::Privacy)
             .unwrap()
-            .starts_with("x-apple.systempreferences:"));
+            .ends_with("?Privacy_Camera"));
+        assert!(link_url(&dir.settings(), Link::PrivacyMicrophone)
+            .unwrap()
+            .ends_with("?Privacy_Microphone"));
         let empty = testing::Scratch::new("ipc-links-empty");
         assert_eq!(link_url(&empty.settings(), Link::Studio), None);
     }

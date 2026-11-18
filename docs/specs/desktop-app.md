@@ -103,15 +103,21 @@ packaging/windows/    open-live-ingest.nsi
   `config::pidfile()`), so `open-live-ingest status` reports it and `open-live-ingest down` stops
   it: SIGTERM on macOS, which the app handles as Stop without asking; `taskkill /F` on Windows,
   after which `down` removes what is left, as it does for a CLI `up`. The app executable is named
-  `open-live-ingest-app` so the existing process-name check (`GATEWAY_COMM`, `process_named` in
-  `src/run.rs`) matches it without change.
+  `open-live-ingest-app` so the existing process-name check (`GATEWAY_COMM` in `src/run.rs`, a
+  prefix of the executable's file name) matches it without change.
 - **One live session per settings file.** Before Go live the app reads `gateway.pid`; if it names
   a running gateway (a CLI `up`, or another app instance) it does not start, and offers "Stop it"
   (the library's `down`). The CLI `up` gains the same refusal (`already running (pid N); run
-  'open-live-ingest down' first`), which today silently runs two loops over the same flows.
-- **A Strom left behind by a crash is reclaimed, not adopted.** If `gateway.pid` is stale and
-  `strom.pid` names a live Strom (process-name checked), Go live first stops it with
-  `local_strom::stop_recorded()`, then starts fresh. Otherwise the next Stop would leave a camera
+  'open-live-ingest down' first`), which today silently runs two loops over the same flows. `up`
+  writes `gateway.pid` right after this check, before it starts or asks Strom, and removes it
+  however it returns, so a gateway that is still starting counts as running too: a second `up`
+  or Go live started meanwhile refuses it, and `down` stops it (a CLI `up` has no signal handler
+  until its inputs are live, so SIGTERM ends it at once and `down` removes what it left).
+- **A Strom left behind by a crash is reclaimed, not adopted.** If `gateway.pid` names no running
+  gateway (starting or live, see above) and `strom.pid` names a live Strom (checked by the
+  executable's file name, `strom` or `strom.exe`, never by its path), Go live first stops it with
+  `local_strom::reclaim_recorded()`, which, unlike `down`'s `stop_recorded()`, waits until it has
+  exited, then starts fresh. Otherwise the next Stop would leave a camera
   open, because an adopted Strom is never stopped.
 - **Windows: no console window for Strom.** The app is a GUI-subsystem executable
   (`#![windows_subsystem = "windows"]`). A console child started from a GUI process gets a console
@@ -330,7 +336,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `stop_other` | — | `null` | `down` (another gateway named by `gateway.pid`) |
 | `quit` | `{confirmed}` | `null` | quit guard (§8) |
 | `show_logs` | `{which: "app" \| "strom"}` | `null` | reveal in Finder/Explorer |
-| `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`: macOS Privacy & Security, for §10's camera row) |
+| `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy" \| "privacy_microphone"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`, `privacy_microphone`: macOS Privacy & Security → Camera or Microphone, for §10's camera/microphone row) |
 
 `open_url` takes a name, not a URL, so the page cannot make the app open an arbitrary address.
 
@@ -340,7 +346,7 @@ unknown command or bad arguments is an error reply, never a panic.
 |---|---|---|
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
 | `input` | `{input, state, message?, action?}` | per-input registering / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
-| `stats` | `{inputs: [{device, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
+| `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
 | `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |
 | `stopping` | `{done, total}` | teardown progress |
 | `stopped` | `{left_behind: [], error}` | teardown finished; anything not removed is named. `error` (`{message, action}`, §10) when the session ended on a failure, else `null` |
@@ -507,7 +513,7 @@ EFP sequence-validation rule for ingest designs does not apply, as this epic add
 | Crate | Where | Decision |
 |---|---|---|
 | `wry`, `tao`, `muda` | app | **Add.** ADR-001: 43 new crates on macOS, 37 on Windows (measured), no JS toolchain |
-| `objc2`, `objc2-foundation`, `objc2-app-kit` | app, macOS | Direct use of crates already in the tree through tao/wry; no new crate. AVFoundation status call via `msg_send!` on the class by name, no `objc2-av-foundation` |
+| `objc2`, `objc2-foundation`, `objc2-app-kit`, `block2` | app, macOS | Direct use of crates already in the tree through tao/wry; no new crate. AVFoundation status call via `msg_send!` on the class by name, no `objc2-av-foundation`; `block2` for the access request's completion handler |
 | `windows` | app, Windows | Already in the tree through tao/wry; direct use for the subclass, mutex and shutdown block reason. Same version as the lockfile resolves |
 | `serde`, `serde_json`, `tokio`, `tracing`, `tracing-subscriber`, `anyhow` | app | Already used by the gateway |
 | `sha2`, `getrandom` | library | **Added** in #75 for PKCE (S256 challenge, random verifier and state): `sha2` 0.11 is the one new crate (its `digest` 0.11 stack is already in the tree through `sha1`); `getrandom` 0.4 was already in the tree |

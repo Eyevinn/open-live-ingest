@@ -337,6 +337,20 @@ enum Phase {
 struct State {
     phase: Phase,
     handle: Option<SessionHandle>,
+    /// Counts Go lives. A session's task changes the state only while this is still
+    /// its own number, so a late end of an earlier session (its checks finishing after
+    /// a Stop, its channel closing after its last event) cannot reset a newer one.
+    session: u64,
+}
+
+impl State {
+    /// Back to Idle, if `session` is still the current one.
+    fn end(&mut self, session: u64) {
+        if self.session == session {
+            self.phase = Phase::Idle;
+            self.handle = None;
+        }
+    }
 }
 
 /// One session at a time, over the settings file, with the keychain an Open Source
@@ -361,6 +375,7 @@ impl GoLive {
             state: Arc::new(Mutex::new(State {
                 phase: Phase::Idle,
                 handle: None,
+                session: 0,
             })),
         }
     }
@@ -379,14 +394,16 @@ impl GoLive {
     /// failure's one line and action. Progress follows as events. Asked again while
     /// a session runs, it replies at once and starts nothing.
     pub fn start(&self, id: u32, deliver: Deliver, runtime: &tokio::runtime::Handle) {
-        {
+        let session = {
             let mut state = self.lock();
             if state.phase != Phase::Idle {
                 deliver(Reply::ok(id, Value::Null).script());
                 return;
             }
             state.phase = Phase::Checking;
-        }
+            state.session += 1;
+            state.session
+        };
         let settings_file = self.settings_file.clone();
         let keychain = self.keychain.clone();
         let host = self.host.clone();
@@ -398,24 +415,29 @@ impl GoLive {
                 Ok(Ok(checked)) => checked,
                 Ok(Err(message)) => {
                     tracing::info!("go live refused: {}", message.message);
-                    lock(&state).phase = Phase::Idle;
+                    lock(&state).end(session);
                     deliver(Reply::failure(id, &message).script());
                     return;
                 }
                 Err(err) => {
                     tracing::warn!("the checks before going live failed: {err}");
-                    lock(&state).phase = Phase::Idle;
+                    lock(&state).end(session);
                     deliver(Reply::failure(id, &Failure::Unmatched.message()).script());
                     return;
                 }
             };
             let mut events = {
                 let mut guard = lock(&state);
-                // Stop pressed while the checks ran: nothing has started.
-                if guard.phase != Phase::Checking {
+                // Stop pressed while the checks ran, and maybe Go live again since:
+                // nothing has started for this one.
+                if guard.session != session || guard.phase != Phase::Checking {
+                    let superseded = guard.session != session;
                     drop(guard);
                     deliver(Reply::ok(id, Value::Null).script());
-                    deliver(Rows::new(ctx).stopped(None).script());
+                    // The page's `stopped` is the newer session's to send.
+                    if !superseded {
+                        deliver(Rows::new(ctx).stopped(None).script());
+                    }
                     return;
                 }
                 let credential = settings
@@ -447,17 +469,13 @@ impl GoLive {
                 );
                 if last {
                     // Idle before the page hears it stopped, so Go live works at once.
-                    let mut guard = lock(&state);
-                    guard.phase = Phase::Idle;
-                    guard.handle = None;
+                    lock(&state).end(session);
                 }
                 for out in rows.on_event(&event, Instant::now()) {
                     deliver(out.script());
                 }
             }
-            let mut guard = lock(&state);
-            guard.phase = Phase::Idle;
-            guard.handle = None;
+            lock(&state).end(session);
         };
         runtime.spawn(task.with_current_subscriber());
     }
@@ -550,7 +568,7 @@ mod tests {
     use crate::testing;
     use open_live_ingest::gateway::{Event as E, InputStats, SummaryRow, UplinkStats};
     use open_live_ingest::keychain::MemoryKeychain;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{channel, Receiver};
 
     fn rows() -> Rows {
@@ -882,6 +900,10 @@ mod tests {
         denied: Option<Media>,
         reclaimed: AtomicBool,
         asked: Mutex<Option<Needs>>,
+        /// When set, each camera check waits for one message on it.
+        gate: Option<Mutex<Receiver<()>>>,
+        /// Camera checks begun.
+        checking: AtomicUsize,
     }
 
     impl Host for FakeHost {
@@ -893,6 +915,12 @@ mod tests {
         }
         fn media_access(&self, needs: Needs) -> Result<(), Media> {
             *self.asked.lock().unwrap() = Some(needs);
+            if let Some(gate) = &self.gate {
+                let gate = gate.lock().unwrap();
+                self.checking.fetch_add(1, Ordering::SeqCst);
+                // A closed gate (the test has ended) lets the check go.
+                let _ = gate.recv();
+            }
             match self.denied {
                 Some(media) => Err(media),
                 None => Ok(()),
@@ -1015,6 +1043,7 @@ port_range = "47110-47112"
             reply["error"]["message"],
             "Open Live Ingest is not allowed to use the microphone. Allow it in System Settings → Privacy & Security, then press Go live."
         );
+        assert_eq!(reply["error"]["action"], "open_microphone_settings");
         assert_eq!(
             *host.asked.lock().unwrap(),
             Some(Needs {
@@ -1080,6 +1109,58 @@ port_range = "47110-47112"
         assert!(!go.is_live());
         go.start(5, deliver, rt.handle());
         assert_eq!(next(&rx), json!({"id": 5, "ok": null}));
+    }
+
+    /// #95 W3: Go live, Stop while the checks run, Go live again. When the first
+    /// checks finish late they start nothing and leave the second Go live alone: no
+    /// session for the first, no `stopped` for the page, still going live.
+    #[test]
+    fn a_late_end_of_an_earlier_go_live_leaves_the_newer_one_alone() {
+        let scratch = testing::Scratch::new("golive-generation");
+        // Before the gate: dropped after it, so a failing assert lets a waiting check
+        // go and the runtime's drop does not wait on it forever.
+        let rt = runtime();
+        let (release, gate) = channel();
+        let host = Arc::new(FakeHost {
+            gate: Some(Mutex::new(gate)),
+            ..FakeHost::default()
+        });
+        let go = go_live(settings_file(&scratch, CAMERA_WITH_MIC), host.clone());
+        let (deliver, rx) = deliverer();
+        let until_checking = |n: usize| {
+            let started = Instant::now();
+            while host.checking.load(Ordering::SeqCst) < n {
+                assert!(started.elapsed() < Duration::from_secs(10), "no check {n}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        go.start(1, deliver.clone(), rt.handle());
+        until_checking(1);
+        go.stop();
+        assert!(!go.is_live());
+        go.start(2, deliver, rt.handle());
+        assert!(go.is_live());
+
+        // The first checks pass now: their reply only, and the second still checking.
+        release.send(()).unwrap();
+        assert_eq!(next(&rx), json!({"id": 1, "ok": null}));
+        until_checking(2);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            go.lock().phase,
+            Phase::Checking,
+            "the first Go live started"
+        );
+        assert!(go.lock().handle.is_none());
+        assert!(rx.try_recv().is_err(), "nothing else for the first Go live");
+
+        // The second is stopped during its checks as well: it ends as Stop says.
+        go.stop();
+        release.send(()).unwrap();
+        assert_eq!(next(&rx), json!({"id": 2, "ok": null}));
+        assert_eq!(next(&rx)["event"], "stopped");
+        assert!(!go.is_live());
     }
 
     #[test]
