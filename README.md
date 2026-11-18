@@ -214,7 +214,18 @@ working; deleting the app breaks it, so remove `/usr/local/bin/open-live-ingest`
 
 ### Windows
 
-On 64-bit (x86_64) Windows, from PowerShell:
+The desktop app comes as an installer on each release,
+[`open-live-ingest-x86_64-pc-windows-msvc-setup.exe`](https://github.com/Eyevinn/open-live-ingest/releases/latest/download/open-live-ingest-x86_64-pc-windows-msvc-setup.exe).
+It installs for all users into `%ProgramFiles%\Open Live Ingest` (Windows asks once to allow it):
+the app with a Start menu entry "Open Live Ingest", and the command-line gateway next to it,
+`"%ProgramFiles%\Open Live Ingest\open-live-ingest.exe"`, which is not put on PATH. Unless Strom
+is already in `%ProgramFiles%\Strom\bin`, it also installs the pinned Strom MSI it carries. It
+needs the Microsoft Edge WebView2 runtime, which Windows 11 has. `setup.exe /S` installs silently.
+Uninstall it from Apps & features: that removes the app, the gateway and the Start menu entry, and
+keeps Strom and your settings. The installer is not code signed yet, so SmartScreen warns
+("More info", then "Run anyway").
+
+For the command-line gateway alone, on 64-bit (x86_64) Windows, from PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/install.ps1 | iex
@@ -240,8 +251,8 @@ code signing. The binary is unsigned, so SmartScreen or Defender may warn before
 Other ways in:
 
 - **By hand.** Each [release](https://github.com/Eyevinn/open-live-ingest/releases) carries a
-  static binary for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), a zip for Windows
-  (x86_64), plus `SHA256SUMS` and a signed build provenance you can check with
+  static binary for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), a zip and the
+  app's installer for Windows (x86_64), plus `SHA256SUMS` and a signed build provenance you can check with
   `gh attestation verify`. The asset names do not carry a version, so
   `releases/latest/download/open-live-ingest-<target>.tar.gz` (`.zip` on Windows) is stable.
 - **Rust users.** `cargo binstall open-live-ingest` fetches the same tarball. `cargo build
@@ -270,7 +281,8 @@ Bump `version` in `Cargo.toml`, commit, then tag and push:
 git tag v0.5.0 && git push origin v0.5.0
 ```
 
-The release workflow refuses a tag that does not match `Cargo.toml`, builds the five binaries,
+The release workflow refuses a tag that does not match `Cargo.toml`, builds the five binaries
+and the Windows installer (installing and uninstalling it once on the runner first),
 and publishes them with a checksum file, build provenance, and generated notes. When the
 `strom-types` pin moves, move `STROM_VERSION` in `install.sh` and `$StromVersion` in `install.ps1`
 with it; a test checks they agree. Run the workflow by hand from the
