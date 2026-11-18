@@ -1953,6 +1953,7 @@ dependencies = [
  "serde_json",
  "tao",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "wry",

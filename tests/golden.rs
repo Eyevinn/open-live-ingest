@@ -708,3 +708,186 @@ fn up_stopped_by_a_signal_tears_down_as_before() {
     assert!(strom_state.lock().unwrap().flows.is_empty());
     assert!(ol_state.lock().unwrap().sources.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The saved selection: `[[input]]` entries say what `up` sends.
+// ---------------------------------------------------------------------------
+
+impl Scratch {
+    /// Adds `text` to the end of the settings file.
+    fn append_settings(&self, text: &str) {
+        let path = self.0.join("gateway.toml");
+        let mut settings = std::fs::read_to_string(&path).unwrap();
+        settings.push_str(text);
+        std::fs::write(path, settings).unwrap();
+    }
+}
+
+fn selection_strom() -> Arc<Mutex<StromState>> {
+    Arc::new(Mutex::new(StromState {
+        video: vec![
+            device("dev-obs", "OBS Virtual Camera", false),
+            device("dev-cam", "FaceTime HD Camera", false),
+        ],
+        audio: vec![device("dev-mic", "USB Microphone", true)],
+        ..Default::default()
+    }))
+}
+
+/// The flows' names and whether each carries an audio device, sorted by name.
+fn flows_of(state: &Arc<Mutex<StromState>>) -> Vec<(String, bool)> {
+    let mut flows: Vec<(String, bool)> = state
+        .lock()
+        .unwrap()
+        .flows
+        .iter()
+        .map(|f| {
+            let audio = f.to_string().contains("dev-mic");
+            (f["name"].as_str().unwrap_or_default().to_string(), audio)
+        })
+        .collect();
+    flows.sort();
+    flows
+}
+
+fn source_names(state: &Arc<Mutex<OpenLiveState>>) -> Vec<String> {
+    let mut names: Vec<String> = state
+        .lock()
+        .unwrap()
+        .sources
+        .iter()
+        .map(|s| s["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+const UP_EVERY_DEVICE: &str = "\
+Bringing up 1 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 6 Mbps in total.
+
+INPUT                                PORT   REGISTERED ADDRESS
+Venue — FaceTime HD Camera           47110  srt://:47110?mode=listener&passphrase=***
+
+Assign these in Studio and activate the production; they read as inactive until
+something is receiving them. Ctrl-C stops and removes them.
+
+  Venue — FaceTime HD Camera — waiting for a receiver
+";
+
+const UP_SAVED_SELECTION: &str = "\
+Bringing up 2 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 12 Mbps in total.
+
+INPUT                                PORT   REGISTERED ADDRESS
+Venue — Test pattern                 47110  srt://:47110?mode=listener&passphrase=***
+Venue — Stage left                   47111  srt://:47111?mode=listener&passphrase=***
+
+Assign these in Studio and activate the production; they read as inactive until
+something is receiving them. Ctrl-C stops and removes them.
+
+  Venue — Test pattern — waiting for a receiver
+  Venue — Stage left — waiting for a receiver
+";
+
+/// Without `[[input]]`, `up` sends every non-virtual device as before. With it, `up`
+/// sends exactly the entries (a virtual device and the test pattern here, not the
+/// FaceTime camera), with the paired audio and the label, and skips one that is not
+/// connected. `--devices` overrides the entries for a run.
+#[test]
+fn up_sends_exactly_the_saved_inputs_and_flags_override_them() {
+    let strom_state = selection_strom();
+    let strom = fake_strom(strom_state.clone());
+    let ol_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(ol_state.clone());
+    let scratch = Scratch::new("selection", &strom, &open_live);
+
+    // No [[input]]: unchanged.
+    let mut up = Running::start(&scratch, &["up"]);
+    assert_golden(up.until("waiting for a receiver"), UP_EVERY_DEVICE);
+    up.kill();
+    assert_eq!(
+        flows_of(&strom_state),
+        [("Venue — FaceTime HD Camera".to_string(), false)]
+    );
+    scratch.run(&["down"]);
+    assert!(strom_state.lock().unwrap().flows.is_empty());
+
+    scratch.append_settings(
+        r#"
+[[input]]
+device = "dev-obs"
+audio = "dev-mic"
+label = "Stage left"
+
+[[input]]
+device = "test"
+
+[[input]]
+device = "dev-unplugged"
+"#,
+    );
+    let mut up = Running::start(&scratch, &["up"]);
+    let out = up.until("Stage left — waiting for a receiver").to_string();
+    up.kill();
+    assert_golden(&out, UP_SAVED_SELECTION);
+    assert_eq!(
+        flows_of(&strom_state),
+        [
+            ("Venue — Stage left".to_string(), true),
+            ("Venue — Test pattern".to_string(), false),
+        ]
+    );
+    assert_eq!(
+        source_names(&ol_state),
+        ["Venue — Stage left", "Venue — Test pattern"]
+    );
+    scratch.run(&["down"]);
+    assert!(strom_state.lock().unwrap().flows.is_empty());
+    assert!(ol_state.lock().unwrap().sources.is_empty());
+
+    // A flag picks for this run, here a device without an entry.
+    let mut up = Running::start(&scratch, &["up", "--devices", "FaceTime"]);
+    assert_golden(up.until("waiting for a receiver"), UP_EVERY_DEVICE);
+    up.kill();
+    assert_eq!(
+        flows_of(&strom_state),
+        [("Venue — FaceTime HD Camera".to_string(), false)]
+    );
+    scratch.run(&["down"]);
+
+    // Picked by flags (`--all`, as it is virtual), a device with an entry keeps the
+    // entry's audio and label.
+    let mut up = Running::start(&scratch, &["up", "--all", "--devices", "dev-obs"]);
+    up.until("Stage left — waiting for a receiver");
+    up.kill();
+    assert_eq!(
+        flows_of(&strom_state),
+        [("Venue — Stage left".to_string(), true)]
+    );
+    scratch.run(&["down"]);
+}
+
+/// `check` refuses one audio source paired with two cameras in `[[input]]`.
+#[test]
+fn check_refuses_one_audio_source_paired_twice() {
+    let strom = fake_strom(selection_strom());
+    let open_live = fake_open_live(Arc::default());
+    let scratch = Scratch::new("pairing", &strom, &open_live);
+    scratch.append_settings(
+        r#"
+[[input]]
+device = "dev-cam"
+audio = "dev-mic"
+
+[[input]]
+device = "dev-obs"
+audio = "dev-mic"
+"#,
+    );
+    let out = scratch.command(&["check"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(r#"audio source "dev-mic" is paired with both "dev-cam" and "dev-obs""#),
+        "{stderr}"
+    );
+}

@@ -51,7 +51,10 @@ use tokio::task::JoinHandle;
 /// or drop it: see the module documentation's caveats.
 pub type Receiver = mpsc::UnboundedReceiver<Event>;
 
-/// Which inputs a session streams: the choices `up` takes as flags.
+/// Which inputs a session streams: the choices `up` takes as flags. With none of
+/// `include_virtual`, `selection` and `test_pattern` set, the settings' `[[input]]`
+/// entries say what to send, and every non-virtual device when there are none; any of
+/// the three overrides the entries for this session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inputs {
     /// Include virtual devices, which produce nothing on their own.

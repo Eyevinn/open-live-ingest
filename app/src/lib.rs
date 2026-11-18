@@ -3,8 +3,8 @@
 //! Everything here is plain Rust with no window and no webview, so it is unit tested
 //! with `cargo test` on any OS: the custom protocol that serves the page, its
 //! Content-Security-Policy, the navigation filter, the IPC dispatcher, and the models
-//! behind the window's steps (`where_to_send`). The window itself (tao, wry, muda) is
-//! `src/main.rs`. See docs/specs/desktop-app.md and
+//! behind the window's steps (`where_to_send`, `what_to_send`). The window itself
+//! (tao, wry, muda) is `src/main.rs`. See docs/specs/desktop-app.md and
 //! docs/decisions/ADR-001-desktop-app-toolkit.md.
 
 pub mod ipc;
@@ -12,6 +12,7 @@ pub mod navigation;
 pub mod protocol;
 #[cfg(test)]
 mod testing;
+pub mod what_to_send;
 pub mod where_to_send;
 
 /// The version both the app and the CLI of one release report.

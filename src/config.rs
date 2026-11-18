@@ -33,16 +33,40 @@ pub struct Config {
     pub inputs: Vec<InputSettings>,
 }
 
-/// One `[[input]]` entry. Today it pairs an audio source with a camera; `up --audio`
-/// replaces these for that run.
+/// One `[[input]]` entry: an input to send. With any present, `up` sends exactly these
+/// (`--devices`, `--all` and `--test` override that for a run); without, it sends every
+/// device. `up --audio` replaces the audio pairings for a run.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InputSettings {
-    /// The camera, by Strom device id or name fragment, as `--devices` takes it.
+    /// The camera, by Strom device id or name fragment, as `--devices` takes it, or
+    /// [`TEST_PATTERN_DEVICE`] for the test pattern. An exact id wins over a fragment.
     pub device: String,
     /// An audio source to send with it, by Strom device id or name fragment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
+    /// The source's name in Studio after `<gateway.name> — `; the device's name when
+    /// unset. Only this part is the operator's: cleanup finds sources by the prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// The `device` of the `[[input]]` entry that sends the test pattern and tone.
+pub const TEST_PATTERN_DEVICE: &str = "test";
+
+impl InputSettings {
+    /// Whether this entry is the test pattern rather than a device.
+    pub fn is_test_pattern(&self) -> bool {
+        self.device.trim().eq_ignore_ascii_case(TEST_PATTERN_DEVICE)
+    }
+
+    /// The label, trimmed, when one is set and not blank.
+    pub fn label(&self) -> Option<&str> {
+        self.label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -654,6 +678,84 @@ pub(crate) fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
     }
 }
 
+/// What is wrong with the `[[input]]` entries alone, each reported. An app saving
+/// its selection checks only these: the rest of the file may still be unfinished.
+pub fn input_problems(inputs: &[InputSettings]) -> Vec<Problem> {
+    check_inputs(inputs)
+        .into_iter()
+        .map(|(setting, err)| Problem::new(setting, format!("{err:#}")))
+        .collect()
+}
+
+// The same checks `up` makes against the resolved devices, made early on the text so
+// the settings file is refused before anything starts.
+fn check_inputs(inputs: &[InputSettings]) -> Vec<(&'static str, anyhow::Error)> {
+    let mut found = Vec::new();
+    let mut devices: Vec<&str> = Vec::new();
+    let mut labels: Vec<(&str, &str)> = Vec::new();
+    let mut paired: Vec<(&str, &str)> = Vec::new();
+    for entry in inputs {
+        let device = entry.device.trim();
+        if device.is_empty() {
+            found.push(("input", anyhow!("an [[input]] entry has no device")));
+            continue;
+        }
+        if devices.iter().any(|d| d.eq_ignore_ascii_case(device)) {
+            found.push((
+                "input",
+                anyhow!("{device:?} has two [[input]] entries; one entry per input"),
+            ));
+            continue;
+        }
+        devices.push(device);
+        match entry.label.as_deref().map(str::trim) {
+            Some("") => found.push((
+                "input",
+                anyhow!("the [[input]] entry for {device:?} has an empty label; remove the line to use the device name"),
+            )),
+            Some(label) => {
+                if let Some((other, _)) = labels.iter().find(|(_, l)| l.eq_ignore_ascii_case(label)) {
+                    found.push((
+                        "input",
+                        anyhow!("{other:?} and {device:?} are both labelled {label:?} in [[input]]; two sources cannot share a name"),
+                    ));
+                } else {
+                    labels.push((device, label));
+                }
+            }
+            None => {}
+        }
+        let Some(audio) = entry.audio.as_deref().map(str::trim) else {
+            continue;
+        };
+        if audio.is_empty() {
+            found.push((
+                "input",
+                anyhow!("the [[input]] entry for {device:?} has an empty audio; remove the line for no audio"),
+            ));
+            continue;
+        }
+        if entry.is_test_pattern() {
+            found.push((
+                "input",
+                anyhow!(
+                    "the test pattern carries its own tone, so its [[input]] entry takes no audio"
+                ),
+            ));
+            continue;
+        }
+        if let Some((other, _)) = paired.iter().find(|(_, a)| a.eq_ignore_ascii_case(audio)) {
+            found.push((
+                "input",
+                anyhow!("audio source {audio:?} is paired with both {other:?} and {device:?} in [[input]]; one audio source goes with one camera"),
+            ));
+            continue;
+        }
+        paired.push((device, audio));
+    }
+    found
+}
+
 /// The checks, in the order `validate` has always made them, each failure with the
 /// setting it concerns.
 fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
@@ -759,34 +861,7 @@ fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
         }
     }
 
-    // The same check `up` makes against the resolved devices, made early on the text
-    // so the settings file is refused before anything starts.
-    let mut paired: Vec<(&str, &str)> = Vec::new();
-    for entry in &cfg.inputs {
-        let device = entry.device.trim();
-        if device.is_empty() {
-            found.push(("input", anyhow!("an [[input]] entry has no device")));
-            continue;
-        }
-        let Some(audio) = entry.audio.as_deref().map(str::trim) else {
-            continue;
-        };
-        if audio.is_empty() {
-            found.push((
-                "input",
-                anyhow!("the [[input]] entry for {device:?} has an empty audio; remove the line for no audio"),
-            ));
-            continue;
-        }
-        if let Some((other, _)) = paired.iter().find(|(_, a)| a.eq_ignore_ascii_case(audio)) {
-            found.push((
-                "input",
-                anyhow!("audio source {audio:?} is paired with both {other:?} and {device:?} in [[input]]; one audio source goes with one camera"),
-            ));
-            continue;
-        }
-        paired.push((device, audio));
-    }
+    found.extend(check_inputs(&cfg.inputs));
 
     if cfg.open_live.register {
         if cfg
@@ -971,10 +1046,12 @@ mod tests {
                 InputSettings {
                     device: "FaceTime".to_string(),
                     audio: Some("USB Microphone".to_string()),
+                    label: None,
                 },
                 InputSettings {
                     device: "DeckLink".to_string(),
                     audio: None,
+                    label: None,
                 },
             ]
         );
@@ -990,6 +1067,58 @@ mod tests {
         assert!(validate(&cfg).is_err());
 
         assert!(toml::from_str::<Config>("[[input]]\ndevice = \"x\"\nmic = \"y\"\n").is_err());
+    }
+
+    /// The app's selection: a label per input, the test pattern by name, and the
+    /// rules `up` relies on refused on the text, every one reported.
+    #[test]
+    fn input_entries_take_a_label_and_refuse_what_up_cannot_send() {
+        let cfg: Config = toml::from_str(
+            "[[input]]\ndevice = \"dev-cam\"\naudio = \"dev-mic\"\nlabel = \"Stage left\"\n\n[[input]]\ndevice = \"test\"\n",
+        )
+        .expect("parses");
+        assert_eq!(cfg.inputs[0].label(), Some("Stage left"));
+        assert!(!cfg.inputs[0].is_test_pattern());
+        assert!(cfg.inputs[1].is_test_pattern());
+        assert_eq!(cfg.inputs[1].label(), None);
+        assert_eq!(input_problems(&cfg.inputs), []);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("label = \"Stage left\""), "{text}");
+        assert_eq!(text.matches("label").count(), 1, "{text}");
+
+        let entry = |device: &str, audio: Option<&str>, label: Option<&str>| InputSettings {
+            device: device.to_string(),
+            audio: audio.map(str::to_string),
+            label: label.map(str::to_string),
+        };
+        let refused = [
+            (
+                vec![entry("cam", None, None), entry("CAM", None, None)],
+                "two [[input]] entries",
+            ),
+            (vec![entry("cam", None, Some(" "))], "empty label"),
+            (
+                vec![
+                    entry("a", None, Some("Stage")),
+                    entry("b", None, Some("stage")),
+                ],
+                "cannot share a name",
+            ),
+            (vec![entry("test", Some("mic"), None)], "its own tone"),
+            (
+                vec![entry("a", Some("mic"), None), entry("b", Some("MIC"), None)],
+                "paired with both",
+            ),
+        ];
+        for (inputs, expected) in refused {
+            let found = input_problems(&inputs);
+            assert_eq!(found.len(), 1, "{inputs:?}: {found:?}");
+            assert_eq!(found[0].setting, Some("input"));
+            assert!(found[0].message.contains(expected), "{found:?}");
+            let mut cfg = valid();
+            cfg.inputs = inputs;
+            assert!(validate(&cfg).unwrap_err().to_string().contains(expected));
+        }
     }
 
     /// A file without `[[input]]` is written back without one.
@@ -1136,10 +1265,12 @@ mod tests {
             InputSettings {
                 device: "FaceTime".to_string(),
                 audio: Some("USB Microphone".to_string()),
+                label: None,
             },
             InputSettings {
                 device: "DeckLink".to_string(),
                 audio: Some("usb microphone".to_string()),
+                label: None,
             },
         ];
         let found = problems_with(&cfg, false);

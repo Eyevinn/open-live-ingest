@@ -31,6 +31,54 @@ h2 {
 
 section.disabled {
   opacity: 0.45;
+  pointer-events: none;
+}
+
+.show-all {
+  float: right;
+  font-size: 0.9rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.75rem;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+
+th,
+td {
+  padding: 0.3rem 0.4rem 0.3rem 0;
+  vertical-align: middle;
+}
+
+.note {
+  display: block;
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+
+.studio-name {
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.studio-name input {
+  flex: 1;
+  min-width: 6rem;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.notice {
+  font-size: 0.9rem;
 }
 
 .problem {
