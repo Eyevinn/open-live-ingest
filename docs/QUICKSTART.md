@@ -165,6 +165,11 @@ entry in the settings with `device` and `audio`. One audio source goes with one 
 is connected or recognised; `up --test` streams a test pattern and tone instead, to commission the
 link before cameras arrive.
 
+With `[[input]]` entries in the settings (the desktop app writes them; `gateway.toml.example` shows
+the fields), `up` sends exactly those inputs, each optionally with an audio source and a `label` for
+its Studio name, and skips one that is not connected. `--devices`, `--all` and `--test` pick for
+one run instead.
+
 ## 5. Start
 
 To try the link once, in the foreground:

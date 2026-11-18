@@ -42,6 +42,10 @@ open-live-ingest check            # validate the settings file
 
 `status --json` and `devices --json` print one JSON document instead of a table.
 
+With `[[input]]` entries in the settings (written by the desktop app, or by hand as in
+`gateway.toml.example`), `up` sends exactly those inputs, with their audio and Studio labels;
+`--devices`, `--all` and `--test` pick for one run instead. Without any, it sends every device.
+
 Run it and it asks for what it needs, checks each answer, remembers it, then registers every capture
 device Strom can see and starts streaming. Built for SSH: line-by-line prompts on any terminal, lists
 picked with the arrow keys, no window. Colour steps back to plain text under `NO_COLOR` or on a dumb

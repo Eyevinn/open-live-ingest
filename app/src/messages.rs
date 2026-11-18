@@ -751,10 +751,12 @@ mod tests {
                 InputSettings {
                     device: "Camera A".to_string(),
                     audio: Some("USB Mic".to_string()),
+                    label: None,
                 },
                 InputSettings {
                     device: "Camera B".to_string(),
                     audio: Some("USB Mic".to_string()),
+                    label: None,
                 },
             ],
             ..Config::default()
