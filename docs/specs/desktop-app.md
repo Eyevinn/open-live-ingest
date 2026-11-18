@@ -345,6 +345,8 @@ unknown command or bad arguments is an error reply, never a panic.
 | `stopping` | `{done, total}` | teardown progress |
 | `stopped` | `{left_behind: []}` | teardown finished; anything not removed is named |
 | `quit_requested` | `{inputs_live}` | the quit guard wants the §8 question shown |
+| `osc_sign_in_page` | `{url}` | the sign-in page was opened in the browser; the window shows its address too, for when no browser opens |
+| `where` | step 1's view (as `state`'s `where`) | after `state`, the workspace and instance names looked up with the kept sign-in |
 
 The variant names on the right are #71's; the app maps whatever names #71 merges with. `message`
 is always produced by `app/src/messages.rs` (§10), never passed through from an error chain.

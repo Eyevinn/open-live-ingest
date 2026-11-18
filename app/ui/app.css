@@ -37,6 +37,60 @@ section.disabled {
   color: #c62828;
 }
 
+input,
+textarea,
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+code.selectable {
+  word-break: break-all;
+  font-size: 0.8rem;
+}
+
+.option {
+  margin: 0.75rem 0;
+}
+
+form label {
+  display: block;
+  margin: 0.4rem 0;
+}
+
+form input {
+  display: block;
+  width: 100%;
+  max-width: 28rem;
+  box-sizing: border-box;
+  margin-top: 0.2rem;
+}
+
+fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+fieldset label {
+  display: block;
+  margin: 0.25rem 0;
+}
+
+button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: LinkText;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+
+button:disabled {
+  opacity: 0.6;
+}
+
 footer {
   margin-top: 2rem;
   font-size: 0.85rem;

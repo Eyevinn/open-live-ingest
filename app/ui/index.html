@@ -14,6 +14,48 @@
     <main>
       <section id="where" aria-labelledby="where-title">
         <h2 id="where-title">1. Where to send</h2>
+        <p id="where-summary" hidden>
+          <span id="where-summary-text"></span>
+          <button type="button" id="where-change" class="link">Change</button>
+        </p>
+        <p id="where-problem" class="problem" role="status" hidden></p>
+        <div id="where-choose" hidden>
+          <div class="option">
+            <button type="button" id="osc-sign-in">Sign in with Open Source Cloud</button>
+            <div id="osc-waiting" hidden>
+              <p>Finish signing in in your browser. If no browser opened, open this address:</p>
+              <p><code id="osc-address" class="selectable"></code></p>
+            </div>
+            <div id="osc-workspace" hidden>
+              <p>
+                Workspace <strong id="osc-workspace-name"></strong>
+                <button type="button" id="osc-change-workspace" class="link">Change workspace</button>
+              </p>
+              <fieldset id="osc-instances-box">
+                <legend>Open Live instance</legend>
+                <div id="osc-instances"></div>
+              </fieldset>
+            </div>
+          </div>
+          <details id="self-hosted" class="option">
+            <summary>Use a self-hosted Open Live</summary>
+            <form id="self-hosted-form">
+              <label>Address <input id="self-hosted-url" type="text" required
+                placeholder="open-live.example.com" autocomplete="off" spellcheck="false"></label>
+              <label>API key <input id="self-hosted-key" type="password"
+                placeholder="Leave empty if it needs none" autocomplete="off"></label>
+              <button type="submit">Check and use</button>
+            </form>
+          </details>
+          <details id="paste-token" class="option">
+            <summary>Advanced: paste a personal access token</summary>
+            <form id="paste-token-form">
+              <label>Open Source Cloud personal access token <input id="paste-token-value"
+                type="password" required autocomplete="off"></label>
+              <button type="submit">Use token</button>
+            </form>
+          </details>
+        </div>
       </section>
       <section id="what" class="disabled" aria-labelledby="what-title" aria-disabled="true">
         <h2 id="what-title">2. What to send</h2>

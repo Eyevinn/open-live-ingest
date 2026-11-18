@@ -20,6 +20,8 @@ const TITLE: &str = "Open Live Ingest";
 enum UserEvent {
     /// A message the page posted with `window.ipc.postMessage`.
     Ipc(String),
+    /// A script for the page from the core: a reply that came later, or an event.
+    Deliver(String),
     /// A menu item was chosen.
     #[cfg(target_os = "macos")]
     Menu(muda::MenuEvent),
@@ -86,7 +88,14 @@ pub fn run() -> ExitCode {
         }
     };
 
-    let mut core = ipc::Core::new(open_live_ingest::config::default_path());
+    // The core answers some commands later, from its own threads; the proxy brings
+    // what it delivers back to this loop, where the webview lives.
+    let deliver_proxy = std::sync::Mutex::new(event_loop.create_proxy());
+    let deliver: ipc::Deliver = std::sync::Arc::new(move |script| {
+        let proxy = deliver_proxy.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = proxy.send_event(UserEvent::Deliver(script));
+    });
+    let mut core = ipc::Core::new(open_live_ingest::config::default_path(), deliver);
     tracing::info!(version = open_live_ingest_app::VERSION, "app started");
 
     event_loop.run(move |event, _target, control_flow| {
@@ -111,6 +120,11 @@ pub fn run() -> ExitCode {
                     if effect == ipc::Effect::Quit {
                         request_quit(control_flow);
                     }
+                }
+            }
+            Event::UserEvent(UserEvent::Deliver(script)) => {
+                if let Err(e) = webview.evaluate_script(&script) {
+                    tracing::warn!("could not deliver a message to the page: {e}");
                 }
             }
             #[cfg(target_os = "macos")]

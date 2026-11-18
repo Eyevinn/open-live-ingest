@@ -95,7 +95,12 @@ pub async fn workspace(credential: impl Into<OscCredential>) -> Result<Workspace
     workspace_at(&osc::Endpoints::production(), &credential.into()).await
 }
 
-async fn workspace_at(endpoints: &osc::Endpoints, credential: &OscCredential) -> Result<Workspace> {
+/// [`workspace`], asking the Open Source Cloud at `endpoints`: production, or a fake
+/// in a test.
+pub async fn workspace_at(
+    endpoints: &osc::Endpoints,
+    credential: &OscCredential,
+) -> Result<Workspace> {
     let token = credential.access_token_at(&endpoints.connect).await?;
     let id = osc::inspect(&token).and_then(|i| i.workspace);
     let instances = osc::open_live_instances_at(endpoints, &token)
@@ -144,7 +149,9 @@ pub async fn osc_sign_in(
     .await
 }
 
-async fn osc_sign_in_at(
+/// [`osc_sign_in`] against the Open Source Cloud at `endpoints`, waiting at most
+/// `wait` for the browser to come back ([`osc::SIGN_IN_TIMEOUT`] in production).
+pub async fn osc_sign_in_at(
     endpoints: &osc::Endpoints,
     wait: std::time::Duration,
     settings: &mut Config,
