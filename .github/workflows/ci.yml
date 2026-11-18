@@ -35,6 +35,52 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  # The desktop app (app/, docs/specs/desktop-app.md). Its window needs the system
+  # webview, so it is built on macOS and Windows only, by name: the build job above
+  # never compiles it (default-members = ["."]). `cargo fmt --all` there covers it.
+  app:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: app
+      - run: cargo clippy -p open-live-ingest-app --all-targets --locked -- -D warnings
+      - run: cargo test -p open-live-ingest-app --locked
+
+      # The app depends on the library with default features off, so the `cli`
+      # feature's terminal crates must not reach it.
+      - name: The app links no terminal crate
+        run: |
+          set -euo pipefail
+          found="$(cargo tree -p open-live-ingest-app -e normal --prefix none --locked \
+            | awk '{print $1}' | grep -xE 'clap|dialoguer|console' | sort -u || true)"
+          [[ -z "$found" ]] || { echo "the app links: $found"; exit 1; }
+          echo "no clap, dialoguer or console in the app"
+
+      # Answered before any window or webview exists, as packaging checks rely on.
+      - name: The app answers --version
+        run: |
+          set -euo pipefail
+          cargo build -p open-live-ingest-app --locked
+          version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "open-live-ingest-app") | .version')"
+          got="$(target/debug/open-live-ingest-app --version)"
+          echo "$got"
+          [[ "$got" == "open-live-ingest-app $version" ]] \
+            || { echo "expected 'open-live-ingest-app $version'"; exit 1; }
+
   # The session AC2 test (`start_events_and_stop_against_a_real_strom`, #[ignore]d so
   # `cargo test` above stays GStreamer-free) against a real Strom: the release binary
   # of the strom-types tag pinned in Cargo.toml, so a pin bump moves this job with it.

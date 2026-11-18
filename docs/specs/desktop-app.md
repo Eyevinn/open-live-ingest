@@ -57,7 +57,7 @@ packaging/windows/    open-live-ingest.nsi
 
 - **Lib and CLI stay one package.** `cargo binstall`, the release paths
   (`target/<target>/release/open-live-ingest`), `build.rs`, `tests/pins.rs` and the tag check in
-  `release.yml` (first `^version` line of `Cargo.toml`) all keep working. Splitting them into two
+  `release.yml` all keep working. Splitting them into two
   crates buys nothing the feature below does not.
 - **A `cli` feature (default on)** makes `clap`, `dialoguer` and `console` optional and is
   `required-features` of the bin target. The app depends on
@@ -68,8 +68,9 @@ packaging/windows/    open-live-ingest.nsi
   job and the musl release builds never need webkit2gtk. The app is built with `-p
   open-live-ingest-app` on macOS and Windows only.
 - **One version.** `version` moves to `[workspace.package]` and both packages inherit it, so the
-  app and the CLI in one release always report the same version. The release tag check keeps
-  reading the first `^version` line, which is then the workspace one.
+  app and the CLI in one release always report the same version. The release tag check reads the
+  `open-live-ingest` package's version with `cargo metadata --no-deps` rather than the first
+  `^version` line of `Cargo.toml`.
 - **CI** (`.github/workflows/ci.yml`) gains an `app` job on `macos-latest` and `windows-latest`:
   `cargo clippy -p open-live-ingest-app --all-targets -- -D warnings` and
   `cargo test -p open-live-ingest-app`. The existing job is unchanged. `cargo fmt --all` covers

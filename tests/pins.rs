@@ -146,3 +146,38 @@ fn version_literals_finds_tags_and_skips_the_rest() {
     let text = "Strom v0.8.2, not v0.8, nor env1.2.3, regex ^v[0-9]+, and v1.10.0.";
     assert_eq!(version_literals(text), vec!["v0.8.2", "v1.10.0"]);
 }
+
+/// `strom-pin.yml`, `bump-strom-pin.sh`, the CI job against a real Strom and
+/// `build-macos-app.sh` all read the pin with `sed -n 's/^strom-types = ...'` on the
+/// root Cargo.toml, so it has to stay one line, at the start, in the root package's
+/// own `[dependencies]` table (not a `[workspace.dependencies]` entry the app inherits).
+#[test]
+fn the_strom_types_pin_is_one_line_in_the_root_dependencies() {
+    let cargo = read("Cargo.toml");
+    let mut table = "";
+    let mut found = Vec::new();
+    for line in cargo.lines() {
+        if line.starts_with('[') {
+            table = line.trim();
+        } else if line.starts_with("strom-types = ") {
+            found.push(table);
+        }
+    }
+    assert_eq!(found, ["[dependencies]"]);
+}
+
+/// `build-macos-app.sh` takes the bundle version from the first `version = "..."` line
+/// of Cargo.toml. With the workspace that is `[workspace.package]`'s, which this
+/// package inherits, so it is still the version the binary reports.
+#[test]
+fn the_first_version_line_of_cargo_toml_is_this_packages_version() {
+    let cargo = read("Cargo.toml");
+    let first = cargo
+        .lines()
+        .find(|l| l.starts_with("version = \""))
+        .expect("a version line");
+    assert_eq!(
+        first,
+        format!("version = \"{}\"", env!("CARGO_PKG_VERSION"))
+    );
+}

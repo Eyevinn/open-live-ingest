@@ -146,9 +146,14 @@ the range, and is reassigned when it is not. Registration therefore precedes the
 mode, where it used to follow them; Open Live being down at start-up is then a start-up error rather
 than a warning, which is right, since without a port there is nothing to build.
 
-## 6. The command line owns what it starts
+## 6. The front ends own what they start
 
-There is one front end and it is a terminal, because the machine is reached over SSH.
+There are two front ends: a terminal, because a venue box is often reached over SSH, and a desktop
+app for a person at the machine (ADR-001). Both drive the same library and own what they start.
+The app is a peer of the command line, not a daemon or a control API: it runs in the foreground,
+starts or adopts Strom through the same `local_strom` code, and everything below holds for it as it
+does for `up`. The terminal stays the front end for SSH and headless boxes, and nothing in it
+changes for the app.
 
 **Setup is running it.** Anything missing is asked for, checked immediately, and written to the
 settings file. The Open Live credential kind is inferred from the address, since nobody can answer
@@ -247,7 +252,10 @@ macOS, so a release is also checked by hand on macOS 27 (README, "Releasing").
 exceptions are two pidfiles: the running `up`, so `down` can ask it to stop before sweeping, and a
 Strom the gateway started, so `down` can stop it after a hard kill. Both pids are checked against
 the process name before they are signalled, because pids are reused after a reboot. A sign-in from
-the app adds one entry in the OS keychain (below).
+the app adds one entry in the OS keychain (above). The desktop app adds two more and nothing else:
+its log file, `app.log` with one rotated copy, and on Windows the WebView2 cache folder
+(`%LOCALAPPDATA%\open-live-ingest\webview`), which WebView2 keeps even for a page that stores
+nothing. The app remembers no window size, tab or recent list (ADR-001, spec section 6).
 
 **One loop.** Every ten seconds, sequentially over all inputs: make sure the flow exists and runs,
 read its SRT statistics, then list the Open Live sources once and create or patch what differs. No
