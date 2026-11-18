@@ -47,7 +47,7 @@ const CLIENT_NAME: &str = "Open Live Ingest";
 /// any port the listener gets.
 const REGISTERED_REDIRECT_URI: &str = "http://127.0.0.1/callback";
 /// How long the person has to finish signing in in the browser.
-pub(crate) const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+pub const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long one connection to the loopback listener may take to send its request.
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_MAX_HEAD: usize = 16 * 1024;
@@ -692,16 +692,20 @@ pub struct Instance {
 
 /// Where Open Source Cloud answers: its OAuth server, the catalog of a workspace's
 /// subscriptions, and the exchange for service tokens. Production unless a test
-/// points them at a fake.
-#[derive(Debug, Clone)]
-pub(crate) struct Endpoints {
+/// points them at a fake; public so an app's own tests can do the same through
+/// [`crate::api::osc_sign_in_at`] and [`crate::api::workspace_at`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Endpoints {
+    /// The OAuth server: `/api/connect/{register,authorize,token}` below it.
     pub connect: String,
+    /// The list of a workspace's subscriptions.
     pub catalog: String,
+    /// The exchange of a personal access token for a service token.
     pub token_exchange: String,
 }
 
 impl Endpoints {
-    pub(crate) fn production() -> Self {
+    pub fn production() -> Self {
         Endpoints {
             connect: CONNECT_URL.to_string(),
             catalog: CATALOG_URL.to_string(),

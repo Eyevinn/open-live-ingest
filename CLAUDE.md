@@ -23,7 +23,8 @@ no media pipeline; Strom does the media.
 - `src/local_strom.rs`: adopt a running Strom, or start and later stop a headless one.
 - `app/`: the desktop app. `app/src/main.rs` and `window.rs` are the window (tao), the system
   webview (wry) and the macOS menu bar (muda); `app/src/lib.rs` is its window-free core: the `oli`
-  custom protocol and its CSP, the navigation filter, the IPC dispatcher. `app/ui/` holds the
+  custom protocol and its CSP, the navigation filter, the IPC dispatcher, and the model of each
+  step of the window (`where_to_send.rs`), tested against fake servers in `testing.rs`. `app/ui/` holds the
   three static page files, compiled in. No npm, no Node, no bundler.
 - The terminal crates (`clap`, `dialoguer`, `console`) sit behind the root package's `cli` feature
   (default on, required by the binary). The app depends on the library with default features off.

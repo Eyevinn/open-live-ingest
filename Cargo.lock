@@ -1946,11 +1946,13 @@ dependencies = [
 name = "open-live-ingest-app"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "muda",
  "open-live-ingest",
  "serde",
  "serde_json",
  "tao",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "wry",
