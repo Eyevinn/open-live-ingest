@@ -112,7 +112,7 @@ pub async fn ensure_running(cfg: &Config, events: &Events) -> Result<LocalStrom>
     let data_dir = data_dir(cfg);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating Strom's data directory at {}", data_dir.display()))?;
-    let log_path = data_dir.join("strom.log");
+    let log_path = log_path(cfg);
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
     let log_err = log.try_clone().context("duplicating the log file handle")?;
@@ -486,6 +486,12 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
+}
+
+/// Where a Strom the gateway starts writes its output (`<data_dir>/strom.log`),
+/// replaced at each start. An adopted Strom logs wherever it was started to.
+pub fn log_path(cfg: &Config) -> PathBuf {
+    data_dir(cfg).join("strom.log")
 }
 
 /// Beside our own settings by default, so a managed Strom never writes into an
@@ -930,6 +936,17 @@ mod tests {
         assert!(data_dir(&cfg).ends_with("strom-data"));
         cfg.strom.data_dir = Some("/tmp/somewhere".to_string());
         assert_eq!(data_dir(&cfg), PathBuf::from("/tmp/somewhere"));
+    }
+
+    #[test]
+    fn strom_logs_into_its_data_directory() {
+        let mut cfg = Config::default();
+        assert!(log_path(&cfg).ends_with(Path::new("strom-data").join("strom.log")));
+        cfg.strom.data_dir = Some("/tmp/somewhere".to_string());
+        assert_eq!(
+            log_path(&cfg),
+            Path::new("/tmp/somewhere").join("strom.log")
+        );
     }
 
     /// The value of `NAME="..."` in the script that builds the macOS app.

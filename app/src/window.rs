@@ -131,6 +131,13 @@ pub fn run() -> ExitCode {
             Event::UserEvent(UserEvent::Menu(event)) if menu_bar.is_quit(&event) => {
                 request_quit(control_flow)
             }
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(UserEvent::Menu(event)) if menu_bar.is_show_logs(&event) => {
+                tracing::info!("menu: show logs");
+                if let Err(message) = core.show_log(ipc::LogFile::App) {
+                    tracing::warn!("show logs failed: {message}");
+                }
+            }
             _ => {}
         }
     })
@@ -181,7 +188,9 @@ mod menu {
     pub struct MenuBar {
         menu: Menu,
         window_menu: Submenu,
+        help_menu: Submenu,
         quit: MenuItem,
+        show_logs: MenuItem,
     }
 
     impl MenuBar {
@@ -239,21 +248,32 @@ mod menu {
                 ],
             )
             .expect("window menu");
-            let menu = Menu::with_items(&[&app_menu, &edit_menu, &window_menu]).expect("menu bar");
+            // Reveals app.log in Finder (spec, section 7).
+            let show_logs = MenuItem::new("Show logs", true, None);
+            let help_menu = Submenu::with_items("Help", true, &[&show_logs]).expect("help menu");
+            let menu = Menu::with_items(&[&app_menu, &edit_menu, &window_menu, &help_menu])
+                .expect("menu bar");
             MenuBar {
                 menu,
                 window_menu,
+                help_menu,
                 quit,
+                show_logs,
             }
         }
 
         pub fn install(&self) {
             self.menu.init_for_nsapp();
             self.window_menu.set_as_windows_menu_for_nsapp();
+            self.help_menu.set_as_help_menu_for_nsapp();
         }
 
         pub fn is_quit(&self, event: &MenuEvent) -> bool {
             event.id() == self.quit.id()
+        }
+
+        pub fn is_show_logs(&self, event: &MenuEvent) -> bool {
+            event.id() == self.show_logs.id()
         }
     }
 }

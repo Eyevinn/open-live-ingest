@@ -144,3 +144,7 @@ footer {
   font-size: 0.85rem;
   opacity: 0.6;
 }
+
+footer button.link {
+  margin-left: 1rem;
+}
