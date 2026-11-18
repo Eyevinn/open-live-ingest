@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Builds a self-contained "Open Live Ingest.app" for Apple silicon: the gateway, the
-# Strom release it is pinned to, and the Homebrew GStreamer that Strom links against,
-# with every library reference rewritten to point inside the bundle. Runs on macOS
-# only. From the repository root:
+# Builds a self-contained "Open Live Ingest.app" for Apple silicon: the desktop app
+# (open-live-ingest-app, the bundle's main executable), the gateway CLI next to it for
+# SSH use, the Strom release they are pinned to, and the Homebrew GStreamer that Strom
+# links against, with every library reference rewritten to point inside the bundle.
+# Runs on macOS only. From the repository root:
 #
 #   cargo build --release --target aarch64-apple-darwin
-#   .github/scripts/build-macos-app.sh target/aarch64-apple-darwin/release/open-live-ingest dist
+#   cargo build --release --target aarch64-apple-darwin -p open-live-ingest-app
+#   .github/scripts/build-macos-app.sh target/aarch64-apple-darwin/release/open-live-ingest \
+#       target/aarch64-apple-darwin/release/open-live-ingest-app dist
 #
 # Needs, on the build Mac: Homebrew with `brew install gstreamer` (the formula carries
 # the full plugin set Strom's installer brings: applemedia/avfvideosrc, x264 and
@@ -18,12 +21,17 @@
 # BUNDLE_PLUGIN_SCANNER, relative to Contents):
 #
 #   Open Live Ingest.app/Contents/
-#     Info.plist
-#     MacOS/open-live-ingest, MacOS/strom
+#     Info.plist                       CFBundleExecutable open-live-ingest-app
+#     MacOS/open-live-ingest-app       the desktop app, what Finder opens
+#     MacOS/open-live-ingest           the CLI, for SSH and a PATH symlink
+#     MacOS/strom
 #     Frameworks/                      GStreamer, GLib and the rest of the closure (files only)
 #     PlugIns/gstreamer/               GStreamer plugins
 #     Helpers/gst-plugin-scanner
-#     Resources/
+#     Resources/AppIcon.icns           from app/icons/AppIcon.icns (CFBundleIconFile)
+#
+# The app and the CLI both find the bundled Strom as "a strom next to the running
+# executable", so either one runs the same gateway with the same GStreamer.
 #
 # Each kind of code sits where Apple's bundle layout puts it, because codesign only
 # accepts nested code in those places. Frameworks, PlugIns, Helpers and MacOS are
@@ -36,27 +44,31 @@
 # Frameworks/* and @loader_path/../../Frameworks for the plugins. Rpaths the Homebrew
 # builds carried are removed. The last step fails if `otool -L` (or an LC_RPATH) of
 # any Mach-O in the bundle still names /opt/homebrew or /usr/local, if one is not
-# signed with the hardened runtime, if strom or open-live-ingest lacks the camera or
-# microphone entitlement, or if `codesign --verify --deep --strict` rejects the bundle.
+# signed with the hardened runtime, if strom, open-live-ingest or open-live-ingest-app
+# lacks the camera or microphone entitlement, or if `codesign --verify --deep --strict`
+# rejects the bundle.
 #
 # Signing, inside out and never with --deep: the libraries and plugins, then
-# gst-plugin-scanner and strom, then the bundle, which signs the main executable
-# (open-live-ingest) and seals everything else. Every Mach-O gets the hardened runtime
-# (--options runtime), and the two executables that run as the app, strom and
-# open-live-ingest, get the entitlements in open-live-ingest.entitlements next to this
-# script (camera and microphone; the file says why each one is there). By default the
-# signature is ad hoc, which Apple silicon requires to load the code at all: the bundle
-# runs on the build Mac and exercises the hardened runtime, but it cannot be
-# notarized. An ad hoc signature has no Team ID, and macOS 27 refuses to map the
-# bundled libraries into an ad hoc signed process under library validation (#66), so
-# an ad hoc build adds com.apple.security.cs.disable-library-validation to strom,
-# open-live-ingest and gst-plugin-scanner; --check requires it there on an ad hoc
+# gst-plugin-scanner, strom and the CLI (open-live-ingest, a nested executable), then
+# the bundle, which signs the main executable (open-live-ingest-app) and seals
+# everything else. Every Mach-O gets the hardened runtime (--options runtime), and the
+# three executables that run as the app, strom, open-live-ingest and
+# open-live-ingest-app, get the entitlements in open-live-ingest.entitlements next to
+# this script (camera and microphone; the file says why each one is there). No other
+# entitlement: the app's webview (WKWebView) runs its JIT in Apple's WebContent process,
+# not in the app. By default the signature is ad hoc, which Apple silicon requires to
+# load the code at all: the bundle runs on the build Mac and exercises the hardened
+# runtime, but it cannot be notarized. An ad hoc signature has no Team ID, and macOS 27
+# refuses to map the bundled libraries into an ad hoc signed process under library
+# validation (#66), so an ad hoc build adds
+# com.apple.security.cs.disable-library-validation to strom, open-live-ingest,
+# open-live-ingest-app and gst-plugin-scanner; --check requires it there on an ad hoc
 # bundle and refuses it on any other. Set MACOS_SIGN_IDENTITY (a "Developer ID
-# Application: ..." identity, or its SHA-1 hash, in a keychain the caller has
-# unlocked) to sign with it instead, with a secure timestamp, ready for notarization,
-# and no hardened-runtime exception; MACOS_SIGN_KEYCHAIN names that keychain when it
-# is not in the search list. MACOS_ENTITLEMENTS overrides the entitlements
-# file. Signing the DMG, notarizing and stapling is left to the caller.
+# Application: ..." identity, or its SHA-1 hash, in a keychain the caller has unlocked)
+# to sign with it instead, with a secure timestamp, ready for notarization, and no
+# hardened-runtime exception; MACOS_SIGN_KEYCHAIN names that keychain when it is not in
+# the search list. MACOS_ENTITLEMENTS overrides the entitlements file. Signing the DMG,
+# notarizing and stapling is left to the caller.
 #
 # Other environment knobs:
 #   BUNDLE_ID             CFBundleIdentifier (default: com.eyevinn.open-live-ingest)
@@ -83,6 +95,13 @@ SCANNER_REL="Helpers/gst-plugin-scanner"
 # The nested-code locations of a bundle (see the layout above).
 NESTED_CODE_DIRS="Frameworks PlugIns Helpers MacOS"
 FORBIDDEN_RE='/opt/homebrew|/usr/local'
+# The bundle's main executable (CFBundleExecutable), the CLI next to it, and Strom.
+APP_EXEC="open-live-ingest-app"
+CLI_EXEC="open-live-ingest"
+EXECUTABLES="MacOS/$APP_EXEC MacOS/$CLI_EXEC MacOS/strom"
+# The icon, committed (app/icons/make-icon.py draws it), and its name in the bundle.
+ICON_NAME="AppIcon"
+ICON_SRC_REL="app/icons/$ICON_NAME.icns"
 # Granted to the executables of an ad hoc build only (see the header).
 LIBRARY_VALIDATION_KEY="com.apple.security.cs.disable-library-validation"
 
@@ -129,8 +148,9 @@ rpaths_of() {
 # a bundle without its executables or plugins is an error, never a pass.
 check_bundle() {
     local app="${1%/}" f d tool req key bad=0 checked=0 list load_cmds rpaths hits dotted sig ents adhoc
+    local plist main_exec icon
     [[ -d "$app/Contents" ]] || die "$app is not an app bundle"
-    for tool in file otool find awk sed grep codesign; do
+    for tool in file otool find awk sed grep codesign plutil; do
         command -v "$tool" >/dev/null 2>&1 || die "$tool not found (the check needs it)"
     done
     # codesign treats a dotted directory in a nested-code location as a bundle.
@@ -144,9 +164,19 @@ check_bundle() {
     [[ -z "$dotted" ]] || die "codesign would take these directories for nested bundles: $dotted"
     say "Checking every Mach-O in $app for $FORBIDDEN_RE"
     list="$(macho_files "$app")" || die "cannot list the Mach-O files in $app"
-    for req in MacOS/open-live-ingest MacOS/strom "$SCANNER_REL"; do
+    for req in $EXECUTABLES "$SCANNER_REL"; do
         grep -qxF "$app/Contents/$req" <<<"$list" || die "Contents/$req is missing or is not a Mach-O"
     done
+    plist="$app/Contents/Info.plist"
+    main_exec="$(plutil -extract CFBundleExecutable raw -o - "$plist")" \
+        || die "cannot read CFBundleExecutable from Contents/Info.plist"
+    [[ "$main_exec" == "$APP_EXEC" ]] \
+        || die "CFBundleExecutable is '$main_exec', not $APP_EXEC"
+    icon="$(plutil -extract CFBundleIconFile raw -o - "$plist")" \
+        || die "cannot read CFBundleIconFile from Contents/Info.plist"
+    [[ -s "$app/Contents/Resources/${icon%.icns}.icns" ]] \
+        || die "CFBundleIconFile names $icon, but Contents/Resources has no ${icon%.icns}.icns"
+    say "OK: CFBundleExecutable is $APP_EXEC, the CLI and strom are next to it, the icon is there"
     grep -qF "$app/Contents/$PLUGIN_DIR_REL/" <<<"$list" || die "Contents/$PLUGIN_DIR_REL holds no plugins"
     while IFS= read -r f; do
         load_cmds="$(otool -L "$f")" || die "otool -L failed on ${f#"$app"/}"
@@ -177,7 +207,7 @@ check_bundle() {
     done <<<"$list"
     [[ $bad -eq 0 ]] || die "Mach-O files in the bundle are signed without the hardened runtime"
     say "OK: all $checked Mach-O files are signed with the hardened runtime"
-    for req in MacOS/open-live-ingest MacOS/strom; do
+    for req in $EXECUTABLES; do
         ents="$(codesign -d --entitlements - --xml "$app/Contents/$req" 2>/dev/null)" \
             || die "cannot read the entitlements of Contents/$req"
         for key in com.apple.security.device.camera com.apple.security.device.audio-input; do
@@ -185,8 +215,8 @@ check_bundle() {
                 || die "Contents/$req lacks the entitlement $key"
         done
     done
-    say "OK: strom and open-live-ingest carry the camera and microphone entitlements"
-    for req in MacOS/open-live-ingest MacOS/strom "$SCANNER_REL"; do
+    say "OK: $APP_EXEC, $CLI_EXEC and strom carry the camera and microphone entitlements"
+    for req in $EXECUTABLES "$SCANNER_REL"; do
         sig="$(codesign -d --verbose=2 "$app/Contents/$req" 2>&1)" \
             || die "Contents/$req is not signed: $sig"
         ents="$(codesign -d --entitlements - --xml "$app/Contents/$req" 2>/dev/null)" \
@@ -216,9 +246,10 @@ real_path() {
     printf '%s/%s\n' "$dir" "$(basename "$p")"
 }
 
-# The build-host paths of the bundle's executables (open-live-ingest, strom and
-# gst-plugin-scanner), set once they are known. dyld resolves @executable_path, and
-# the rpaths of the image chain, from whichever of them loaded a library.
+# The build-host paths of the bundle's executables (open-live-ingest-app,
+# open-live-ingest, strom and gst-plugin-scanner), set once they are known. dyld
+# resolves @executable_path, and the rpaths of the image chain, from whichever of them
+# loaded a library.
 exec_origins=()
 
 # Resolve a dependency of the build-host file `origin` (as it sat before copying) to
@@ -270,22 +301,29 @@ if [[ "${1:-}" == "--check" ]]; then
     exit 0
 fi
 
-if [[ $# -ne 2 ]]; then
-    echo "usage: $0 <aarch64-apple-darwin open-live-ingest binary> <output dir>" >&2
+if [[ $# -ne 3 ]]; then
+    echo "usage: $0 <aarch64-apple-darwin open-live-ingest binary> <aarch64-apple-darwin open-live-ingest-app binary> <output dir>" >&2
     echo "       $0 --check <path/to/$APP_NAME>" >&2
     exit 2
 fi
 ingest_bin="$1"
-out_dir="$2"
+app_bin="$2"
+out_dir="$3"
 
 [[ "$(uname -s)" == "Darwin" ]] || die "this script runs on macOS only"
-for tool in brew curl jq shasum otool install_name_tool codesign lipo file plutil; do
+for tool in brew curl jq shasum otool install_name_tool codesign lipo file plutil sips; do
     command -v "$tool" >/dev/null 2>&1 || die "$tool not found"
 done
-[[ -f "$ingest_bin" ]] || die "$ingest_bin not found"
-lipo -archs "$ingest_bin" | grep -qw arm64 || die "$ingest_bin is not an arm64 Mach-O"
+for bin in "$ingest_bin" "$app_bin"; do
+    [[ -f "$bin" ]] || die "$bin not found"
+    lipo -archs "$bin" | grep -qw arm64 || die "$bin is not an arm64 Mach-O"
+done
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+icon_src="$root/$ICON_SRC_REL"
+[[ -s "$icon_src" ]] || die "no app icon at $icon_src (app/icons/make-icon.py draws it)"
+# sips reads .icns; a file it cannot read would leave the app with a blank icon.
+sips -g pixelWidth "$icon_src" >/dev/null 2>&1 || die "$icon_src is not an icon macOS can read"
 
 # The same pin Cargo.toml, build.rs and install.sh use: the strom-types tag.
 strom_tag="$(sed -n 's/^strom-types = .*tag = "\([^"]*\)".*/\1/p' "$root/Cargo.toml")"
@@ -343,8 +381,10 @@ mkdir -p "$contents/MacOS" "$contents/$FRAMEWORKS_REL" "$contents/$PLUGIN_DIR_RE
     "$contents/$(dirname "$SCANNER_REL")" "$contents/Resources"
 say "Assembling $app"
 
-install -m 0755 "$ingest_bin" "$contents/MacOS/open-live-ingest"
+install -m 0755 "$app_bin" "$contents/MacOS/$APP_EXEC"
+install -m 0755 "$ingest_bin" "$contents/MacOS/$CLI_EXEC"
 install -m 0755 "$strom_bin" "$contents/MacOS/strom"
+install -m 0644 "$icon_src" "$contents/Resources/$ICON_NAME.icns"
 
 min_version="${MACOS_MIN_VERSION:-$(sw_vers -productVersion | cut -d. -f1).0}"
 cat >"$contents/Info.plist" <<EOF
@@ -359,7 +399,9 @@ cat >"$contents/Info.plist" <<EOF
     <key>CFBundleIdentifier</key>
     <string>${BUNDLE_ID:-com.eyevinn.open-live-ingest}</string>
     <key>CFBundleExecutable</key>
-    <string>open-live-ingest</string>
+    <string>$APP_EXEC</string>
+    <key>CFBundleIconFile</key>
+    <string>$ICON_NAME</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -370,6 +412,10 @@ cat >"$contents/Info.plist" <<EOF
     <string>$app_version</string>
     <key>LSMinimumSystemVersion</key>
     <string>$min_version</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.video</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
     <key>NSCameraUsageDescription</key>
     <string>Open Live Ingest sends the cameras you choose to Open Live.</string>
     <key>NSMicrophoneUsageDescription</key>
@@ -387,8 +433,11 @@ changes="$work/changes.tsv"
 : >"$origins"
 : >"$changes"
 
-printf '%s\t%s\n' "$contents/MacOS/open-live-ingest" "$(real_path "$ingest_bin")" >>"$origins"
-printf '%s\t%s\n' "$contents/MacOS/strom" "$strom_bin" >>"$origins"
+{
+    printf '%s\t%s\n' "$contents/MacOS/$APP_EXEC" "$(real_path "$app_bin")"
+    printf '%s\t%s\n' "$contents/MacOS/$CLI_EXEC" "$(real_path "$ingest_bin")"
+    printf '%s\t%s\n' "$contents/MacOS/strom" "$strom_bin"
+} >>"$origins"
 
 exclude=" ${GST_PLUGIN_EXCLUDE-libgstpython.dylib} "
 plugin_count=0
@@ -406,7 +455,7 @@ done
 [[ $plugin_count -gt 0 ]] || die "no plugins found in $gst_prefix/lib/gstreamer-1.0"
 cp -L "$gst_scanner" "$contents/$SCANNER_REL"
 printf '%s\t%s\n' "$contents/$SCANNER_REL" "$(real_path "$gst_scanner")" >>"$origins"
-exec_origins=("$(real_path "$ingest_bin")" "$strom_bin" "$(real_path "$gst_scanner")")
+exec_origins=("$(real_path "$app_bin")" "$(real_path "$ingest_bin")" "$strom_bin" "$(real_path "$gst_scanner")")
 say "Copied $plugin_count GStreamer plugins and gst-plugin-scanner"
 
 # Walk the closure breadth first. origins.tsv grows as libraries are copied in, so
@@ -435,7 +484,7 @@ while :; do
         printf '%s\t%s\t%s\n' "$file" "$dep" "$name" >>"$changes"
     done < <(deps_of "$file")
 done
-say "Bundled $(($(wc -l <"$origins") - plugin_count - 3)) libraries into $FRAMEWORKS_REL"
+say "Bundled $(($(wc -l <"$origins") - plugin_count - 4)) libraries into $FRAMEWORKS_REL"
 
 # --- Rewrite install names and rpaths ---------------------------------------------------
 while IFS= read -r entry; do
@@ -468,10 +517,12 @@ done <"$origins"
 
 # --- Signing ------------------------------------------------------------------------------
 # Rewriting breaks the signatures; Apple silicon refuses to load unsigned code. Inside
-# out, no --deep: every nested Mach-O first, then the bundle. Signing the bundle signs
-# its main executable (open-live-ingest) and seals the nested code, which must already
-# be signed, so open-live-ingest is never signed on its own. The bundle is signed with
-# the entitlements too, since that signature is the main executable's.
+# out, no --deep: every nested Mach-O first (libraries and plugins, gst-plugin-scanner,
+# strom, the CLI), then the bundle. Signing the bundle signs its main executable
+# (open-live-ingest-app) and seals the nested code, which must already be signed, so
+# the app binary is never signed on its own. The bundle is signed with the
+# entitlements too, since that signature is the main executable's. The CLI is not the
+# main executable, but over SSH it is the process TCC sees, so it gets them as well.
 entitlements="${MACOS_ENTITLEMENTS:-$root/.github/scripts/open-live-ingest.entitlements}"
 [[ -f "$entitlements" ]] || die "no entitlements file at $entitlements"
 plutil -lint "$entitlements" >/dev/null || die "$entitlements is not a valid plist"
@@ -484,7 +535,7 @@ else
     say "MACOS_SIGN_IDENTITY not set: signing AD HOC (hardened runtime, no timestamp)."
     say "An ad hoc signed app cannot be notarized, and Gatekeeper rejects it once downloaded."
     sign_args=(--sign -)
-    say "Ad hoc: strom, open-live-ingest and gst-plugin-scanner get $LIBRARY_VALIDATION_KEY."
+    say "Ad hoc: strom, $CLI_EXEC, $APP_EXEC and gst-plugin-scanner get $LIBRARY_VALIDATION_KEY."
     plistbuddy=/usr/libexec/PlistBuddy
     [[ -x "$plistbuddy" ]] || die "$plistbuddy not found"
     adhoc_entitlements="$work/adhoc.entitlements"
@@ -516,6 +567,7 @@ while IFS= read -r entry; do
 done <"$origins"
 sign "${scanner_sign_args[@]+"${scanner_sign_args[@]}"}" "$contents/$SCANNER_REL"
 sign --entitlements "$entitlements" "$contents/MacOS/strom"
+sign --entitlements "$entitlements" "$contents/MacOS/$CLI_EXEC"
 sign --entitlements "$entitlements" "$app"
 
 # --- AC1 ------------------------------------------------------------------------------

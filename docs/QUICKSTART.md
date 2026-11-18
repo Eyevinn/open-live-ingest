@@ -1,7 +1,9 @@
 # Quickstart
 
 An exact command sequence for a fresh Linux box or Mac (Windows: see [Windows](#windows) at the
-end), written to be followed by a script or an
+end; a Mac set up from the DMG instead: see
+[Mac: install from the DMG, open the app](#mac-install-from-the-dmg-open-the-app)), written to be
+followed by a script or an
 agent as well as a person. Each step gives the command, what success looks like, and what to do
 when it does not. Nothing here prompts.
 
@@ -254,6 +256,41 @@ started. With a service installed, stop the service instead, which does the same
 systemctl --user disable --now open-live-ingest        # Linux
 launchctl bootout gui/$(id -u)/se.eyevinn.open-live-ingest   # macOS
 ```
+
+## Mac: install from the DMG, open the app
+
+On an Apple silicon Mac, the app replaces step 1 and needs no terminal. Only what differs is listed
+here.
+
+Install: download `open-live-ingest-macos-aarch64.dmg` from
+<https://github.com/Eyevinn/open-live-ingest/releases/latest>, open it, and drag
+**Open Live Ingest** onto the Applications folder next to it. Then open Open Live Ingest from
+Applications.
+
+Success: a window titled Open Live Ingest opens, and no terminal does. The app carries its own
+Strom and GStreamer; it neither installs nor uses another one. macOS asks once for the camera and
+the microphone, the first time a feed uses them: allow both.
+
+If the release has no DMG, it is not yet notarized with Apple (#25): use step 1's `install.sh`
+instead. A DMG from a release workflow run's artifacts is signed ad hoc, and macOS refuses to open
+the app once it has been downloaded.
+
+For SSH use, and for steps 2 to 7 as written, put the CLI that comes with the app on `PATH` (once,
+from Terminal on the Mac or over SSH):
+
+```bash
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest" /usr/local/bin/open-live-ingest
+open-live-ingest --version   # open-live-ingest X.Y.Z, the app's version
+```
+
+Success: exit 0 and the version line. `open-live-ingest: command not found` means `/usr/local/bin`
+is not on `PATH`; add it (`export PATH="/usr/local/bin:$PATH"`). Through the symlink the CLI runs
+the app's own Strom and reads the same settings file as the app, so a box set up in the window
+answers `open-live-ingest status` and `down`, and the launchd agent of step 5 (which runs
+`/usr/local/bin/open-live-ingest`) works unchanged. The symlink replaces an `open-live-ingest`
+that `install.sh` put there. Deleting the app breaks it: remove `/usr/local/bin/open-live-ingest`
+with the app.
 
 ## Windows
 
