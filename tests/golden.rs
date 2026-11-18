@@ -708,3 +708,43 @@ fn up_stopped_by_a_signal_tears_down_as_before() {
     assert!(strom_state.lock().unwrap().flows.is_empty());
     assert!(ol_state.lock().unwrap().sources.is_empty());
 }
+
+/// A second `up` on the same settings while the first is live refuses, and touches
+/// nothing: no flow, no source, no Strom. The one change to `up`'s output (#95).
+#[test]
+fn a_second_up_refuses_while_one_is_live() {
+    let strom_state = Arc::new(Mutex::new(StromState::default()));
+    let strom = fake_strom(strom_state.clone());
+    let ol_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(ol_state.clone());
+    let scratch = Scratch::new("refusal", &strom, &open_live);
+
+    let mut first = Running::start(&scratch, &["up", "--test"]);
+    first.until("waiting for a receiver");
+    let pid = first.child.id();
+
+    // Bounded: a second `up` that does not refuse would run until stopped.
+    let mut second = scratch.command(&["up", "--test"]).spawn().unwrap();
+    let started = std::time::Instant::now();
+    while second.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = second.kill();
+            first.kill();
+            panic!("the second up did not refuse");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let second = second.wait_with_output().unwrap();
+    let stdout = String::from_utf8(second.stdout).unwrap();
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    first.kill();
+
+    assert!(!second.status.success(), "the second up started");
+    assert_golden(&stdout, "");
+    assert_golden(
+        &stderr,
+        &format!("Error: already running (pid {pid}); run 'open-live-ingest down' first\n"),
+    );
+    assert_eq!(strom_state.lock().unwrap().flows.len(), 1);
+    assert_eq!(ol_state.lock().unwrap().sources.len(), 1);
+}

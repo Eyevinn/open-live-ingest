@@ -31,5 +31,9 @@ tao = "0.37"
 wry = "0.57"
 
 # Windows has no menu bar (docs/specs/desktop-app.md, section 5).
+# objc2 and block2 (both already in the tree through tao and wry) ask AVFoundation for
+# camera and microphone access before Go live (section 4).
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = "0.20"
+objc2 = "0.6"
+block2 = "0.6"

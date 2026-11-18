@@ -11,6 +11,8 @@
 //! reply or event can carry one, and its `Debug` is redacted. Only the command name is
 //! logged, never the arguments, and an error reply never quotes what the page sent.
 
+use crate::go_live::{self, GoLive};
+use crate::messages::Message;
 use crate::where_to_send::{Opener, WhereToSend, WhereView};
 use open_live_ingest::keychain::OsKeychain;
 use open_live_ingest::osc;
@@ -85,6 +87,8 @@ pub enum Link {
     Strom,
     Studio,
     Help,
+    /// macOS System Settings → Privacy & Security, for camera and microphone access.
+    Privacy,
 }
 
 /// Every command the page can send (section 9.2).
@@ -176,6 +180,17 @@ impl Reply {
         }
     }
 
+    /// An error reply with section 10's line and action.
+    pub fn failure(id: u32, message: &Message) -> Self {
+        Reply {
+            id,
+            outcome: Outcome::Error(ErrorReply {
+                message: message.message.clone(),
+                action: message.action.map(|a| a.id()),
+            }),
+        }
+    }
+
     /// The script that hands this reply to the page.
     pub fn script(&self) -> String {
         receive_script(self)
@@ -243,6 +258,7 @@ pub fn parse(raw: &str) -> Result<(u32, Command), Malformed> {
 
 const NOT_UNDERSTOOD: &str = "The app did not understand that request. Restart the app.";
 const NOT_YET: &str = "This version of Open Live Ingest cannot do that yet.";
+const STOP_FIRST: &str = "Press Stop before changing what or where to send.";
 
 /// The view model `state` returns.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -267,8 +283,8 @@ pub type Deliver = Arc<dyn Fn(String) + Send + Sync>;
 /// [`Deliver`] when it is done, so the window never stops answering meanwhile.
 pub struct Core {
     settings_file: PathBuf,
-    live: bool,
     where_to_send: Arc<WhereToSend>,
+    go_live: Arc<GoLive>,
     deliver: Deliver,
     runtime: tokio::runtime::Runtime,
 }
@@ -309,17 +325,35 @@ impl Core {
             .enable_all()
             .build()
             .expect("starting the app core's runtime");
+        // A GUI process: a Strom it starts must not open a console window (Windows).
+        open_live_ingest::local_strom::start_without_console_window();
+        let go_live = GoLive::new(
+            settings_file.clone(),
+            Arc::new(OsKeychain::default()),
+            Arc::new(go_live::System),
+        );
         Core {
             settings_file,
-            live: false,
             where_to_send: Arc::new(where_to_send),
+            go_live: Arc::new(go_live),
             deliver,
             runtime,
         }
     }
 
+    /// The core with step 3 of the caller's: fakes, in tests.
+    pub fn with_go_live(mut self, go_live: GoLive) -> Self {
+        self.go_live = Arc::new(go_live);
+        self
+    }
+
+    /// Going live, live or stopping.
+    pub fn live(&self) -> bool {
+        self.go_live.is_live()
+    }
+
     fn view_model(&self) -> ViewModel {
-        view_model(&self.settings_file, self.live, self.where_to_send.view())
+        view_model(&self.settings_file, self.live(), self.where_to_send.view())
     }
 
     /// Handle one message from the page. `None` when the reply comes later through
@@ -344,6 +378,10 @@ impl Core {
     fn handle(&mut self, id: u32, command: Command) -> Option<(Reply, Effect)> {
         let name = command.name();
         let model = self.where_to_send.clone();
+        // While live the rest of the window is read-only (section 5).
+        if self.live() && changes_settings(&command) {
+            return Some((Reply::error(id, STOP_FIRST), Effect::None));
+        }
         match command {
             Command::State => {
                 // What is saved, at once; the workspace and instance names follow as
@@ -374,7 +412,7 @@ impl Core {
             Command::ChooseInstance { url } => {
                 let reply = match model.choose_instance(&url) {
                     Ok(view) => {
-                        let vm = view_model(&self.settings_file, self.live, view);
+                        let vm = view_model(&self.settings_file, self.live(), view);
                         Reply::ok(id, to_json(&vm))
                     }
                     Err(err) => failed(id, name, &err, &[]),
@@ -382,7 +420,7 @@ impl Core {
                 Some((reply, Effect::None))
             }
             Command::SelfHosted { url, api_key } => {
-                let (settings_file, live) = (self.settings_file.clone(), self.live);
+                let (settings_file, live) = (self.settings_file.clone(), self.live());
                 let secret = api_key.expose().to_string();
                 self.later(id, name, vec![secret], async move {
                     let view = model.self_hosted(&url, api_key.expose()).await?;
@@ -390,8 +428,41 @@ impl Core {
                 });
                 None
             }
+            Command::GoLive => {
+                self.go_live
+                    .start(id, self.deliver.clone(), self.runtime.handle());
+                None
+            }
+            Command::Stop => {
+                self.go_live.stop();
+                Some((Reply::ok(id, Value::Null), Effect::None))
+            }
+            Command::StopOther => {
+                let (go_live, deliver) = (self.go_live.clone(), self.deliver.clone());
+                let task = async move {
+                    let reply = match go_live.stop_other().await {
+                        Ok(()) => Reply::ok(id, Value::Null),
+                        Err(message) => Reply::failure(id, &message),
+                    };
+                    deliver(reply.script());
+                };
+                self.runtime.spawn(task.with_current_subscriber());
+                None
+            }
+            Command::OpenUrl { which } => {
+                let reply = match link_url(&self.settings_file, which) {
+                    Some(url) => match osc::open_browser(&url) {
+                        Ok(()) => Reply::ok(id, Value::Null),
+                        Err(err) => failed(id, name, &err, &[]),
+                    },
+                    None => Reply::error(id, "There is no address for that yet."),
+                };
+                Some((reply, Effect::None))
+            }
             // Nothing is live yet, so there is nothing to ask about: quit.
-            Command::Quit { .. } if !self.live => Some((Reply::ok(id, Value::Null), Effect::Quit)),
+            Command::Quit { .. } if !self.live() => {
+                Some((Reply::ok(id, Value::Null), Effect::Quit))
+            }
             _ => Some((Reply::error(id, NOT_YET), Effect::None)),
         }
     }
@@ -416,6 +487,37 @@ impl Core {
         };
         // The work logs to the subscriber of the thread that asked for it.
         self.runtime.spawn(task.with_current_subscriber());
+    }
+}
+
+/// The commands that change the settings, refused while live.
+fn changes_settings(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::OscSignIn
+            | Command::OscPasteToken { .. }
+            | Command::OscWorkspaces
+            | Command::ChooseInstance { .. }
+            | Command::SelfHosted { .. }
+            | Command::SetInputs { .. }
+            | Command::SetAdvanced(_)
+    )
+}
+
+/// The address `open_url` opens for a name: from the settings, never from the page.
+fn link_url(settings_file: &std::path::Path, which: Link) -> Option<String> {
+    match which {
+        Link::Help => Some("https://github.com/Eyevinn/open-live-ingest#readme".to_string()),
+        Link::Privacy => Some(
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera".to_string(),
+        ),
+        Link::Strom | Link::Studio => {
+            let settings = open_live_ingest::api::load_from(settings_file).ok()?;
+            match which {
+                Link::Strom => Some(settings.strom.url),
+                _ => settings.open_live.url.filter(|u| !u.trim().is_empty()),
+            }
+        }
     }
 }
 
@@ -836,12 +938,117 @@ mod tests {
 
     #[test]
     fn commands_not_wired_up_yet_say_so() {
-        let (reply, effect) = core().dispatch(r#"{"id": 5, "cmd": "go_live"}"#).unwrap();
+        let (reply, effect) = core()
+            .dispatch(r#"{"id": 5, "cmd": "show_logs", "args": {"which": "app"}}"#)
+            .unwrap();
         assert_eq!(effect, Effect::None);
         assert_eq!(
             serde_json::to_value(reply).unwrap(),
             json!({"id": 5, "error": {"message": NOT_YET, "action": null}})
         );
+    }
+
+    /// A machine where the camera check waits until the test lets it go, so the core
+    /// stays in Go live meanwhile.
+    struct HeldAtTheCheck(Mutex<Option<Receiver<()>>>);
+
+    impl go_live::Host for HeldAtTheCheck {
+        fn other_gateway(&self) -> Option<u32> {
+            None
+        }
+        fn reclaim_strom(&self) {}
+        fn media_access(
+            &self,
+            _: crate::media_access::Needs,
+        ) -> Result<(), crate::messages::Media> {
+            if let Some(release) = self.0.lock().unwrap().take() {
+                let _ = release.recv_timeout(Duration::from_secs(30));
+            }
+            Ok(())
+        }
+    }
+
+    /// Go live through the dispatcher: while it runs the view model says live and
+    /// commands that change the settings are refused; Stop during the checks starts
+    /// nothing, and the page hears `stopped`.
+    #[test]
+    fn go_live_and_stop_through_the_dispatcher() {
+        let dir = testing::Scratch::new("ipc-go-live");
+        std::fs::write(
+            dir.settings(),
+            "[strom]\nurl = \"http://127.0.0.1:9\"\nmanage = false\n\n[open_live]\nregister = false\n\n[uplink]\nhost = \"cloud.example.com\"\nport_range = \"47110-47112\"\n\n[[input]]\ndevice = \"test\"\n",
+        )
+        .unwrap();
+        let (release, held) = channel();
+        let (core, rx) = core_with(dir.settings(), nowhere());
+        let mut core = core.with_go_live(GoLive::new(
+            dir.settings(),
+            Arc::new(MemoryKeychain::new()),
+            Arc::new(HeldAtTheCheck(Mutex::new(Some(held)))),
+        ));
+
+        assert!(core.dispatch(r#"{"id": 1, "cmd": "go_live"}"#).is_none());
+        assert!(core.live());
+        let state = reply_json(&mut core, r#"{"id": 2, "cmd": "state"}"#);
+        assert_eq!(state["ok"]["live"], true);
+        let refused = reply_json(
+            &mut core,
+            r#"{"id": 3, "cmd": "choose_instance", "args": {"url": "https://example.com"}}"#,
+        );
+        assert_eq!(refused["error"]["message"], STOP_FIRST);
+
+        let stop = reply_json(&mut core, r#"{"id": 4, "cmd": "stop"}"#);
+        assert_eq!(stop, json!({"id": 4, "ok": null}));
+        release.send(()).unwrap();
+        assert_eq!(next_delivered(&rx), json!({"id": 1, "ok": null}));
+        let stopped = next_delivered(&rx);
+        assert_eq!(stopped["event"], "stopped");
+        assert_eq!(stopped["data"]["error"], Value::Null);
+        assert!(!core.live());
+    }
+
+    /// A failed check is an error reply with section 10's line and its action.
+    #[test]
+    fn a_refused_go_live_replies_with_the_line_and_the_action() {
+        let dir = testing::Scratch::new("ipc-go-live-refused");
+        std::fs::write(dir.settings(), "[gateway\n").unwrap();
+        let (mut core, rx) = core_with(dir.settings(), nowhere());
+        assert!(core.dispatch(r#"{"id": 6, "cmd": "go_live"}"#).is_none());
+        let reply = next_delivered(&rx);
+        assert_eq!(reply["id"], 6);
+        assert!(reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("The settings file has a problem: "));
+        assert_eq!(reply["error"]["action"], "show_file");
+    }
+
+    #[test]
+    fn open_url_takes_its_address_from_the_settings_never_the_page() {
+        let dir = testing::Scratch::new("ipc-links");
+        std::fs::write(
+            dir.settings(),
+            "[open_live]\nurl = \"https://venue.example.osaas.io\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            link_url(&dir.settings(), Link::Studio).as_deref(),
+            Some("https://venue.example.osaas.io")
+        );
+        assert_eq!(
+            link_url(&dir.settings(), Link::Strom).as_deref(),
+            Some(
+                open_live_ingest::config::Config::default()
+                    .strom
+                    .url
+                    .as_str()
+            )
+        );
+        assert!(link_url(&dir.settings(), Link::Privacy)
+            .unwrap()
+            .starts_with("x-apple.systempreferences:"));
+        let empty = testing::Scratch::new("ipc-links-empty");
+        assert_eq!(link_url(&empty.settings(), Link::Studio), None);
     }
 
     #[test]

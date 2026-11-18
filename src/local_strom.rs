@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -73,6 +74,37 @@ impl Drop for LocalStrom {
         }
         std::fs::remove_file(config::strom_pidfile()).ok();
         events.emit(Event::StromStopped);
+    }
+}
+
+/// Whether a Strom this process starts gets no console window (Windows). Set once by
+/// a GUI-subsystem app through [`start_without_console_window`]; the CLI leaves it
+/// off and keeps its console behaviour.
+static NO_CONSOLE_WINDOW: AtomicBool = AtomicBool::new(false);
+
+/// Windows `CREATE_NEW_PROCESS_GROUP`: Strom gets a Ctrl-C of its own, not the
+/// gateway's.
+#[cfg_attr(not(windows), allow(dead_code))]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// Windows `CREATE_NO_WINDOW`: a console program started from a GUI process would
+/// otherwise get a console window of its own.
+#[cfg_attr(not(windows), allow(dead_code))]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// For an app with no console of its own (a Windows GUI-subsystem executable): every
+/// Strom this process starts from now on is started with `CREATE_NO_WINDOW`, so no
+/// console window opens next to the app. Has no effect elsewhere than on Windows.
+pub fn start_without_console_window() {
+    NO_CONSOLE_WINDOW.store(true, Ordering::Relaxed);
+}
+
+/// The creation flags a Strom is started with on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn creation_flags(no_console_window: bool) -> u32 {
+    if no_console_window {
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    } else {
+        CREATE_NEW_PROCESS_GROUP
     }
 }
 
@@ -140,8 +172,7 @@ pub async fn ensure_running(cfg: &Config, events: &Events) -> Result<LocalStrom>
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(creation_flags(NO_CONSOLE_WINDOW.load(Ordering::Relaxed)));
     }
     let child = command
         .spawn()
@@ -530,6 +561,42 @@ pub fn stop_recorded(events: &Events) {
     std::fs::remove_file(&pidfile).ok();
 }
 
+/// Reclaims a Strom left behind by a gateway that ended without its teardown (a
+/// crash, a force quit): when `strom.pid` names a running Strom, it is stopped and
+/// waited for, so the Strom the next session starts is one it owns and stops again.
+/// Adopting the leftover instead would leave a camera open after the next Stop,
+/// because an adopted Strom is never stopped. Call it only when no gateway is live
+/// (see [`crate::run::running_gateway`]): a live one's Strom is not left behind.
+/// Returns whether a Strom was stopped. Blocks for up to [`STOP_TIMEOUT`].
+pub fn reclaim_recorded(events: &Events) -> bool {
+    reclaim_recorded_at(&config::strom_pidfile(), events)
+}
+
+fn reclaim_recorded_at(pidfile: &Path, events: &Events) -> bool {
+    let Some(pid) = std::fs::read_to_string(pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if !crate::run::process_named(pid, "strom") {
+        std::fs::remove_file(pidfile).ok();
+        return false;
+    }
+    info!(pid, "stopping the Strom an earlier session left behind");
+    events.emit(Event::StromLeftOverStopping { pid });
+    signal_term(pid);
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while crate::run::process_named(pid, "strom") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if crate::run::process_named(pid, "strom") {
+        warn!(pid, "the Strom left behind did not stop in time");
+    }
+    std::fs::remove_file(pidfile).ok();
+    true
+}
+
 #[cfg(unix)]
 fn signal_term(pid: u32) {
     unsafe {
@@ -555,6 +622,83 @@ fn signal_term(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app's launch option adds `CREATE_NO_WINDOW`; the CLI keeps today's flags.
+    #[test]
+    fn a_gui_app_starts_strom_without_a_console_window() {
+        assert_eq!(creation_flags(false), 0x0000_0200);
+        assert_eq!(creation_flags(true), 0x0800_0200);
+    }
+
+    /// A pidfile naming no Strom is stale: removed, and nothing is stopped.
+    #[test]
+    fn a_stale_strom_pidfile_is_removed_and_nothing_stopped() {
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("strom.pid");
+        // This test process: alive, but not a Strom.
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = {
+            let seen = seen.clone();
+            Events::new(move |e| seen.lock().unwrap().push(e))
+        };
+        assert!(!reclaim_recorded_at(&pidfile, &events));
+        assert!(!pidfile.exists());
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(!reclaim_recorded_at(&pidfile, &events), "no pidfile at all");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Strom left running by a crashed session is stopped and waited for, not
+    /// adopted. A copy of `sleep` named `strom` stands in for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_strom_left_behind_is_stopped_and_waited_for() {
+        // Process names come from `ps`, which every CI runner has; a bare container
+        // may not, and then there is nothing to check this against.
+        if Command::new("ps").arg("-p").arg("1").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("strom");
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .expect("a sleep executable");
+        std::fs::copy(sleep, &fake).unwrap();
+        let mut child = Command::new(&fake).arg("60").spawn().unwrap();
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        // `ps` may not see the new process name at once.
+        let started = Instant::now();
+        while !crate::run::process_named(child.id(), "strom") {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the fake Strom never showed up"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = {
+            let seen = seen.clone();
+            Events::new(move |e| seen.lock().unwrap().push(e))
+        };
+        // Reaped on a thread, as a parent would: an unreaped child stays a zombie
+        // that `ps` still lists.
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(reclaim_recorded_at(&pidfile, &events));
+        assert!(!pidfile.exists());
+        assert!(!crate::run::process_named(pid, "strom"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Event::StromLeftOverStopping { pid }]
+        );
+        reaper.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn the_port_is_read_from_the_url_and_a_default_port_is_not_guessed() {

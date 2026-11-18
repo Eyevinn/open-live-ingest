@@ -1947,7 +1947,9 @@ name = "open-live-ingest-app"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "block2",
  "muda",
+ "objc2",
  "open-live-ingest",
  "serde",
  "serde_json",

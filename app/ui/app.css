@@ -96,3 +96,46 @@ footer {
   font-size: 0.85rem;
   opacity: 0.6;
 }
+
+/* 3. Go live: the rows, the banner, and read-only while live. */
+body.live #where,
+body.live #what {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+#go-notices .notice {
+  margin: 0.5rem 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  background: color-mix(in srgb, #f9a825 25%, transparent);
+}
+
+#go-rows {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+}
+
+#go-rows li {
+  margin: 0.3rem 0;
+}
+
+#go-rows .state {
+  font-weight: 600;
+  margin-left: 0.5rem;
+}
+
+#go-rows .state-live {
+  color: #2e7d32;
+}
+
+#go-rows .state-failed {
+  color: #c62828;
+}
+
+#go-rows .detail {
+  display: block;
+  font-size: 0.85rem;
+  opacity: 0.8;
+}

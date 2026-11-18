@@ -330,7 +330,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `stop_other` | — | `null` | `down` (another gateway named by `gateway.pid`) |
 | `quit` | `{confirmed}` | `null` | quit guard (§8) |
 | `show_logs` | `{which: "app" \| "strom"}` | `null` | reveal in Finder/Explorer |
-| `open_url` | `{which: "strom" \| "studio" \| "help"}` | `null` | system browser; URLs come from settings, never from the page |
+| `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`: macOS Privacy & Security, for §10's camera row) |
 
 `open_url` takes a name, not a URL, so the page cannot make the app open an arbitrary address.
 
@@ -339,11 +339,11 @@ unknown command or bad arguments is an error reply, never a panic.
 | `event` | `data` | From library event (#71/#72) |
 |---|---|---|
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
-| `input` | `{device, state, message?, action?}` | per-input registering / connecting / live / failed / removed |
+| `input` | `{input, state, message?, action?}` | per-input registering / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
 | `stats` | `{inputs: [{device, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
 | `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |
 | `stopping` | `{done, total}` | teardown progress |
-| `stopped` | `{left_behind: []}` | teardown finished; anything not removed is named |
+| `stopped` | `{left_behind: [], error}` | teardown finished; anything not removed is named. `error` (`{message, action}`, §10) when the session ended on a failure, else `null` |
 | `quit_requested` | `{inputs_live}` | the quit guard wants the §8 question shown |
 | `osc_sign_in_page` | `{url}` | the sign-in page was opened in the browser; the window shows its address too, for when no browser opens |
 | `where` | step 1's view (as `state`'s `where`) | after `state`, the workspace and instance names looked up with the kept sign-in |

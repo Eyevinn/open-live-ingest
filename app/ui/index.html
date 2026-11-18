@@ -62,6 +62,14 @@
       </section>
       <section id="go" class="disabled" aria-labelledby="go-title" aria-disabled="true">
         <h2 id="go-title">3. Go live</h2>
+        <p><button type="button" id="go-button">Go live</button>
+          <span id="go-strom" role="status"></span></p>
+        <div id="go-notices" role="status"></div>
+        <p id="go-problem" class="problem" role="alert" hidden>
+          <span id="go-problem-text"></span>
+          <button type="button" id="go-problem-action" class="link" hidden></button>
+        </p>
+        <ul id="go-rows"></ul>
       </section>
       <p id="problem" class="problem" role="alert" hidden></p>
     </main>

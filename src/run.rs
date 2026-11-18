@@ -377,7 +377,7 @@ impl Reporter {
         });
         let initial = snapshot_of(live, &host, strom_version.as_deref());
         Ok(Some(Self {
-            heartbeat: Heartbeat::start(target, initial),
+            heartbeat: Heartbeat::start(target, initial, events.clone()),
             host,
             strom_version,
         }))
@@ -448,6 +448,11 @@ pub async fn up(
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
+    // One live session per settings file: a second loop over the same flows and
+    // sources would fight the first for them.
+    if let Some(pid) = running_gateway() {
+        return Err(AlreadyRunning { pid }.into());
+    }
     let Inputs {
         include_virtual,
         selection,
@@ -1875,6 +1880,32 @@ pub fn render_status(r: &StatusReport) -> String {
     out
 }
 
+/// Another gateway is live on this machine: a CLI `up` or the app, named by the
+/// pidfile. `up` refuses to start a second one; `down` stops it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlreadyRunning {
+    pub pid: u32,
+}
+
+impl fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "already running (pid {}); run 'open-live-ingest down' first",
+            self.pid
+        )
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+/// The pid of a gateway that is live now, by the pidfile: a CLI `up` or the app,
+/// checked by process name so a stale pidfile names nothing. This process is not
+/// counted: an app that has ended one session may start the next.
+pub fn running_gateway() -> Option<u32> {
+    read_pidfile().filter(|&pid| pid != std::process::id() && is_running_gateway(pid))
+}
+
 fn write_pidfile() -> Result<()> {
     let path = config::pidfile();
     if let Some(parent) = path.parent() {
@@ -2651,6 +2682,25 @@ mod tests {
     /// `down` finds a running `up` by its command name, so the needle must be what
     /// `ps` prints for this binary: a prefix of the package name, within Linux's
     /// 15-byte limit.
+    #[test]
+    fn already_running_names_the_pid_and_the_way_out() {
+        assert_eq!(
+            AlreadyRunning { pid: 4242 }.to_string(),
+            "already running (pid 4242); run 'open-live-ingest down' first"
+        );
+    }
+
+    /// The app's executable is matched by the same name check as the CLI's.
+    #[test]
+    fn the_gateway_comm_matches_the_app_too() {
+        assert!(comm_matches("open-live-ingest-app", GATEWAY_COMM));
+        assert!(comm_matches(
+            "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest-app",
+            GATEWAY_COMM
+        ));
+        assert!(image_matches("open-live-ingest-app.exe", GATEWAY_COMM));
+    }
+
     #[test]
     fn the_gateway_comm_is_the_package_name_cut_to_fifteen_bytes() {
         assert!(env!("CARGO_PKG_NAME").starts_with(GATEWAY_COMM));
