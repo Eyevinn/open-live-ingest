@@ -5,7 +5,8 @@
 //! Content-Security-Policy, the navigation filter, the IPC dispatcher, the models
 //! behind the window's steps (`where_to_send`, `what_to_send`, `go_live`, with section
 //! 10's failure messages in `messages`), the quit guard (`quit`, section 8) and the
-//! log file (`logs`). The window itself
+//! log file (`logs`), and `stdio`, the same core over stdin and stdout for the
+//! agent-run end to end. The window itself
 //! (tao, wry, muda) is `src/main.rs`. See docs/specs/desktop-app.md and
 //! docs/decisions/ADR-001-desktop-app-toolkit.md.
 
@@ -17,6 +18,7 @@ pub mod messages;
 pub mod navigation;
 pub mod protocol;
 pub mod quit;
+pub mod stdio;
 #[cfg(test)]
 mod testing;
 pub mod what_to_send;
