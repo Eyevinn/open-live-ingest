@@ -7,7 +7,7 @@ name: Release
 # rewrites SHA256SUMS to cover it and attests it; otherwise it is skipped and the
 # release is the archives only. The manual trigger builds the same artifacts and
 # SHA256SUMS without publishing anything, to try the workflow out. A pull request
-# that changes this workflow, the macOS app script, the desktop app (app/) or the
+# that changes this workflow, the macOS app or Strom MSI script, the desktop app (app/) or the
 # packaging (packaging/) runs it too, so the change is proven before it merges; like
 # a manual run from a branch, it publishes nothing (`release` and `release-macos` run
 # only on a tag ref).
@@ -19,6 +19,7 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
+      - .github/scripts/fetch-strom-msi.sh
       - .github/scripts/open-live-ingest.entitlements
       - app/**
       - packaging/**
@@ -197,29 +198,17 @@ jobs:
           } >> "$GITHUB_ENV"
           ls -l stage
 
-      # The same pin Cargo.toml, build.rs, install.ps1 and build-macos-app.sh use.
+      # The script reads the Strom version from the strom-types tag in Cargo.toml, so
+      # this workflow never names one (tests/pins.rs).
       - name: Download the Strom MSI and check its digest
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          strom_tag="$(sed -n 's/^strom-types = .*tag = "\([^"]*\)".*/\1/p' Cargo.toml)"
-          [[ "$strom_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-            || { echo "cannot read the strom-types tag from Cargo.toml (got '$strom_tag')"; exit 1; }
-          asset="strom-${strom_tag#v}-windows-x86_64.msi"
-          digest="$(gh api "repos/Eyevinn/strom/releases/tags/$strom_tag" \
-            --jq ".assets[] | select(.name == \"$asset\") | .digest")"
-          [[ "$digest" == sha256:* ]] \
-            || { echo "GitHub records no SHA-256 digest for $asset of Strom $strom_tag"; exit 1; }
-          mkdir strom
-          gh release download "$strom_tag" --repo Eyevinn/strom --pattern "$asset" --dir strom
-          have="sha256:$(sha256sum "strom/$asset" | cut -d ' ' -f 1)"
-          test "$have" = "$digest" \
-            || { echo "$asset: $have does not match the digest GitHub records ($digest)"; exit 1; }
-          echo "Strom $strom_tag: $asset matches $digest"
+          msi="$(.github/scripts/fetch-strom-msi.sh strom)"
           {
-            echo "STROM_MSI_NAME=$asset"
-            echo "STROM_MSI=$(cygpath -w "$PWD/strom/$asset")"
+            echo "STROM_MSI_NAME=$(basename "$msi")"
+            echo "STROM_MSI=$(cygpath -w "$PWD/$msi")"
           } >> "$GITHUB_ENV"
 
       - name: Install NSIS
@@ -314,7 +303,6 @@ jobs:
           # A clean runner, so the installer has to run the Strom MSI itself.
           if (Test-Path -LiteralPath $dir) { Fail "$dir exists before the install" }
           if (Test-Path -LiteralPath $strom) { Fail "$strom exists before the install, so the MSI would not be exercised" }
-          $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 
           Write-Host "--- silent install"
           $p = Start-Process -FilePath (Join-Path $env:GITHUB_WORKSPACE $env:SETUP) -ArgumentList '/S' -Wait -PassThru
@@ -342,13 +330,19 @@ jobs:
           if ($lnk.TargetPath -ne $app) { Fail "the shortcut points at '$($lnk.TargetPath)', not $app" }
 
           if (-not (Test-Path -LiteralPath $strom)) { Fail "strom.exe is not at $strom after the install" }
+          # The MSI adds GStreamer to the machine PATH, which this step's PATH predates.
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
           $stromVersion = (& $strom --version 2>&1 | Out-String).Trim()
           Write-Host "Strom at the MSI path: $stromVersion (exit code $LASTEXITCODE)"
 
           $entry = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
           if (-not $entry) { Fail "no Apps & features entry at $key" }
           if ($entry.DisplayVersion -ne $env:VERSION) { Fail "Apps & features says $($entry.DisplayVersion), not $env:VERSION" }
-          if ([Environment]::GetEnvironmentVariable('Path', 'Machine') -ne $machinePath) { Fail "the install changed the machine PATH" }
+          # The Strom MSI may change PATH for GStreamer; this installer adds nothing to it.
+          foreach ($scope in 'Machine', 'User') {
+            $entries = [Environment]::GetEnvironmentVariable('Path', $scope) -split ';' | ForEach-Object { $_.TrimEnd('\') }
+            if ($entries -contains $dir) { Fail "the install put $dir on the $scope PATH" }
+          }
 
           Write-Host "--- the app's window for 5 s"
           $proc = Start-Process -FilePath $app -PassThru
