@@ -92,6 +92,102 @@ fn matching<'a>(devices: &'a [DeviceResponse], wanted: &str) -> Vec<&'a DeviceRe
         .collect()
 }
 
+/// What a saved `[[input]]` selection comes to in this run.
+#[derive(Debug, Clone)]
+pub struct SavedSelection {
+    /// The cameras to send, sorted by name as [`choose`] sorts them, so ports are
+    /// allocated as they would be for the same devices picked by flag.
+    pub cameras: Vec<DeviceResponse>,
+    /// Whether the test pattern is one of the inputs.
+    pub test_pattern: bool,
+    /// The entries whose device Strom does not report now (unplugged, or another
+    /// machine's), as written. Skipped, not an error: the others still go live.
+    pub absent: Vec<String>,
+}
+
+/// The inputs the settings' `[[input]]` entries name, among every device Strom
+/// reports. A virtual device is sent when an entry names it: someone chose it.
+/// Refused when an entry's name fragment matches several devices (starting the wrong
+/// camera is worse than asking again), or when two entries come to one device.
+pub fn choose_saved(all: &[DeviceResponse], entries: &[InputSettings]) -> Result<SavedSelection> {
+    let mut cameras: Vec<DeviceResponse> = Vec::new();
+    let mut test_pattern = false;
+    let mut absent = Vec::new();
+    for entry in entries {
+        if entry.is_test_pattern() {
+            test_pattern = true;
+            continue;
+        }
+        let wanted = entry.device.trim();
+        let device = match exact_or_matching(all, wanted).as_slice() {
+            [] => {
+                absent.push(entry.device.clone());
+                continue;
+            }
+            [device] => *device,
+            several => bail!(
+                "[[input]] device {wanted:?} matches {} devices ({}). Use the device id `open-live-ingest devices` lists.",
+                several.len(),
+                several
+                    .iter()
+                    .map(|d| d.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        if cameras.iter().any(|c| c.id == device.id) {
+            bail!(
+                "two [[input]] entries name {:?}; one entry per input",
+                device.name
+            );
+        }
+        cameras.push(device.clone());
+    }
+    cameras.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(SavedSelection {
+        cameras,
+        test_pattern,
+        absent,
+    })
+}
+
+/// The device an entry names: the one whose id is exactly `wanted`, else every
+/// device matching it by id or name fragment, as `--devices` matches.
+fn exact_or_matching<'a>(devices: &'a [DeviceResponse], wanted: &str) -> Vec<&'a DeviceResponse> {
+    match devices.iter().find(|d| d.id == wanted) {
+        Some(exact) => vec![exact],
+        None => matching(devices, wanted),
+    }
+}
+
+/// Names each input by its `[[input]]` entry's label, `<gateway.name> — <label>`,
+/// where one is set; the others keep the device's name. Entries are matched to this
+/// run's cameras as [`choose_saved`] matches them, so a label follows its device when
+/// flags pick the devices too.
+pub fn apply_labels(
+    inputs: &mut [Input],
+    entries: &[InputSettings],
+    cameras: &[DeviceResponse],
+    gateway_name: &str,
+) {
+    let prefix = name_prefix(gateway_name);
+    for input in inputs {
+        let entry = entries.iter().find(|entry| match &input.source {
+            Source::Test { .. } => entry.is_test_pattern(),
+            Source::Device { device_id, .. } => {
+                !entry.is_test_pattern()
+                    && matches!(
+                        exact_or_matching(cameras, entry.device.trim()).as_slice(),
+                        [device] if device.id == *device_id
+                    )
+            }
+        });
+        if let Some(label) = entry.and_then(InputSettings::label) {
+            input.name = format!("{prefix}{label}");
+        }
+    }
+}
+
 /// An audio source to send with a camera, each named by id or name fragment as
 /// `--devices` names cameras. Written `<camera>=<audio>` on the command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,7 +235,7 @@ pub fn settings_pairings(
         else {
             continue;
         };
-        if matching(cameras, entry.device.trim()).is_empty() {
+        if exact_or_matching(cameras, entry.device.trim()).is_empty() {
             absent.push(entry.device.clone());
             continue;
         }
@@ -522,19 +618,109 @@ mod tests {
             InputSettings {
                 device: "FaceTime".to_string(),
                 audio: Some("USB Microphone".to_string()),
+                label: None,
             },
             InputSettings {
                 device: "DeckLink".to_string(),
                 audio: Some("Scarlett".to_string()),
+                label: None,
             },
             InputSettings {
                 device: "d2".to_string(),
                 audio: None,
+                label: None,
             },
         ];
         let (pairings, absent) = settings_pairings(&entries, &cameras);
         assert_eq!(pairings, [pairing("FaceTime=USB Microphone")]);
         assert_eq!(absent, ["DeckLink"]);
+    }
+
+    fn entry(device: &str, label: Option<&str>) -> InputSettings {
+        InputSettings {
+            device: device.to_string(),
+            audio: None,
+            label: label.map(str::to_string),
+        }
+    }
+
+    /// A saved selection sends exactly what it names: by exact id first, a virtual
+    /// device too when named, the test pattern by name, and an unplugged device set
+    /// aside rather than refused.
+    #[test]
+    fn a_saved_selection_picks_exactly_its_entries() {
+        let picked = choose_saved(
+            &devices(),
+            &[
+                entry("d2", None),
+                entry("test", None),
+                entry("OBS", None),
+                entry("dev-gone", None),
+            ],
+        )
+        .unwrap();
+        let ids: Vec<&str> = picked.cameras.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, ["d2", "d1"], "sorted by name");
+        assert!(picked.test_pattern);
+        assert_eq!(picked.absent, ["dev-gone"]);
+
+        let picked = choose_saved(&devices(), &[entry("d3", None)]).unwrap();
+        assert!(!picked.test_pattern);
+        assert_eq!(picked.cameras.len(), 1);
+
+        // An id that is also a fragment of another device's name means that id.
+        let mut list = devices();
+        list.push(device("Face", "Studio Face Cam"));
+        let picked = choose_saved(&list, &[entry("Face", None)]).unwrap();
+        assert_eq!(picked.cameras[0].id, "Face");
+
+        let err = choose_saved(&devices(), &[entry("Camera", None)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches 2 devices"), "{err}");
+        let err = choose_saved(&devices(), &[entry("d2", None), entry("FaceTime", None)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("two [[input]] entries"), "{err}");
+    }
+
+    /// Only the part after the prefix is the label: the prefix stays, so cleanup still
+    /// finds the source.
+    #[test]
+    fn labels_rename_after_the_prefix_and_unlabelled_inputs_keep_the_device_name() {
+        let cameras = choose(devices(), false, None).unwrap();
+        let mut inputs = inputs_for(
+            &cameras,
+            true,
+            "Venue A",
+            &Uplink::default(),
+            &Capture::default(),
+            "cloud",
+            &(9000..=9002).collect(),
+        )
+        .unwrap();
+        apply_labels(
+            &mut inputs,
+            &[
+                entry("test", Some("Bars")),
+                entry("FaceTime", Some(" Stage left ")),
+                entry("d3", None),
+                entry("dev-gone", Some("Gone")),
+            ],
+            &cameras,
+            "Venue A",
+        );
+        let names: Vec<&str> = inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Venue A — Bars",
+                "Venue A — DeckLink Mini Recorder",
+                "Venue A — Stage left",
+            ]
+        );
+        // The flow id follows the device, never the label.
+        assert_eq!(inputs[2].id, "dev-d2");
     }
 
     /// Better a clear error than two inputs fighting over one port.

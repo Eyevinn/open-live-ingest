@@ -11,10 +11,13 @@
 //! reply or event can carry one, and its `Debug` is redacted. Only the command name is
 //! logged, never the arguments, and an error reply never quotes what the page sent.
 
+use crate::what_to_send::{self, DeviceSource};
+use open_live_ingest::api::{self, Devices, SaveError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// A credential the page sends: an API key, a token, a passphrase. It can be read in the
 /// core, but it cannot be serialised back to the page, and it does not print.
@@ -238,6 +241,10 @@ pub fn parse(raw: &str) -> Result<(u32, Command), Malformed> {
 
 const NOT_UNDERSTOOD: &str = "The app did not understand that request. Restart the app.";
 const NOT_YET: &str = "This version of Open Live Ingest cannot do that yet.";
+const NO_DEVICE_LIST: &str =
+    "Could not get the list of cameras from the video engine. Show logs for details.";
+const NOT_SAVED: &str = "Could not save the settings. Show logs for details.";
+const READ_ONLY_WHILE_LIVE: &str = "Stop first: what is sent cannot change while live.";
 
 /// The view model `state` returns.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -247,11 +254,32 @@ pub struct ViewModel {
     pub live: bool,
 }
 
+/// Delivers a reply that was not ready when its command arrived. Called from another
+/// thread; the window hands the reply to its event loop.
+pub type LateReply = Arc<dyn Fn(Reply) + Send + Sync>;
+
 /// The app core the dispatcher drives. The window owns one and hands it every message.
-#[derive(Debug)]
 pub struct Core {
     settings_file: PathBuf,
     live: bool,
+    device_source: Arc<dyn DeviceSource>,
+    /// Where a reply goes that is computed off the window's thread. Without one, such
+    /// commands run on the caller's thread and reply at once (tests).
+    late: Option<LateReply>,
+    /// The last device list Strom gave, for the rows and the names in messages.
+    listed: Arc<Mutex<Option<Devices>>>,
+    /// Whether the What to send step lists virtual devices.
+    show_all: bool,
+}
+
+impl fmt::Debug for Core {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Core")
+            .field("settings_file", &self.settings_file)
+            .field("live", &self.live)
+            .field("show_all", &self.show_all)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Core {
@@ -259,7 +287,24 @@ impl Core {
         Core {
             settings_file,
             live: false,
+            device_source: Arc::new(what_to_send::Strom),
+            late: None,
+            listed: Arc::default(),
+            show_all: false,
         }
+    }
+
+    /// Lists devices from `source` instead of the local Strom.
+    pub fn with_device_source(mut self, source: Arc<dyn DeviceSource>) -> Self {
+        self.device_source = source;
+        self
+    }
+
+    /// Runs slow commands (listing devices, which may start a Strom) on a thread of
+    /// their own and hands their replies to `late`, so the window stays responsive.
+    pub fn with_late_replies(mut self, late: LateReply) -> Self {
+        self.late = Some(late);
+        self
     }
 
     fn view_model(&self) -> ViewModel {
@@ -270,8 +315,9 @@ impl Core {
         }
     }
 
-    /// Handle one message from the page. `None` when there is nothing to reply to (no
-    /// readable `id`), which is logged and otherwise ignored.
+    /// Handle one message from the page. `None` when there is nothing to reply to now:
+    /// no readable `id` (logged and otherwise ignored), or a reply that arrives later
+    /// through [`with_late_replies`](Self::with_late_replies).
     pub fn dispatch(&mut self, raw: &str) -> Option<(Reply, Effect)> {
         let (id, command) = match parse(raw) {
             Ok(parsed) => parsed,
@@ -285,21 +331,112 @@ impl Core {
             }
         };
         tracing::info!(id, cmd = command.name(), "ui command");
-        Some(self.handle(id, command))
+        self.handle(id, command)
     }
 
-    fn handle(&mut self, id: u32, command: Command) -> (Reply, Effect) {
-        match command {
-            Command::State => (
-                Reply::ok(
-                    id,
-                    serde_json::to_value(self.view_model()).expect("plain JSON"),
-                ),
-                Effect::None,
+    fn handle(&mut self, id: u32, command: Command) -> Option<(Reply, Effect)> {
+        let reply = match command {
+            Command::State => Reply::ok(
+                id,
+                serde_json::to_value(self.view_model()).expect("plain JSON"),
             ),
             // Nothing is live yet, so there is nothing to ask about: quit.
-            Command::Quit { .. } if !self.live => (Reply::ok(id, Value::Null), Effect::Quit),
-            _ => (Reply::error(id, NOT_YET), Effect::None),
+            Command::Quit { .. } if !self.live => {
+                return Some((Reply::ok(id, Value::Null), Effect::Quit))
+            }
+            Command::Devices { show_all } => return self.devices(id, show_all),
+            Command::SetInputs { inputs } => self.set_inputs(id, &inputs),
+            _ => Reply::error(id, NOT_YET),
+        };
+        Some((reply, Effect::None))
+    }
+
+    /// The settings as the CLI reads them, or the reply saying why they cannot be read.
+    fn settings(&self, id: u32) -> Result<open_live_ingest::config::Config, Reply> {
+        api::load_from(&self.settings_file).map_err(|err| {
+            tracing::warn!("reading the settings: {err:#}");
+            Reply::error(
+                id,
+                &format!(
+                    "The settings file has a problem: {}.",
+                    err.root_cause()
+                        .to_string()
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                ),
+            )
+        })
+    }
+
+    /// `devices`: the What to send rows for what Strom reports now.
+    fn devices(&mut self, id: u32, show_all: bool) -> Option<(Reply, Effect)> {
+        self.show_all = show_all;
+        let settings = match self.settings(id) {
+            Ok(settings) => settings,
+            Err(reply) => return Some((reply, Effect::None)),
+        };
+        let source = self.device_source.clone();
+        let listed = self.listed.clone();
+        let work = move || match source.devices(&settings) {
+            Ok(devices) => {
+                let model = what_to_send::model(Some(&devices), &settings, show_all);
+                *listed.lock().unwrap_or_else(|e| e.into_inner()) = Some(devices);
+                Reply::ok(id, serde_json::to_value(model).expect("plain JSON"))
+            }
+            Err(err) => {
+                tracing::warn!("listing devices: {err:#}");
+                Reply::error(id, NO_DEVICE_LIST)
+            }
+        };
+        match &self.late {
+            None => Some((work(), Effect::None)),
+            Some(late) => {
+                let late = late.clone();
+                std::thread::spawn(move || late(work()));
+                None
+            }
+        }
+    }
+
+    /// `set_inputs`: the ticked rows, checked and saved as `[[input]]`.
+    fn set_inputs(&mut self, id: u32, inputs: &[InputArgs]) -> Reply {
+        if self.live {
+            return Reply::error(id, READ_ONLY_WHILE_LIVE);
+        }
+        let mut settings = match self.settings(id) {
+            Ok(settings) => settings,
+            Err(reply) => return reply,
+        };
+        let listed = self
+            .listed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let entries = what_to_send::entries(inputs, listed.as_ref());
+        if let Err(message) = what_to_send::check(&entries, listed.as_ref()) {
+            return Reply::error(id, &message);
+        }
+        settings.inputs = entries;
+        match api::save_to(&self.settings_file, &settings) {
+            Ok(()) => {
+                let model = what_to_send::model(listed.as_ref(), &settings, self.show_all);
+                Reply::ok(id, serde_json::to_value(model).expect("plain JSON"))
+            }
+            Err(SaveError::Invalid(problems)) => Reply::error(
+                id,
+                &format!(
+                    "The settings file has a problem: {}.",
+                    problems
+                        .first()
+                        .map_or("", |p| p.message.as_str())
+                        .trim_end_matches('.')
+                ),
+            ),
+            Err(SaveError::Write(err)) => {
+                tracing::warn!("saving the settings: {err:#}");
+                Reply::error(id, NOT_SAVED)
+            }
         }
     }
 }
@@ -307,6 +444,7 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use open_live_ingest::config::InputSettings;
     use serde_json::json;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -484,6 +622,204 @@ mod tests {
         );
     }
 
+    struct FakeStrom(Option<Devices>);
+
+    impl DeviceSource for FakeStrom {
+        fn devices(&self, _settings: &open_live_ingest::config::Config) -> anyhow::Result<Devices> {
+            self.0
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Strom at http://127.0.0.1:8080 is not answering"))
+        }
+    }
+
+    /// A settings file in a directory of its own, as the Where to send step leaves it.
+    struct SettingsFile(PathBuf);
+
+    impl SettingsFile {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("oli-app-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("gateway.toml");
+            std::fs::write(
+                &path,
+                "[gateway]\nname = \"Venue\"\n\n[open_live]\nurl = \"https://open-live.example.com\"\nauth_mode = \"direct\"\n",
+            )
+            .unwrap();
+            SettingsFile(path)
+        }
+
+        fn core(&self, devices: Option<Devices>) -> Core {
+            Core::new(self.0.clone()).with_device_source(Arc::new(FakeStrom(devices)))
+        }
+
+        fn read(&self) -> open_live_ingest::config::Config {
+            toml::from_str(&std::fs::read_to_string(&self.0).unwrap()).unwrap()
+        }
+    }
+
+    impl Drop for SettingsFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    fn devices() -> Devices {
+        crate::what_to_send::tests::devices()
+    }
+
+    #[test]
+    fn devices_replies_with_the_rows() {
+        let file = SettingsFile::new("devices");
+        let reply = reply_json(
+            &mut file.core(Some(devices())),
+            r#"{"id": 1, "cmd": "devices", "args": {"show_all": false}}"#,
+        );
+        let ok = &reply["ok"];
+        assert_eq!(ok["name_prefix"], "Venue — ");
+        let rows: Vec<&str> = ok["video"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["device"].as_str().unwrap())
+            .collect();
+        assert_eq!(rows, ["test", "dev-cam"]);
+        assert_eq!(ok["video"][1]["label"], "FaceTime HD Camera");
+        assert_eq!(ok["audio"][0]["device"], "dev-mic");
+    }
+
+    /// A Strom that cannot be asked is one line for the person; the details go to the
+    /// log only.
+    #[test]
+    fn devices_that_cannot_be_listed_say_so_in_one_line() {
+        let file = SettingsFile::new("no-strom");
+        let reply = reply_json(
+            &mut file.core(None),
+            r#"{"id": 2, "cmd": "devices", "args": {"show_all": true}}"#,
+        );
+        assert_eq!(
+            reply,
+            json!({"id": 2, "error": {"message": NO_DEVICE_LIST, "action": null}})
+        );
+    }
+
+    /// With late replies, listing runs off the caller's thread and the reply arrives
+    /// through the hook, not from `dispatch`.
+    #[test]
+    fn devices_reply_late_when_the_window_asks_for_it() {
+        let file = SettingsFile::new("late");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let mut core = file
+            .core(Some(devices()))
+            .with_late_replies(Arc::new(move |reply| {
+                let _ = tx.lock().unwrap().send(reply);
+            }));
+        assert!(core
+            .dispatch(r#"{"id": 3, "cmd": "devices", "args": {"show_all": false}}"#)
+            .is_none());
+        let reply = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a late reply");
+        let reply = serde_json::to_value(reply).unwrap();
+        assert_eq!(reply["id"], 3);
+        assert_eq!(reply["ok"]["video"][0]["device"], "test");
+    }
+
+    /// The selection is saved as `[[input]]` on every change, in the CLI's format, and
+    /// the reply shows it ticked.
+    #[test]
+    fn set_inputs_saves_the_selection_as_input_entries() {
+        let file = SettingsFile::new("save");
+        let mut core = file.core(Some(devices()));
+        reply_json(
+            &mut core,
+            r#"{"id": 1, "cmd": "devices", "args": {"show_all": true}}"#,
+        );
+        let reply = reply_json(
+            &mut core,
+            r#"{"id": 2, "cmd": "set_inputs", "args": {"inputs": [
+                {"device": "test"},
+                {"device": "dev-obs", "audio": "dev-mic", "label": "Stage left"},
+                {"device": "dev-cam", "label": "FaceTime HD Camera"}]}}"#,
+        );
+        let rows = reply["ok"]["video"].as_array().expect("the rows");
+        assert!(rows.iter().all(|r| r["ticked"] == true), "{reply}");
+        assert_eq!(reply["ok"]["audio"][0]["paired_with"], "dev-obs");
+
+        let saved = file.read();
+        assert_eq!(
+            saved.inputs,
+            [
+                InputSettings {
+                    device: "test".into(),
+                    audio: None,
+                    label: None,
+                },
+                InputSettings {
+                    device: "dev-obs".into(),
+                    audio: Some("dev-mic".into()),
+                    label: Some("Stage left".into()),
+                },
+                InputSettings {
+                    device: "dev-cam".into(),
+                    audio: None,
+                    label: None,
+                },
+            ]
+        );
+        open_live_ingest::config::validate(&saved).expect("the CLI accepts it");
+
+        // Unticking everything removes the entries: `up` is back to every device.
+        reply_json(
+            &mut core,
+            r#"{"id": 3, "cmd": "set_inputs", "args": {"inputs": []}}"#,
+        );
+        let text = std::fs::read_to_string(&file.0).unwrap();
+        assert!(!text.contains("[[input]]"), "{text}");
+    }
+
+    /// #64 AC5: the second camera cannot take an audio source the first one has, and
+    /// the file is left as it was.
+    #[test]
+    fn set_inputs_refuses_an_audio_source_paired_twice() {
+        let file = SettingsFile::new("pair-twice");
+        let mut core = file.core(Some(devices()));
+        reply_json(
+            &mut core,
+            r#"{"id": 1, "cmd": "devices", "args": {"show_all": true}}"#,
+        );
+        let before = std::fs::read_to_string(&file.0).unwrap();
+        let reply = reply_json(
+            &mut core,
+            r#"{"id": 2, "cmd": "set_inputs", "args": {"inputs": [
+                {"device": "dev-cam", "audio": "dev-mic"},
+                {"device": "dev-obs", "audio": "dev-mic"}]}}"#,
+        );
+        assert_eq!(
+            reply["error"]["message"],
+            "USB Microphone is already used with FaceTime HD Camera. Pick another audio input."
+        );
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), before);
+    }
+
+    /// Until Where to send is done the file cannot be saved, and the reply says why.
+    #[test]
+    fn set_inputs_on_unfinished_settings_names_the_problem() {
+        let file = SettingsFile::new("unfinished");
+        std::fs::write(&file.0, "[gateway]\nname = \"Venue\"\n").unwrap();
+        let reply = reply_json(
+            &mut file.core(Some(devices())),
+            r#"{"id": 2, "cmd": "set_inputs", "args": {"inputs": [{"device": "test"}]}}"#,
+        );
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("The settings file has a problem: "),
+            "{message}"
+        );
+        assert!(message.contains("open_live.url"), "{message}");
+    }
+
     #[test]
     fn commands_not_wired_up_yet_say_so() {
         let (reply, effect) = core().dispatch(r#"{"id": 5, "cmd": "go_live"}"#).unwrap();
@@ -560,19 +896,24 @@ mod tests {
             .with_max_level(tracing::Level::TRACE)
             .with_ansi(false)
             .finish();
+        // The global subscriber, not a scoped one: with tests dispatching on other
+        // threads, tracing's level and interest caches can leave a scoped subscriber
+        // hearing nothing. Other tests' lines land in this log too; none carries these
+        // secrets, and none may.
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other test sets a global subscriber");
+        tracing::callsite::rebuild_interest_cache();
         let mut replies = Vec::new();
         let mut debug = Vec::new();
-        tracing::subscriber::with_default(subscriber, || {
-            let mut core = core();
-            for message in &messages {
-                let raw = message.to_string();
-                if let Ok((_, command)) = parse(&raw) {
-                    debug.push(format!("{command:?}"));
-                }
-                let (reply, _) = core.dispatch(&raw).expect("a reply");
-                replies.push(reply.script());
+        let mut core = core();
+        for message in &messages {
+            let raw = message.to_string();
+            if let Ok((_, command)) = parse(&raw) {
+                debug.push(format!("{command:?}"));
             }
-        });
+            let (reply, _) = core.dispatch(&raw).expect("a reply");
+            replies.push(reply.script());
+        }
         let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
 
         assert_eq!(replies.len(), messages.len());

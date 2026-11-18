@@ -20,6 +20,8 @@ const TITLE: &str = "Open Live Ingest";
 enum UserEvent {
     /// A message the page posted with `window.ipc.postMessage`.
     Ipc(String),
+    /// A reply the core computed off this thread (a device list, which may start Strom).
+    Reply(ipc::Reply),
     /// A menu item was chosen.
     #[cfg(target_os = "macos")]
     Menu(muda::MenuEvent),
@@ -86,7 +88,12 @@ pub fn run() -> ExitCode {
         }
     };
 
-    let mut core = ipc::Core::new(open_live_ingest::config::default_path());
+    let reply_proxy = event_loop.create_proxy();
+    let mut core = ipc::Core::new(open_live_ingest::config::default_path()).with_late_replies(
+        std::sync::Arc::new(move |reply| {
+            let _ = reply_proxy.send_event(UserEvent::Reply(reply));
+        }),
+    );
     tracing::info!(version = open_live_ingest_app::VERSION, "app started");
 
     event_loop.run(move |event, _target, control_flow| {
@@ -111,6 +118,11 @@ pub fn run() -> ExitCode {
                     if effect == ipc::Effect::Quit {
                         request_quit(control_flow);
                     }
+                }
+            }
+            Event::UserEvent(UserEvent::Reply(reply)) => {
+                if let Err(e) = webview.evaluate_script(&reply.script()) {
+                    tracing::warn!("could not deliver a reply to the page: {e}");
                 }
             }
             #[cfg(target_os = "macos")]

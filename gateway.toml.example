@@ -97,11 +97,18 @@ keyframe_interval = 25          # frames; one or two seconds' worth
 [log]
 level = "info"
 
-# Send an audio source (a USB microphone, an audio interface) with a camera. Both
-# by Strom device id or name fragment, as `open-live-ingest devices` lists them.
-# One entry per camera, and one audio source goes with one camera. The audio
-# device runs on its own clock; see docs/DESIGN.md. `up --audio "CAMERA=AUDIO"`
-# replaces these for a run.
+# What to send. Without any [[input]], `up` sends every device except the virtual
+# ones. With them, `up` sends exactly these, one entry per input; `--devices`,
+# `--all` and `--test` pick for one run instead. The desktop app writes these.
+#   device: by Strom device id or name fragment, as `open-live-ingest devices` lists
+#           them (an exact id wins), or "test" for the test pattern.
+#   audio:  optional, an audio source (a USB microphone, an audio interface) to send
+#           with the camera. One audio source goes with one camera. It runs on its
+#           own clock; see docs/DESIGN.md. `up --audio "CAMERA=AUDIO"` replaces these
+#           pairings for a run.
+#   label:  optional, the source's name in Studio after "<gateway name> — "; the
+#           device's name when unset.
 # [[input]]
 # device = "FaceTime"
 # audio = "USB Microphone"
+# label = "Stage left"
