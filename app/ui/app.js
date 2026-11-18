@@ -505,6 +505,79 @@ function wireGoLive() {
 }
 
 // ---------------------------------------------------------------------------
+// Quitting while live (spec, section 8)
+// ---------------------------------------------------------------------------
+
+// The core decides; the page only asks. Stop and quit runs the Stop teardown and the
+// app quits when it is done; Quit anyway is offered when it takes long.
+let quitting = false;
+
+function quitQuestion(inputs) {
+  if (inputs === 0) {
+    return "You are going live. Stop and quit?";
+  }
+  return "You are live with " + inputs + (inputs === 1 ? " input" : " inputs") + ". Stop and quit?";
+}
+
+function askToQuit(inputs) {
+  const dialog = byId("quit-dialog");
+  if (!quitting) {
+    byId("quit-text").textContent = quitQuestion(inputs);
+  }
+  if (!dialog.open) {
+    dialog.showModal();
+  }
+}
+
+function resetQuit() {
+  quitting = false;
+  byId("quit-stop").disabled = false;
+  byId("quit-cancel").disabled = false;
+  byId("quit-anyway").hidden = true;
+  byId("quit-progress").hidden = true;
+}
+
+function wireQuit() {
+  const dialog = byId("quit-dialog");
+  document.addEventListener("oli:quit_requested", (event) => askToQuit(event.detail.inputs_live));
+  byId("quit-cancel").addEventListener("click", () => dialog.close());
+  // Escape closes the question, but not once Stop and quit has begun.
+  dialog.addEventListener("cancel", (event) => {
+    if (quitting) {
+      event.preventDefault();
+    }
+  });
+  byId("quit-stop").addEventListener("click", async () => {
+    quitting = true;
+    byId("quit-stop").disabled = true;
+    byId("quit-cancel").disabled = true;
+    byId("quit-progress").textContent = "Stopping…";
+    byId("quit-progress").hidden = false;
+    try {
+      await call("quit", { confirmed: true });
+    } catch (error) {
+      dialog.close();
+      resetQuit();
+      showGoProblem(error);
+    }
+  });
+  byId("quit-anyway").addEventListener("click", () => {
+    call("quit", { confirmed: true, anyway: true }).catch((error) => {
+      byId("quit-progress").textContent = error && error.message ? error.message : String(error);
+    });
+  });
+  document.addEventListener("oli:quit_anyway", () => {
+    byId("quit-anyway").hidden = false;
+  });
+  document.addEventListener("oli:stopping", (event) => {
+    if (quitting) {
+      byId("quit-progress").textContent =
+        "Stopping… " + event.detail.done + " of " + event.detail.total;
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Logs
 // ---------------------------------------------------------------------------
 
@@ -525,6 +598,7 @@ function wireLogs() {
 async function start() {
   wireWhere();
   wireGoLive();
+  wireQuit();
   wireLogs();
   const state = await call("state");
   document.getElementById("version").textContent = "Version " + state.version;

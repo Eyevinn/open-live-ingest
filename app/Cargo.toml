@@ -19,6 +19,15 @@ anyhow = "1.0"
 # window keeps answering meanwhile.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
+# SIGTERM from `open-live-ingest down` is Stop without asking on macOS (spec, section 8).
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", features = ["signal"] }
+
+# Runs AppKit's event loop, which must own the main thread: no libtest harness.
+[[test]]
+name = "macos_should_terminate"
+harness = false
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }
 toml = "0.8.23"
@@ -38,3 +47,18 @@ wry = "0.57"
 muda = "0.20"
 objc2 = "0.6"
 block2 = "0.6"
+
+# Quitting while live on Windows (spec, section 8): the window subclass for
+# WM_QUERYENDSESSION, the shutdown block reason and the single-instance mutex. The
+# `windows` crate tao already depends on, at the version the lockfile resolves; the
+# only feature tao does not already turn on is Win32_System_Shutdown (and
+# Win32_Security, which CreateMutexW's signature names). No new crate.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Shutdown",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

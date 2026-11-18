@@ -338,7 +338,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `go_live` | — | `null` (progress arrives as events) | §4 checks, `Session::start` (#72) |
 | `stop` | — | `null` | `SessionHandle::stop` |
 | `stop_other` | — | `null` | `down` (another gateway named by `gateway.pid`) |
-| `quit` | `{confirmed}` | `null` | quit guard (§8) |
+| `quit` | `{confirmed, anyway?}` | `null` | quit guard (§8): `confirmed: false` asks (the question when live), `true` is Stop and quit, `anyway: true` is Quit anyway once offered |
 | `show_logs` | `{which: "app" \| "strom"}` | `null` | reveal in Finder/Explorer |
 | `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy" \| "privacy_microphone"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`, `privacy_microphone`: macOS Privacy & Security → Camera or Microphone, for §10's camera/microphone row) |
 
@@ -355,6 +355,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `stopping` | `{done, total}` | teardown progress |
 | `stopped` | `{left_behind: [], error}` | teardown finished; anything not removed is named. `error` (`{message, action}`, §10) when the session ended on a failure, else `null` |
 | `quit_requested` | `{inputs_live}` | the quit guard wants the §8 question shown |
+| `quit_anyway` | `{}` | Stop and quit has run for 15 s: the question adds "Quit anyway" (§8) |
 | `osc_sign_in_page` | `{url}` | the sign-in page was opened in the browser; the window shows its address too, for when no browser opens |
 | `where` | step 1's view (as `state`'s `where`) | after `state`, the workspace and instance names looked up with the kept sign-in |
 

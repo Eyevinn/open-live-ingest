@@ -191,3 +191,22 @@ body.live #what {
 footer button.link {
   margin-left: 1rem;
 }
+
+/* The quit question while live (spec, section 8). */
+dialog {
+  max-width: 26rem;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+dialog::backdrop {
+  background: color-mix(in srgb, black 30%, transparent);
+}
+
+.quit-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-bottom: 0;
+}

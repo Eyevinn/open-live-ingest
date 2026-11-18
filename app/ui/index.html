@@ -85,6 +85,15 @@
       </details>
       <p id="problem" class="problem" role="alert" hidden></p>
     </main>
+    <dialog id="quit-dialog" aria-labelledby="quit-text">
+      <p id="quit-text"></p>
+      <p id="quit-progress" role="status" hidden></p>
+      <p class="quit-buttons">
+        <button type="button" id="quit-anyway" hidden>Quit anyway</button>
+        <button type="button" id="quit-cancel">Cancel</button>
+        <button type="button" id="quit-stop">Stop and quit</button>
+      </p>
+    </dialog>
     <footer>
       <span id="version"></span>
       <button type="button" id="show-logs" class="link" hidden>Show logs</button>
