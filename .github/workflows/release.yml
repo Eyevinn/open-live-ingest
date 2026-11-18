@@ -7,9 +7,10 @@ name: Release
 # rewrites SHA256SUMS to cover it and attests it; otherwise it is skipped and the
 # release is the archives only. The manual trigger builds the same artifacts and
 # SHA256SUMS without publishing anything, to try the workflow out. A pull request
-# that changes this workflow or the macOS app script runs it too, so the change is
-# proven before it merges; like a manual run from a branch, it publishes nothing
-# (`release` and `release-macos` run only on a tag ref).
+# that changes this workflow, the macOS app script, the desktop app (app/) or the
+# packaging (packaging/) runs it too, so the change is proven before it merges; like
+# a manual run from a branch, it publishes nothing (`release` and `release-macos` run
+# only on a tag ref).
 on:
   push:
     tags: ["v*"]
@@ -19,6 +20,8 @@ on:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
       - .github/scripts/open-live-ingest.entitlements
+      - app/**
+      - packaging/**
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,6 +75,24 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
 
       - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The desktop app (app/, docs/specs/desktop-app.md) on the two platforms it ships
+      # on. The workspace's default members are the gateway only, so it needs its own
+      # -p. Its artifact name must not start with "$BIN-": `checksums` and `release`
+      # pick the archives up by that prefix, and the app binary is not a release asset
+      # of its own. `macos-app` puts it in the DMG as the bundle's main executable.
+      - name: Build the desktop app
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          cargo build --release --locked -p open-live-ingest-app --target ${{ matrix.target }}
+          case "${{ matrix.target }}" in *-windows-*) exe=.exe ;; *) exe= ;; esac
+          echo "APP_BINARY=target/${{ matrix.target }}/release/open-live-ingest-app$exe" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        with:
+          name: app-binary-${{ matrix.target }}
+          path: ${{ env.APP_BINARY }}
+          if-no-files-found: error
 
       # No version in the asset name, so releases/latest/download/<asset> is a stable
       # URL. The tag names the version; so does the binary. Windows gets a zip (7-Zip
@@ -167,12 +188,15 @@ jobs:
             --generate-notes
 
   # Open Live Ingest.app for Apple silicon in a drag-to-install DMG, built from the
-  # aarch64-apple-darwin binary of `build` by .github/scripts/build-macos-app.sh. The
+  # aarch64-apple-darwin binaries of `build` by .github/scripts/build-macos-app.sh: the
+  # desktop app (artifact app-binary-aarch64-apple-darwin) is the bundle's main
+  # executable, and the gateway CLI from the tarball sits next to it for SSH use. The
   # script bundles the Strom the strom-types tag in Cargo.toml names, so the workflow
   # never names a Strom version itself.
   #
-  # Every Mach-O in the app is signed with the hardened runtime, and strom and
-  # open-live-ingest with the entitlements in .github/scripts/open-live-ingest.entitlements.
+  # Every Mach-O in the app is signed with the hardened runtime, and strom,
+  # open-live-ingest and open-live-ingest-app with the entitlements in
+  # .github/scripts/open-live-ingest.entitlements.
   # The identity depends on the repository secrets (#25):
   #   - APPLE_DEVELOPER_ID_P12 set: its Developer ID Application certificate is imported
   #     into a temporary keychain, which the last step deletes on every outcome, and the
@@ -221,6 +245,11 @@ jobs:
           path: tarball
       - name: Unpack the gateway
         run: tar xzf "tarball/$BIN-$TARGET.tar.gz" -C tarball
+      # An artifact does not keep the executable bit; the script installs it 0755.
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-binary-${{ env.TARGET }}
+          path: app-binary
 
       # The GStreamer the bundle carries, plugins included; see the script's header.
       - name: Install GStreamer
@@ -267,13 +296,14 @@ jobs:
 
       # dmg-root becomes the DMG's volume: the app and an /Applications link. The script
       # signs with MACOS_SIGN_IDENTITY when the import step set it, ad hoc otherwise,
-      # and fails unless every Mach-O carries the hardened runtime and the executables
-      # the camera and microphone entitlements.
+      # and fails unless every Mach-O carries the hardened runtime and the three
+      # executables the camera and microphone entitlements.
       - name: Build and sign the app bundle
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          .github/scripts/build-macos-app.sh "tarball/$BIN-$TARGET/$BIN" dmg-root
+          .github/scripts/build-macos-app.sh "tarball/$BIN-$TARGET/$BIN" \
+            app-binary/open-live-ingest-app dmg-root
           ln -s /Applications dmg-root/Applications
 
       # hdiutil on hosted runners sometimes fails with "Resource busy"; retry it.
@@ -335,11 +365,14 @@ jobs:
         run: xcrun stapler staple "$DMG"
 
       # On every run, on the app as the DMG carries it, mounted away from the build path:
-      # - build-macos-app.sh --check: no Mach-O load command or rpath names /opt/homebrew
-      #   or /usr/local, every Mach-O has the hardened runtime, strom and open-live-ingest
-      #   have the camera and microphone entitlements, and the strict deep codesign
-      #   verify passes.
-      # - the signature and entitlements of the main executable, for the log.
+      # - build-macos-app.sh --check: CFBundleExecutable is open-live-ingest-app, with the
+      #   CLI and strom next to it and the icon in Resources; no Mach-O load command or
+      #   rpath names /opt/homebrew or /usr/local, every Mach-O has the hardened runtime,
+      #   strom, open-live-ingest and open-live-ingest-app have the camera and
+      #   microphone entitlements, and the strict deep codesign verify passes.
+      # - the signature and entitlements of the main executable and the CLI, for the log.
+      # - the app and the CLI start under the hardened runtime from the mounted DMG
+      #   (dyld and library validation load them) and report the bundle's version.
       # - the bundled Strom reports 0.8.1 or later.
       # - the bundled Strom starts under the hardened runtime with the bundle's
       #   GStreamer, as the gateway starts it: the plugin scanner builds the registry,
@@ -358,7 +391,16 @@ jobs:
             || { echo "the DMG has no /Applications link"; exit 1; }
           contents="$mnt/$APP/Contents"
           .github/scripts/build-macos-app.sh --check "$mnt/$APP"
+          codesign -dv --entitlements - "$contents/MacOS/open-live-ingest-app"
           codesign -dv --entitlements - "$contents/MacOS/open-live-ingest"
+          bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$contents/Info.plist")"
+          for exe in open-live-ingest-app open-live-ingest; do
+            got="$("$contents/MacOS/$exe" --version)" \
+              || { echo "$exe --version failed from the DMG"; exit 1; }
+            echo "bundled $exe: $got"
+            test "$got" = "$exe $bundle_version" \
+              || { echo "expected '$exe $bundle_version' from $exe --version"; exit 1; }
+          done
           otool -L "$contents/MacOS/strom"
           out="$("$contents/MacOS/strom" --version)"
           echo "bundled Strom: $out"

@@ -235,7 +235,8 @@ fn tail_of_log(path: &Path) -> String {
 ///
 /// ```text
 /// Open Live Ingest.app/Contents/
-///     MacOS/open-live-ingest
+///     MacOS/open-live-ingest-app   the desktop app, the bundle's main executable
+///     MacOS/open-live-ingest       the CLI
 ///     MacOS/strom
 ///     Frameworks/                  GStreamer and GLib libraries
 ///     PlugIns/gstreamer/           GStreamer plugins

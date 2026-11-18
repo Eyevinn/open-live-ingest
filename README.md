@@ -183,6 +183,35 @@ curl -fsSL https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/insta
 Binaries land in `/usr/local/bin` when it is writable, else `~/.local/bin`. `INSTALL_DIR`,
 `VERSION`, and `SKIP_STROM=true` override that; the script's header lists every knob.
 
+### Mac: install from the DMG, open the app
+
+On an Apple silicon Mac, no terminal needed: download `open-live-ingest-macos-aarch64.dmg` from
+the [latest release](https://github.com/Eyevinn/open-live-ingest/releases/latest), open it, and
+drag **Open Live Ingest** onto the Applications folder next to it. Then open Open Live Ingest from
+Applications, Launchpad or Spotlight. It opens a window, not a terminal. The app carries its own
+Strom and GStreamer, so nothing else is installed and a Strom or GStreamer already on the Mac is
+left alone. macOS asks once for the camera and the microphone, the first time a feed uses them.
+
+The DMG is on a release only once it is notarized with Apple (#25). Until then a release has the
+archives only, and the DMG a release workflow run builds is signed ad hoc, which Gatekeeper
+refuses once it has been downloaded; use `install.sh` above instead.
+
+The same app holds the command-line gateway, at
+`/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest`. For SSH use, put it on `PATH`
+with a symlink, once:
+
+```bash
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest" /usr/local/bin/open-live-ingest
+open-live-ingest --version   # open-live-ingest X.Y.Z, the same version as the app
+```
+
+Through the symlink, the CLI runs the app's own Strom and GStreamer, and it reads the same
+settings file as the app, so a box set up in the window also answers `open-live-ingest status`
+and `down` over SSH. The symlink replaces an `open-live-ingest` that `install.sh` put in
+`/usr/local/bin`. Updating the app (dragging a newer DMG's app over it) keeps the symlink
+working; deleting the app breaks it, so remove `/usr/local/bin/open-live-ingest` too.
+
 ### Windows
 
 On 64-bit (x86_64) Windows, from PowerShell:
@@ -258,17 +287,21 @@ re-enable it from the Actions tab (select `Strom pin`, then "Enable workflow").
 
 ### The macOS app bundle
 
-`.github/scripts/build-macos-app.sh` builds `Open Live Ingest.app` for Apple silicon: the gateway,
-the Strom release the `strom-types` tag pins (checked against the SHA-256 digest GitHub records for
+`.github/scripts/build-macos-app.sh` builds `Open Live Ingest.app` for Apple silicon: the desktop
+app (`open-live-ingest-app`, the bundle's `CFBundleExecutable`), the gateway CLI next to it, the
+Strom release the `strom-types` tag pins (checked against the SHA-256 digest GitHub records for
 the asset), and the Homebrew GStreamer that Strom links against, with every library reference
-rewritten to point inside the bundle. It refuses to finish if any Mach-O in the bundle still names
-`/opt/homebrew` or `/usr/local`. To run it by hand on an Apple silicon Mac with Homebrew, `jq` and
-the Xcode command line tools:
+rewritten to point inside the bundle. The icon is `app/icons/AppIcon.icns`, drawn by
+`app/icons/make-icon.py` (stock Python 3, no packages). It refuses to finish if any Mach-O in the
+bundle still names `/opt/homebrew` or `/usr/local`. To run it by hand on an Apple silicon Mac with
+Homebrew, `jq` and the Xcode command line tools:
 
 ```bash
 brew install gstreamer jq
 cargo build --release --target aarch64-apple-darwin
-.github/scripts/build-macos-app.sh target/aarch64-apple-darwin/release/open-live-ingest dist
+cargo build --release --target aarch64-apple-darwin -p open-live-ingest-app
+.github/scripts/build-macos-app.sh target/aarch64-apple-darwin/release/open-live-ingest \
+  target/aarch64-apple-darwin/release/open-live-ingest-app dist
 .github/scripts/build-macos-app.sh --check "dist/Open Live Ingest.app"   # the check step on its own
 ```
 
@@ -283,10 +316,12 @@ macOS runner. On an Apple silicon Mac with macOS 27, install the DMG from the re
 
 ```bash
 "/Applications/Open Live Ingest.app/Contents/MacOS/strom" --version
+"/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest-app" --version
 "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest" up --test
 ```
 
-Both must start without a `dyld` error, and `up --test` must reach "Strom is up" (then Ctrl-C).
+All three must start without a `dyld` error, and `up --test` must reach "Strom is up" (then Ctrl-C).
+Then open the app from Applications: its window must appear.
 If it stops after "Starting Strom", the error is in the `strom.log` it names.
 
 ## License

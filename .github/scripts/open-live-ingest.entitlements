@@ -1,9 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Entitlements of the two executables that run as the app: Contents/MacOS/open-live-ingest
-  and Contents/MacOS/strom. build-macos-app.sh signs them with these and the hardened
-  runtime; gst-plugin-scanner (which only loads plugins to list them) gets none.
+  Entitlements of the three executables that run as the app: Contents/MacOS/open-live-ingest-app
+  (the desktop app, the bundle's main executable), Contents/MacOS/open-live-ingest (the CLI,
+  the process TCC sees over SSH) and Contents/MacOS/strom. build-macos-app.sh signs them with
+  these and the hardened runtime; gst-plugin-scanner (which only loads plugins to list them)
+  gets none. The app's webview needs nothing more: WKWebView runs its JIT in Apple's
+  WebContent process, not in the app.
 
   com.apple.security.device.camera       Strom opens the cameras (GStreamer's
                                           avfvideosrc). Under the hardened runtime a
@@ -16,7 +19,7 @@
   and is signed with the same Team ID as the executables. An ad hoc build has no Team ID,
   and macOS 27 then refuses to map the bundled libraries into strom ("different Team
   IDs", #66). For an ad hoc build only, build-macos-app.sh therefore signs strom,
-  open-live-ingest and gst-plugin-scanner with this file plus
+  open-live-ingest, open-live-ingest-app and gst-plugin-scanner with this file plus
   com.apple.security.cs.disable-library-validation (the scanner with that key alone),
   and its bundle check refuses that key on any other signature. Add an exception here
   only when a Developer ID build shows it is needed, with the reason.
