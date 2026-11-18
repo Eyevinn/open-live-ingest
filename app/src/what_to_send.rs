@@ -14,6 +14,8 @@ use open_live_ingest::devices::name_prefix;
 use open_live_ingest::gateway::Events;
 use open_live_ingest::run::DeviceReport;
 use serde::Serialize;
+use std::future::Future;
+use std::pin::Pin;
 
 /// The test pattern row's name, the one the CLI gives its source.
 pub const TEST_PATTERN_NAME: &str = "Test pattern";
@@ -21,10 +23,14 @@ pub const TEST_PATTERN_NAME: &str = "Test pattern";
 /// Shown when Strom reports no video device at all (spec, section 10).
 pub const NO_CAMERAS: &str = "No cameras found. Connect one, or tick Test pattern.";
 
+/// A device list on its way.
+pub type DeviceList<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Devices>> + Send + 'a>>;
+
 /// Where the device list comes from: Strom through the library, or a fake in tests.
-/// Called off the window's thread: listing may start a Strom and wait for it.
+/// Run on the core's runtime, off the window's thread: listing may start a Strom and
+/// wait for it.
 pub trait DeviceSource: Send + Sync {
-    fn devices(&self, settings: &Config) -> anyhow::Result<Devices>;
+    fn devices<'a>(&'a self, settings: &'a Config) -> DeviceList<'a>;
 }
 
 /// The devices the local Strom reports, through the library's `devices`: a managed
@@ -33,11 +39,8 @@ pub trait DeviceSource: Send + Sync {
 pub struct Strom;
 
 impl DeviceSource for Strom {
-    fn devices(&self, settings: &Config) -> anyhow::Result<Devices> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(open_live_ingest::api::devices(settings, &Events::discard()))
+    fn devices<'a>(&'a self, settings: &'a Config) -> DeviceList<'a> {
+        Box::pin(async move { open_live_ingest::api::devices(settings, &Events::discard()).await })
     }
 }
 

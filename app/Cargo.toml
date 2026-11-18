@@ -10,22 +10,23 @@ publish = false
 [dependencies]
 # The gateway library without the `cli` feature: no clap, dialoguer or console.
 open-live-ingest = { path = "..", default-features = false }
-anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-# Already in the library's tree: a current-thread runtime to list devices off the
-# window's thread.
-tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+# The runtime the core runs what waits on a server, Strom or the browser on, so the
+# window keeps answering meanwhile.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }
+toml = "0.8.23"
 
 # The window (tao), the system webview in it (wry) and the macOS menu bar (muda):
 # docs/decisions/ADR-001-desktop-app-toolkit.md. Only on macOS and Windows, so the
 # app's own core (protocol, CSP, navigation filter, IPC) also builds and tests on Linux
 # without webkit2gtk. wry's `devtools` feature stays off, so release builds have none.
-[dev-dependencies]
-toml = "0.8.23"
-
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 tao = "0.37"
 wry = "0.57"

@@ -12,12 +12,16 @@
 //! logged, never the arguments, and an error reply never quotes what the page sent.
 
 use crate::what_to_send::{self, DeviceSource};
+use crate::where_to_send::{Opener, WhereToSend, WhereView};
 use open_live_ingest::api::{self, Devices, SaveError};
+use open_live_ingest::keychain::OsKeychain;
+use open_live_ingest::osc;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use tracing::instrument::WithSubscriber;
 
 /// A credential the page sends: an API key, a token, a passphrase. It can be read in the
 /// core, but it cannot be serialised back to the page, and it does not print.
@@ -252,43 +256,78 @@ pub struct ViewModel {
     pub version: &'static str,
     pub settings_file: String,
     pub live: bool,
+    /// Step 1, "Where to send".
+    #[serde(rename = "where")]
+    pub where_to_send: WhereView,
 }
 
-/// Delivers a reply that was not ready when its command arrived. Called from another
-/// thread; the window hands the reply to its event loop.
-pub type LateReply = Arc<dyn Fn(Reply) + Send + Sync>;
+/// Hands a script to the page: how replies that come later, and events, reach it. The
+/// window evaluates it in the webview on the main thread.
+pub type Deliver = Arc<dyn Fn(String) + Send + Sync>;
 
 /// The app core the dispatcher drives. The window owns one and hands it every message.
+///
+/// A command that answers from what is at hand (`state`, `choose_instance`,
+/// `set_inputs`, `quit`) is answered by [`dispatch`](Self::dispatch). One that waits on
+/// a server, on Strom or on the person in the browser runs on the core's own runtime,
+/// and its reply goes through [`Deliver`] when it is done, so the window never stops
+/// answering meanwhile.
 pub struct Core {
     settings_file: PathBuf,
     live: bool,
+    where_to_send: Arc<WhereToSend>,
+    deliver: Deliver,
+    runtime: tokio::runtime::Runtime,
     device_source: Arc<dyn DeviceSource>,
-    /// Where a reply goes that is computed off the window's thread. Without one, such
-    /// commands run on the caller's thread and reply at once (tests).
-    late: Option<LateReply>,
     /// The last device list Strom gave, for the rows and the names in messages.
     listed: Arc<Mutex<Option<Devices>>>,
     /// Whether the What to send step lists virtual devices.
     show_all: bool,
 }
 
-impl fmt::Debug for Core {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Core")
-            .field("settings_file", &self.settings_file)
-            .field("live", &self.live)
-            .field("show_all", &self.show_all)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Core {
-    pub fn new(settings_file: PathBuf) -> Self {
+    /// The core over the settings file, the OS keychain and Open Source Cloud itself.
+    pub fn new(settings_file: PathBuf, deliver: Deliver) -> Self {
+        let page = deliver.clone();
+        let open: Opener = Arc::new(move |url: &str| {
+            // Shown in the window too, for when no browser opens. The address holds
+            // only public values: the client id, the redirect, the PKCE challenge and
+            // the state.
+            page(Event::new("osc_sign_in_page", json!({ "url": url })).script());
+            if let Err(err) = osc::open_browser(url) {
+                tracing::warn!("could not open the system browser for the sign-in: {err:#}");
+            }
+            Ok(())
+        });
+        let where_to_send = WhereToSend::new(
+            settings_file.clone(),
+            Arc::new(OsKeychain::default()),
+            osc::Endpoints::production(),
+            osc::SIGN_IN_TIMEOUT,
+            open,
+        );
+        Self::with_where_to_send(settings_file, where_to_send, deliver)
+    }
+
+    /// The core over a step 1 model of the caller's: fakes, in tests.
+    pub fn with_where_to_send(
+        settings_file: PathBuf,
+        where_to_send: WhereToSend,
+        deliver: Deliver,
+    ) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("oli-core")
+            .enable_all()
+            .build()
+            .expect("starting the app core's runtime");
         Core {
             settings_file,
             live: false,
+            where_to_send: Arc::new(where_to_send),
+            deliver,
+            runtime,
             device_source: Arc::new(what_to_send::Strom),
-            late: None,
             listed: Arc::default(),
             show_all: false,
         }
@@ -300,24 +339,13 @@ impl Core {
         self
     }
 
-    /// Runs slow commands (listing devices, which may start a Strom) on a thread of
-    /// their own and hands their replies to `late`, so the window stays responsive.
-    pub fn with_late_replies(mut self, late: LateReply) -> Self {
-        self.late = Some(late);
-        self
-    }
-
     fn view_model(&self) -> ViewModel {
-        ViewModel {
-            version: env!("CARGO_PKG_VERSION"),
-            settings_file: self.settings_file.display().to_string(),
-            live: self.live,
-        }
+        view_model(&self.settings_file, self.live, self.where_to_send.view())
     }
 
-    /// Handle one message from the page. `None` when there is nothing to reply to now:
-    /// no readable `id` (logged and otherwise ignored), or a reply that arrives later
-    /// through [`with_late_replies`](Self::with_late_replies).
+    /// Handle one message from the page. `None` when the reply comes later through
+    /// [`Deliver`], or when there is nothing to reply to (no readable `id`), which is
+    /// logged and otherwise ignored.
     pub fn dispatch(&mut self, raw: &str) -> Option<(Reply, Effect)> {
         let (id, command) = match parse(raw) {
             Ok(parsed) => parsed,
@@ -335,41 +363,81 @@ impl Core {
     }
 
     fn handle(&mut self, id: u32, command: Command) -> Option<(Reply, Effect)> {
-        let reply = match command {
-            Command::State => Reply::ok(
-                id,
-                serde_json::to_value(self.view_model()).expect("plain JSON"),
-            ),
-            // Nothing is live yet, so there is nothing to ask about: quit.
-            Command::Quit { .. } if !self.live => {
-                return Some((Reply::ok(id, Value::Null), Effect::Quit))
+        let name = command.name();
+        let model = self.where_to_send.clone();
+        match command {
+            Command::State => {
+                // What is saved, at once; the workspace and instance names follow as
+                // a `where` event once Open Source Cloud has been asked.
+                if model.needs_lookup() {
+                    let deliver = self.deliver.clone();
+                    let task = async move {
+                        let view = model.refresh().await;
+                        deliver(Event::new("where", to_json(&view)).script());
+                    };
+                    self.runtime.spawn(task.with_current_subscriber());
+                }
+                Some((Reply::ok(id, to_json(&self.view_model())), Effect::None))
             }
-            Command::Devices { show_all } => return self.devices(id, show_all),
-            Command::SetInputs { inputs } => self.set_inputs(id, &inputs),
-            _ => Reply::error(id, NOT_YET),
-        };
-        Some((reply, Effect::None))
+            Command::OscSignIn | Command::OscWorkspaces => {
+                self.later(id, name, Vec::new(), async move {
+                    model.sign_in().await.map(|view| to_json(&view))
+                });
+                None
+            }
+            Command::OscPasteToken { token } => {
+                let secret = token.expose().to_string();
+                self.later(id, name, vec![secret], async move {
+                    model.paste_token(token.expose()).await.map(|v| to_json(&v))
+                });
+                None
+            }
+            Command::ChooseInstance { url } => {
+                let reply = match model.choose_instance(&url) {
+                    Ok(view) => {
+                        let vm = view_model(&self.settings_file, self.live, view);
+                        Reply::ok(id, to_json(&vm))
+                    }
+                    Err(err) => failed(id, name, &err, &[]),
+                };
+                Some((reply, Effect::None))
+            }
+            Command::SelfHosted { url, api_key } => {
+                let (settings_file, live) = (self.settings_file.clone(), self.live);
+                let secret = api_key.expose().to_string();
+                self.later(id, name, vec![secret], async move {
+                    let view = model.self_hosted(&url, api_key.expose()).await?;
+                    Ok(to_json(&view_model(&settings_file, live, view)))
+                });
+                None
+            }
+            Command::Devices { show_all } => self.devices(id, show_all),
+            Command::SetInputs { inputs } => Some((self.set_inputs(id, &inputs), Effect::None)),
+            // Nothing is live yet, so there is nothing to ask about: quit.
+            Command::Quit { .. } if !self.live => Some((Reply::ok(id, Value::Null), Effect::Quit)),
+            _ => Some((Reply::error(id, NOT_YET), Effect::None)),
+        }
     }
 
     /// The settings as the CLI reads them, or the reply saying why they cannot be read.
+    /// Only the first line of the error is logged: toml quotes the offending line, which
+    /// may be the one with a credential on it.
     fn settings(&self, id: u32) -> Result<open_live_ingest::config::Config, Reply> {
         api::load_from(&self.settings_file).map_err(|err| {
-            tracing::warn!("reading the settings: {err:#}");
+            let first = |text: String| text.lines().next().unwrap_or_default().to_string();
+            tracing::warn!("reading the settings: {}", first(format!("{err:#}")));
             Reply::error(
                 id,
                 &format!(
                     "The settings file has a problem: {}.",
-                    err.root_cause()
-                        .to_string()
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
+                    first(err.root_cause().to_string())
                 ),
             )
         })
     }
 
-    /// `devices`: the What to send rows for what Strom reports now.
+    /// `devices`: the What to send rows for what Strom reports now. Listing may start a
+    /// Strom and wait for it, so it runs on the core's runtime and replies later.
     fn devices(&mut self, id: u32, show_all: bool) -> Option<(Reply, Effect)> {
         self.show_all = show_all;
         let settings = match self.settings(id) {
@@ -378,25 +446,20 @@ impl Core {
         };
         let source = self.device_source.clone();
         let listed = self.listed.clone();
-        let work = move || match source.devices(&settings) {
-            Ok(devices) => {
-                let model = what_to_send::model(Some(&devices), &settings, show_all);
-                *listed.lock().unwrap_or_else(|e| e.into_inner()) = Some(devices);
-                Reply::ok(id, serde_json::to_value(model).expect("plain JSON"))
+        self.reply_later(async move {
+            match source.devices(&settings).await {
+                Ok(devices) => {
+                    let model = what_to_send::model(Some(&devices), &settings, show_all);
+                    *listed.lock().unwrap_or_else(|e| e.into_inner()) = Some(devices);
+                    Reply::ok(id, to_json(&model))
+                }
+                Err(err) => {
+                    tracing::warn!("listing devices: {err:#}");
+                    Reply::error(id, NO_DEVICE_LIST)
+                }
             }
-            Err(err) => {
-                tracing::warn!("listing devices: {err:#}");
-                Reply::error(id, NO_DEVICE_LIST)
-            }
-        };
-        match &self.late {
-            None => Some((work(), Effect::None)),
-            Some(late) => {
-                let late = late.clone();
-                std::thread::spawn(move || late(work()));
-                None
-            }
-        }
+        });
+        None
     }
 
     /// `set_inputs`: the ticked rows, checked and saved as `[[input]]`.
@@ -421,7 +484,7 @@ impl Core {
         match api::save_to(&self.settings_file, &settings) {
             Ok(()) => {
                 let model = what_to_send::model(listed.as_ref(), &settings, self.show_all);
-                Reply::ok(id, serde_json::to_value(model).expect("plain JSON"))
+                Reply::ok(id, to_json(&model))
             }
             Err(SaveError::Invalid(problems)) => Reply::error(
                 id,
@@ -439,18 +502,128 @@ impl Core {
             }
         }
     }
+
+    /// Runs `work` on the core's runtime and delivers its reply when it is done. An
+    /// error is one line, with every one of `secrets` taken out of it.
+    fn later(
+        &self,
+        id: u32,
+        name: &'static str,
+        secrets: Vec<String>,
+        work: impl std::future::Future<Output = anyhow::Result<Value>> + Send + 'static,
+    ) {
+        self.reply_later(async move {
+            let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+            match work.await {
+                Ok(value) => Reply::ok(id, value),
+                Err(err) => failed(id, name, &err, &secrets),
+            }
+        });
+    }
+
+    /// Runs `work` on the core's runtime and delivers the reply it makes.
+    fn reply_later(&self, work: impl std::future::Future<Output = Reply> + Send + 'static) {
+        let deliver = self.deliver.clone();
+        let task = async move { deliver(work.await.script()) };
+        // The work logs to the subscriber of the thread that asked for it.
+        self.runtime.spawn(task.with_current_subscriber());
+    }
+}
+
+fn view_model(settings_file: &std::path::Path, live: bool, where_to_send: WhereView) -> ViewModel {
+    ViewModel {
+        version: env!("CARGO_PKG_VERSION"),
+        settings_file: settings_file.display().to_string(),
+        live,
+        where_to_send,
+    }
+}
+
+fn to_json(value: &impl Serialize) -> Value {
+    serde_json::to_value(value).expect("plain JSON")
+}
+
+/// The error reply for a command that failed, logged by name with the same line.
+fn failed(id: u32, name: &'static str, err: &anyhow::Error, secrets: &[&str]) -> Reply {
+    let message = one_line(err, secrets);
+    tracing::warn!(id, cmd = name, "ui command failed: {message}");
+    Reply::error(id, &message)
+}
+
+/// An error chain as the one line the page shows. The library builds its errors from
+/// status codes and never quotes a credential; this also takes out any of `secrets`
+/// the page sent with the command, should one have ended up in it anyway.
+fn one_line(err: &anyhow::Error, secrets: &[&str]) -> String {
+    let mut line = format!("{err:#}").replace(['\r', '\n'], " ");
+    for secret in secrets.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        line = line.replace(secret, "<redacted>");
+    }
+    line
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing;
     use open_live_ingest::config::InputSettings;
-    use serde_json::json;
+    use open_live_ingest::keychain::MemoryKeychain;
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::mpsc::{channel, Receiver};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// A core over `settings_file`, the given Open Source Cloud, an in-memory keychain
+    /// and a fake browser, with what it delivers later on the receiver.
+    fn core_with(settings_file: PathBuf, endpoints: osc::Endpoints) -> (Core, Receiver<String>) {
+        core_over(settings_file, endpoints, Arc::new(MemoryKeychain::new()))
+    }
+
+    fn core_over(
+        settings_file: PathBuf,
+        endpoints: osc::Endpoints,
+        keychain: Arc<MemoryKeychain>,
+    ) -> (Core, Receiver<String>) {
+        let (tx, rx) = channel();
+        let tx = Mutex::new(tx);
+        let deliver: Deliver = Arc::new(move |script| {
+            let _ = tx.lock().unwrap().send(script);
+        });
+        let where_to_send = WhereToSend::new(
+            settings_file.clone(),
+            keychain,
+            endpoints,
+            Duration::from_secs(10),
+            testing::browser(testing::SIGNED_IN),
+        );
+        (
+            Core::with_where_to_send(settings_file, where_to_send, deliver),
+            rx,
+        )
+    }
+
+    /// Nothing listens on port 9 of the loopback.
+    fn nowhere() -> osc::Endpoints {
+        osc::Endpoints {
+            connect: "http://127.0.0.1:9".into(),
+            catalog: "http://127.0.0.1:9/mysubscriptions".into(),
+            token_exchange: "http://127.0.0.1:9/servicetoken".into(),
+        }
+    }
 
     fn core() -> Core {
-        Core::new(PathBuf::from("/home/someone/gateway.toml"))
+        core_with(PathBuf::from("/home/someone/gateway.toml"), nowhere()).0
+    }
+
+    /// The next script delivered later, as the JSON handed to `window.oli.receive`.
+    fn next_delivered(rx: &Receiver<String>) -> Value {
+        let script = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a reply delivered later");
+        let json = script
+            .strip_prefix("window.oli.receive(")
+            .and_then(|s| s.strip_suffix(')'))
+            .expect("a receive script");
+        serde_json::from_str(json).unwrap()
     }
 
     fn reply_json(core: &mut Core, raw: &str) -> Value {
@@ -469,8 +642,159 @@ mod tests {
                     "version": env!("CARGO_PKG_VERSION"),
                     "settings_file": "/home/someone/gateway.toml",
                     "live": false,
+                    "where": {
+                        "mode": "none",
+                        "ready": false,
+                        "url": null,
+                        "instance": null,
+                        "workspace": null,
+                        "instances": [],
+                        "signed_in": false,
+                        "api_key_set": false,
+                        "summary": null,
+                        "problem": null,
+                    },
                 }
             })
+        );
+    }
+
+    /// Step 1 through the dispatcher: a sign-in replies later with the workspace and
+    /// its instances; `choose_instance` replies at once with the view model; a later
+    /// `state` shows "Sending to <instance> (<workspace>)".
+    #[test]
+    fn where_to_send_commands_reply_through_the_dispatcher() {
+        let osc = testing::FakeOsc::start(&[
+            ("venue", "https://venue.example.osaas.io"),
+            ("rehearsal", "https://rehearsal.example.osaas.io"),
+        ]);
+        let dir = testing::Scratch::new("ipc-where");
+        let (mut core, rx) = core_with(dir.settings(), osc.endpoints());
+
+        assert!(core
+            .dispatch(r#"{"id": 1, "cmd": "osc_sign_in"}"#)
+            .is_none());
+        let reply = next_delivered(&rx);
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["ok"]["workspace"], testing::WORKSPACE);
+        assert_eq!(reply["ok"]["instances"].as_array().unwrap().len(), 2);
+
+        let (reply, _) = core
+            .dispatch(r#"{"id": 2, "cmd": "choose_instance", "args": {"url": "https://venue.example.osaas.io"}}"#)
+            .unwrap();
+        let reply = serde_json::to_value(reply).unwrap();
+        assert_eq!(
+            reply["ok"]["where"]["summary"],
+            "Sending to venue (venue-ws)"
+        );
+
+        let (reply, _) = core
+            .dispatch(
+                r#"{"id": 3, "cmd": "choose_instance", "args": {"url": "https://example.com"}}"#,
+            )
+            .unwrap();
+        let reply = serde_json::to_value(reply).unwrap();
+        assert!(
+            reply["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not in workspace venue-ws"),
+            "{reply}"
+        );
+
+        // A new launch over the same file and keychain is not possible with a fresh
+        // in-memory keychain, so the lookup is checked on the model; here `state`
+        // shows what is saved.
+        let state = reply_json(&mut core, r#"{"id": 4, "cmd": "state"}"#);
+        assert_eq!(
+            state["ok"]["where"]["summary"],
+            "Sending to venue (venue-ws)"
+        );
+        assert!(rx.try_recv().is_err(), "nothing to look up: already listed");
+    }
+
+    /// A later launch: `state` answers at once with what is saved, and a `where` event
+    /// follows with the names Open Source Cloud gives.
+    #[test]
+    fn state_after_a_launch_is_followed_by_the_looked_up_names() {
+        let osc = testing::FakeOsc::start(&[("venue", "https://venue.example.osaas.io")]);
+        let dir = testing::Scratch::new("ipc-later");
+        let keychain = Arc::new(MemoryKeychain::new());
+        let (mut first, rx) = core_over(dir.settings(), osc.endpoints(), keychain.clone());
+        assert!(first
+            .dispatch(r#"{"id": 1, "cmd": "osc_sign_in"}"#)
+            .is_none());
+        assert_eq!(next_delivered(&rx)["ok"]["ready"], true);
+        drop(first);
+
+        let (mut later, rx) = core_over(dir.settings(), osc.endpoints(), keychain);
+        let state = reply_json(&mut later, r#"{"id": 2, "cmd": "state"}"#);
+        assert_eq!(
+            state["ok"]["where"]["summary"],
+            "Sending to venue.example.osaas.io"
+        );
+        let event = next_delivered(&rx);
+        assert_eq!(event["event"], "where");
+        assert_eq!(event["data"]["summary"], "Sending to venue (venue-ws)");
+    }
+
+    #[test]
+    fn a_self_hosted_check_that_fails_replies_with_one_line() {
+        let open_live = testing::fake_open_live("the-key");
+        let dir = testing::Scratch::new("ipc-self-hosted");
+        let (mut core, rx) = core_with(dir.settings(), nowhere());
+        let raw = json!({"id": 8, "cmd": "self_hosted",
+                         "args": {"url": open_live, "api_key": "wrong"}})
+        .to_string();
+        assert!(core.dispatch(&raw).is_none());
+        let reply = next_delivered(&rx);
+        assert_eq!(reply["id"], 8);
+        let message = reply["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("could not reach Open Live at"),
+            "{message}"
+        );
+        assert!(!message.contains('\n'));
+        assert_eq!(reply["error"]["action"], Value::Null);
+
+        let raw = json!({"id": 9, "cmd": "self_hosted",
+                         "args": {"url": open_live, "api_key": "the-key"}})
+        .to_string();
+        assert!(core.dispatch(&raw).is_none());
+        let reply = next_delivered(&rx);
+        assert_eq!(reply["ok"]["where"]["mode"], "self_hosted");
+        assert_eq!(reply["ok"]["where"]["ready"], true);
+        assert_eq!(reply["ok"]["where"]["api_key_set"], true);
+    }
+
+    /// A failed command is logged by name with the line the page gets, and neither has
+    /// the secret in it.
+    #[test]
+    fn a_failed_command_is_logged_without_its_secret() {
+        let log = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let err = anyhow::anyhow!("HTTP 401 for OLI-SECRET-KEY");
+        let reply = tracing::subscriber::with_default(subscriber, || {
+            failed(7, "self_hosted", &err, &["OLI-SECRET-KEY"])
+        });
+        let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            log.contains("ui command failed: HTTP 401 for <redacted>"),
+            "{log}"
+        );
+        assert!(!log.contains("OLI-SECRET-KEY"), "{log}");
+        assert!(!reply.script().contains("OLI-SECRET-KEY"));
+    }
+
+    #[test]
+    fn a_secret_is_taken_out_of_an_error_line() {
+        let err = anyhow::anyhow!("refused key s3cret").context("checking\nOpen Live");
+        assert_eq!(
+            one_line(&err, &[" s3cret ", ""]),
+            "checking Open Live: refused key <redacted>"
         );
     }
 
@@ -625,10 +949,15 @@ mod tests {
     struct FakeStrom(Option<Devices>);
 
     impl DeviceSource for FakeStrom {
-        fn devices(&self, _settings: &open_live_ingest::config::Config) -> anyhow::Result<Devices> {
-            self.0
+        fn devices<'a>(
+            &'a self,
+            _settings: &'a open_live_ingest::config::Config,
+        ) -> what_to_send::DeviceList<'a> {
+            let listed = self
+                .0
                 .clone()
-                .ok_or_else(|| anyhow::anyhow!("Strom at http://127.0.0.1:8080 is not answering"))
+                .ok_or_else(|| anyhow::anyhow!("Strom at http://127.0.0.1:8080 is not answering"));
+            Box::pin(async move { listed })
         }
     }
 
@@ -649,8 +978,10 @@ mod tests {
             SettingsFile(path)
         }
 
-        fn core(&self, devices: Option<Devices>) -> Core {
-            Core::new(self.0.clone()).with_device_source(Arc::new(FakeStrom(devices)))
+        /// A core over this file that lists `devices`, or fails to list any.
+        fn core(&self, devices: Option<Devices>) -> (Core, Receiver<String>) {
+            let (core, rx) = core_with(self.0.clone(), nowhere());
+            (core.with_device_source(Arc::new(FakeStrom(devices))), rx)
         }
 
         fn read(&self) -> open_live_ingest::config::Config {
@@ -668,13 +999,20 @@ mod tests {
         crate::what_to_send::tests::devices()
     }
 
+    /// `devices` replies later, through [`Deliver`]: listing may start a Strom.
+    fn list(core: &mut Core, rx: &Receiver<String>, id: u32, show_all: bool) -> Value {
+        let raw = json!({"id": id, "cmd": "devices", "args": {"show_all": show_all}});
+        assert!(core.dispatch(&raw.to_string()).is_none(), "a reply later");
+        let reply = next_delivered(rx);
+        assert_eq!(reply["id"], id);
+        reply
+    }
+
     #[test]
-    fn devices_replies_with_the_rows() {
+    fn devices_replies_later_with_the_rows() {
         let file = SettingsFile::new("devices");
-        let reply = reply_json(
-            &mut file.core(Some(devices())),
-            r#"{"id": 1, "cmd": "devices", "args": {"show_all": false}}"#,
-        );
+        let (mut core, rx) = file.core(Some(devices()));
+        let reply = list(&mut core, &rx, 1, false);
         let ok = &reply["ok"];
         assert_eq!(ok["name_prefix"], "Venue — ");
         let rows: Vec<&str> = ok["video"]
@@ -693,37 +1031,11 @@ mod tests {
     #[test]
     fn devices_that_cannot_be_listed_say_so_in_one_line() {
         let file = SettingsFile::new("no-strom");
-        let reply = reply_json(
-            &mut file.core(None),
-            r#"{"id": 2, "cmd": "devices", "args": {"show_all": true}}"#,
-        );
+        let (mut core, rx) = file.core(None);
         assert_eq!(
-            reply,
+            list(&mut core, &rx, 2, true),
             json!({"id": 2, "error": {"message": NO_DEVICE_LIST, "action": null}})
         );
-    }
-
-    /// With late replies, listing runs off the caller's thread and the reply arrives
-    /// through the hook, not from `dispatch`.
-    #[test]
-    fn devices_reply_late_when_the_window_asks_for_it() {
-        let file = SettingsFile::new("late");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx = Mutex::new(tx);
-        let mut core = file
-            .core(Some(devices()))
-            .with_late_replies(Arc::new(move |reply| {
-                let _ = tx.lock().unwrap().send(reply);
-            }));
-        assert!(core
-            .dispatch(r#"{"id": 3, "cmd": "devices", "args": {"show_all": false}}"#)
-            .is_none());
-        let reply = rx
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("a late reply");
-        let reply = serde_json::to_value(reply).unwrap();
-        assert_eq!(reply["id"], 3);
-        assert_eq!(reply["ok"]["video"][0]["device"], "test");
     }
 
     /// The selection is saved as `[[input]]` on every change, in the CLI's format, and
@@ -731,11 +1043,8 @@ mod tests {
     #[test]
     fn set_inputs_saves_the_selection_as_input_entries() {
         let file = SettingsFile::new("save");
-        let mut core = file.core(Some(devices()));
-        reply_json(
-            &mut core,
-            r#"{"id": 1, "cmd": "devices", "args": {"show_all": true}}"#,
-        );
+        let (mut core, rx) = file.core(Some(devices()));
+        list(&mut core, &rx, 1, true);
         let reply = reply_json(
             &mut core,
             r#"{"id": 2, "cmd": "set_inputs", "args": {"inputs": [
@@ -784,11 +1093,8 @@ mod tests {
     #[test]
     fn set_inputs_refuses_an_audio_source_paired_twice() {
         let file = SettingsFile::new("pair-twice");
-        let mut core = file.core(Some(devices()));
-        reply_json(
-            &mut core,
-            r#"{"id": 1, "cmd": "devices", "args": {"show_all": true}}"#,
-        );
+        let (mut core, rx) = file.core(Some(devices()));
+        list(&mut core, &rx, 1, true);
         let before = std::fs::read_to_string(&file.0).unwrap();
         let reply = reply_json(
             &mut core,
@@ -809,7 +1115,7 @@ mod tests {
         let file = SettingsFile::new("unfinished");
         std::fs::write(&file.0, "[gateway]\nname = \"Venue\"\n").unwrap();
         let reply = reply_json(
-            &mut file.core(Some(devices())),
+            &mut file.core(Some(devices())).0,
             r#"{"id": 2, "cmd": "set_inputs", "args": {"inputs": [{"device": "test"}]}}"#,
         );
         let message = reply["error"]["message"].as_str().unwrap();
@@ -878,9 +1184,14 @@ mod tests {
             "OLI-SECRET-WRONG-TYPE",
             "OLI-SECRET-UNKNOWN-FIELD",
         ];
+        // Both are fakes that refuse: the key and the token cross into the core, are
+        // sent to a server, and come back as error replies delivered later.
+        let open_live = testing::fake_open_live("the-real-key");
+        let osc = testing::FakeOsc::start(&[]);
+        let dir = testing::Scratch::new("ipc-secrets");
         let messages = [
             json!({"id": 1, "cmd": "self_hosted",
-                   "args": {"url": "https://example.com", "api_key": SECRETS[0]}}),
+                   "args": {"url": open_live, "api_key": SECRETS[0]}}),
             json!({"id": 2, "cmd": "osc_paste_token", "args": {"token": SECRETS[1]}}),
             json!({"id": 3, "cmd": "set_advanced",
                    "args": {"uplink": {"passphrase": SECRETS[2]}}}),
@@ -905,22 +1216,30 @@ mod tests {
         tracing::callsite::rebuild_interest_cache();
         let mut replies = Vec::new();
         let mut debug = Vec::new();
-        let mut core = core();
+        let (mut core, rx) = core_with(dir.settings(), osc.endpoints());
         for message in &messages {
             let raw = message.to_string();
             if let Ok((_, command)) = parse(&raw) {
                 debug.push(format!("{command:?}"));
             }
-            let (reply, _) = core.dispatch(&raw).expect("a reply");
-            replies.push(reply.script());
+            if let Some((reply, _)) = core.dispatch(&raw) {
+                replies.push(reply.script());
+            }
         }
+        let mut later = Vec::new();
+        for _ in 0..2 {
+            let reply = next_delivered(&rx);
+            assert!(reply.get("error").is_some(), "{reply}");
+            later.push(reply.to_string());
+        }
+        drop(core);
         let log = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
 
-        assert_eq!(replies.len(), messages.len());
+        assert_eq!(replies.len() + later.len(), messages.len());
         assert_eq!(debug.len(), 3, "the first three parse");
         assert!(log.contains("cmd=\"self_hosted\"") || log.contains("cmd=self_hosted"));
         for secret in SECRETS {
-            for reply in &replies {
+            for reply in replies.iter().chain(&later) {
                 assert!(!reply.contains(secret), "{secret} in reply {reply}");
             }
             for line in &debug {
