@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
+use std::path::Path;
 use std::time::Duration;
 use strom_types::api::SrtCallerStats;
 use strom_types::discovery::DeviceResponse;
@@ -1924,7 +1925,12 @@ impl std::error::Error for AlreadyRunning {}
 /// checked by process name so a stale pidfile names nothing. This process is not
 /// counted: an app that has ended one session may start the next.
 pub fn running_gateway() -> Option<u32> {
-    read_pidfile().filter(|&pid| pid != std::process::id() && is_running_gateway(pid))
+    running_gateway_in(&config::pidfile())
+}
+
+/// [`running_gateway`], by the pidfile at `pidfile`.
+pub(crate) fn running_gateway_in(pidfile: &Path) -> Option<u32> {
+    read_pidfile_at(pidfile).filter(|&pid| pid != std::process::id() && is_running_gateway(pid))
 }
 
 fn write_pidfile() -> Result<()> {
@@ -1971,11 +1977,11 @@ impl Drop for Pidfile {
 }
 
 fn read_pidfile() -> Option<u32> {
-    std::fs::read_to_string(config::pidfile())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    read_pidfile_at(&config::pidfile())
+}
+
+fn read_pidfile_at(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn remove_pidfile() {

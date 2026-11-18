@@ -556,6 +556,13 @@ fn checks(settings_file: &std::path::Path, host: &dyn Host) -> Result<(Config, C
     if let Err(media) = host.media_access(needs) {
         return Err(Failure::AccessDenied { media }.message());
     }
+    // Again: macOS may have asked for minutes, and a gateway started meanwhile is
+    // refused, not reclaimed. `reclaim_strom` checks once more itself, after it has
+    // read `strom.pid`, which closes the gap between these two calls.
+    if let Some(pid) = host.other_gateway() {
+        tracing::info!(pid, "another gateway started during the checks");
+        return Err(Failure::AlreadyLive.message());
+    }
     host.reclaim_strom();
     let ctx = Context::of(&settings);
     Ok((settings, ctx))
@@ -897,6 +904,10 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         other: Option<u32>,
+        /// A gateway that starts while the camera check runs (a CLI `up` started
+        /// while macOS shows its prompt).
+        starts_during_check: Option<u32>,
+        checked: AtomicBool,
         denied: Option<Media>,
         reclaimed: AtomicBool,
         asked: Mutex<Option<Needs>>,
@@ -908,13 +919,16 @@ mod tests {
 
     impl Host for FakeHost {
         fn other_gateway(&self) -> Option<u32> {
-            self.other
+            self.other.or(self
+                .starts_during_check
+                .filter(|_| self.checked.load(Ordering::SeqCst)))
         }
         fn reclaim_strom(&self) {
             self.reclaimed.store(true, Ordering::SeqCst);
         }
         fn media_access(&self, needs: Needs) -> Result<(), Media> {
             *self.asked.lock().unwrap() = Some(needs);
+            self.checked.store(true, Ordering::SeqCst);
             if let Some(gate) = &self.gate {
                 let gate = gate.lock().unwrap();
                 self.checking.fetch_add(1, Ordering::SeqCst);
@@ -1024,6 +1038,29 @@ port_range = "47110-47112"
         );
         assert_eq!(reply["error"]["action"], "stop_it");
         assert!(!go.is_live());
+        assert!(!host.reclaimed.load(Ordering::SeqCst));
+    }
+
+    /// A gateway that starts while the checks run (here, during the camera check,
+    /// which on macOS can wait minutes on its prompt) is refused like one that was
+    /// already live, and its Strom is not reclaimed.
+    #[test]
+    fn a_gateway_started_during_the_checks_is_refused_not_reclaimed() {
+        let scratch = testing::Scratch::new("golive-other-late");
+        let host = FakeHost {
+            starts_during_check: Some(4343),
+            ..FakeHost::default()
+        };
+        let err = checks(&settings_file(&scratch, CAMERA_WITH_MIC), &host).unwrap_err();
+        assert_eq!(
+            err.message,
+            "Open Live Ingest is already live from another window or a terminal."
+        );
+        assert_eq!(err.action, Some(Action::StopIt));
+        assert!(
+            host.asked.lock().unwrap().is_some(),
+            "the camera was checked"
+        );
         assert!(!host.reclaimed.load(Ordering::SeqCst));
     }
 

@@ -572,24 +572,35 @@ pub fn stop_recorded(events: &Events) {
 /// crash, a force quit): when `strom.pid` names a running Strom, it is stopped and
 /// waited for, so the Strom the next session starts is one it owns and stops again.
 /// Adopting the leftover instead would leave a camera open after the next Stop,
-/// because an adopted Strom is never stopped. Call it only when no gateway is running
-/// (see [`crate::run::running_gateway`]): a running one's Strom is not left behind.
-/// `up` writes `gateway.pid` before it starts Strom, so that covers a gateway that is
-/// still starting as well as a live one.
+/// because an adopted Strom is never stopped.
+///
+/// Nothing is stopped while another gateway is running (see
+/// [`crate::run::running_gateway`]): its Strom is not left behind, it is in use. That
+/// check is made here, after `strom.pid` is read, not by the caller beforehand. `up`
+/// writes `gateway.pid` before it starts Strom and writes `strom.pid`, so a
+/// `strom.pid` that belongs to a running gateway, or to one that is still starting,
+/// is always covered by a `gateway.pid` by the time it is read here: a gateway that
+/// starts while the caller is busy (the app waiting on the macOS camera prompt) is
+/// never mistaken for a crash's leftover.
 /// Returns whether a Strom was stopped. Blocks for up to [`STOP_TIMEOUT`].
 pub fn reclaim_recorded(events: &Events) -> bool {
-    reclaim_recorded_at(&config::strom_pidfile(), events)
+    reclaim_recorded_at(&config::strom_pidfile(), &config::pidfile(), events)
 }
 
-fn reclaim_recorded_at(pidfile: &Path, events: &Events) -> bool {
-    let Some(pid) = std::fs::read_to_string(pidfile)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-    else {
+fn reclaim_recorded_at(pidfile: &Path, gateway_pidfile: &Path, events: &Events) -> bool {
+    let Some(pid) = read_pid(pidfile) else {
         return false;
     };
+    // Only after the read: see above.
+    if let Some(gateway) = crate::run::running_gateway_in(gateway_pidfile) {
+        info!(
+            pid,
+            gateway, "a gateway is running: its Strom is not reclaimed"
+        );
+        return false;
+    }
     if !crate::run::process_named(pid, "strom") {
-        std::fs::remove_file(pidfile).ok();
+        remove_if_still(pidfile, pid);
         return false;
     }
     info!(pid, "stopping the Strom an earlier session left behind");
@@ -602,8 +613,22 @@ fn reclaim_recorded_at(pidfile: &Path, events: &Events) -> bool {
     if crate::run::process_named(pid, "strom") {
         warn!(pid, "the Strom left behind did not stop in time");
     }
-    std::fs::remove_file(pidfile).ok();
+    remove_if_still(pidfile, pid);
     true
+}
+
+fn read_pid(pidfile: &Path) -> Option<u32> {
+    std::fs::read_to_string(pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// Removes `pidfile` only while it still names `pid`: a gateway that started in the
+/// meantime has recorded its own Strom there.
+fn remove_if_still(pidfile: &Path, pid: u32) {
+    if read_pid(pidfile) == Some(pid) {
+        std::fs::remove_file(pidfile).ok();
+    }
 }
 
 #[cfg(unix)]
@@ -645,67 +670,158 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oli-reclaim-stale-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let pidfile = dir.join("strom.pid");
+        let no_gateway = dir.join("gateway.pid");
         // This test process: alive, but not a Strom.
         std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let (events, seen) = recording();
+        assert!(!reclaim_recorded_at(&pidfile, &no_gateway, &events));
+        assert!(!pidfile.exists());
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(
+            !reclaim_recorded_at(&pidfile, &no_gateway, &events),
+            "no pidfile at all"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Events that are kept, to be looked at after.
+    fn recording() -> (Events, std::sync::Arc<std::sync::Mutex<Vec<Event>>>) {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let events = {
             let seen = seen.clone();
             Events::new(move |e| seen.lock().unwrap().push(e))
         };
-        assert!(!reclaim_recorded_at(&pidfile, &events));
-        assert!(!pidfile.exists());
-        assert!(seen.lock().unwrap().is_empty());
-        assert!(!reclaim_recorded_at(&pidfile, &events), "no pidfile at all");
-        std::fs::remove_dir_all(&dir).ok();
+        (events, seen)
     }
 
-    /// A Strom left running by a crashed session is stopped and waited for, not
-    /// adopted. A copy of `sleep` named `strom` stands in for it.
+    /// Whether this machine can tell processes apart by name: process names come from
+    /// `ps`, which every CI runner has; a bare container may not, and then there is
+    /// nothing to check against.
     #[cfg(unix)]
-    #[test]
-    fn a_strom_left_behind_is_stopped_and_waited_for() {
-        // Process names come from `ps`, which every CI runner has; a bare container
-        // may not, and then there is nothing to check this against.
-        if Command::new("ps").arg("-p").arg("1").output().is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("oli-reclaim-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join("strom");
+    fn ps_works() -> bool {
+        Command::new("ps").arg("-p").arg("1").output().is_ok()
+    }
+
+    /// A copy of `sleep` named `name` in `dir`, running for a minute. It stands in for
+    /// a Strom or a gateway.
+    #[cfg(unix)]
+    fn spawn_named(dir: &Path, name: &str) -> std::process::Child {
+        let fake = dir.join(name);
         let sleep = ["/bin/sleep", "/usr/bin/sleep"]
             .into_iter()
             .find(|p| Path::new(p).is_file())
             .expect("a sleep executable");
         std::fs::copy(sleep, &fake).unwrap();
-        let mut child = Command::new(&fake).arg("60").spawn().unwrap();
-        let pidfile = dir.join("strom.pid");
-        std::fs::write(&pidfile, child.id().to_string()).unwrap();
-        // `ps` may not see the new process name at once.
+        Command::new(&fake).arg("60").spawn().unwrap()
+    }
+
+    /// Waits until `seen` holds: `ps` may not show a new process's name at once.
+    #[cfg(unix)]
+    fn wait_until(what: &str, seen: impl Fn() -> bool) {
         let started = Instant::now();
-        while !crate::run::process_named(child.id(), "strom") {
+        while !seen() {
             assert!(
                 started.elapsed() < Duration::from_secs(10),
-                "the fake Strom never showed up"
+                "{what} never showed up"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events = {
-            let seen = seen.clone();
-            Events::new(move |e| seen.lock().unwrap().push(e))
-        };
+    }
+
+    #[cfg(unix)]
+    fn a_strom(pid: u32) -> bool {
+        crate::run::process_named(pid, "strom")
+    }
+
+    /// A Strom left running by a crashed session is stopped and waited for, not
+    /// adopted.
+    #[cfg(unix)]
+    #[test]
+    fn a_strom_left_behind_is_stopped_and_waited_for() {
+        if !ps_works() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = spawn_named(&dir, "strom");
+        wait_until("the fake Strom", || a_strom(child.id()));
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        let (events, seen) = recording();
         // Reaped on a thread, as a parent would: an unreaped child stays a zombie
         // that `ps` still lists.
         let pid = child.id();
         let reaper = std::thread::spawn(move || child.wait());
-        assert!(reclaim_recorded_at(&pidfile, &events));
+        assert!(reclaim_recorded_at(
+            &pidfile,
+            &dir.join("gateway.pid"),
+            &events
+        ));
         assert!(!pidfile.exists());
-        assert!(!crate::run::process_named(pid, "strom"));
+        assert!(!a_strom(pid));
         assert_eq!(
             *seen.lock().unwrap(),
             vec![Event::StromLeftOverStopping { pid }]
         );
         reaper.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Strom `strom.pid` names belongs to a gateway that `gateway.pid` names and
+    /// that is running (one started while the app waited on its checks): it is not
+    /// signalled, and its `strom.pid` is left for that gateway.
+    #[cfg(unix)]
+    #[test]
+    fn the_strom_of_a_running_gateway_is_never_reclaimed() {
+        if !ps_works() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-gw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gateway_pidfile = dir.join("gateway.pid");
+        let mut strom = spawn_named(&dir, "strom");
+        let mut gateway = spawn_named(&dir, env!("CARGO_PKG_NAME"));
+        std::fs::write(&gateway_pidfile, gateway.id().to_string()).unwrap();
+        wait_until("the fake Strom", || a_strom(strom.id()));
+        wait_until("the fake gateway", || {
+            crate::run::running_gateway_in(&gateway_pidfile) == Some(gateway.id())
+        });
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, strom.id().to_string()).unwrap();
+        let (events, seen) = recording();
+
+        assert!(!reclaim_recorded_at(&pidfile, &gateway_pidfile, &events));
+        assert!(a_strom(strom.id()), "the gateway's Strom is still running");
+        assert_eq!(
+            std::fs::read_to_string(&pidfile).unwrap(),
+            strom.id().to_string()
+        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        // Once that gateway has gone, the same Strom is a leftover again.
+        gateway.kill().unwrap();
+        gateway.wait().unwrap();
+        let pid = strom.id();
+        let reaper = std::thread::spawn(move || strom.wait());
+        assert!(reclaim_recorded_at(&pidfile, &gateway_pidfile, &events));
+        assert!(!a_strom(pid));
+        assert!(!pidfile.exists());
+        reaper.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gateway that started after `strom.pid` was read and recorded its own Strom
+    /// there keeps that record when the stale one it replaced is cleaned up.
+    #[test]
+    fn a_newer_strom_pid_is_not_removed() {
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-newer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, "4242").unwrap();
+        remove_if_still(&pidfile, 4141);
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), "4242");
+        remove_if_still(&pidfile, 4242);
+        assert!(!pidfile.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

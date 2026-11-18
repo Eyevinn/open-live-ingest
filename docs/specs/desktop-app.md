@@ -118,7 +118,11 @@ packaging/windows/    open-live-ingest.nsi
   executable's file name, `strom` or `strom.exe`, never by its path), Go live first stops it with
   `local_strom::reclaim_recorded()`, which, unlike `down`'s `stop_recorded()`, waits until it has
   exited, then starts fresh. Otherwise the next Stop would leave a camera
-  open, because an adopted Strom is never stopped.
+  open, because an adopted Strom is never stopped. Go live checks `gateway.pid` again after the
+  camera check (on macOS that can wait minutes on the prompt), and `reclaim_recorded()` checks it
+  once more itself, after it has read `strom.pid`: since `up` writes `gateway.pid` before it starts
+  Strom, a gateway that starts at any point during the checks is refused, and its Strom is never
+  stopped.
 - **Windows: no console window for Strom.** The app is a GUI-subsystem executable
   (`#![windows_subsystem = "windows"]`). A console child started from a GUI process gets a console
   window of its own, so when the app starts Strom the library adds `CREATE_NO_WINDOW` to the
