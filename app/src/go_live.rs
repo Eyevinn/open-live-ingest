@@ -409,7 +409,7 @@ impl GoLive {
                     return;
                 }
             };
-            let (handle, mut events) = {
+            let mut events = {
                 let mut guard = lock(&state);
                 // Stop pressed while the checks ran: nothing has started.
                 if guard.phase != Phase::Checking {
@@ -427,10 +427,11 @@ impl GoLive {
                     Some(credential) => Session::start_with(settings, inputs, credential),
                     None => Session::start(settings, inputs),
                 };
+                // Under the same lock as the phase, so a Stop from now on reaches it.
                 guard.phase = Phase::Live;
-                (handle, events)
+                guard.handle = Some(handle);
+                events
             };
-            lock(&state).handle = Some(handle);
             tracing::info!("going live");
             deliver(Reply::ok(id, Value::Null).script());
 
