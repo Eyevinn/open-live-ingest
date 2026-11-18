@@ -1,7 +1,9 @@
 ## Project Overview
-One crate: a library and a thin CLI binary over it. The gateway is a command line tool that
-drives a Strom instance on the same machine and registers sources with Open Live. It owns no
-media pipeline; Strom does the media.
+A Cargo workspace of two packages sharing one version and one `Cargo.lock`. The root package
+`open-live-ingest` is a library and a thin CLI binary over it; `app/` (`open-live-ingest-app`) is
+the desktop app for macOS and Windows, a second front end over the same library (ADR-001). The
+gateway drives a Strom instance on the same machine and registers sources with Open Live. It owns
+no media pipeline; Strom does the media.
 
 - `src/lib.rs`: the library. It never prints, reads stdin, calls `std::process::exit` or
   handles a signal (`tests/library_boundary.rs` checks this); progress is `gateway::Event`s.
@@ -19,6 +21,12 @@ media pipeline; Strom does the media.
 - `src/run.rs`: `up`, `down`, `status`, `devices`.
 - `src/setup.rs`: interactive setup. Binary only: it prompts on the terminal.
 - `src/local_strom.rs`: adopt a running Strom, or start and later stop a headless one.
+- `app/`: the desktop app. `app/src/main.rs` and `window.rs` are the window (tao), the system
+  webview (wry) and the macOS menu bar (muda); `app/src/lib.rs` is its window-free core: the `oli`
+  custom protocol and its CSP, the navigation filter, the IPC dispatcher. `app/ui/` holds the
+  three static page files, compiled in. No npm, no Node, no bundler.
+- The terminal crates (`clap`, `dialoguer`, `console`) sit behind the root package's `cli` feature
+  (default on, required by the binary). The app depends on the library with default features off.
 
 ## Language
 - All code, comments, commit messages, PR titles, PR descriptions, and documentation in English.
@@ -53,18 +61,27 @@ media pipeline; Strom does the media.
   never a stopped or restarted flow.
 - `up` owns what it started. Ctrl-C and SIGTERM remove the flows and sources; SIGHUP does not.
 - No local state beyond the settings file, two pidfiles (the running `up`, and a Strom it
-  started), and the one keychain entry an app sign-in keeps the OSC credential in. Flows are recognised by derived id, sources by the gateway's name prefix.
+  started), the one keychain entry an app sign-in keeps the OSC credential in, the desktop app's
+  `app.log` (with one rotated copy), and on Windows the app's WebView2 cache folder
+  (`%LOCALAPPDATA%\open-live-ingest\webview`). Flows are recognised by derived id, sources by the
+  gateway's name prefix.
 - A Strom already listening is adopted and never stopped. Only a Strom the gateway started is
   stopped, on the way out.
 
 ## Build
 - `cargo check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` run anywhere: no
-  GStreamer, no device access. Keep it that way.
+  GStreamer, no device access. Keep it that way. `default-members = ["."]`, so at the root they
+  build the root package only.
+- The app is built with `-p open-live-ingest-app`. On macOS and Windows that includes the window;
+  elsewhere only its core builds (the window needs webkit2gtk there, and Linux is not a target).
+  The CI `app` job runs its clippy and tests on macOS and Windows.
 
 ## Documentation
 - The code is the source of truth. `docs/DESIGN.md` records decisions and reasoning, not
   implementation. Do not narrate past bugs in comments; git history holds that.
-- Doc filenames in `docs/` use `UPPER_SNAKE_CASE`. `README.md` stays lowercase.
+- Doc filenames in `docs/` use `UPPER_SNAKE_CASE`. `README.md` stays lowercase. Specs in
+  `docs/specs/` and decision records in `docs/decisions/` are exempt and keep their own names
+  (`desktop-app.md`, `ADR-001-desktop-app-toolkit.md`).
 
 ## Tests
 - `tests/golden.rs` pins what `devices`, `status`, `up --test` and `down` print, running the

@@ -46,19 +46,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The tag must name the version Cargo.toml carries, so a release never ships a
-      # binary that reports a different version than its filename.
-      - name: Check the tag against Cargo.toml
-        if: github.ref_type == 'tag'
-        run: |
-          crate="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          test "$crate" = "${{ github.ref_name }}" \
-            || { echo "tag ${{ github.ref_name }} but Cargo.toml says $crate"; exit 1; }
-
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
+
+      # The tag must name the version Cargo.toml carries, so a release never ships a
+      # binary that reports a different version than its filename. Cargo itself reads
+      # it: the version is the workspace's, inherited by the open-live-ingest package.
+      - name: Check the tag against Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          crate="v$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "open-live-ingest") | .version')"
+          test "$crate" = "${{ github.ref_name }}" \
+            || { echo "tag ${{ github.ref_name }} but Cargo.toml says $crate"; exit 1; }
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}

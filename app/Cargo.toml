@@ -1,0 +1,28 @@
+[package]
+name = "open-live-ingest-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop app for Open Live Ingest (macOS and Windows)"
+publish = false
+
+[dependencies]
+# The gateway library without the `cli` feature: no clap, dialoguer or console.
+open-live-ingest = { path = "..", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The window (tao), the system webview in it (wry) and the macOS menu bar (muda):
+# docs/decisions/ADR-001-desktop-app-toolkit.md. Only on macOS and Windows, so the
+# app's own core (protocol, CSP, navigation filter, IPC) also builds and tests on Linux
+# without webkit2gtk. wry's `devtools` feature stays off, so release builds have none.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tao = "0.37"
+wry = "0.57"
+
+# Windows has no menu bar (docs/specs/desktop-app.md, section 5).
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.20"

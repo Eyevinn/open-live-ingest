@@ -234,9 +234,13 @@ impl Default for Uplink {
 
 /// Which end of the SRT link dials. A deployment constraint, not a preference:
 /// whichever end listens needs an inbound UDP port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(
+    feature = "cli",
+    derive(clap::ValueEnum),
+    value(rename_all = "lowercase")
+)]
 #[serde(rename_all = "lowercase")]
-#[value(rename_all = "lowercase")]
 pub enum UplinkMode {
     /// The venue dials the cloud. Nothing inbound at the venue.
     #[default]

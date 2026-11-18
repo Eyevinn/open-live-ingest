@@ -1,0 +1,44 @@
+/* The window's look. Platform fonts and colours, light and dark. */
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem 2rem;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+h1 {
+  font-size: 1.4rem;
+  margin: 0 0 1.5rem;
+}
+
+section {
+  border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  padding: 0.75rem 0 1rem;
+}
+
+h2 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+section.disabled {
+  opacity: 0.45;
+}
+
+.problem {
+  color: #c62828;
+}
+
+footer {
+  margin-top: 2rem;
+  font-size: 0.85rem;
+  opacity: 0.6;
+}
