@@ -811,6 +811,23 @@ jobs:
           E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
+          # The bundled Strom the app starts has an unauthenticated API and listens
+          # on all interfaces: drop traffic to its port (8080, the default [strom]
+          # url) on every interface but loopback before the app can start it, as
+          # #83 does with iptables. The script also keeps OSC_ACCESS_TOKEN and
+          # GH_TOKEN out of the app's environment, and so out of Strom's.
+          sudo pfctl -f /etc/pf.conf
+          echo 'block drop in quick on ! lo0 proto { tcp udp } from any to any port 8080' \
+            | sudo pfctl -a com.apple/oli-e2e -f -
+          sudo pfctl -E 2>&1 | grep -v '^Token' || true
+          if ! sudo pfctl -a com.apple/oli-e2e -sr 2>/dev/null | grep -q 'port = 8080'; then
+            echo "::error title=e2e app::the pf rule for Strom's port did not load"
+            exit 1
+          fi
+          if ! sudo pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+            echo "::error title=e2e app::pf is not enabled"
+            exit 1
+          fi
           mnt="$RUNNER_TEMP/dmg"
           mkdir -p "$mnt"
           hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"

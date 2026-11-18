@@ -20,8 +20,9 @@ In order, each logged and written to the step summary:
   3. `go_live`: the source `<gateway name> — Test pattern` appears in Open Live, and
      Strom runs a flow of that name.
   4. `stop`: the page's `stopped` event, with no error and nothing left behind; the
-     source is gone from Open Live and the flow from Strom (or Strom itself, when the
-     app started it and stopped it again).
+     source is gone from Open Live and the flow from Strom. When nothing answers at
+     Strom's address any more, the app must have said it stopped the Strom it started
+     (a `strom` event with state `stopped`); a Strom that died by itself fails.
   5. `go_live` again: no input fails (an Open Live 409 on a source left behind would
      fail it) and the source appears again.
   6. Quitting while live, as the close button does: `quit` asks (`quit_requested`),
@@ -43,10 +44,24 @@ Whatever happens, the exit path closes the app (stdin closed: its bounded teardo
 and deletes any source still carrying the run's gateway name. Sources named
 `oli-app-e2e-` left by an earlier run that was killed are removed before step 3.
 
-Python standard library only. The token, the service token and the instance address
-are masked in the log; no response body that can carry them is printed. Replies and
-events cannot carry a secret (the core never serialises one), so the app's lines are
-logged.
+Secrets and the bundled Strom (the reason is #83's, e2e-audio-device.sh): the app is
+started with OSC_ACCESS_TOKEN and GH_TOKEN removed from its environment. The app
+starts the bundled Strom with its own environment, and Strom would seed its own
+Open Source Cloud access from OSC_ACCESS_TOKEN while its API is unauthenticated. The
+app itself does not need the variable: the token reaches it over IPC
+(`osc_paste_token`), as a pasted token does from the page. Strom also listens on all
+interfaces; the workflow step loads a pf rule that drops traffic to its port (8080)
+on every interface but loopback before this script runs, as #83 does with iptables.
+Nothing GitHub documents promises that a hosted macOS runner cannot be reached from
+outside, so the rule is loaded rather than assumed unneeded; the step fails if pf
+does not take it.
+
+Python standard library only. The token and the service token are masked as soon as
+they are known. Every `url` value in the app's lines (the instance addresses the
+workspace lists, the address chosen), and its host without the scheme, is masked
+before the line is printed; loopback addresses (Strom's) are not. No response body
+that can carry a secret is printed. Replies and events cannot carry a secret (the
+core never serialises one), so the app's lines are logged.
 """
 
 import json
@@ -66,6 +81,8 @@ TEST_PATTERN_NAME = "Test pattern"
 PREFIX = "oli-app-e2e-"
 # `[strom] url` when the settings do not set it (src/config.rs).
 STROM_URL = "http://127.0.0.1:8080"
+# Never handed to the app, so never to the Strom it starts (#83).
+WITHHELD_ENV = ("OSC_ACCESS_TOKEN", "GH_TOKEN")
 
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY") or os.devnull
 ON_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
@@ -80,9 +97,35 @@ def record(text):
         f.write(text + "\n")
 
 
+MASKED = set()
+
+
 def mask(value):
-    if ON_ACTIONS and value:
+    if ON_ACTIONS and value and value not in MASKED:
+        MASKED.add(value)
         print(f"::add-mask::{value}", flush=True)
+
+
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+
+
+def mask_urls(value):
+    """Masks every non-loopback `url` value in an app line, and its host without the
+    scheme, so that the line can be printed."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == "url" and isinstance(item, str) and item:
+                bare = item.split("://", 1)[-1].rstrip("/")
+                host = bare.split("/", 1)[0]
+                if host.rsplit(":", 1)[0] not in LOOPBACK_HOSTS:
+                    mask(item)
+                    mask(bare)
+                    mask(host)
+            else:
+                mask_urls(item)
+    elif isinstance(value, list):
+        for item in value:
+            mask_urls(item)
 
 
 def passed(text):
@@ -111,8 +154,12 @@ class App:
     events out, one JSON value per line."""
 
     def __init__(self, exe, stderr_log):
+        # OSC_ACCESS_TOKEN and GH_TOKEN stay out of the app, and so out of the Strom it
+        # starts: see the header (#83).
+        env = {k: v for k, v in os.environ.items() if k not in WITHHELD_ENV}
         self.proc = subprocess.Popen(
             [exe, "--ipc-stdio"],
+            env=env,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr_log,
@@ -147,6 +194,8 @@ class App:
             self.lines.put(None)
         else:
             self.seen.append(message)
+            # Before anything prints it: the instance address is not for the log.
+            mask_urls(message)
             print(f"    app: {json.dumps(message, ensure_ascii=False)}", flush=True)
         return message
 
@@ -227,6 +276,23 @@ class App:
         """Reads what the app has said so far, without waiting."""
         while self._take(0.01) not in ("timeout", None):
             pass
+
+    def strom_stopped(self, since, timeout):
+        """Whether the app has said, since line `since`, that it stopped the Strom it
+        started (a `strom` event with state `stopped`), waiting up to `timeout` for it."""
+
+        def said():
+            return any(
+                m.get("event") == "strom" and (m.get("data") or {}).get("state") == "stopped"
+                for m in self.seen[since:]
+            )
+
+        self.drain()
+        deadline = time.monotonic() + timeout
+        while not said() and time.monotonic() < deadline:
+            if self._take(max(0.1, deadline - time.monotonic())) in ("timeout", None):
+                break
+        return said()
 
     def failed_rows(self, since):
         self.drain()
@@ -335,10 +401,15 @@ class Strom:
             time.sleep(2)
         fail(f"Strom at {self.url} runs no flow named '{name}' after {timeout} s")
 
-    def check_gone(self, flow_id, step):
+    def check_gone(self, flow_id, step, app, since):
+        """The flow is gone from Strom. When nothing answers at Strom's address, the app
+        must have said since line `since` that it stopped the Strom it started: a Strom
+        that died by itself takes its flows with it too, and must not pass."""
         flows = self.flows()
         if flows is None:
-            passed(f"{step}: the flow is gone with the Strom the app started, which it stopped (nothing answers at {self.url})")
+            if not app.strom_stopped(since, 15):
+                fail(f"{step}: nothing answers at {self.url}, and the app did not say it stopped the Strom it started")
+            passed(f"{step}: the flow is gone with the Strom the app started, which it says it stopped (nothing answers at {self.url})")
             return
         if any(f.get("id") == flow_id for f in flows):
             fail(f"{step}: Strom still has flow {flow_id}")
@@ -392,6 +463,7 @@ def tick_the_test_pattern(app):
 
 
 def go_live(app, open_live, strom, source_name, step):
+    """Go live; returns the source, the flow and the app line the session began at."""
     since = len(app.seen)
     reply = app.call("go_live", timeout=120)
     if "error" in reply:
@@ -402,7 +474,7 @@ def go_live(app, open_live, strom, source_name, step):
     passed(f"{step}: source '{source_name}' ({source.get('id')}) is in Open Live (streamType {source.get('streamType')}, status {source.get('status')})")
     flow = strom.wait_for_flow(source_name, 60)
     passed(f"{step}: Strom runs flow {flow.get('id')} for it")
-    return source, flow
+    return source, flow, since
 
 
 def stopped_cleanly(data, step):
@@ -454,11 +526,10 @@ def run(exe, work):
             record(f"- SKIPPED: {missing}. The app core checks above passed; Go live, Stop and quit while live against '{instance}' did not run.")
             return
 
+        # The reply lists the workspace's instances; `_take` masked their addresses
+        # before the reply was printed.
         where = app.ok("osc_paste_token", {"token": pat}, timeout=90)
         instances = where.get("instances") or []
-        for listed in instances:
-            mask(listed.get("url"))
-            mask((listed.get("url") or "").removeprefix("https://"))
         chosen = [i for i in instances if i.get("name") == instance]
         if not chosen:
             fail(f"missing capability: the OSC_ACCESS_TOKEN workspace has no Open Live instance named '{instance}'")
@@ -480,7 +551,7 @@ def run(exe, work):
         strom = Strom(STROM_URL)
 
         # 3. Go live.
-        _, flow = go_live(app, open_live, strom, source_name, "Go live")
+        _, flow, since = go_live(app, open_live, strom, source_name, "Go live")
 
         # 4. Stop.
         app.ok("stop")
@@ -490,10 +561,15 @@ def run(exe, work):
         if left:
             fail(f"Stop: {len(left)} source(s) of '{gateway_name}' are still in Open Live")
         passed("Stop: the app reports stopped, nothing left behind, and the source is gone from Open Live")
-        strom.check_gone(flow.get("id"), "Stop")
+        strom.check_gone(flow.get("id"), "Stop", app, since)
 
-        # 5. Go live again: no 409.
-        _, flow = go_live(app, open_live, strom, source_name, "Go live again (no 409)")
+        # 5. Go live again: no 409. Open Live answers 409 when a source of the same
+        # name is still registered, and the app shows that as an `input` row with
+        # state `failed`. go_live() checks those rows once, as soon as the source is
+        # back. That is enough only because step 4 has already checked that no source
+        # of this gateway was left behind (wait_gone); do not loosen step 4 without
+        # making this check wait for the rows to settle.
+        _, flow, since = go_live(app, open_live, strom, source_name, "Go live again (no 409)")
 
         # 6. Quit while live.
         app.ok("quit", {"confirmed": False})
@@ -515,7 +591,7 @@ def run(exe, work):
         if left:
             fail(f"Quit while live: {len(left)} source(s) of '{gateway_name}' are still in Open Live")
         passed("Quit while live: Stop and quit ended the app and the source is gone from Open Live")
-        strom.check_gone(flow.get("id"), "Quit while live")
+        strom.check_gone(flow.get("id"), "Quit while live", app, since)
         say("e2e app: all checks passed")
     finally:
         app.close()
