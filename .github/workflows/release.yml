@@ -1,13 +1,13 @@
 name: Release
 
 # Pushing a tag such as v0.3.0 builds one binary per platform (a tarball each, a
-# zip for Windows) and attaches them to a GitHub release, with SHA256SUMS and
-# build-provenance attestations (`release`). When the Apple secrets (#25) exist and
+# zip for Windows) and the Windows installer (`windows-app`), and attaches them to a
+# GitHub release, with SHA256SUMS and build-provenance attestations (`release`). When the Apple secrets (#25) exist and
 # the macOS DMG was notarized, `release-macos` then adds the DMG to that release,
 # rewrites SHA256SUMS to cover it and attests it; otherwise it is skipped and the
 # release is the archives only. The manual trigger builds the same artifacts and
 # SHA256SUMS without publishing anything, to try the workflow out. A pull request
-# that changes this workflow, the macOS app script, the desktop app (app/) or the
+# that changes this workflow, the macOS app or Strom MSI script, the desktop app (app/) or the
 # packaging (packaging/) runs it too, so the change is proven before it merges; like
 # a manual run from a branch, it publishes nothing (`release` and `release-macos` run
 # only on a tag ref).
@@ -19,6 +19,7 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
+      - .github/scripts/fetch-strom-msi.sh
       - .github/scripts/open-live-ingest.entitlements
       - app/**
       - packaging/**
@@ -117,15 +118,284 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  # Open Live Ingest for Windows: an NSIS installer next to the zip
+  # (docs/specs/desktop-app.md, section 11.2), from the x86_64-pc-windows-msvc binaries
+  # of `build` (the CLI from the zip, the desktop app from app-binary-<target>) and the
+  # Strom MSI the strom-types tag in Cargo.toml names, so the workflow never names a
+  # Strom version itself. packaging/windows/open-live-ingest.nsi is the script; its
+  # header says what it installs and where.
+  #
+  # The MSI is checked against the SHA-256 digest GitHub records for it before makensis
+  # runs, as install.ps1 does; no digest, no installer. makensis comes from the runner
+  # image when it has one, otherwise from Chocolatey at NSIS_VERSION.
+  #
+  # Signing depends on the repository secrets (docs/specs/desktop-app.md, section 15 Q9):
+  #   - all six AZURE_* secrets below set: Azure Trusted Signing (now Azure Artifact
+  #     Signing) signs the app and the CLI before they go into the installer, then the
+  #     installer, and the job fails unless all three carry a valid Authenticode
+  #     signature.
+  #   - not set (pull requests, and every run until a human adds them): nothing is
+  #     signed and a notice says so. SmartScreen warns when the installer is run.
+  # Secrets are read only through step inputs, never echoed.
+  #
+  # The smoke test runs on every run, on the installer as it is uploaded: a silent
+  # install into %ProgramFiles%, both executables report the release version, the
+  # Start menu shortcut points at the app, the Strom MSI put strom.exe at
+  # %ProgramFiles%\Strom\bin, the app's window process is still running after 5 s and
+  # WebView2 made its folder under %LOCALAPPDATA%\open-live-ingest\webview, then a silent
+  # uninstall removes the app, the CLI, the shortcut and the Apps & features entry and
+  # leaves Strom.
+  #
+  # The installer is a release asset of its own, published by `release` with the
+  # archives, so it follows the same #36 go/no-go as the Windows zip and has no gate of
+  # its own. Its artifact name starts with "$BIN-" and ends in "-setup.exe", the pattern
+  # `checksums` and `release` pick it up by.
+  windows-app:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      SETUP: open-live-ingest-x86_64-pc-windows-msvc-setup.exe
+      # Chocolatey's nsis package, used only when the image has no makensis.
+      NSIS_VERSION: "3.13.0"
+      # "true" or "false"; secrets cannot be read in `if:` directly.
+      HAS_TRUSTED_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_TRUSTED_SIGNING_ENDPOINT != '' && secrets.AZURE_TRUSTED_SIGNING_ACCOUNT != '' && secrets.AZURE_TRUSTED_SIGNING_CERT_PROFILE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ env.TARGET }}.zip
+          path: zip
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-binary-${{ env.TARGET }}
+          path: app-binary
+
+      # stage/ is what the installer carries. The version is the workspace's in
+      # Cargo.toml, which `build` has already checked against the tag on a tag ref.
+      - name: Stage the files
+        run: |
+          set -euo pipefail
+          7z x -ozip "zip/$BIN-$TARGET.zip" > /dev/null
+          mkdir stage
+          cp "zip/$BIN-$TARGET/$BIN.exe" app-binary/open-live-ingest-app.exe LICENSE-MIT LICENSE-APACHE stage/
+          cp app/icons/AppIcon.ico stage/open-live-ingest.ico
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\([^"]*\)".*/\1/p' Cargo.toml)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] \
+            || { echo "cannot read the workspace version from Cargo.toml (got '$version')"; exit 1; }
+          if [[ "${{ github.ref_type }}" == tag && "v$version" != "${{ github.ref_name }}" ]]; then
+            echo "tag ${{ github.ref_name }} but Cargo.toml says $version"; exit 1
+          fi
+          {
+            echo "VERSION=$version"
+            echo "VERSION_QUAD=${BASH_REMATCH[0]}.0"
+            echo "STAGE=$(cygpath -w "$PWD/stage")"
+          } >> "$GITHUB_ENV"
+          ls -l stage
+
+      # The script reads the Strom version from the strom-types tag in Cargo.toml, so
+      # this workflow never names one (tests/pins.rs).
+      - name: Download the Strom MSI and check its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          msi="$(.github/scripts/fetch-strom-msi.sh strom)"
+          {
+            echo "STROM_MSI_NAME=$(basename "$msi")"
+            echo "STROM_MSI=$(cygpath -w "$PWD/$msi")"
+          } >> "$GITHUB_ENV"
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $makensis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) {
+            choco install nsis --version $env:NSIS_VERSION -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install nsis $env:NSIS_VERSION failed ($LASTEXITCODE)" }
+            $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") |
+              Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (-not $makensis) { throw "makensis.exe not found after installing NSIS $env:NSIS_VERSION" }
+          }
+          Write-Host "makensis: $makensis, $(& $makensis /VERSION)"
+          "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Sign the app and the CLI
+        if: env.HAS_TRUSTED_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          files: |
+            ${{ github.workspace }}\stage\open-live-ingest-app.exe
+            ${{ github.workspace }}\stage\open-live-ingest.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Say the installer is unsigned
+        if: env.HAS_TRUSTED_SIGNING != 'true'
+        run: echo "::notice title=Unsigned::The Azure Trusted Signing secrets are not set, so the installer, the app and the CLI are not signed. SmartScreen warns when the installer is run."
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:MAKENSIS -V3 -WX `
+            "-DVERSION=$env:VERSION" "-DVERSION_QUAD=$env:VERSION_QUAD" "-DSTAGE=$env:STAGE" `
+            "-DSTROM_MSI=$env:STROM_MSI" "-DSTROM_MSI_NAME=$env:STROM_MSI_NAME" `
+            "-DOUTFILE=$env:GITHUB_WORKSPACE\$env:SETUP" `
+            packaging\windows\open-live-ingest.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
+          Get-Item -LiteralPath $env:SETUP | Format-List Name, Length
+
+      - name: Sign the installer
+        if: env.HAS_TRUSTED_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          files: ${{ github.workspace }}\${{ env.SETUP }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Check the signatures
+        if: env.HAS_TRUSTED_SIGNING == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in "stage\open-live-ingest-app.exe", "stage\open-live-ingest.exe", $env:SETUP) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            Write-Host "$f : $($sig.Status), $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$f is not validly signed ($($sig.Status): $($sig.StatusMessage))" }
+          }
+
+      - name: Smoke test the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Fail([string]$Message) { Write-Host "::error::$Message"; exit 1 }
+          $dir = Join-Path $env:ProgramFiles 'Open Live Ingest'
+          $app = Join-Path $dir 'open-live-ingest-app.exe'
+          $cli = Join-Path $dir 'open-live-ingest.exe'
+          $uninstaller = Join-Path $dir 'uninstall.exe'
+          $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Open Live Ingest.lnk'
+          $strom = Join-Path $env:ProgramFiles 'Strom\bin\strom.exe'
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OpenLiveIngest'
+          $webview = Join-Path $env:LOCALAPPDATA 'open-live-ingest\webview'
+          $appLog = Join-Path $env:LOCALAPPDATA 'open-live-ingest\logs\app.log'
+
+          # A clean runner, so the installer has to run the Strom MSI itself.
+          if (Test-Path -LiteralPath $dir) { Fail "$dir exists before the install" }
+          if (Test-Path -LiteralPath $strom) { Fail "$strom exists before the install, so the MSI would not be exercised" }
+
+          Write-Host "--- silent install"
+          $p = Start-Process -FilePath (Join-Path $env:GITHUB_WORKSPACE $env:SETUP) -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            $msiLog = Join-Path $env:TEMP 'open-live-ingest-strom-msi.log'
+            if (Test-Path -LiteralPath $msiLog) { Get-Content -LiteralPath $msiLog -Tail 80 }
+            Fail "the silent install exited with $($p.ExitCode)"
+          }
+          foreach ($f in $app, $cli, $uninstaller, 'LICENSE-MIT', 'LICENSE-APACHE', 'open-live-ingest.ico') {
+            $path = if ([IO.Path]::IsPathRooted($f)) { $f } else { Join-Path $dir $f }
+            if (-not (Test-Path -LiteralPath $path)) { Fail "$path is missing after the install" }
+          }
+          Get-ChildItem -LiteralPath $dir | Format-Table Name, Length
+
+          foreach ($exe in @(@($app, 'open-live-ingest-app'), @($cli, 'open-live-ingest'))) {
+            $got = (& $exe[0] --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { Fail "$($exe[0]) --version exited with $LASTEXITCODE" }
+            Write-Host "installed $($exe[1]): $got"
+            if ($got -ne "$($exe[1]) $env:VERSION") { Fail "expected '$($exe[1]) $env:VERSION' from $($exe[0]) --version, got '$got'" }
+          }
+
+          if (-not (Test-Path -LiteralPath $shortcut)) { Fail "the Start menu shortcut $shortcut is missing" }
+          $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+          Write-Host "shortcut: $($lnk.TargetPath), icon $($lnk.IconLocation)"
+          if ($lnk.TargetPath -ne $app) { Fail "the shortcut points at '$($lnk.TargetPath)', not $app" }
+
+          if (-not (Test-Path -LiteralPath $strom)) { Fail "strom.exe is not at $strom after the install" }
+          # The MSI adds GStreamer to the machine PATH, which this step's PATH predates.
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          $stromVersion = (& $strom --version 2>&1 | Out-String).Trim()
+          Write-Host "Strom at the MSI path: $stromVersion (exit code $LASTEXITCODE)"
+
+          $entry = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+          if (-not $entry) { Fail "no Apps & features entry at $key" }
+          if ($entry.DisplayVersion -ne $env:VERSION) { Fail "Apps & features says $($entry.DisplayVersion), not $env:VERSION" }
+          # The Strom MSI may change PATH for GStreamer; this installer adds nothing to it.
+          foreach ($scope in 'Machine', 'User') {
+            $entries = [Environment]::GetEnvironmentVariable('Path', $scope) -split ';' | ForEach-Object { $_.TrimEnd('\') }
+            if ($entries -contains $dir) { Fail "the install put $dir on the $scope PATH" }
+          }
+
+          Write-Host "--- the app's window for 5 s"
+          $proc = Start-Process -FilePath $app -PassThru
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            if (Test-Path -LiteralPath $appLog) { Get-Content -LiteralPath $appLog -Tail 80 }
+            Fail "the app exited within 5 s (exit code $($proc.ExitCode))"
+          }
+          $proc.Refresh()
+          Write-Host "the app is running (pid $($proc.Id), main window handle $($proc.MainWindowHandle))"
+          $deadline = (Get-Date).AddSeconds(20)
+          while (-not (Test-Path -LiteralPath $webview) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+          $webviewMade = Test-Path -LiteralPath $webview
+          Stop-Process -Id $proc.Id -Force
+          $proc.WaitForExit(15000) | Out-Null
+          if (Test-Path -LiteralPath $appLog) { Write-Host "--- app.log (tail)"; Get-Content -LiteralPath $appLog -Tail 20 }
+          if (-not $webviewMade) { Fail "WebView2 made no user-data folder at $webview" }
+          if (Test-Path -LiteralPath (Join-Path $dir 'open-live-ingest-app.exe.WebView2')) { Fail "WebView2 made its folder next to the app" }
+
+          # The uninstaller copies itself to %TEMP% and runs from there, so wait for the
+          # files to go rather than for the process.
+          Write-Host "--- silent uninstall"
+          $p = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Fail "the silent uninstall exited with $($p.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(60)
+          while (((Test-Path -LiteralPath $dir) -or (Test-Path -LiteralPath $shortcut)) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+          if (Test-Path -LiteralPath $app) { Fail "$app is still there after the uninstall" }
+          if (Test-Path -LiteralPath $cli) { Fail "$cli is still there after the uninstall" }
+          if (Test-Path -LiteralPath $dir) { Fail "$dir is still there after the uninstall" }
+          if (Test-Path -LiteralPath $shortcut) { Fail "the shortcut is still there after the uninstall" }
+          if (Test-Path -LiteralPath $key) { Fail "the Apps & features entry is still there after the uninstall" }
+          if (-not (Test-Path -LiteralPath $strom)) { Fail "the uninstall removed Strom" }
+          if (-not (Test-Path -LiteralPath $webview)) { Fail "the uninstall removed the user's WebView2 folder" }
+          Write-Host "OK: install, both versions, shortcut, Strom, the app's window and uninstall"
+          # GitHub's pwsh wrapper exits with the last native command's code otherwise.
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SETUP }}
+          path: ${{ env.SETUP }}
+          if-no-files-found: error
+
   # Runs on the manual trigger too, so a dry run shows the SHA256SUMS a release
   # would carry. It needs no write permission; publishing stays in `release`.
   checksums:
-    needs: build
+    needs: [build, windows-app]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      # The archives of `build` only, by name pattern, never a DMG of macos-app.
+      # The archives of `build` and the installer of `windows-app` only, by name
+      # pattern, never a DMG of macos-app.
       - uses: actions/download-artifact@v4
         with:
           pattern: ${{ env.BIN }}-*.tar.gz
@@ -136,8 +406,13 @@ jobs:
           pattern: ${{ env.BIN }}-*.zip
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.BIN }}-*-setup.exe
+          path: dist
+          merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum -- *.tar.gz *.zip *-setup.exe > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: SHA256SUMS
@@ -146,16 +421,16 @@ jobs:
 
   release:
     if: github.ref_type == 'tag'
-    needs: [build, checksums]
+    needs: [build, windows-app, checksums]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      # Only the archives of `build` and the SHA256SUMS of `checksums`, each by name.
-      # Any other artifact of the run (the DMGs of macos-app) is never downloaded here,
-      # so a re-run of this job cannot publish it.
+      # Only the archives of `build`, the installer of `windows-app` and the SHA256SUMS
+      # of `checksums`, each by name. Any other artifact of the run (the DMGs of
+      # macos-app) is never downloaded here, so a re-run of this job cannot publish it.
       - uses: actions/download-artifact@v4
         with:
           pattern: ${{ env.BIN }}-*.tar.gz
@@ -168,16 +443,23 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@v4
         with:
+          pattern: ${{ env.BIN }}-*-setup.exe
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
           name: SHA256SUMS
           path: dist
       - name: Verify the checksums
         run: cd dist && sha256sum -c SHA256SUMS
-      # Signed build provenance for each archive, checked with `gh attestation verify`.
+      # Signed build provenance for each archive and the installer, checked with
+      # `gh attestation verify`.
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*-setup.exe
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -482,7 +764,7 @@ jobs:
           fi
 
   # Adds the notarized DMG to the release `release` created: the DMG itself, a
-  # SHA256SUMS that covers the release's tarballs, the Windows zip and the DMG
+  # SHA256SUMS that covers the release's tarballs, the Windows zip and installer, and the DMG
   # (replacing the one `release` uploaded), and a build-provenance attestation for the DMG, checked with
   # `gh attestation verify open-live-ingest-macos-aarch64.dmg --repo Eyevinn/open-live-ingest`.
   # Skipped, not failed, when macos-app did not notarize (no Apple secrets) or failed,
@@ -510,9 +792,9 @@ jobs:
         run: |
           set -euo pipefail
           test -s "dist/$DMG" || { echo "the notarized artifact holds no $DMG"; exit 1; }
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip' --dir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip' --pattern '*-setup.exe' --dir dist
           cd dist
-          sha256sum -- *.tar.gz *.zip "$DMG" > SHA256SUMS
+          sha256sum -- *.tar.gz *.zip *-setup.exe "$DMG" > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@v2
         with:

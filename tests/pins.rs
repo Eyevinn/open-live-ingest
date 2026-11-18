@@ -1,7 +1,9 @@
 //! The install scripts install the Strom release the gateway is built against. That
 //! version is written in Cargo.toml, install.sh and install.ps1, so this checks they
 //! agree, and that build.rs hands the same one to the binary. The macOS app script
-//! reads it from Cargo.toml, and the release workflow's DMG is built by that script.
+//! reads it from Cargo.toml, and the release workflow's DMG is built by that script; the
+//! Strom MSI script reads it too, and the release workflow's Windows installer embeds
+//! the MSI that script fetches.
 
 use std::fs;
 use std::path::Path;
@@ -139,6 +141,40 @@ fn the_release_dmg_bundles_the_strom_cargo_toml_pins() {
             "release.yml sets {knob}; the DMG must bundle the Strom Cargo.toml pins"
         );
     }
+}
+
+/// The Windows installer embeds the Strom MSI the strom-types tag names:
+/// fetch-strom-msi.sh reads the tag from Cargo.toml, and release.yml gets the MSI from it.
+#[test]
+fn the_windows_installer_embeds_the_strom_cargo_toml_pins() {
+    let script = read(".github/scripts/fetch-strom-msi.sh");
+    assert!(
+        script
+            .lines()
+            .any(|l| l.trim_start().starts_with("strom_tag=")
+                && l.contains("strom-types")
+                && l.contains("Cargo.toml")),
+        "fetch-strom-msi.sh must derive strom_tag from the strom-types tag in Cargo.toml"
+    );
+    assert!(
+        !script.contains("STROM_VERSION="),
+        "fetch-strom-msi.sh must not carry its own STROM_VERSION"
+    );
+    let pinned = env!("STROM_PINNED_VERSION");
+    for literal in version_literals(&script) {
+        assert_eq!(
+            literal, pinned,
+            "fetch-strom-msi.sh names Strom {literal} but Cargo.toml pins strom-types to {pinned}"
+        );
+    }
+    let workflow = read(".github/workflows/release.yml");
+    assert!(
+        workflow.lines().any(|l| {
+            let l = l.trim_start();
+            !l.starts_with('#') && l.contains(".github/scripts/fetch-strom-msi.sh ")
+        }),
+        "release.yml must get the installer's Strom MSI from fetch-strom-msi.sh"
+    );
 }
 
 #[test]
