@@ -3,13 +3,16 @@
 //! Everything here is plain Rust with no window and no webview, so it is unit tested
 //! with `cargo test` on any OS: the custom protocol that serves the page, its
 //! Content-Security-Policy, the navigation filter, the IPC dispatcher, the models
-//! behind the window's steps (`where_to_send`, `what_to_send`), and the log file
-//! (`logs`). The window itself (tao, wry, muda) is `src/main.rs`. See
-//! docs/specs/desktop-app.md and
+//! behind the window's steps (`where_to_send`, `what_to_send`, `go_live`, with section
+//! 10's failure messages in `messages`), and the log file (`logs`). The window itself
+//! (tao, wry, muda) is `src/main.rs`. See docs/specs/desktop-app.md and
 //! docs/decisions/ADR-001-desktop-app-toolkit.md.
 
+pub mod go_live;
 pub mod ipc;
 pub mod logs;
+pub mod media_access;
+pub mod messages;
 pub mod navigation;
 pub mod protocol;
 #[cfg(test)]

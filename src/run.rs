@@ -31,6 +31,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
+use std::path::Path;
 use std::time::Duration;
 use strom_types::api::SrtCallerStats;
 use strom_types::discovery::DeviceResponse;
@@ -377,7 +378,7 @@ impl Reporter {
         });
         let initial = snapshot_of(live, &host, strom_version.as_deref());
         Ok(Some(Self {
-            heartbeat: Heartbeat::start(target, initial),
+            heartbeat: Heartbeat::start(target, initial, events.clone()),
             host,
             strom_version,
         }))
@@ -448,6 +449,16 @@ pub async fn up(
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
+    // One live session per settings file: a second loop over the same flows and
+    // sources would fight the first for them.
+    if let Some(pid) = running_gateway() {
+        return Err(AlreadyRunning { pid }.into());
+    }
+    // Recorded at once, not once the inputs are live: a gateway that is still starting
+    // (Strom's readiness wait, registration) is a running gateway too. A second `up`
+    // or the app's Go live refuses it, and the app's Strom reclaim never takes its
+    // Strom for one left behind (#95). Removed again however this returns.
+    let _pidfile = Pidfile::write(events);
     let Inputs {
         include_virtual,
         selection,
@@ -583,14 +594,6 @@ pub async fn up(
     };
 
     events.emit(summary(&live));
-    if let Err(err) = write_pidfile() {
-        warn!(err = %format_args!("{err:#}"), "could not write the pidfile; `down` will still find the flows and sources");
-        events.emit(Event::Warning {
-            message: format!(
-                "could not write the pidfile ({err:#}); `down` will still find the flows and sources"
-            ),
-        });
-    }
     let reporter = Reporter::start(&cfg, strom_version, &live, events)?;
 
     let (outcome, stop) = match run_until_stopped(
@@ -640,9 +643,9 @@ pub async fn up(
             );
         }
     }
-    // Only a Strom we started is stopped here; an adopted one is left running.
+    // Only a Strom we started is stopped here; an adopted one is left running. The
+    // pidfile goes after it, when `_pidfile` drops.
     drop(local_strom);
-    remove_pidfile();
     outcome
 }
 
@@ -1899,6 +1902,37 @@ pub fn render_status(r: &StatusReport) -> String {
     out
 }
 
+/// Another gateway is live on this machine: a CLI `up` or the app, named by the
+/// pidfile. `up` refuses to start a second one; `down` stops it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlreadyRunning {
+    pub pid: u32,
+}
+
+impl fmt::Display for AlreadyRunning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "already running (pid {}); run 'open-live-ingest down' first",
+            self.pid
+        )
+    }
+}
+
+impl std::error::Error for AlreadyRunning {}
+
+/// The pid of a gateway that is live now, by the pidfile: a CLI `up` or the app,
+/// checked by process name so a stale pidfile names nothing. This process is not
+/// counted: an app that has ended one session may start the next.
+pub fn running_gateway() -> Option<u32> {
+    running_gateway_in(&config::pidfile())
+}
+
+/// [`running_gateway`], by the pidfile at `pidfile`.
+pub(crate) fn running_gateway_in(pidfile: &Path) -> Option<u32> {
+    read_pidfile_at(pidfile).filter(|&pid| pid != std::process::id() && is_running_gateway(pid))
+}
+
 fn write_pidfile() -> Result<()> {
     let path = config::pidfile();
     if let Some(parent) = path.parent() {
@@ -1909,12 +1943,45 @@ fn write_pidfile() -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
+/// This process's entry in the pidfile for the length of one `up`, from its refusal
+/// check to its return, whichever way it returns.
+struct Pidfile {
+    written: bool,
+}
+
+impl Pidfile {
+    fn write(events: &Events) -> Self {
+        let written = match write_pidfile() {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(err = %format_args!("{err:#}"), "could not write the pidfile; `down` will still find the flows and sources");
+                events.emit(Event::Warning {
+                    message: format!(
+                        "could not write the pidfile ({err:#}); `down` will still find the flows and sources"
+                    ),
+                });
+                false
+            }
+        };
+        Pidfile { written }
+    }
+}
+
+impl Drop for Pidfile {
+    fn drop(&mut self) {
+        // Only while it is still ours: `down` may have removed it already.
+        if self.written && read_pidfile() == Some(std::process::id()) {
+            remove_pidfile();
+        }
+    }
+}
+
 fn read_pidfile() -> Option<u32> {
-    std::fs::read_to_string(config::pidfile())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    read_pidfile_at(&config::pidfile())
+}
+
+fn read_pidfile_at(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn remove_pidfile() {
@@ -1924,12 +1991,13 @@ fn remove_pidfile() {
 /// Whether the pid is alive and is a gateway. Pids are reused after a reboot, so a
 /// stale pidfile must never have `down` signal an unrelated process.
 fn is_running_gateway(pid: u32) -> bool {
-    process_named(pid, GATEWAY_COMM)
+    process_is(pid, Exe::StartsWith(GATEWAY_COMM))
 }
 
 /// What `ps -o comm=` shows for this binary. Linux keeps only the first 15 bytes of
-/// a command name (`open-live-inges`); macOS prints the full path, which ends in the
-/// whole name. The truncated name is contained in both.
+/// a command name (`open-live-inges`); macOS prints the full path, whose file name is
+/// the whole name. Both file names start with it, and so does the app's
+/// (`open-live-ingest-app`).
 const GATEWAY_COMM: &str = truncate_comm(env!("CARGO_PKG_NAME"));
 
 /// The first 15 bytes of `name`, Linux's limit for a command name.
@@ -1944,9 +2012,26 @@ const fn truncate_comm(name: &str) -> &str {
     }
 }
 
-/// Whether the pid is alive and its command name contains `needle`.
+/// What a process's executable file name is matched against. Only the file name: the
+/// rest of a path (`/Users/lindstrom/…`, a folder named `nostromo`) never counts, so
+/// a pid reused by an unrelated process is not taken for ours.
+#[derive(Debug, Clone, Copy)]
+enum Exe<'a> {
+    /// Exactly this name (`strom`); `.exe` and case do not count on Windows, and a
+    /// name longer than Linux's 15-byte command name may be cut to it.
+    Is(&'a str),
+    /// A name that starts with this (the gateway's, which the app's extends).
+    StartsWith(&'a str),
+}
+
+/// Whether the pid is alive and its executable is named `name` (`strom`, `ping`),
+/// by file name, not by anything in its path.
+pub fn process_named(pid: u32, name: &str) -> bool {
+    process_is(pid, Exe::Is(name))
+}
+
 #[cfg(not(windows))]
-pub fn process_named(pid: u32, needle: &str) -> bool {
+fn process_is(pid: u32, exe: Exe) -> bool {
     if !process_alive(pid) {
         return false;
     }
@@ -1956,29 +2041,49 @@ pub fn process_named(pid: u32, needle: &str) -> bool {
     else {
         return false;
     };
-    comm_matches(&String::from_utf8_lossy(&out.stdout), needle)
+    comm_matches(&String::from_utf8_lossy(&out.stdout), exe)
 }
 
-/// Whether the pid is alive and its image name (`strom.exe`,
-/// `open-live-ingest.exe`) contains `needle`, ignoring case. The image name comes
-/// from the row tasklist prints for exactly this pid, so a stale pid that has been
-/// reused matches only if the new process has the same name.
+/// The image name comes from the row tasklist prints for exactly this pid, so a stale
+/// pid that has been reused matches only if the new process has the same name.
 #[cfg(windows)]
-pub fn process_named(pid: u32, needle: &str) -> bool {
-    tasklist_image(pid).is_some_and(|image| image_matches(&image, needle))
+fn process_is(pid: u32, exe: Exe) -> bool {
+    tasklist_image(pid).is_some_and(|image| image_matches(&image, exe))
 }
 
-/// Whether a command name from `ps -o comm=` contains `needle`.
+/// Whether a command name from `ps -o comm=` (a bare name on Linux, a full path on
+/// macOS) names `exe`, by its file name.
 #[cfg_attr(windows, allow(dead_code))]
-fn comm_matches(comm: &str, needle: &str) -> bool {
-    comm.contains(needle)
+fn comm_matches(comm: &str, exe: Exe) -> bool {
+    let file = comm.trim().rsplit('/').next().unwrap_or_default();
+    match exe {
+        Exe::Is(name) => {
+            !name.is_empty() && (file == name || (name.len() > 15 && file == truncate_comm(name)))
+        }
+        Exe::StartsWith(prefix) => !prefix.is_empty() && file.starts_with(prefix),
+    }
 }
 
-/// Whether a Windows image name contains `needle`. Windows file names are case
-/// insensitive, so `Strom.exe` is the same program as `strom.exe`.
+/// Whether a Windows image name names `exe`. Windows file names are case insensitive,
+/// so `Strom.EXE` is the same program as `strom.exe`, and `strom` names it too.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn image_matches(image: &str, needle: &str) -> bool {
-    !needle.is_empty() && image.to_lowercase().contains(&needle.to_lowercase())
+fn image_matches(image: &str, exe: Exe) -> bool {
+    fn stem(name: &str) -> String {
+        let file = name.trim().rsplit(['\\', '/']).next().unwrap_or_default();
+        let file = file.to_lowercase();
+        match file.strip_suffix(".exe") {
+            Some(stem) => stem.to_string(),
+            None => file,
+        }
+    }
+    let file = stem(image);
+    match exe {
+        Exe::Is(name) => {
+            let name = stem(name);
+            !name.is_empty() && file == name
+        }
+        Exe::StartsWith(prefix) => !prefix.is_empty() && file.starts_with(&prefix.to_lowercase()),
+    }
 }
 
 /// The image name tasklist reports for `pid`, or None when no such process runs.
@@ -2672,9 +2777,29 @@ mod tests {
         assert!(port_clashes(&wanted, &fine, &prefix, Some("gw-1")).is_empty());
     }
 
-    /// `down` finds a running `up` by its command name, so the needle must be what
-    /// `ps` prints for this binary: a prefix of the package name, within Linux's
-    /// 15-byte limit.
+    #[test]
+    fn already_running_names_the_pid_and_the_way_out() {
+        assert_eq!(
+            AlreadyRunning { pid: 4242 }.to_string(),
+            "already running (pid 4242); run 'open-live-ingest down' first"
+        );
+    }
+
+    /// The app's executable is matched by the same name check as the CLI's.
+    #[test]
+    fn the_gateway_comm_matches_the_app_too() {
+        let gateway = Exe::StartsWith(GATEWAY_COMM);
+        assert!(comm_matches("open-live-ingest-app", gateway));
+        assert!(comm_matches(
+            "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest-app",
+            gateway
+        ));
+        assert!(image_matches("open-live-ingest-app.exe", gateway));
+    }
+
+    /// `down` finds a running `up` by its command name, so the name must be what `ps`
+    /// prints for this binary: a prefix of the package name, within Linux's 15-byte
+    /// limit.
     #[test]
     fn the_gateway_comm_is_the_package_name_cut_to_fifteen_bytes() {
         assert!(env!("CARGO_PKG_NAME").starts_with(GATEWAY_COMM));
@@ -2685,15 +2810,50 @@ mod tests {
 
     #[test]
     fn a_running_gateway_is_recognised_on_linux_and_macos() {
+        let gateway = Exe::StartsWith(GATEWAY_COMM);
         // Linux: the comm truncated to 15 characters, with ps's trailing newline.
-        assert!(comm_matches("open-live-inges\n", GATEWAY_COMM));
+        assert!(comm_matches("open-live-inges\n", gateway));
         // macOS: the full path of the executable.
+        assert!(comm_matches("/usr/local/bin/open-live-ingest\n", gateway));
+        assert!(!comm_matches("strom\n", gateway));
+        assert!(!comm_matches("", gateway));
+        // A folder named after the gateway does not make what is in it one.
+        assert!(!comm_matches("/opt/open-live-ingest/bin/strom\n", gateway));
+    }
+
+    /// #95 W1: Strom is matched by its file name only. A reused pid whose path merely
+    /// contains "strom" (a home folder, `nostromo`) is not a Strom, so the reclaim
+    /// and `down` never signal it.
+    #[test]
+    fn strom_is_matched_by_its_file_name_not_its_path() {
+        let strom = Exe::Is("strom");
+        assert!(comm_matches("strom\n", strom));
         assert!(comm_matches(
-            "/usr/local/bin/open-live-ingest\n",
-            GATEWAY_COMM
+            "/Applications/Open Live Ingest.app/Contents/MacOS/strom\n",
+            strom
         ));
-        assert!(!comm_matches("strom\n", GATEWAY_COMM));
-        assert!(!comm_matches("", GATEWAY_COMM));
+        assert!(!comm_matches("/Users/lindstrom/.cargo/bin/cargo\n", strom));
+        assert!(!comm_matches("/Users/bergstrom/bin/sleep\n", strom));
+        assert!(!comm_matches("nostromo\n", strom));
+        assert!(!comm_matches("/usr/bin/strom-helper\n", strom));
+        assert!(!comm_matches("", strom));
+        assert!(!comm_matches("strom\n", Exe::Is("")));
+        // A name longer than Linux's 15 bytes matches its cut form.
+        assert!(comm_matches(
+            "open-live-inges\n",
+            Exe::Is("open-live-ingest")
+        ));
+
+        assert!(image_matches("Strom.EXE", strom));
+        assert!(image_matches("strom.exe", strom));
+        assert!(image_matches(
+            "C:\\Program Files\\Open Live Ingest\\strom.exe",
+            strom
+        ));
+        assert!(!image_matches("nostromo.exe", strom));
+        assert!(!image_matches("lindstrom.exe", strom));
+        assert!(!image_matches("strom-helper.exe", strom));
+        assert!(image_matches("PING.EXE", Exe::Is("ping.exe")));
     }
 
     /// What `tasklist /FI "PID eq <pid>" /FO CSV /NH` prints, parsed on every OS.
@@ -2702,14 +2862,14 @@ mod tests {
         let gateway = "\"open-live-ingest.exe\",\"4242\",\"Console\",\"1\",\"12,345 K\"\r\n";
         let image = parse_tasklist_csv(gateway, 4242).expect("a row for pid 4242");
         assert_eq!(image, "open-live-ingest.exe");
-        assert!(image_matches(&image, GATEWAY_COMM));
-        assert!(!image_matches(&image, "strom"));
+        assert!(image_matches(&image, Exe::StartsWith(GATEWAY_COMM)));
+        assert!(!image_matches(&image, Exe::Is("strom")));
 
         let strom = "\"Strom.EXE\",\"77\",\"Services\",\"0\",\"51,204 K\"\r\n";
         let image = parse_tasklist_csv(strom, 77).expect("a row for pid 77");
-        assert!(image_matches(&image, "strom"));
-        assert!(!image_matches(&image, GATEWAY_COMM));
-        assert!(!image_matches(&image, ""));
+        assert!(image_matches(&image, Exe::Is("strom")));
+        assert!(!image_matches(&image, Exe::StartsWith(GATEWAY_COMM)));
+        assert!(!image_matches(&image, Exe::Is("")));
     }
 
     /// A stale pid must never match an unrelated process: no row, a localised

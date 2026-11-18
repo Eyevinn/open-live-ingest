@@ -98,6 +98,7 @@ function renderWhere(where) {
   const what = byId("what");
   what.classList.toggle("disabled", !where.ready);
   what.setAttribute("aria-disabled", String(!where.ready));
+  setGoEnabled(where.ready);
 }
 
 function clearProblem() {
@@ -302,6 +303,208 @@ async function listDevices(showAll) {
 }
 
 // ---------------------------------------------------------------------------
+// 3. Go live / Stop
+// ---------------------------------------------------------------------------
+
+const STATE_TEXT = {
+  registering: "Registering",
+  connecting: "Connecting",
+  live: "Live",
+  failed: "Failed",
+  stopping: "Stopping",
+  stopped: "Stopped",
+  not_connected: "Not connected",
+};
+
+let live = false;
+const rows = new Map();
+const notices = new Map();
+
+function setGoEnabled(ready) {
+  const go = byId("go");
+  const enabled = ready || live;
+  go.classList.toggle("disabled", !enabled);
+  go.setAttribute("aria-disabled", String(!enabled));
+  byId("go-button").disabled = !enabled;
+}
+
+// Live: the button stops, and the rest of the window is read-only.
+function setLive(on) {
+  live = on;
+  document.body.classList.toggle("live", on);
+  byId("go-button").textContent = on ? "Stop" : "Go live";
+}
+
+// What each action does (spec, section 10). Actions with no command yet show no button.
+const ACTIONS = {
+  retry: { label: "Go live", run: () => goLive() },
+  stop_it: { label: "Stop it", run: () => stopOther() },
+  sign_in: { label: "Sign in", run: () => byId("where-change").click() },
+  change: { label: "Change", run: () => byId("where-change").click() },
+  open_studio: { label: "Open Studio", run: () => call("open_url", { which: "studio" }) },
+  open_settings: { label: "Open Settings", run: () => call("open_url", { which: "privacy" }) },
+  open_microphone_settings: {
+    label: "Open Settings",
+    run: () => call("open_url", { which: "privacy_microphone" }),
+  },
+  help: { label: "Help", run: () => call("open_url", { which: "help" }) },
+  show_logs: { label: "Show logs", run: () => call("show_logs", { which: "app" }) },
+  show_strom_log: { label: "Show logs", run: () => call("show_logs", { which: "strom" }) },
+};
+
+function actionButton(action) {
+  const known = action && ACTIONS[action];
+  if (!known) {
+    return null;
+  }
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "link";
+  button.textContent = known.label;
+  button.addEventListener("click", () => Promise.resolve(known.run()).catch(showGoProblem));
+  return button;
+}
+
+function showGoProblem(error) {
+  const text = byId("go-problem-text");
+  text.textContent = error && error.message ? error.message : String(error);
+  const slot = byId("go-problem-action");
+  const button = actionButton(error && error.action);
+  slot.hidden = !button;
+  if (button) {
+    slot.replaceWith(button);
+    button.id = "go-problem-action";
+  }
+  byId("go-problem").hidden = false;
+}
+
+function clearGoProblem() {
+  byId("go-problem").hidden = true;
+}
+
+function renderRows() {
+  const list = byId("go-rows");
+  list.replaceChildren();
+  for (const row of rows.values()) {
+    const item = document.createElement("li");
+    item.append(row.input);
+    const state = document.createElement("span");
+    state.className = "state state-" + row.state;
+    state.textContent = STATE_TEXT[row.state] || row.state;
+    item.append(state);
+    if (typeof row.bitrate_kbps === "number" && row.state === "live") {
+      item.append(" " + (row.bitrate_kbps / 1000).toFixed(1) + " Mbps");
+    }
+    if (row.message) {
+      const detail = document.createElement("span");
+      detail.className = "detail";
+      detail.textContent = row.message;
+      const button = actionButton(row.action);
+      if (button) {
+        detail.append(" ", button);
+      }
+      item.append(detail);
+    }
+    list.append(item);
+  }
+}
+
+function renderNotices() {
+  const box = byId("go-notices");
+  box.replaceChildren();
+  for (const notice of notices.values()) {
+    const line = document.createElement("p");
+    line.className = "notice";
+    line.textContent = notice.message;
+    const button = actionButton(notice.action);
+    if (button) {
+      line.append(" ", button);
+    }
+    box.append(line);
+  }
+}
+
+async function goLive() {
+  clearGoProblem();
+  rows.clear();
+  notices.clear();
+  renderRows();
+  renderNotices();
+  setLive(true);
+  try {
+    await call("go_live");
+  } catch (error) {
+    setLive(false);
+    showGoProblem(error);
+  }
+}
+
+async function stopOther() {
+  clearGoProblem();
+  await call("stop_other");
+  await goLive();
+}
+
+function wireGoLive() {
+  byId("go-button").addEventListener("click", async () => {
+    if (live) {
+      byId("go-button").disabled = true;
+      await call("stop").catch(showGoProblem);
+    } else {
+      await goLive();
+    }
+  });
+  document.addEventListener("oli:strom", (event) => {
+    const words = { starting: "Starting Strom…", ready: "", stopped: "" };
+    byId("go-strom").textContent = words[event.detail.state] || "";
+  });
+  document.addEventListener("oli:input", (event) => {
+    const old = rows.get(event.detail.input) || {};
+    rows.set(event.detail.input, { ...old, ...event.detail });
+    renderRows();
+  });
+  document.addEventListener("oli:stats", (event) => {
+    for (const stats of event.detail.inputs) {
+      const row = rows.get(stats.input);
+      if (row) {
+        row.bitrate_kbps = stats.bitrate_kbps;
+      }
+    }
+    renderRows();
+  });
+  document.addEventListener("oli:notice", (event) => {
+    if (event.detail.clear) {
+      notices.delete(event.detail.clear);
+    } else {
+      notices.set(event.detail.kind, event.detail);
+    }
+    renderNotices();
+  });
+  document.addEventListener("oli:stopping", (event) => {
+    byId("go-strom").textContent =
+      "Stopping… " + event.detail.done + " of " + event.detail.total;
+  });
+  document.addEventListener("oli:stopped", (event) => {
+    setLive(false);
+    byId("go-button").disabled = false;
+    byId("go-strom").textContent = "";
+    notices.clear();
+    renderNotices();
+    if (event.detail.error) {
+      showGoProblem(event.detail.error);
+    } else if (event.detail.left_behind.length > 0) {
+      showGoProblem({
+        message:
+          "Still in Studio, held by an active production: " +
+          event.detail.left_behind.join(", ") +
+          ". Deactivate it in Studio; the next Go live removes them.",
+        action: "open_studio",
+      });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Logs
 // ---------------------------------------------------------------------------
 
@@ -321,9 +524,11 @@ function wireLogs() {
 
 async function start() {
   wireWhere();
+  wireGoLive();
   wireLogs();
   const state = await call("state");
   document.getElementById("version").textContent = "Version " + state.version;
+  setLive(state.live);
   renderWhere(state.where);
   byId("show-all").addEventListener("change", (event) => {
     listDevices(event.target.checked).catch(showProblem);

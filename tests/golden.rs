@@ -98,6 +98,10 @@ struct StromState {
     video: Vec<Value>,
     audio: Vec<Value>,
     flows: Vec<Value>,
+    /// While set, every request waits: a gateway asking is still starting.
+    stalled: bool,
+    /// Requests that have waited because of `stalled`.
+    stalled_requests: usize,
 }
 
 fn device(id: &str, name: &str, audio: bool) -> Value {
@@ -115,6 +119,12 @@ fn device(id: &str, name: &str, audio: bool) -> Value {
 
 fn fake_strom(state: Arc<Mutex<StromState>>) -> String {
     serve(Arc::new(move |req: &Request| {
+        if state.lock().unwrap().stalled {
+            state.lock().unwrap().stalled_requests += 1;
+            while state.lock().unwrap().stalled {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         let mut s = state.lock().unwrap();
         let path = req.path.as_str();
         let flow_route = path.strip_prefix("/api/flows/");
@@ -707,6 +717,88 @@ fn up_stopped_by_a_signal_tears_down_as_before() {
     assert!(clean, "up did not exit cleanly");
     assert!(strom_state.lock().unwrap().flows.is_empty());
     assert!(ol_state.lock().unwrap().sources.is_empty());
+}
+
+/// A second `up` on the same settings while the first is live refuses, and touches
+/// nothing: no flow, no source, no Strom. The one change to `up`'s output (#95).
+#[test]
+fn a_second_up_refuses_while_one_is_live() {
+    let strom_state = Arc::new(Mutex::new(StromState::default()));
+    let strom = fake_strom(strom_state.clone());
+    let ol_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(ol_state.clone());
+    let scratch = Scratch::new("refusal", &strom, &open_live);
+
+    let mut first = Running::start(&scratch, &["up", "--test"]);
+    first.until("waiting for a receiver");
+    let pid = first.child.id();
+
+    // Bounded: a second `up` that does not refuse would run until stopped.
+    let mut second = scratch.command(&["up", "--test"]).spawn().unwrap();
+    let started = std::time::Instant::now();
+    while second.try_wait().unwrap().is_none() {
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = second.kill();
+            first.kill();
+            panic!("the second up did not refuse");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let second = second.wait_with_output().unwrap();
+    let stdout = String::from_utf8(second.stdout).unwrap();
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    first.kill();
+
+    assert!(!second.status.success(), "the second up started");
+    assert_golden(&stdout, "");
+    assert_golden(
+        &stderr,
+        &format!("Error: already running (pid {pid}); run 'open-live-ingest down' first\n"),
+    );
+    assert_eq!(strom_state.lock().unwrap().flows.len(), 1);
+    assert_eq!(ol_state.lock().unwrap().sources.len(), 1);
+}
+
+/// #95 C1: an `up` that is still starting (here, held at its first Strom request) is
+/// already a running gateway. A second `up` refuses it, as the app's Go live does,
+/// whose Strom reclaim therefore never takes a starting gateway's Strom for one left
+/// behind.
+#[test]
+fn a_second_up_refuses_while_one_is_still_starting() {
+    let strom_state = Arc::new(Mutex::new(StromState {
+        stalled: true,
+        ..StromState::default()
+    }));
+    let strom = fake_strom(strom_state.clone());
+    let ol_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(ol_state.clone());
+    let scratch = Scratch::new("refusal-starting", &strom, &open_live);
+
+    let mut first = Running::start(&scratch, &["up", "--test"]);
+    let pid = first.child.id();
+    let started = std::time::Instant::now();
+    while strom_state.lock().unwrap().stalled_requests == 0 {
+        if started.elapsed() > Duration::from_secs(60) {
+            first.kill();
+            panic!("the first up never asked Strom");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let second = scratch.command(&["up", "--test"]).output().unwrap();
+    assert!(!second.status.success(), "the second up started");
+    assert_golden(&String::from_utf8(second.stdout).unwrap(), "");
+    assert_golden(
+        &String::from_utf8(second.stderr).unwrap(),
+        &format!("Error: already running (pid {pid}); run 'open-live-ingest down' first\n"),
+    );
+
+    // The first goes on to go live, alone.
+    strom_state.lock().unwrap().stalled = false;
+    first.until("waiting for a receiver");
+    first.kill();
+    assert_eq!(strom_state.lock().unwrap().flows.len(), 1);
+    assert_eq!(ol_state.lock().unwrap().sources.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
