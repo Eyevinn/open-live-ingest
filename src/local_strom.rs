@@ -565,8 +565,10 @@ pub fn stop_recorded(events: &Events) {
 /// crash, a force quit): when `strom.pid` names a running Strom, it is stopped and
 /// waited for, so the Strom the next session starts is one it owns and stops again.
 /// Adopting the leftover instead would leave a camera open after the next Stop,
-/// because an adopted Strom is never stopped. Call it only when no gateway is live
-/// (see [`crate::run::running_gateway`]): a live one's Strom is not left behind.
+/// because an adopted Strom is never stopped. Call it only when no gateway is running
+/// (see [`crate::run::running_gateway`]): a running one's Strom is not left behind.
+/// `up` writes `gateway.pid` before it starts Strom, so that covers a gateway that is
+/// still starting as well as a live one.
 /// Returns whether a Strom was stopped. Blocks for up to [`STOP_TIMEOUT`].
 pub fn reclaim_recorded(events: &Events) -> bool {
     reclaim_recorded_at(&config::strom_pidfile(), events)
