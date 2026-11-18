@@ -15,12 +15,13 @@ serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
-# The runtime the core runs what waits on a server or the browser on, so the window
-# keeps answering meanwhile.
+# The runtime the core runs what waits on a server, Strom or the browser on, so the
+# window keeps answering meanwhile.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }
+toml = "0.8.23"
 
 # The window (tao), the system webview in it (wry) and the macOS menu bar (muda):
 # docs/decisions/ADR-001-desktop-app-toolkit.md. Only on macOS and Windows, so the

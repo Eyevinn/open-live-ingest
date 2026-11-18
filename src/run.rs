@@ -472,25 +472,46 @@ pub async fn up(
     let open_live = open_live_client(&cfg, credential.as_ref())?;
     warn_of_sign_in_end(open_live.as_ref(), events);
 
-    let chosen = if test_pattern {
-        Vec::new()
+    // A saved `[[input]]` selection says what to send, unless a flag picks for this run.
+    let saved = !test_pattern && !include_virtual && selection.is_none() && !cfg.inputs.is_empty();
+    let (chosen, test_pattern) = if test_pattern {
+        (Vec::new(), true)
     } else {
         let all = strom
             .video_devices()
             .await
             .context("asking Strom what capture devices it can see")?;
-        devices::choose(all, include_virtual, selection.as_deref())?
+        if saved {
+            let picked = devices::choose_saved(&all, &cfg.inputs)?;
+            for device in &picked.absent {
+                let message = format!(
+                    "[[input]] device {device:?} is not connected; it is skipped, the others go live"
+                );
+                warn!("{message}");
+                events.emit(Event::Warning { message });
+            }
+            (picked.cameras, picked.test_pattern)
+        } else {
+            (
+                devices::choose(all, include_virtual, selection.as_deref())?,
+                false,
+            )
+        }
     };
     if chosen.is_empty() && !test_pattern {
+        if saved {
+            bail!("None of the devices in the settings' [[input]] entries is connected. `open-live-ingest devices` lists what Strom can see; --devices or --all picks for one run.");
+        }
         bail!("Strom reports no capture devices. Virtual ones are skipped unless --all; --test streams a test pattern instead.");
     }
 
     // Resolved and checked here, before any port is asked for or any flow exists.
-    let pairings = if !audio_pairings.is_empty() || test_pattern {
+    let pairings = if !audio_pairings.is_empty() || chosen.is_empty() {
         audio_pairings
     } else {
         let (pairings, absent) = devices::settings_pairings(&cfg.inputs, &chosen);
-        for device in absent {
+        // A saved selection has said so already, as not connected.
+        for device in absent.into_iter().filter(|_| !saved) {
             warn!("[[input]] pairs audio with {device:?}, which is not among this run's cameras; skipped");
             events.emit(Event::Warning {
                 message: format!("[[input]] pairs audio with {device:?}, which is not among this run's cameras; skipped"),
@@ -520,6 +541,9 @@ pub async fn up(
         &cloud.ports,
     )?;
     devices::attach_audio(&mut inputs, &audio);
+    devices::apply_labels(&mut inputs, &cfg.inputs, &chosen, &cfg.gateway.name);
+    // Sources are found by name: two inputs with one name would share a source.
+    devices::check_unique_names(&inputs)?;
 
     // Each input costs an encoder and its share of the uplink, which is easy to
     // overlook when one command starts all of them.

@@ -41,15 +41,18 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Register every capture device with Open Live and stream it. Stays running:
-    /// Ctrl-C stops and removes the feeds, while a closed SSH session does not.
+    /// Register every capture device with Open Live and stream it, or exactly the
+    /// inputs the settings' [[input]] entries name. Stays running: Ctrl-C stops and
+    /// removes the feeds, while a closed SSH session does not.
     Up {
         /// Include virtual devices, which are skipped by default because they
-        /// produce nothing unless another application is running.
+        /// produce nothing unless another application is running. Overrides the
+        /// settings' [[input]] selection for this run.
         #[arg(long)]
         all: bool,
 
         /// Only these devices, by id or name fragment, e.g. `--devices "FaceTime,DeckLink"`.
+        /// Overrides the settings' [[input]] selection for this run.
         #[arg(long)]
         devices: Option<String>,
 
@@ -61,7 +64,8 @@ enum Command {
         audio: Vec<devices::AudioPairing>,
 
         /// Stream a test pattern and tone instead of any device, to commission the
-        /// link before the cameras arrive.
+        /// link before the cameras arrive. Overrides the settings' [[input]]
+        /// selection for this run.
         #[arg(long)]
         test: bool,
 

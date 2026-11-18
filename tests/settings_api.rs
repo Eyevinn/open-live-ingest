@@ -177,6 +177,7 @@ fn settings_saved_through_the_api_are_what_the_cli_reads() {
     cfg.inputs = vec![InputSettings {
         device: "FaceTime".to_string(),
         audio: Some("USB Microphone".to_string()),
+        label: Some("Stage left".to_string()),
     }];
     api::save_to(&path, &cfg).expect("saves");
 
