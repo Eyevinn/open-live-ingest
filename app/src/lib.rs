@@ -4,7 +4,8 @@
 //! with `cargo test` on any OS: the custom protocol that serves the page, its
 //! Content-Security-Policy, the navigation filter, the IPC dispatcher, the models
 //! behind the window's steps (`where_to_send`, `what_to_send`, `go_live`, with section
-//! 10's failure messages in `messages`), and the log file (`logs`). The window itself
+//! 10's failure messages in `messages`), the quit guard (`quit`, section 8) and the
+//! log file (`logs`). The window itself
 //! (tao, wry, muda) is `src/main.rs`. See docs/specs/desktop-app.md and
 //! docs/decisions/ADR-001-desktop-app-toolkit.md.
 
@@ -15,6 +16,7 @@ pub mod media_access;
 pub mod messages;
 pub mod navigation;
 pub mod protocol;
+pub mod quit;
 #[cfg(test)]
 mod testing;
 pub mod what_to_send;

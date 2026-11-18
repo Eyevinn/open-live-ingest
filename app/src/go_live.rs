@@ -26,8 +26,10 @@ use open_live_ingest::session::{Inputs, Session, SessionHandle};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tracing::instrument::WithSubscriber;
 
 /// How long an input may run with nothing reaching the cloud before its row says so.
@@ -294,6 +296,20 @@ impl Rows {
         out
     }
 
+    /// The inputs still being sent: registering, connecting or live. What the quit
+    /// question counts (section 8).
+    pub fn sending(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.state,
+                    RowState::Registering | RowState::Connecting | RowState::Live
+                )
+            })
+            .count()
+    }
+
     fn stopped(&self, error: Option<Message>) -> Event {
         Event::new(
             "stopped",
@@ -341,15 +357,22 @@ struct State {
     /// its own number, so a late end of an earlier session (its checks finishing after
     /// a Stop, its channel closing after its last event) cannot reset a newer one.
     session: u64,
+    /// Woken whenever the phase goes back to Idle.
+    idle: Arc<Notify>,
 }
 
 impl State {
     /// Back to Idle, if `session` is still the current one.
     fn end(&mut self, session: u64) {
         if self.session == session {
-            self.phase = Phase::Idle;
-            self.handle = None;
+            self.set_idle();
         }
+    }
+
+    fn set_idle(&mut self) {
+        self.phase = Phase::Idle;
+        self.handle = None;
+        self.idle.notify_waiters();
     }
 }
 
@@ -360,6 +383,8 @@ pub struct GoLive {
     keychain: Arc<dyn SecretStore>,
     host: Arc<dyn Host>,
     state: Arc<Mutex<State>>,
+    /// The inputs the current session is sending, for the quit question.
+    sending: Arc<AtomicUsize>,
 }
 
 impl GoLive {
@@ -376,7 +401,9 @@ impl GoLive {
                 phase: Phase::Idle,
                 handle: None,
                 session: 0,
+                idle: Arc::new(Notify::new()),
             })),
+            sending: Arc::default(),
         }
     }
 
@@ -387,6 +414,27 @@ impl GoLive {
     /// Going live, live or stopping: the rest of the window is read-only.
     pub fn is_live(&self) -> bool {
         self.lock().phase != Phase::Idle
+    }
+
+    /// How many inputs the session is sending: registering, connecting or live.
+    pub fn inputs_live(&self) -> usize {
+        self.sending.load(Ordering::SeqCst)
+    }
+
+    /// Returns once nothing is live: at once when nothing is, else when the session
+    /// has ended (its teardown done) or a Go live still in its checks was stopped.
+    pub async fn until_idle(&self) {
+        let idle = self.lock().idle.clone();
+        loop {
+            let notified = idle.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so an end in between is not missed.
+            notified.as_mut().enable();
+            if !self.is_live() {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Goes live, on `runtime`. The reply to command `id` is delivered once the
@@ -408,6 +456,8 @@ impl GoLive {
         let keychain = self.keychain.clone();
         let host = self.host.clone();
         let state = self.state.clone();
+        let sending = self.sending.clone();
+        sending.store(0, Ordering::SeqCst);
         let task = async move {
             let checked =
                 tokio::task::spawn_blocking(move || checks(&settings_file, host.as_ref())).await;
@@ -471,7 +521,9 @@ impl GoLive {
                     // Idle before the page hears it stopped, so Go live works at once.
                     lock(&state).end(session);
                 }
-                for out in rows.on_event(&event, Instant::now()) {
+                let out = rows.on_event(&event, Instant::now());
+                sending.store(rows.sending(), Ordering::SeqCst);
+                for out in out {
                     deliver(out.script());
                 }
             }
@@ -483,13 +535,25 @@ impl GoLive {
     /// Stops the session: its teardown runs and the rows show it. Nothing to stop is
     /// not an error.
     pub fn stop(&self) {
+        self.stop_for(Stop::Interrupt);
+    }
+
+    /// Stops the session because the process is about to be ended from outside (a
+    /// Windows logout or shutdown): the teardown is bounded to the library's
+    /// `ENDING_TEARDOWN` (`teardown_within`). A teardown already running is left to
+    /// run as it is.
+    pub fn stop_ending(&self) {
+        self.stop_for(Stop::Ending);
+    }
+
+    fn stop_for(&self, why: Stop) {
         let mut state = self.lock();
         match state.phase {
-            Phase::Checking => state.phase = Phase::Idle,
+            Phase::Checking => state.set_idle(),
             Phase::Live => {
                 state.phase = Phase::Stopping;
                 if let Some(handle) = state.handle.as_mut() {
-                    handle.request_stop(Stop::Interrupt);
+                    handle.request_stop(why);
                 }
             }
             Phase::Idle | Phase::Stopping => {}
@@ -1208,6 +1272,68 @@ port_range = "47110-47112"
             Arc::new(FakeHost::default()),
         );
         assert_eq!(runtime().block_on(go.stop_other()), Ok(()));
+    }
+
+    /// What the quit question counts: the inputs registering, connecting or live, not
+    /// the failed, stopped or absent ones.
+    #[test]
+    fn the_inputs_being_sent_are_counted_for_the_quit_question() {
+        let mut rows = rows();
+        let t = Instant::now();
+        assert_eq!(rows.sending(), 0);
+        rows.on_event(&summary(&[CAM, "Venue — Two", "Venue — Three"]), t);
+        rows.on_event(
+            &E::Input {
+                input: CAM.to_string(),
+                state: InputState::OnAir,
+            },
+            t,
+        );
+        rows.on_event(
+            &E::InputFailed {
+                input: "Venue — Three".to_string(),
+                reason: "POST flow start failed with HTTP 500".to_string(),
+            },
+            t,
+        );
+        assert_eq!(rows.sending(), 2);
+        rows.on_event(&E::Stopping, t);
+        assert_eq!(rows.sending(), 0, "stopping is not sending");
+    }
+
+    /// Stop and quit waits on this: at once when idle, and as soon as a Go live in
+    /// its checks is stopped (here by the bounded stop of a Windows logout).
+    #[test]
+    fn until_idle_returns_once_nothing_is_live() {
+        let scratch = testing::Scratch::new("golive-idle");
+        let rt = runtime();
+        let (release, gate) = channel();
+        let host = Arc::new(FakeHost {
+            gate: Some(Mutex::new(gate)),
+            ..FakeHost::default()
+        });
+        let go = Arc::new(go_live(
+            settings_file(&scratch, CAMERA_WITH_MIC),
+            host.clone(),
+        ));
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(1), go.until_idle()).await })
+            .expect("idle at once");
+
+        let (deliver, _rx) = deliverer();
+        go.start(1, deliver, rt.handle());
+        assert!(go.is_live());
+        let waiting = {
+            let go = go.clone();
+            rt.spawn(async move { go.until_idle().await })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiting.is_finished(), "still going live");
+        go.stop_ending();
+        rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), waiting).await })
+            .expect("woken when stopped")
+            .unwrap();
+        assert!(!go.is_live());
+        release.send(()).unwrap();
     }
 
     #[test]

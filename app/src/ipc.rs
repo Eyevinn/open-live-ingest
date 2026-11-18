@@ -14,6 +14,7 @@
 use crate::go_live::{self, GoLive};
 use crate::logs;
 use crate::messages::Message;
+use crate::quit::{Exit, QuitGuard, QuitHandle};
 use crate::what_to_send::{self, DeviceSource};
 use crate::where_to_send::{Opener, WhereToSend, WhereView};
 use open_live_ingest::api::{self, Devices, SaveError};
@@ -107,19 +108,40 @@ pub enum Link {
 pub enum Command {
     State,
     OscSignIn,
-    OscPasteToken { token: Secret },
+    OscPasteToken {
+        token: Secret,
+    },
     OscWorkspaces,
-    ChooseInstance { url: String },
-    SelfHosted { url: String, api_key: Secret },
-    Devices { show_all: bool },
-    SetInputs { inputs: Vec<InputArgs> },
+    ChooseInstance {
+        url: String,
+    },
+    SelfHosted {
+        url: String,
+        api_key: Secret,
+    },
+    Devices {
+        show_all: bool,
+    },
+    SetInputs {
+        inputs: Vec<InputArgs>,
+    },
     SetAdvanced(AdvancedArgs),
     GoLive,
     Stop,
     StopOther,
-    Quit { confirmed: bool },
-    ShowLogs { which: LogFile },
-    OpenUrl { which: Link },
+    /// `confirmed: false` asks to quit (the question when live); `true` is Stop and
+    /// quit; `anyway` is Quit anyway, once offered (section 8).
+    Quit {
+        confirmed: bool,
+        #[serde(default)]
+        anyway: bool,
+    },
+    ShowLogs {
+        which: LogFile,
+    },
+    OpenUrl {
+        which: Link,
+    },
 }
 
 impl Command {
@@ -271,6 +293,8 @@ const NO_SETTINGS: &str = "The settings file could not be read, so the Strom log
 const NO_DEVICE_LIST: &str =
     "Could not get the list of cameras from the video engine. Show logs for details.";
 const NOT_SAVED: &str = "Could not save the settings. Show logs for details.";
+const STILL_STOPPING: &str =
+    "Still stopping the live inputs. Quit anyway is offered if it takes long.";
 
 /// The view model `state` returns.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -310,6 +334,10 @@ pub struct Core {
     listed: Arc<Mutex<Option<Devices>>>,
     /// Whether the What to send step lists virtual devices.
     show_all: bool,
+    /// Quitting while live (section 8).
+    quit: Arc<Mutex<QuitGuard>>,
+    /// Ends the window's event loop.
+    exit: Exit,
 }
 
 impl Core {
@@ -366,7 +394,41 @@ impl Core {
             device_source: Arc::new(what_to_send::Strom),
             listed: Arc::default(),
             show_all: false,
+            quit: Arc::default(),
+            exit: Arc::new(|| tracing::warn!("asked to quit with no window to close")),
         }
+    }
+
+    /// The core with `exit` ending the app: the window's event loop, or a fake in
+    /// tests. Called from the core's own threads when a stop to quit is done.
+    pub fn with_exit(mut self, exit: Exit) -> Self {
+        self.exit = exit;
+        self
+    }
+
+    /// The core with Quit anyway offered after `after`: shorter, in tests.
+    pub fn with_quit_anyway_after(mut self, after: std::time::Duration) -> Self {
+        self.quit = Arc::new(Mutex::new(QuitGuard::with_quit_anyway_after(after)));
+        self
+    }
+
+    /// The quit guard over this core's session, for the window and the platform
+    /// hooks (section 8).
+    pub fn quit_handle(&self) -> QuitHandle {
+        QuitHandle {
+            go_live: self.go_live.clone(),
+            guard: self.quit.clone(),
+            runtime: self.runtime.handle().clone(),
+            deliver: self.deliver.clone(),
+            exit: self.exit.clone(),
+        }
+    }
+
+    /// The close button, Cmd-W, Cmd-Q, the app menu's Quit, Dock → Quit and a macOS
+    /// logout: quits when nothing is live, and otherwise asks the page to show the
+    /// question.
+    pub fn request_quit(&self) -> Effect {
+        self.quit_handle().request()
     }
 
     /// The core with step 3 of the caller's: fakes, in tests.
@@ -534,10 +596,20 @@ impl Core {
             }
             Command::Devices { show_all } => self.devices(id, show_all),
             Command::SetInputs { inputs } => Some((self.set_inputs(id, &inputs), Effect::None)),
-            // Nothing is live yet, so there is nothing to ask about: quit.
-            Command::Quit { .. } if !self.live() => {
-                Some((Reply::ok(id, Value::Null), Effect::Quit))
+            Command::Quit { anyway: true, .. } => Some(if self.quit_handle().quit_anyway() {
+                (Reply::ok(id, Value::Null), Effect::Quit)
+            } else {
+                (Reply::error(id, STILL_STOPPING), Effect::None)
+            }),
+            Command::Quit {
+                confirmed: true, ..
+            } => {
+                let effect = self.quit_handle().stop_and_quit();
+                Some((Reply::ok(id, Value::Null), effect))
             }
+            Command::Quit {
+                confirmed: false, ..
+            } => Some((Reply::ok(id, Value::Null), self.request_quit())),
             _ => Some((Reply::error(id, NOT_YET), Effect::None)),
         }
     }
@@ -1351,6 +1423,178 @@ mod tests {
         assert_eq!(stopped["event"], "stopped");
         assert_eq!(stopped["data"]["error"], Value::Null);
         assert!(!core.live());
+    }
+
+    /// Settings a Go live gets through the checks with: the test pattern, sending to
+    /// the Strom at `strom_url`, which is never started.
+    fn live_settings(dir: &testing::Scratch, strom_url: &str) {
+        std::fs::write(
+            dir.settings(),
+            format!("[strom]\nurl = \"{strom_url}\"\nmanage = false\n\n[open_live]\nregister = false\n\n[uplink]\nhost = \"cloud.example.com\"\nport_range = \"47110-47112\"\n\n[[input]]\ndevice = \"test\"\n"),
+        )
+        .unwrap();
+    }
+
+    /// An [`Exit`] that says on the receiver when it was called.
+    fn fake_exit() -> (Exit, Receiver<()>) {
+        let (tx, rx) = channel();
+        let tx = Mutex::new(tx);
+        let exit: Exit = Arc::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        });
+        (exit, rx)
+    }
+
+    /// The next event delivered later, skipping replies and other events.
+    fn next_event(rx: &Receiver<String>, name: &str) -> Value {
+        loop {
+            let message = next_delivered(rx);
+            if message["event"] == name {
+                return message;
+            }
+        }
+    }
+
+    /// Section 8 while live: the close button, Cmd-Q, the menu and the Dock all ask
+    /// the question (`quit_requested`) and quit nothing; Cancel leaves it so. Stop and
+    /// quit stops, and the app ends once the stop is done.
+    #[test]
+    fn quit_while_live_asks_then_stop_and_quit_ends_the_app_when_stopped() {
+        let dir = testing::Scratch::new("ipc-quit-live");
+        live_settings(&dir, "http://127.0.0.1:9");
+        let (release, held) = channel();
+        let (core, rx) = core_with(dir.settings(), nowhere());
+        let (exit, exited) = fake_exit();
+        let mut core = core
+            .with_go_live(GoLive::new(
+                dir.settings(),
+                Arc::new(MemoryKeychain::new()),
+                Arc::new(HeldAtTheCheck(Mutex::new(Some(held)))),
+            ))
+            .with_exit(exit);
+        assert!(core.dispatch(r#"{"id": 1, "cmd": "go_live"}"#).is_none());
+        assert!(core.live());
+
+        // The page's own quit, and every window or menu way of quitting.
+        let (reply, effect) = core
+            .dispatch(r#"{"id": 2, "cmd": "quit", "args": {"confirmed": false}}"#)
+            .unwrap();
+        assert_eq!(effect, Effect::None);
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            json!({"id": 2, "ok": null})
+        );
+        assert_eq!(
+            next_delivered(&rx),
+            json!({"event": "quit_requested", "data": {"inputs_live": 0}})
+        );
+        assert_eq!(core.request_quit(), Effect::None, "Cancel, then Cmd-Q");
+        assert_eq!(next_delivered(&rx)["event"], "quit_requested");
+        assert!(
+            !core.quit_handle().may_terminate(),
+            "macOS is told to cancel"
+        );
+        assert!(exited.try_recv().is_err());
+
+        // Stop and quit: Go live is still in its checks, so the stop is at once.
+        let (reply, effect) = core
+            .dispatch(r#"{"id": 3, "cmd": "quit", "args": {"confirmed": true}}"#)
+            .unwrap();
+        assert_eq!(
+            effect,
+            Effect::None,
+            "the app ends when stopped, not before"
+        );
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            json!({"id": 3, "ok": null})
+        );
+        exited
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the app ends once stopped");
+        assert!(!core.live());
+        assert!(core.quit_handle().may_terminate());
+        assert_eq!(core.request_quit(), Effect::Quit);
+        release.send(()).unwrap();
+    }
+
+    /// Stop and quit with a teardown that takes long: Quit anyway is refused until the
+    /// page has been offered it (`quit_anyway`), and then ends the app at once.
+    #[test]
+    fn quit_anyway_is_offered_when_the_stop_takes_long() {
+        // A Strom that takes the connection and never answers, so the session is
+        // still starting (and its stop waits) for the client's whole timeout.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dir = testing::Scratch::new("ipc-quit-anyway");
+        live_settings(
+            &dir,
+            &format!("http://127.0.0.1:{}", silent.local_addr().unwrap().port()),
+        );
+        let (core, rx) = core_with(dir.settings(), nowhere());
+        let (exit, exited) = fake_exit();
+        let mut core = core
+            .with_go_live(GoLive::new(
+                dir.settings(),
+                Arc::new(MemoryKeychain::new()),
+                Arc::new(HeldAtTheCheck(Mutex::new(None))),
+            ))
+            .with_quit_anyway_after(Duration::from_millis(300))
+            .with_exit(exit);
+        assert!(core.dispatch(r#"{"id": 1, "cmd": "go_live"}"#).is_none());
+        assert_eq!(next_delivered(&rx), json!({"id": 1, "ok": null}));
+
+        const ANYWAY: &str =
+            r#"{"id": 2, "cmd": "quit", "args": {"confirmed": true, "anyway": true}}"#;
+        let refused = reply_json(&mut core, ANYWAY);
+        assert_eq!(
+            refused["error"]["message"], STILL_STOPPING,
+            "nothing offered yet"
+        );
+
+        let (_, effect) = core
+            .dispatch(r#"{"id": 3, "cmd": "quit", "args": {"confirmed": true}}"#)
+            .unwrap();
+        assert_eq!(effect, Effect::None);
+        assert_eq!(
+            next_event(&rx, "quit_anyway"),
+            json!({"event": "quit_anyway", "data": {}})
+        );
+        assert!(exited.try_recv().is_err(), "still stopping");
+        let (reply, effect) = core.dispatch(ANYWAY).unwrap();
+        assert_eq!(effect, Effect::Quit);
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            json!({"id": 2, "ok": null})
+        );
+        assert!(core.quit_handle().may_terminate());
+        drop(silent);
+    }
+
+    /// The bounded teardown a Windows logout runs does nothing when nothing is live,
+    /// and stops a Go live still in its checks at once.
+    #[test]
+    fn end_session_stops_what_is_live_and_waits_no_longer_than_its_bound() {
+        let dir = testing::Scratch::new("ipc-end-session");
+        live_settings(&dir, "http://127.0.0.1:9");
+        let (release, held) = channel();
+        let (core, _rx) = core_with(dir.settings(), nowhere());
+        let core = core.with_go_live(GoLive::new(
+            dir.settings(),
+            Arc::new(MemoryKeychain::new()),
+            Arc::new(HeldAtTheCheck(Mutex::new(Some(held)))),
+        ));
+        let quitting = core.quit_handle();
+        quitting.end_session();
+        assert!(!core.live());
+
+        let mut core = core;
+        assert!(core.dispatch(r#"{"id": 1, "cmd": "go_live"}"#).is_none());
+        let started = std::time::Instant::now();
+        quitting.end_session();
+        assert!(started.elapsed() < crate::quit::END_SESSION_WAIT);
+        assert!(!core.live());
+        assert!(quitting.may_terminate());
+        release.send(()).unwrap();
     }
 
     /// A failed check is an error reply with section 10's line and its action.
