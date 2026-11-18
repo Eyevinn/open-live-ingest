@@ -174,8 +174,27 @@ function wireWhere() {
   document.addEventListener("oli:where", (event) => renderWhere(event.detail));
 }
 
+// ---------------------------------------------------------------------------
+// Logs
+// ---------------------------------------------------------------------------
+
+function showLog(which) {
+  clearProblem();
+  call("show_logs", { which }).catch(showProblem);
+}
+
+function wireLogs() {
+  // macOS has Help > Show logs in the menu bar; Windows has no menu bar, so the
+  // link is in the footer there (spec, section 5).
+  const showLogs = byId("show-logs");
+  showLogs.hidden = !/Windows/.test(navigator.userAgent);
+  showLogs.addEventListener("click", () => showLog("app"));
+  byId("show-strom-log").addEventListener("click", () => showLog("strom"));
+}
+
 async function start() {
   wireWhere();
+  wireLogs();
   const state = await call("state");
   document.getElementById("version").textContent = "Version " + state.version;
   renderWhere(state.where);
