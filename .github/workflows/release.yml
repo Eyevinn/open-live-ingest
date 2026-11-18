@@ -763,6 +763,88 @@ jobs:
             echo "No temporary keychain to delete"
           fi
 
+  # The agent-run end to end (OL-59i, #100; spec section 14), on the DMG `macos-app`
+  # has just built and checked: the app executable the DMG carries, started with
+  # `--ipc-stdio` (the app core with no window and no webview), is fed the same
+  # messages the page sends, with the test pattern, against the Open Live instance
+  # `openlivedev`: Go live, the source in Open Live, Stop, the source and flow gone,
+  # Go live again with no 409, quit while live removes them. What it checks and how:
+  # .github/scripts/e2e-app.py.
+  #
+  # Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
+  # token for the workspace that owns `openlivedev` (the same secret as the
+  # e2e-audio-device workflow). Without it, a run by hand fails and names the secret;
+  # a pull request run still starts the DMG's app core, lists devices through the
+  # bundled Strom and checks that Go live is refused and quit ends the app, then warns
+  # naming the secret and passes. Fork pull requests get no secrets and skip the job.
+  #
+  # The Windows half runs from the installer once #36 (camera go/no-go on Windows 11)
+  # is a go; until then the step summary says so. Never on a tag ref: a release does
+  # not wait on a shared test instance. One run at a time per instance, shared with
+  # the e2e-audio-device workflow (`e2e-openlivedev`): a third queued run cancels the
+  # pending one, which is then re-run by hand.
+  e2e-macos:
+    needs: macos-app
+    if: >-
+      github.ref_type != 'tag' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    concurrency:
+      group: e2e-openlivedev
+      cancel-in-progress: false
+    env:
+      APP: Open Live Ingest.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DMG }}
+      - name: Go live, Stop and quit while live from the DMG, against Open Live
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          OPEN_LIVE_INSTANCE: openlivedev
+          # A run by hand needs the secret; a pull request run without it warns and
+          # passes after the checks that need none.
+          E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          set -euo pipefail
+          # The bundled Strom the app starts has an unauthenticated API and listens
+          # on all interfaces: drop traffic to its port (8080, the default [strom]
+          # url) on every interface but loopback before the app can start it, as
+          # #83 does with iptables. The script also keeps OSC_ACCESS_TOKEN and
+          # GH_TOKEN out of the app's environment, and so out of Strom's.
+          sudo pfctl -f /etc/pf.conf
+          echo 'block drop in quick on ! lo0 proto { tcp udp } from any to any port 8080' \
+            | sudo pfctl -a com.apple/oli-e2e -f -
+          sudo pfctl -E 2>&1 | grep -v '^Token' || true
+          if ! sudo pfctl -a com.apple/oli-e2e -sr 2>/dev/null | grep -q 'port = 8080'; then
+            echo "::error title=e2e app::the pf rule for Strom's port did not load"
+            exit 1
+          fi
+          if ! sudo pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+            echo "::error title=e2e app::pf is not enabled"
+            exit 1
+          fi
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
+          python3 -I .github/scripts/e2e-app.py "$mnt/$APP/Contents/MacOS/open-live-ingest-app"
+      - name: Windows
+        if: always()
+        run: |
+          echo "- Windows: not run. The Windows half runs from the installer once #36 (camera capture through Strom on Windows 11) is a go; #36 is not a go yet." >> "$GITHUB_STEP_SUMMARY"
+      - name: App log
+        if: always()
+        run: |
+          log="$HOME/Library/Logs/open-live-ingest/app.log"
+          if [[ -f "$log" ]]; then cat "$log"; else echo "no app log at $log"; fi
+          strom_log="$(find "$HOME/Library/Application Support/open-live-ingest" -name strom.log 2>/dev/null | head -n 1)"
+          if [[ -n "$strom_log" ]]; then echo "--- $strom_log (tail) ---"; tail -n 100 "$strom_log"; fi
+
   # Adds the notarized DMG to the release `release` created: the DMG itself, a
   # SHA256SUMS that covers the release's tarballs, the Windows zip and installer, and the DMG
   # (replacing the one `release` uploaded), and a build-provenance attestation for the DMG, checked with

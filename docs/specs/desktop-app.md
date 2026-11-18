@@ -362,6 +362,18 @@ unknown command or bad arguments is an error reply, never a panic.
 The variant names on the right are #71's; the app maps whatever names #71 merges with. `message`
 is always produced by `app/src/messages.rs` (§10), never passed through from an error chain.
 
+### 9.3a The same API over stdin and stdout (`--ipc-stdio`)
+
+`open-live-ingest-app --ipc-stdio` runs the app core with no window and no webview: each stdin
+line is one page message (§9.1), each stdout line one reply or event, the JSON the page would be
+handed by `window.oli.receive`. It is the same `ipc::Core` the window drives, so a test of the
+release artifact (the DMG's or the installer's executable) exercises the same commands and model
+the page does; OL-59i's end to end (`.github/scripts/e2e-app.py`) uses it. The process ends as the
+window does: a `quit` with nothing live, Stop and quit once the teardown is done, SIGTERM on macOS
+(Stop without asking), or stdin closing (the bounded teardown of §8). It opens no port and gives
+nothing a local process could not do with the CLI as the same user; replies and events carry no
+secret (§9.4), so stdout can be logged.
+
 ### 9.4 Security of the webview
 
 - Content only from the app's own custom protocol `oli`, loaded as `oli://localhost/` (macOS;
