@@ -10,7 +10,8 @@
 //! a dropped handle) and, with a fake Open Live, that a failed startup removes the
 //! sources it registered, that a stop removes them, and that a session started to
 //! keep its sources (the desktop app) leaves them for the next one to adopt with the
-//! same id.
+//! same id, while its stop (`teardown`, and `teardown_within` when the process is
+//! ending) still sweeps the other sources carrying its gateway's name prefix.
 //!
 //! `start_events_and_stop_against_a_real_strom` (#72 AC2) needs a real Strom, at the
 //! release `Cargo.toml` pins, already listening, so it is `#[ignore]`d. Run it with
@@ -519,6 +520,92 @@ async fn a_stop_removes_the_sources_unless_kept() {
         open_live_state.lock().unwrap().sources.is_empty(),
         "the source is still in Open Live"
     );
+}
+
+/// #115 review: a session keeping its sources still sweeps the other sources of
+/// its gateway at a stop, by name prefix, and leaves its own. `why` picks the
+/// teardown: `Stop::Interrupt` (`teardown`, the app's Stop) or `Stop::Ending`
+/// (`teardown_within`, Windows ending the process). The stale source is added
+/// once the session is on air, so only the teardown's sweep can remove it.
+async fn a_kept_session_sweeps_the_other_sources_of_its_gateway(gateway_id: &str, why: Stop) {
+    no_terminal_and_a_scratch_user_dir();
+    let strom_state = Arc::new(Mutex::new(StromState {
+        delivering: true,
+        ..StromState::default()
+    }));
+    let strom = fake_strom(strom_state.clone());
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+    let name = "Session test — Test pattern";
+    let stale = "Session test — Old label";
+    let foreign = "Another gateway — Test pattern";
+
+    let (mut handle, mut events) = Session::start_keeping_sources(
+        registering_settings(&strom, &open_live, gateway_id),
+        Inputs::test_pattern(),
+        None,
+    );
+    until_state(&mut events, InputState::OnAir, Duration::from_secs(60)).await;
+    let (slot, _) = source_named(&open_live_state, name).expect("no source registered");
+    {
+        let mut ol = open_live_state.lock().unwrap();
+        for (id, source_name) in [("src-stale", stale), ("src-foreign", foreign)] {
+            ol.sources.push(json!({
+                "id": id,
+                "name": source_name,
+                "address": "srt://:47259?mode=listener",
+                "streamType": "srt",
+                "status": "inactive",
+            }));
+        }
+    }
+
+    handle.request_stop(why);
+    let rest = to_the_end(&mut events, Duration::from_secs(60)).await;
+    tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("the session did not end")
+        .expect("the session ended on an error");
+    assert_torn_down(&rest, name);
+    assert!(
+        rest.contains(&Event::SourceRetained {
+            input: name.to_string()
+        }),
+        "{rest:?}"
+    );
+    assert!(
+        rest.contains(&Event::SourceRemoved {
+            input: stale.to_string()
+        }),
+        "the stale source was not swept: {rest:?}"
+    );
+    assert!(
+        !rest.contains(&Event::SourceRemoved {
+            input: name.to_string()
+        }),
+        "{rest:?}"
+    );
+    let ol = open_live_state.lock().unwrap();
+    assert_eq!(ol.deleted, 1, "only the stale source goes");
+    let left: Vec<&str> = ol
+        .sources
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(left, [slot.as_str(), "src-foreign"]);
+    assert_eq!(ol.sources[0]["status"], "inactive");
+}
+
+#[tokio::test]
+async fn a_kept_session_sweeps_the_other_sources_of_its_gateway_at_stop() {
+    a_kept_session_sweeps_the_other_sources_of_its_gateway("gw-session-sweep", Stop::Interrupt)
+        .await;
+}
+
+#[tokio::test]
+async fn a_kept_session_sweeps_the_other_sources_of_its_gateway_when_ending() {
+    a_kept_session_sweeps_the_other_sources_of_its_gateway("gw-session-sweep-end", Stop::Ending)
+        .await;
 }
 
 /// #72 AC2, against a real Strom; see the module documentation.
