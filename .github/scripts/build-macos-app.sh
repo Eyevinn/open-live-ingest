@@ -47,8 +47,9 @@
 # builds carried are removed. The last step fails if `otool -L` (or an LC_RPATH) of
 # any Mach-O in the bundle still names /opt/homebrew or /usr/local, if one is not
 # signed with the hardened runtime, if strom, open-live-ingest or open-live-ingest-app
-# lacks the camera or microphone entitlement, or if `codesign --verify --deep --strict`
-# rejects the bundle.
+# lacks the camera or microphone entitlement, if strom lacks
+# com.apple.security.cs.allow-jit or any other executable or gst-plugin-scanner carries
+# it, or if `codesign --verify --deep --strict` rejects the bundle.
 #
 # Signing, inside out and never with --deep: the libraries and plugins, then
 # gst-plugin-scanner, strom and the CLI (open-live-ingest, a nested executable), then
@@ -56,7 +57,9 @@
 # everything else. Every Mach-O gets the hardened runtime (--options runtime), and the
 # three executables that run as the app, strom, open-live-ingest and
 # open-live-ingest-app, get the entitlements in open-live-ingest.entitlements next to
-# this script (camera and microphone; the file says why each one is there). No other
+# this script (camera and microphone; the file says why each one is there). strom alone
+# also gets com.apple.security.cs.allow-jit, which the script adds to a copy of that
+# file, so GStreamer's ORC can compile its inner loops at run time (#113). No other
 # entitlement: the app's webview (WKWebView) runs its JIT in Apple's WebContent process,
 # not in the app. By default the signature is ad hoc, which Apple silicon requires to
 # load the code at all: the bundle runs on the build Mac and exercises the hardened
@@ -68,8 +71,9 @@
 # bundle and refuses it on any other. Set MACOS_SIGN_IDENTITY (a "Developer ID
 # Application: ..." identity, or its SHA-1 hash, in a keychain the caller has unlocked)
 # to sign with it instead, with a secure timestamp, ready for notarization, and no
-# hardened-runtime exception; MACOS_SIGN_KEYCHAIN names that keychain when it is not in
-# the search list. MACOS_ENTITLEMENTS overrides the entitlements file. Signing the DMG,
+# hardened-runtime exception but strom's allow-jit; MACOS_SIGN_KEYCHAIN names that
+# keychain when it is not in the search list. MACOS_ENTITLEMENTS overrides the
+# entitlements file (strom still gets allow-jit on top of it). Signing the DMG,
 # notarizing and stapling is left to the caller.
 #
 # Other environment knobs:
@@ -107,6 +111,9 @@ ICON_NAME="AppIcon"
 ICON_SRC_REL="app/icons/$ICON_NAME.icns"
 # Granted to the executables of an ad hoc build only (see the header).
 LIBRARY_VALIDATION_KEY="com.apple.security.cs.disable-library-validation"
+# Granted to strom alone, ad hoc or Developer ID (see the header and #113).
+JIT_KEY="com.apple.security.cs.allow-jit"
+JIT_EXEC="MacOS/strom"
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { echo "==> $*" >&2; }
@@ -124,6 +131,19 @@ macho_files() {
             *Mach-O*) printf '%s\n' "$f" ;;
         esac
     done <<<"$list"
+}
+
+# Whether the entitlements XML in $1 (`codesign -d --entitlements - --xml`) grants the
+# key $2 (set to <true/>). With $3 = any, whether it names the key at all, whatever
+# the value.
+has_entitlement() {
+    local flat
+    flat="$(tr -d ' \t\n' <<<"$1")"
+    if [[ "${3:-}" == any ]]; then
+        grep -qF "<key>$2</key>" <<<"$flat"
+    else
+        grep -qF "<key>$2</key><true/>" <<<"$flat"
+    fi
 }
 
 # The libraries a Mach-O loads, without its own install name.
@@ -215,8 +235,7 @@ check_bundle() {
         ents="$(codesign -d --entitlements - --xml "$app/Contents/$req" 2>/dev/null)" \
             || die "cannot read the entitlements of Contents/$req"
         for key in com.apple.security.device.camera com.apple.security.device.audio-input; do
-            grep -qF "<key>$key</key><true/>" <<<"$(tr -d ' \t\n' <<<"$ents")" \
-                || die "Contents/$req lacks the entitlement $key"
+            has_entitlement "$ents" "$key" || die "Contents/$req lacks the entitlement $key"
         done
     done
     say "OK: $APP_EXEC, $CLI_EXEC and strom carry the camera and microphone entitlements"
@@ -227,13 +246,20 @@ check_bundle() {
             || die "cannot read the entitlements of Contents/$req"
         adhoc=false
         if grep -qx 'Signature=adhoc' <<<"$sig"; then adhoc=true; fi
-        if grep -qF "<key>$LIBRARY_VALIDATION_KEY</key><true/>" <<<"$(tr -d ' \t\n' <<<"$ents")"; then
+        if has_entitlement "$ents" "$LIBRARY_VALIDATION_KEY"; then
             $adhoc || die "Contents/$req is not signed ad hoc but carries $LIBRARY_VALIDATION_KEY"
         elif $adhoc; then
             die "Contents/$req is signed ad hoc but lacks $LIBRARY_VALIDATION_KEY"
         fi
+        # ORC's JIT (#113): strom, which runs the GStreamer pipelines, and nothing else.
+        if [[ "$req" == "$JIT_EXEC" ]]; then
+            has_entitlement "$ents" "$JIT_KEY" || die "Contents/$req lacks $JIT_KEY"
+        elif has_entitlement "$ents" "$JIT_KEY" any; then
+            die "Contents/$req carries $JIT_KEY, which only $JIT_EXEC may have"
+        fi
     done
     say "OK: $LIBRARY_VALIDATION_KEY is on the executables if and only if they are signed ad hoc"
+    say "OK: $JIT_KEY is on $JIT_EXEC and on no other executable or gst-plugin-scanner"
     codesign --verify --deep --strict --verbose=2 "$app" || die "codesign does not accept $app"
     say "OK: codesign --verify --strict accepts the bundle"
 }
@@ -530,6 +556,8 @@ done <"$origins"
 entitlements="${MACOS_ENTITLEMENTS:-$root/.github/scripts/open-live-ingest.entitlements}"
 [[ -f "$entitlements" ]] || die "no entitlements file at $entitlements"
 plutil -lint "$entitlements" >/dev/null || die "$entitlements is not a valid plist"
+plistbuddy=/usr/libexec/PlistBuddy
+[[ -x "$plistbuddy" ]] || die "$plistbuddy not found"
 scanner_sign_args=()
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
     say "Signing with the Developer ID identity (hardened runtime, secure timestamp)"
@@ -540,8 +568,6 @@ else
     say "An ad hoc signed app cannot be notarized, and Gatekeeper rejects it once downloaded."
     sign_args=(--sign -)
     say "Ad hoc: strom, $CLI_EXEC, $APP_EXEC and gst-plugin-scanner get $LIBRARY_VALIDATION_KEY."
-    plistbuddy=/usr/libexec/PlistBuddy
-    [[ -x "$plistbuddy" ]] || die "$plistbuddy not found"
     adhoc_entitlements="$work/adhoc.entitlements"
     cp "$entitlements" "$adhoc_entitlements"
     "$plistbuddy" -c "Delete :$LIBRARY_VALIDATION_KEY" "$adhoc_entitlements" >/dev/null 2>&1 || true
@@ -563,6 +589,18 @@ EOF
     plutil -lint "$scanner_entitlements" >/dev/null || die "$scanner_entitlements is not a valid plist"
     scanner_sign_args=(--entitlements "$scanner_entitlements")
 fi
+# strom alone also gets ORC's JIT (#113): GStreamer's ORC compiles the inner loops of
+# videoconvert, videoscale, audioconvert and the like to machine code at run time, and
+# under the hardened runtime that needs com.apple.security.cs.allow-jit. Without it
+# ORC logs "Failed to create write and exec mmap regions" and falls back to slower C.
+# The key is added here, not in the file, so the app, the CLI and the scanner (which
+# run no pipeline) never get it; --check enforces that.
+strom_entitlements="$work/strom.entitlements"
+cp "$entitlements" "$strom_entitlements"
+"$plistbuddy" -c "Delete :$JIT_KEY" "$strom_entitlements" >/dev/null 2>&1 || true
+"$plistbuddy" -c "Add :$JIT_KEY bool true" "$strom_entitlements" >/dev/null \
+    || die "cannot add $JIT_KEY to $strom_entitlements"
+plutil -convert xml1 "$strom_entitlements" || die "$strom_entitlements is not a valid plist"
 sign() { codesign --force --options runtime "${sign_args[@]}" "$@" </dev/null; }
 while IFS= read -r entry; do
     file="${entry%%$'\t'*}"
@@ -570,7 +608,7 @@ while IFS= read -r entry; do
     sign "$file"
 done <"$origins"
 sign "${scanner_sign_args[@]+"${scanner_sign_args[@]}"}" "$contents/$SCANNER_REL"
-sign --entitlements "$entitlements" "$contents/MacOS/strom"
+sign --entitlements "$strom_entitlements" "$contents/$JIT_EXEC"
 sign --entitlements "$entitlements" "$contents/MacOS/$CLI_EXEC"
 sign --entitlements "$entitlements" "$app"
 

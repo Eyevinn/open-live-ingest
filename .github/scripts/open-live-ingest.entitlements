@@ -21,8 +21,27 @@
   IDs", #66). For an ad hoc build only, build-macos-app.sh therefore signs strom,
   open-live-ingest, open-live-ingest-app and gst-plugin-scanner with this file plus
   com.apple.security.cs.disable-library-validation (the scanner with that key alone),
-  and its bundle check refuses that key on any other signature. Add an exception here
-  only when a Developer ID build shows it is needed, with the reason.
+  and its bundle check refuses that key on any other signature.
+
+  One hardened-runtime exception is granted, to strom alone, and not in this file:
+  build-macos-app.sh signs Contents/MacOS/strom with a copy of this file plus
+
+  com.apple.security.cs.allow-jit         GStreamer's ORC compiles the inner loops of
+                                          videoconvert, videoscale, audioconvert and the
+                                          like to machine code at run time. The Developer
+                                          ID build of v0.5.0 showed that without the key
+                                          the hardened runtime refuses ORC's write and
+                                          exec mapping ("ORC: ERROR: ... Failed to create
+                                          write and exec mmap regions", #110, #113), and
+                                          ORC falls back to slower C code, more CPU load
+                                          on the uplink's pipeline.
+
+  It is kept out of this file so the app, the CLI and gst-plugin-scanner, which run no
+  pipeline, never get it; the bundle check requires it on strom and refuses it on every
+  other signature. Library validation stays on for a Developer ID build: allow-jit only
+  lets strom map memory for code it generates itself (MAP_JIT), it does not let strom
+  load a library signed by another team. Add another exception only when a Developer ID
+  build shows it is needed, with the reason.
 -->
 <plist version="1.0">
 <dict>
