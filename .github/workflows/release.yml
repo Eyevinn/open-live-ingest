@@ -669,10 +669,11 @@ jobs:
       #   a test pattern through videoconvert, videoscale and audioconvert, whose inner
       #   loops are ORC programs, so ORC JITs them (allow-jit, #113); and the gateway's
       #   own test-pattern flow (Source::Test, x264 and the SRT uplink).
-      # - with both flows running, the Strom process has no library, module or ORC JIT
-      #   file (orcexec.*) mapped from outside the app other than macOS's own (lsof:
-      #   DYLD_PRINT_LIBRARIES is ignored under the hardened runtime), though this
-      #   runner has Homebrew's GStreamer and GLib installed.
+      # - with both flows running, the Strom process has no library or module mapped
+      #   from outside the app other than macOS's own (lsof: DYLD_PRINT_LIBRARIES is
+      #   ignored under the hardened runtime), though this runner has Homebrew's
+      #   GStreamer and GLib installed. ORC's JIT buffers (orcexec.* in $HOME or
+      #   $TMPDIR) are flagged with a warning annotation, not failed on.
       # - nothing in its log says a library, plugin or GIO module failed to load
       #   (library validation, a bad signature), names a Homebrew path, or says ORC
       #   could not JIT (`ORC: ERROR`, #113).
@@ -838,8 +839,11 @@ jobs:
 
           # Every file mapped into Strom (lsof's "txt"): the executable, its libraries,
           # modules it loaded, and the dyld shared cache macOS's own libraries live in.
-          # An orcexec.* file is ORC's JIT fallback when it cannot get an executable
-          # anonymous mapping: code from outside the bundle, so it fails the check too.
+          # orcexec.* files are ORC's JIT buffers: on macOS ORC (0.4.44) maps a temp file
+          # in $HOME twice, writable and executable, even with allow-jit (#113), so they
+          # hold code the bundled liborc generated, not code loaded from outside. They
+          # are flagged (a warning annotation) and must sit in $HOME or $TMPDIR, but do
+          # not fail the check; anything else outside the app and macOS still does.
           app_real="$(cd "$mnt/$APP" && pwd -P)"
           mapped="$(lsof -n -P -p "$strom_pid" -a -d txt -Fn | sed -n 's/^n//p')" \
             || { echo "lsof failed on the bundled Strom"; exit 1; }
@@ -848,6 +852,17 @@ jobs:
             || { echo "lsof shows no bundled plugin mapped into Strom, so this check saw nothing"; exit 1; }
           outside="$(grep -vE "^($app_real|$mnt/$APP)/|^/usr/lib/|^/System/" <<<"$mapped" \
             | grep -E '/opt/homebrew|/usr/local|\.(dylib|so)$|\.framework/|/orcexec\.' || true)"
+          orcexec="$(grep -E '/orcexec\.[^/]*$' <<<"$outside" || true)"
+          if [[ -n "$orcexec" ]]; then
+            echo "::warning title=ORC JIT buffers mapped into the bundled Strom::$(tr '\n' ' ' <<<"$orcexec")"
+            echo "flagged: ORC JIT buffers (orcexec.*) mapped into Strom:"; printf '%s\n' "$orcexec"
+            tmp_real="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P || echo /private/tmp)"
+            stray="$(grep -vE "^($HOME|${TMPDIR%/}|$tmp_real)/orcexec\.[^/]*$" <<<"$orcexec" || true)"
+            if [[ -n "$stray" ]]; then
+              echo "orcexec.* mapped from outside \$HOME and \$TMPDIR:"; printf '%s\n' "$stray"; exit 1
+            fi
+            outside="$(grep -vE '/orcexec\.[^/]*$' <<<"$outside" || true)"
+          fi
           if [[ -n "$outside" ]]; then
             echo "the bundled Strom loaded these from outside $APP:"; printf '%s\n' "$outside"; exit 1
           fi
