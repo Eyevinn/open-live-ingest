@@ -109,18 +109,25 @@ def mask(value):
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 
+# Keys whose string value is a URL. `uplink` and `registered` are the `summary` event's
+# caller uplink to the cloud Strom and the address registered with Open Live.
+URL_KEYS = ("url", "uplink", "registered")
+
+
 def mask_urls(value):
-    """Masks every non-loopback `url` value in an app line, and its host without the
-    scheme, so that the line can be printed."""
+    """Masks every non-loopback URL value (see URL_KEYS) in an app line, its host and
+    its hostname (without scheme or query), so that the line can be printed."""
     if isinstance(value, dict):
         for key, item in value.items():
-            if key == "url" and isinstance(item, str) and item:
+            if key in URL_KEYS and isinstance(item, str) and item:
                 bare = item.split("://", 1)[-1].rstrip("/")
-                host = bare.split("/", 1)[0]
-                if host.rsplit(":", 1)[0] not in LOOPBACK_HOSTS:
+                host = bare.split("/", 1)[0].split("?", 1)[0]
+                hostname = host.rsplit(":", 1)[0]
+                if hostname and hostname not in LOOPBACK_HOSTS:
                     mask(item)
                     mask(bare)
                     mask(host)
+                    mask(hostname)
             else:
                 mask_urls(item)
     elif isinstance(value, list):
