@@ -9,11 +9,14 @@
 //! the video and audio frames in it afterwards.
 //!
 //! It reads the uplink's `/api/flows/<id>/srt-stats` the moment the peer appears, 10 s
-//! later, and at the end of the window, and fails (exit status 1) when
-//! `packets_sent_dropped` grew by 1 % or more of `packets_sent` over the window, or
-//! when the receiver got no video or no audio frames. `snd_buf_level_ms` is printed
-//! with every sample: a send buffer that holds more than the SRT latency is the
-//! backlog the issue suspects.
+//! later, and at the end of the window. The caller's SRT counters start at 0 for each
+//! connection, so the check uses their absolute values (a baseline of 0), not growth
+//! since the first sample: the backlog burst at connect is already in that first
+//! sample, and a drop burst there must count. It fails (exit status 1) when
+//! `packets_sent_dropped` is 1 % or more of `packets_sent` at +10 s or at the end of
+//! the window, or when the receiver got no video or no audio frames.
+//! `snd_buf_level_ms` is printed with every sample: a send buffer that holds more
+//! than the SRT latency is the backlog the issue suspects.
 //!
 //! Needs a running Strom (the pinned release, with GStreamer's `srt`, `x264` and
 //! `avenc_aac`), `srt-live-transmit` and `ffprobe` on the PATH. Nothing else: no
@@ -37,14 +40,15 @@ use anyhow::{bail, Context, Result};
 use open_live_ingest::config::{Uplink, Video};
 use open_live_ingest::flow::{self, Input, Source, TEST_INPUT_ID};
 use open_live_ingest::strom::{StromClient, PINNED_VERSION};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 use strom_types::api::SrtCallerStats;
 
 const GATEWAY_ID: &str = "repro-late-connect";
 const LATENCY_MS: u32 = 200;
-/// The share of `packets_sent` that `packets_sent_dropped` may grow by.
+/// The share of `packets_sent` that `packets_sent_dropped` may reach, counted from 0 at
+/// connect.
 const MAX_DROP_RATIO: f64 = 0.01;
 /// How long to wait for the uplink to report a peer once the listener is up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -164,7 +168,7 @@ async fn main() -> Result<ExitCode> {
         let last = peer(&strom, &id).await?;
         sample(&format!("+{} s", connected.elapsed().as_secs()), &last);
 
-        Ok((growth(&first, &ten), growth(&first, &last)))
+        Ok((totals(&ten), totals(&last)))
     }
     .await;
 
@@ -179,27 +183,29 @@ async fn main() -> Result<ExitCode> {
     let ((sent10, dropped10), (sent, dropped)) = outcome?;
 
     println!(
-        "first 10 s: {dropped10} of {sent10} sent dropped ({})",
+        "since connect, at +10 s: {dropped10} of {sent10} sent dropped ({})",
         percent(dropped10, sent10)
     );
     println!(
-        "window:     {dropped} of {sent} sent dropped ({})",
+        "since connect, at end:   {dropped} of {sent} sent dropped ({})",
         percent(dropped, sent)
     );
     let (video_frames, audio_frames) = count_frames(&o.out)?;
     println!(
-        "receiver:   {video_frames} video and {audio_frames} audio frames in {}",
+        "receiver: {video_frames} video and {audio_frames} audio frames in {}",
         o.out.display()
     );
 
-    let drops_ok = sent > 0 && (dropped as f64) < MAX_DROP_RATIO * sent as f64;
+    let drops_ok = under_ratio(sent10, dropped10) && under_ratio(sent, dropped);
     let media_ok = video_frames > 0 && audio_frames > 0;
     if drops_ok && media_ok {
         println!("PASS: under 1 % dropped, and the receiver decodes video and audio");
         Ok(ExitCode::SUCCESS)
     } else {
         if !drops_ok {
-            println!("FAIL: packets_sent_dropped grew by 1 % or more of packets_sent");
+            println!(
+                "FAIL: packets_sent_dropped reached 1 % or more of packets_sent since connect"
+            );
         }
         if !media_ok {
             println!("FAIL: the receiver did not get both video and audio frames");
@@ -209,7 +215,7 @@ async fn main() -> Result<ExitCode> {
 }
 
 /// `srt-live-transmit` listening on `port`, writing what it receives to `out`.
-fn spawn_receiver(port: u16, out: &PathBuf) -> Result<Child> {
+fn spawn_receiver(port: u16, out: &Path) -> Result<Child> {
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     Command::new("srt-live-transmit")
         .arg(format!("srt://:{port}?mode=listener&latency={LATENCY_MS}"))
@@ -262,13 +268,18 @@ fn show<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or_else(|| "-".to_string(), |v| v.to_string())
 }
 
-/// Packets sent and packets dropped between two samples.
-fn growth(from: &SrtCallerStats, to: &SrtCallerStats) -> (u64, u64) {
-    let delta = |a: Option<u64>, b: Option<u64>| b.unwrap_or(0).saturating_sub(a.unwrap_or(0));
+/// Packets sent and packets dropped since the connection began. The caller's counters
+/// start at 0 per connection, so the absolute values include the burst at connect.
+fn totals(s: &SrtCallerStats) -> (u64, u64) {
     (
-        delta(from.packets_sent, to.packets_sent),
-        delta(from.packets_sent_dropped, to.packets_sent_dropped),
+        s.packets_sent.unwrap_or(0),
+        s.packets_sent_dropped.unwrap_or(0),
     )
+}
+
+/// Something was sent, and under `MAX_DROP_RATIO` of it was dropped.
+fn under_ratio(sent: u64, dropped: u64) -> bool {
+    sent > 0 && (dropped as f64) < MAX_DROP_RATIO * sent as f64
 }
 
 fn percent(part: u64, whole: u64) -> String {
@@ -279,7 +290,7 @@ fn percent(part: u64, whole: u64) -> String {
 }
 
 /// Decoded video and audio frames in the received file, by `ffprobe -count_frames`.
-fn count_frames(path: &PathBuf) -> Result<(u64, u64)> {
+fn count_frames(path: &Path) -> Result<(u64, u64)> {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-count_frames", "-of", "json"])
         .args(["-show_entries", "stream=codec_type,nb_read_frames"])
