@@ -77,6 +77,9 @@ pub enum Event {
     /// Open Live refused to remove a source, for `reason` (usually an active
     /// production holding it).
     SourceKept { input: String, reason: String },
+    /// A source was left in Open Live on purpose (`run::Sources::Keep`), marked
+    /// inactive, for the next run to adopt with the same id.
+    SourceRetained { input: String },
 
     /// `down` found a running `up` and asked it to stop.
     AskingRunningToStop { pid: u32 },
@@ -92,8 +95,9 @@ pub enum Event {
     Stopped,
     /// A session ended on an error, before it ran or as it ran, for `reason`: the
     /// same text the CLI prints after `Error:`. Anything it had started has been
-    /// removed again, flows and the Open Live sources it registered, except after a
-    /// panic (see `session`'s caveats). Its last event.
+    /// removed again, flows and the Open Live sources it registered (unless it keeps
+    /// its sources, `run::Sources::Keep`), except after a panic (see `session`'s
+    /// caveats). Its last event.
     Failed { reason: String },
 }
 

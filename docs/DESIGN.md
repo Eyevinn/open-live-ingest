@@ -207,6 +207,14 @@ agent and be reconciled forever from a config file. Carrying both models meant d
 per-input supervisor tasks, a persisted state file, and a control API that the command line never
 used. The daemon is a different product; if it is ever wanted, it should be built as one.
 
+**The app's Stop keeps its Open Live sources.** A Studio production slot references a source by id,
+and the source is the venue's stable identity for an input, not part of a run. So the app's Stop
+and quit remove the flows but leave each input's source in Open Live, marked inactive
+(`run::Sources::Keep`), and the next Go live adopts it by name with the same id and port, as `up`
+already adopts a source left by a run that ended without cleanup. Removing it instead left every
+slot pointing at a deleted id after Stop and Go live. The CLI `up` still removes its sources: `down`
+is the way to clear the app's too.
+
 **Adopt, never replace.** A Strom already listening at the configured URL is used as it is and
 never stopped: it may be a service the box depends on, or another operator's session. Only when
 nothing answers does `up` start a headless Strom itself, with its own data directory so it never

@@ -8,7 +8,9 @@
 //!
 //! The other fake-Strom tests pin the stop contract (a stop asked for during startup,
 //! a dropped handle) and, with a fake Open Live, that a failed startup removes the
-//! sources it registered.
+//! sources it registered, that a stop removes them, and that a session started to
+//! keep its sources (the desktop app) leaves them for the next one to adopt with the
+//! same id.
 //!
 //! `start_events_and_stop_against_a_real_strom` (#72 AC2) needs a real Strom, at the
 //! release `Cargo.toml` pins, already listening, so it is `#[ignore]`d. Run it with
@@ -362,6 +364,163 @@ async fn a_registration_failing_part_way_removes_the_sources_before_it() {
     assert_eq!(strom_state.lock().unwrap().created, 0, "a flow was started");
 }
 
+/// Reads events until an input reports `wanted`, and returns them. Any failure event
+/// fails the test with its reason.
+async fn until_state(events: &mut Receiver, wanted: InputState, within: Duration) -> Vec<Event> {
+    let mut seen = Vec::new();
+    let wait = async {
+        while let Some(event) = events.recv().await {
+            if let Event::Failed { reason } | Event::InputFailed { reason, .. } = &event {
+                panic!("failed: {reason}");
+            }
+            let reached = matches!(&event, Event::Input { state, .. } if *state == wanted);
+            seen.push(event);
+            if reached {
+                return;
+            }
+        }
+        panic!("the session ended before an input was {wanted:?}: {seen:?}");
+    };
+    if tokio::time::timeout(within, wait).await.is_err() {
+        panic!("no input was {wanted:?} within {within:?}: {seen:?}");
+    }
+    seen
+}
+
+/// The source the fake Open Live holds under `name`: its id and address.
+fn source_named(state: &Mutex<OpenLiveState>, name: &str) -> Option<(String, String)> {
+    state
+        .lock()
+        .unwrap()
+        .sources
+        .iter()
+        .find(|s| s["name"] == name)
+        .map(|s| {
+            (
+                s["id"].as_str().unwrap().to_string(),
+                s["address"].as_str().unwrap().to_string(),
+            )
+        })
+}
+
+/// #115: the desktop app's Stop then Go live. Go live registers the source; a
+/// production slot takes its id and the feed goes on air; Stop removes the flow but
+/// leaves the source, marked inactive; Go live again adopts that same source, with
+/// the same id and port, creating none, so the slot still names it and the new flow
+/// sends to the port the slot's listener is on.
+#[tokio::test]
+async fn a_session_keeping_its_sources_is_adopted_with_the_same_id_by_the_next() {
+    no_terminal_and_a_scratch_user_dir();
+    let strom_state = Arc::new(Mutex::new(StromState {
+        delivering: true,
+        ..StromState::default()
+    }));
+    let strom = fake_strom(strom_state.clone());
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+    let settings = registering_settings(&strom, &open_live, "gw-session-keep");
+    let name = "Session test — Test pattern";
+
+    // Go live: registered, and on air once bytes move between two polls.
+    let (handle, mut events) =
+        Session::start_keeping_sources(settings.clone(), Inputs::test_pattern(), None);
+    until_state(&mut events, InputState::OnAir, Duration::from_secs(60)).await;
+    let (slot, address) = source_named(&open_live_state, name).expect("no source registered");
+    assert_eq!(open_live_state.lock().unwrap().created, 1);
+    let port = address
+        .strip_prefix("srt://:")
+        .and_then(|rest| rest.split(['?', '/']).next())
+        .unwrap_or_else(|| panic!("no listener port in {address}"))
+        .to_string();
+
+    // Stop: the flow goes, the source stays, and is no longer marked active.
+    let rest = stop(handle, &mut events).await;
+    assert_torn_down(&rest, name);
+    assert!(
+        rest.contains(&Event::SourceRetained {
+            input: name.to_string()
+        }),
+        "{rest:?}"
+    );
+    assert!(
+        !rest
+            .iter()
+            .any(|e| matches!(e, Event::SourceRemoved { .. })),
+        "{rest:?}"
+    );
+    assert!(strom_state.lock().unwrap().flows.is_empty());
+    {
+        let ol = open_live_state.lock().unwrap();
+        assert_eq!(ol.deleted, 0, "a source was deleted");
+        assert_eq!(ol.sources.len(), 1);
+        assert_eq!(ol.sources[0]["id"], slot.as_str());
+        assert_eq!(ol.sources[0]["status"], "inactive");
+        assert_eq!(ol.patched.last().map(String::as_str), Some("inactive"));
+    }
+
+    // Go live again: the same source, nothing created, and the flow sends to its port.
+    strom_state.lock().unwrap().delivering = false;
+    let (handle, mut events) =
+        Session::start_keeping_sources(settings, Inputs::test_pattern(), None);
+    let seen = until_up(&mut events, Duration::from_secs(60)).await;
+    assert!(
+        !seen.iter().any(|e| matches!(e, Event::Registered { .. })),
+        "registered anew: {seen:?}"
+    );
+    assert_eq!(
+        open_live_state.lock().unwrap().created,
+        1,
+        "a source was created"
+    );
+    assert_eq!(
+        source_named(&open_live_state, name).map(|(id, _)| id),
+        Some(slot.clone()),
+        "the slot's source id changed"
+    );
+    let flow = strom_state.lock().unwrap().flows[0].to_string();
+    assert!(
+        flow.contains(&format!("cloud.example.com:{port}")),
+        "the flow does not send to port {port}: {flow}"
+    );
+
+    let rest = stop(handle, &mut events).await;
+    assert_torn_down(&rest, name);
+    let ol = open_live_state.lock().unwrap();
+    assert_eq!(ol.deleted, 0, "a source was deleted");
+    assert_eq!(ol.sources.len(), 1);
+    assert_eq!(ol.sources[0]["id"], slot.as_str());
+}
+
+/// The CLI's `up` (a session not started to keep its sources) still removes them at
+/// a stop.
+#[tokio::test]
+async fn a_stop_removes_the_sources_unless_kept() {
+    no_terminal_and_a_scratch_user_dir();
+    let strom = fake_strom(Arc::new(Mutex::new(StromState::default())));
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+
+    let (handle, mut events) = Session::start(
+        registering_settings(&strom, &open_live, "gw-session-remove"),
+        Inputs::test_pattern(),
+    );
+    until_up(&mut events, Duration::from_secs(30)).await;
+    assert_eq!(open_live_state.lock().unwrap().sources.len(), 1);
+    let rest = stop(handle, &mut events).await;
+    let name = "Session test — Test pattern";
+    assert_torn_down(&rest, name);
+    assert!(
+        rest.contains(&Event::SourceRemoved {
+            input: name.to_string()
+        }),
+        "{rest:?}"
+    );
+    assert!(
+        open_live_state.lock().unwrap().sources.is_empty(),
+        "the source is still in Open Live"
+    );
+}
+
 /// #72 AC2, against a real Strom; see the module documentation.
 #[tokio::test]
 #[ignore = "needs a real Strom at OLI_TEST_STROM_URL (default http://127.0.0.1:8080)"]
@@ -503,8 +662,8 @@ fn answer(mut stream: TcpStream, handler: &Handler) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// A fake Strom: discovery and the flow API, flows kept in memory. Nothing ever
-// receives the uplink, so SRT statistics are always absent.
+// A fake Strom: discovery and the flow API, flows kept in memory. Unless told it is
+// delivering, nothing receives the uplink, so SRT statistics are absent.
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
@@ -515,6 +674,10 @@ struct StromState {
     created: usize,
     /// Refuse every new flow, as a Strom missing an encoder does.
     refuse_flows: bool,
+    /// Something receives the uplink: SRT statistics with bytes moving on every poll.
+    delivering: bool,
+    /// SRT statistics polls answered while delivering.
+    polls: u64,
 }
 
 fn device(id: &str, name: &str) -> Value {
@@ -571,6 +734,18 @@ fn route(method: &str, path: &str, request: Value, s: &mut StromState) -> (u16, 
                     s.flows.remove(at);
                     (204, Value::Null)
                 }
+                ("GET", "srt-stats") if s.delivering => {
+                    s.polls += 1;
+                    let stats = json!({
+                        "flow_id": id,
+                        "stats": { "connections": { "uplink:srtsink": {
+                            "role": "sink",
+                            "connected": true,
+                            "callers": [{ "bytes_sent": s.polls * 100_000, "rtt_ms": 5.0 }],
+                        } } },
+                    });
+                    (200, stats)
+                }
                 ("GET", "srt-stats") => (404, json!({ "error": "no stats" })),
                 _ => (404, Value::Null),
             }
@@ -594,6 +769,10 @@ struct OpenLiveState {
     created: usize,
     /// Refuse creating sources once this many have been created.
     refuse_create_after: Option<usize>,
+    /// Sources ever deleted.
+    deleted: usize,
+    /// The `status` of every PATCH, in order.
+    patched: Vec<String>,
 }
 
 fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
@@ -639,8 +818,23 @@ fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
                 s.sources.push(source.clone());
                 (201, source)
             }
+            ("PATCH", _, Some(id)) => {
+                let Some(source) = s.sources.iter_mut().find(|x| x["id"] == id) else {
+                    return (404, json!({ "error": "Source not found" }));
+                };
+                for field in ["name", "address", "streamType", "status", "latency"] {
+                    if !request[field].is_null() {
+                        source[field] = request[field].clone();
+                    }
+                }
+                let source = source.clone();
+                s.patched
+                    .push(request["status"].as_str().unwrap_or_default().to_string());
+                (200, source)
+            }
             ("DELETE", _, Some(id)) => {
                 s.sources.retain(|x| x["id"] != id);
+                s.deleted += 1;
                 (204, Value::Null)
             }
             _ => (404, Value::Null),

@@ -300,6 +300,9 @@ fn render(event: &Event) -> Option<String> {
             format!("  {input} — source removed from Open Live\n")
         }
         Event::SourceKept { input, reason } => format!("  {}\n", kept_message(input, reason)),
+        Event::SourceRetained { input } => {
+            format!("  {input} — source kept in Open Live for the next run\n")
+        }
         Event::AskingRunningToStop { pid } => {
             format!("Asking the running gateway (pid {pid}) to stop.\n")
         }
@@ -560,6 +563,12 @@ mod tests {
                     reason: "HTTP 409 Conflict".to_string(),
                 },
                 "  Venue — Camera stays in Open Live: HTTP 409 Conflict. Deactivate that production, then run `open-live-ingest down`.\n".to_string(),
+            ),
+            (
+                Event::SourceRetained {
+                    input: "Venue — Camera".to_string(),
+                },
+                "  Venue — Camera — source kept in Open Live for the next run\n".to_string(),
             ),
             (
                 Event::AskingRunningToStop { pid: 4242 },

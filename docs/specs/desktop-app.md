@@ -105,6 +105,14 @@ packaging/windows/    open-live-ingest.nsi
   after which `down` removes what is left, as it does for a CLI `up`. The app executable is named
   `open-live-ingest-app` so the existing process-name check (`GATEWAY_COMM` in `src/run.rs`, a
   prefix of the executable's file name) matches it without change.
+- **Stop keeps the Open Live sources (#115).** A production slot references a source by id, so
+  Stop (and quitting while live, §8) removes the flows but leaves each input's source in Open Live,
+  marked inactive (`run::Sources::Keep`, `Event::SourceRetained`). The next Go live adopts it by
+  name with the same id and port (`plan_port`'s `Keep`, `reconcile_sources`), so the slot keeps
+  working without picking the source in Studio again. Sources carrying the prefix that are not
+  this session's inputs (a renamed label, an input not ticked now) are still swept at Stop, and
+  `open-live-ingest down` removes them all. The CLI `up` keeps removing its sources (`DESIGN.md`
+  §6).
 - **One live session per settings file.** Before Go live the app reads `gateway.pid`; if it names
   a running gateway (a CLI `up`, or another app instance) it does not start, and offers "Stop it"
   (the library's `down`). The CLI `up` gains the same refusal (`already running (pid N); run
@@ -154,10 +162,10 @@ sequenceDiagram
     alt problems
         App-->>UI: error (one line + action, §10)
     else ok
-        App->>Lib: Session::start(settings, inputs)
+        App->>Lib: Session::start_keeping_sources(settings, inputs, credential)
         Lib->>S: probe strom.url; start headless if unreachable (strom.pid)
         Lib-->>App: Event: Strom starting / ready
-        Lib->>OL: register sources (caller mode: port 0 → assigned port)
+        Lib->>OL: adopt each input's source by name (same id, same port), or register it (caller mode: port 0 → assigned port)
         Lib->>S: create + start one flow per input (derived flow id)
         Lib-->>App: Event per input: registering → connecting → live
         App-->>UI: {"event":"input", ...} per change, {"event":"stats"} every tick
@@ -165,9 +173,10 @@ sequenceDiagram
     P->>UI: Stop (or quit, §8)
     UI->>App: {"cmd":"stop"}
     App->>Lib: SessionHandle::stop()
-    Lib->>OL: heartbeat "stopping", then remove sources
+    Lib->>OL: heartbeat "stopping"
     Lib->>S: remove flows; stop the Strom we started
-    Lib-->>App: Event: removed … / stopped
+    Lib->>OL: keep each input's source, marked inactive; sweep other sources of the prefix
+    Lib-->>App: Event: removed … / kept … / stopped
     App-->>UI: {"event":"stopped"}
 ```
 
@@ -287,12 +296,13 @@ The rule is the CLI's (`DESIGN.md` §6): a deliberate stop stops, an accident do
 | Logout / restart (macOS) | Quit | Same question; macOS reports that Open Live Ingest cancelled the logout. A venue does not go off air because someone logged out by accident |
 | Logout / shutdown (Windows) | Quit | `WM_QUERYENDSESSION`: `ShutdownBlockReasonCreate("Stopping the live feeds")`, run the bounded teardown (`teardown_within`, the CLI's 4 s deadline), then allow the session to end. Windows does not wait for a dialog here |
 | `open-live-ingest down` from a terminal | — | macOS: SIGTERM → Stop without asking, then exit. Windows: `taskkill /F`, and `down` removes the rest |
-| Crash, Force Quit, Task Manager end task | — | Flows and sources remain; the next Go live or `down` cleans up (§4, Strom reclaim) |
+| Crash, Force Quit, Task Manager end task | — | Flows and sources remain; the next Go live removes the flows and adopts the sources, or `down` removes both (§4, Strom reclaim) |
 
 - **Stop and quit** runs the same teardown as the Stop button (`SessionHandle::stop()`, with
-  progress in the rows), then exits. If it has not finished after 15 s, the dialog adds "Quit
-  anyway"; whatever is left is swept by the next Go live or `down`, which find flows by derived id
-  and sources by name prefix.
+  progress in the rows): the flows are removed and the sources kept (§4), so a relaunch and Go live
+  feeds the same production slots. Then it exits. If it has not finished after 15 s, the dialog
+  adds "Quit anyway"; flows left behind are removed by the next Go live or `down`, which find them
+  by derived id.
 - **macOS implementation.** tao 0.37 implements no `applicationShouldTerminate:` (ADR-001). The app
   adds that method to tao's application delegate class at start with the Objective-C runtime
   (`class_addMethod`, through `objc2`). A unit test on the macOS CI job asserts the method is
@@ -561,7 +571,7 @@ i.
 | OL-59f | Logs: file writer with rotation, Show logs / Show Strom log, secret-free log test | a | Rotation and no-secrets tests pass |
 | OL-59g | macOS packaging: `build-macos-app.sh` app binary, Info.plist keys, icon, signing order, `--check`; `release.yml` artifact and DMG check; README/QUICKSTART | a, #67 | `release.yml` PR run passes `Check the DMG`, including the app's `--version` |
 | OL-59h | Windows installer: NSIS script, Strom MSI chaining with digest check, WebView2 check, shortcut, uninstaller; `release.yml` `windows-app` job, checksums, attestation | a | `release.yml` PR run builds the installer and passes the install/uninstall smoke test |
-| OL-59i | Agent-run end to end: on a macOS runner, from the PR's DMG artifact, drive the app core (the same commands the page sends, through the model, no webview) with the test pattern against the `openlivedev` instance: Go live → source in Open Live → Stop → source and flow gone → Go live again with no 409 → quit while live removes them (#62 AC2). Same on Windows once #36 is a go | b–h | Results posted on #62 with run links |
+| OL-59i | Agent-run end to end: on a macOS runner, from the PR's DMG artifact, drive the app core (the same commands the page sends, through the model, no webview) with the test pattern against the `openlivedev` instance: Go live → source in Open Live → Stop → the flow is gone, the source is kept → Go live again with no 409, reusing the source with the same id (#115) → quit while live removes the flow and keeps the source (#62 AC2). Same on Windows once #36 is a go | b–h | Results posted on #62 with run links |
 
 What a human does next, for #62's closing comment: on an Apple Silicon Mac, install the notarized
 DMG (needs #25), sign in, pick an instance, tick a camera with its microphone, Go live, and time it

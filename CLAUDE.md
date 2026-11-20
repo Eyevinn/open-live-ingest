@@ -63,6 +63,8 @@ no media pipeline; Strom does the media.
 - Open Live being unreachable must never disturb the feed: a warning and a retry on the next tick,
   never a stopped or restarted flow.
 - `up` owns what it started. Ctrl-C and SIGTERM remove the flows and sources; SIGHUP does not.
+  The app's Stop removes the flows and keeps the sources, for the next Go live to adopt with the
+  same id (`run::Sources::Keep`).
 - No local state beyond the settings file, two pidfiles (the running `up`, and a Strom it
   started), the one keychain entry an app sign-in keeps the OSC credential in, the desktop app's
   `app.log` (with one rotated copy), and on Windows the app's WebView2 cache folder
