@@ -767,8 +767,9 @@ jobs:
   # has just built and checked: the app executable the DMG carries, started with
   # `--ipc-stdio` (the app core with no window and no webview), is fed the same
   # messages the page sends, with the test pattern, against the Open Live instance
-  # `openlivedev`: Go live, the source in Open Live, Stop, the source and flow gone,
-  # Go live again with no 409, quit while live removes them. What it checks and how:
+  # `openlivedev`: Go live, the source in Open Live, Stop, the flow gone and the source
+  # kept, Go live again with no 409 reusing the same source id (#115), quit while live
+  # removes the flow and keeps the source. What it checks and how:
   # .github/scripts/e2e-app.py.
   #
   # Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
