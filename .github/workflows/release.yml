@@ -19,6 +19,8 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
+      - .github/scripts/e2e-app.py
+      - .github/scripts/test_e2e_app.py
       - .github/scripts/fetch-strom-msi.sh
       - .github/scripts/open-live-ingest.entitlements
       - app/**
@@ -771,12 +773,21 @@ jobs:
   # Go live again with no 409, quit while live removes them. What it checks and how:
   # .github/scripts/e2e-app.py.
   #
+  # The uplink's SRT stats while live (#112): with no secret, the app goes live to a
+  # stand-in Open Live on loopback and a local SRT listener (srt-live-transmit, from
+  # Homebrew's `srt`) starts at least 30 s later; with the secret, the openlivedev
+  # production that takes the source is activated at least 30 s after Go live. Either
+  # way the uplink's srt-stats are sampled twice, 60 s apart, and the job fails, with
+  # the numbers in the log, when packets_sent_dropped grows by more than 1 % of
+  # packets_sent or the uplink reports connected=false. The check itself is unit
+  # tested first (.github/scripts/test_e2e_app.py).
+  #
   # Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
   # token for the workspace that owns `openlivedev` (the same secret as the
   # e2e-audio-device workflow). Without it, a run by hand fails and names the secret;
   # a pull request run still starts the DMG's app core, lists devices through the
-  # bundled Strom and checks that Go live is refused and quit ends the app, then warns
-  # naming the secret and passes. Fork pull requests get no secrets and skip the job.
+  # bundled Strom, checks that Go live is refused, runs the late-listener check and
+  # checks that quit ends the app, then warns naming the secret and passes. Fork pull requests get no secrets and skip the job.
   #
   # The Windows half runs from the installer once #36 (camera go/no-go on Windows 11)
   # is a go; until then the step summary says so. Never on a tag ref: a release does
@@ -789,7 +800,7 @@ jobs:
       github.ref_type != 'tag' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     concurrency:
@@ -802,6 +813,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: ${{ env.DMG }}
+      - name: Unit tests of the uplink SRT stats check
+        run: python3 -I .github/scripts/test_e2e_app.py
+      - name: Install the local SRT listener (srt-live-transmit)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install srt
+          command -v srt-live-transmit
       - name: Go live, Stop and quit while live from the DMG, against Open Live
         env:
           OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
@@ -809,6 +829,11 @@ jobs:
           # A run by hand needs the secret; a pull request run without it warns and
           # passes after the checks that need none.
           E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+          # The SRT stats check (#112): the receiver comes up this long after Go
+          # live, and the uplink is sampled this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
         run: |
           set -euo pipefail
           # The bundled Strom the app starts has an unauthenticated API and listens
