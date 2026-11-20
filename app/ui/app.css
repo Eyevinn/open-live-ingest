@@ -188,6 +188,12 @@ body.live #what {
   opacity: 0.8;
 }
 
+#go-rows .status-line {
+  display: block;
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+
 footer button.link {
   margin-left: 1rem;
 }

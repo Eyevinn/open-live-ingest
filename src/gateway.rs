@@ -110,6 +110,10 @@ pub struct SummaryRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InputStats {
     pub input: String,
+    /// The input's Strom flow, whose `srt-stats` the uplink numbers come from.
+    pub flow_id: strom_types::FlowId,
+    /// The input's Open Live source, once registered. What a production holds.
+    pub source_id: Option<String>,
     pub state: InputState,
     /// None while nothing is receiving the uplink.
     pub uplink: Option<UplinkStats>,

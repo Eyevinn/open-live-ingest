@@ -1,5 +1,6 @@
-//! Client for the Open Live `/api/v1/sources` API, and the two ways of
-//! authenticating against it.
+//! Client for the Open Live `/api/v1/sources` API, the part of
+//! `/api/v1/productions` that tells which productions hold a source, and the two ways
+//! of authenticating against it.
 //!
 //! The credential must never reach the logs: errors are built from status codes, and
 //! request bodies are never dumped because the source address carries the passphrase.
@@ -102,6 +103,101 @@ impl Source {
     /// Open Live's `connect.warning` for this source, if it reports one.
     pub fn connect_warning(&self) -> Option<&str> {
         self.connect.as_ref()?.warning.as_deref()
+    }
+}
+
+/// A production's state, as Open Live's `ProductionStatus` names it. A state this
+/// gateway does not know still decodes, as `Unknown`, so a newer Open Live does not
+/// break the production list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProductionState {
+    Inactive,
+    Activating,
+    Active,
+    /// Was active and has been stopped; it does not run again until activated.
+    Ended,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProductionState {
+    /// The word for it, as Open Live spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProductionState::Inactive => "inactive",
+            ProductionState::Activating => "activating",
+            ProductionState::Active => "active",
+            ProductionState::Ended => "ended",
+            ProductionState::Unknown => "unknown",
+        }
+    }
+}
+
+/// One source assignment of a production: which source sits in which mixer input
+/// (the slot, `video_in_<n>`). Open Live's assignment carries more (a guest return
+/// feed, recording); only these two are read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProductionSlot {
+    #[serde(rename = "sourceId")]
+    pub source_id: String,
+    #[serde(rename = "mixerInput")]
+    pub mixer_input: String,
+}
+
+/// A production as `GET /api/v1/productions` lists it, reduced to what tells whether
+/// it holds a source of this gateway and whether it runs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawProduction")]
+pub struct Production {
+    pub id: String,
+    pub name: String,
+    pub state: ProductionState,
+    pub sources: Vec<ProductionSlot>,
+}
+
+impl Production {
+    /// The slots (mixer inputs) that hold `source_id`, in Open Live's order. Empty
+    /// when this production does not use the source.
+    pub fn slots_of<'a>(&'a self, source_id: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.sources
+            .iter()
+            .filter(move |s| s.source_id == source_id)
+            .map(|s| s.mixer_input.as_str())
+    }
+}
+
+/// The wire shape. The production routes return the CouchDB document, so the id is
+/// `_id` (as Studio reads it), although the OpenAPI document names it `id`; either is
+/// taken, `_id` first.
+#[derive(Deserialize)]
+struct RawProduction {
+    #[serde(rename = "_id", default)]
+    doc_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: String,
+    status: ProductionState,
+    #[serde(default)]
+    sources: Vec<ProductionSlot>,
+}
+
+impl TryFrom<RawProduction> for Production {
+    type Error = String;
+
+    fn try_from(raw: RawProduction) -> std::result::Result<Self, Self::Error> {
+        let id = raw
+            .doc_id
+            .or(raw.id)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "a production without an id".to_string())?;
+        Ok(Production {
+            id,
+            name: raw.name,
+            state: raw.status,
+            sources: raw.sources,
+        })
     }
 }
 
@@ -407,6 +503,60 @@ impl OpenLiveClient {
         }
         ok_or_refused(res, "DELETE source").await?;
         Ok(())
+    }
+
+    /// Every production on the instance, whatever its state.
+    pub async fn list_productions(&self) -> Result<Vec<Production>> {
+        let res = self
+            .get("/api/v1/productions")
+            .await?
+            .send()
+            .await
+            .context("GET productions")?;
+        ok(res, "GET productions")?
+            .json()
+            .await
+            .context("decoding productions")
+    }
+
+    /// Puts `source_id` in the slot `mixer_input` (`video_in_<n>`) of a production,
+    /// replacing whatever that slot held. Open Live answers 201 with the assignment.
+    /// A production that is already running reads its slots at activation, so the
+    /// change may only take effect when it is activated again.
+    pub async fn assign_source(
+        &self,
+        production_id: &str,
+        source_id: &str,
+        mixer_input: &str,
+    ) -> Result<ProductionSlot> {
+        let url = self.url_of(&["api", "v1", "productions", production_id, "sources"])?;
+        let body = ProductionSlot {
+            source_id: source_id.to_string(),
+            mixer_input: mixer_input.to_string(),
+        };
+        let res = self
+            .auth(self.http.post(url))
+            .await?
+            .json(&body)
+            .send()
+            .await
+            .context("POST production source")?;
+        ok_or_refused(res, "POST production source")
+            .await?
+            .json()
+            .await
+            .context("decoding the production source")
+    }
+
+    /// The base URL with `segments` appended, each percent-encoded, so an id from
+    /// the server cannot reach another route.
+    fn url_of(&self, segments: &[&str]) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.base_url).context("the Open Live URL")?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("the Open Live URL cannot take a path"))?
+            .pop_if_empty()
+            .extend(segments);
+        Ok(url)
     }
 
     async fn get(&self, path: &str) -> Result<reqwest::RequestBuilder> {
@@ -1287,6 +1437,179 @@ mod tests {
         assert_eq!(
             patched.connect_warning(),
             Some("srt-port-outside-strom-ports")
+        );
+    }
+
+    /// Like `serve_once`, and hands back the request it got: the request line, the
+    /// headers and the body, as text.
+    async fn serve_once_seeing(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Headers, then as much body as content-length says.
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length || n == 0 {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = seen_tx.send(String::from_utf8_lossy(&request).to_string());
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Open Live's list, in the shape its route sends: CouchDB documents with `_id`,
+    /// every state, a production with no sources, and fields the gateway ignores.
+    #[tokio::test]
+    async fn the_production_list_decodes_ids_states_and_slots() {
+        let (base, seen) = serve_once_seeing(
+            "200 OK",
+            r#"[
+              {"_id":"prod-1","_rev":"3-x","type":"production","name":"Morning Show","status":"active",
+               "sources":[{"sourceId":"src-1","mixerInput":"video_in_0","record":"transcode"},
+                          {"sourceId":"src-2","mixerInput":"video_in_1"},
+                          {"sourceId":"src-1","mixerInput":"video_in_3"}],
+               "pipeline":{"stromConfig":null,"status":"running"},"subscriberCount":2},
+              {"_id":"prod-2","name":"Evening News","status":"inactive","sources":[]},
+              {"_id":"prod-3","name":"Rehearsal","status":"activating","sources":[{"sourceId":"src-1","mixerInput":"video_in_2"}]},
+              {"_id":"prod-4","name":"Yesterday","status":"ended"},
+              {"id":"prod-5","name":"Future","status":"paused","sources":[]}
+            ]"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, Some("key")).unwrap();
+        let productions = client.list_productions().await.unwrap();
+
+        let request = seen.await.unwrap();
+        assert!(request.starts_with("GET /api/v1/productions HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer key"));
+
+        let ids: Vec<&str> = productions.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["prod-1", "prod-2", "prod-3", "prod-4", "prod-5"]);
+        let states: Vec<ProductionState> = productions.iter().map(|p| p.state).collect();
+        assert_eq!(
+            states,
+            [
+                ProductionState::Active,
+                ProductionState::Inactive,
+                ProductionState::Activating,
+                ProductionState::Ended,
+                ProductionState::Unknown,
+            ]
+        );
+        assert_eq!(productions[0].name, "Morning Show");
+        assert_eq!(
+            productions[0].slots_of("src-1").collect::<Vec<_>>(),
+            ["video_in_0", "video_in_3"]
+        );
+        assert_eq!(productions[0].slots_of("src-9").count(), 0);
+        assert!(productions[3].sources.is_empty());
+    }
+
+    #[test]
+    fn a_production_without_an_id_is_refused() {
+        let err = serde_json::from_value::<Production>(serde_json::json!({
+            "name": "x", "status": "active", "sources": []
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("without an id"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_production_list_is_an_error_with_the_status_only() {
+        let base = serve_once(
+            "503 Service Unavailable",
+            r#"{"error":"Database unavailable"}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client.list_productions().await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "GET productions failed with HTTP 503 Service Unavailable"
+        );
+    }
+
+    /// The body is Open Live's `SourceAssignmentInput`: `sourceId` and `mixerInput`,
+    /// nothing else, so no guest return, preview or recording is switched on. The
+    /// production id is one path segment, encoded.
+    #[tokio::test]
+    async fn assigning_a_source_posts_the_source_and_the_slot() {
+        let (base, seen) = serve_once_seeing(
+            "201 Created",
+            r#"{"sourceId":"src-1","mixerInput":"video_in_2","_rev":"4-y"}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&format!("{base}/"), AuthMode::Direct, None).unwrap();
+        let slot = client
+            .assign_source("prod-1/../x", "src-1", "video_in_2")
+            .await
+            .unwrap();
+        assert_eq!(
+            slot,
+            ProductionSlot {
+                source_id: "src-1".to_string(),
+                mixer_input: "video_in_2".to_string(),
+            }
+        );
+        let request = seen.await.unwrap();
+        assert!(
+            request.starts_with("POST /api/v1/productions/prod-1%2F..%2Fx/sources HTTP/1.1"),
+            "{request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"sourceId": "src-1", "mixerInput": "video_in_2"})
+        );
+    }
+
+    #[tokio::test]
+    async fn assigning_to_a_missing_production_is_an_error() {
+        let base = serve_once(
+            "404 Not Found",
+            r#"{"error":"Production not found","statusCode":404}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client
+            .assign_source("prod-9", "src-1", "video_in_0")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "POST production source failed with HTTP 404 Not Found"
         );
     }
 
