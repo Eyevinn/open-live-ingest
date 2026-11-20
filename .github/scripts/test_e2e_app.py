@@ -6,7 +6,9 @@ loopback:
     python3 -I .github/scripts/test_e2e_app.py
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import unittest
@@ -17,6 +19,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SPEC = importlib.util.spec_from_file_location("e2e_app", os.path.join(HERE, "e2e-app.py"))
 e2e = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(e2e)
+# Never write these tests' PASS and WARNING lines into the real job summary.
+e2e.SUMMARY = os.devnull
 
 
 def sample(at, sent, dropped, connected=True):
@@ -98,9 +102,31 @@ class JudgeUplink(unittest.TestCase):
         self.assertIn("no packets_sent", problem)
 
 
+class UplinkProblems(unittest.TestCase):
+    """The dropped share is kept apart from the fatal problems (E2E_UPLINK_DROP_WARN_ONLY)."""
+
+    def test_drops_alone_are_only_the_dropped_problem(self):
+        fatal, dropped = e2e.uplink_problems([sample(0, 0, 0), sample(60, 10000, 101)])
+        self.assertIsNone(fatal)
+        self.assertIn("1.01 % dropped", dropped)
+
+    def test_a_reconnect_after_a_drop_is_still_fatal(self):
+        samples = [sample(0, 0, 0), sample(60, 10000, 5000), sample(120, 300, 0)]
+        fatal, dropped = e2e.uplink_problems(samples)
+        self.assertIn("reconnected", fatal)
+        self.assertIn("packets_sent_dropped by 5000", dropped)
+
+    def test_connected_false_and_nothing_sent_are_fatal(self):
+        self.assertIn("connected=false", e2e.uplink_problems([sample(0, 0, 0), sample(60, 10000, 9000, connected=False)])[0])
+        self.assertIn("sent no packets", e2e.uplink_problems([sample(0, 500, 0), sample(60, 500, 0)])[0])
+
+    def test_a_clean_uplink_has_no_problem(self):
+        self.assertEqual(e2e.uplink_problems([sample(0, 0, 0), sample(60, 10000, 100)]), (None, None))
+
+
 class SrtSettings(unittest.TestCase):
     def setUp(self):
-        self.saved = {k: os.environ.pop(k, None) for k in ("E2E_SRT_SAMPLES", "E2E_SRT_INTERVAL", "E2E_LATE_SECONDS")}
+        self.saved = {k: os.environ.pop(k, None) for k in ENV_KEYS}
 
     def tearDown(self):
         for key, value in self.saved.items():
@@ -116,6 +142,34 @@ class SrtSettings(unittest.TestCase):
         self.assertEqual(e2e.srt_settings(), (2, 60, 30))
         os.environ.update({"E2E_SRT_SAMPLES": "3", "E2E_SRT_INTERVAL": "90", "E2E_LATE_SECONDS": "45"})
         self.assertEqual(e2e.srt_settings(), (3, 90, 45))
+
+    def test_a_value_that_is_not_a_number_fails_naming_it(self):
+        os.environ["E2E_SRT_INTERVAL"] = "1m"
+        with self.assertRaises(e2e.Failed) as caught:
+            e2e.srt_settings()
+        self.assertIn("E2E_SRT_INTERVAL must be a whole number, not '1m'", str(caught.exception))
+
+    def test_the_drop_switch_is_off_unless_true(self):
+        self.assertFalse(e2e.drops_warn_only())
+        os.environ["E2E_UPLINK_DROP_WARN_ONLY"] = "false"
+        self.assertFalse(e2e.drops_warn_only())
+        os.environ["E2E_UPLINK_DROP_WARN_ONLY"] = "true"
+        self.assertTrue(e2e.drops_warn_only())
+        os.environ["E2E_UPLINK_DROP_WARN_ONLY"] = "yes"
+        with self.assertRaises(e2e.Failed):
+            e2e.drops_warn_only()
+
+    def test_the_part(self):
+        self.assertEqual(e2e.part(), "all")
+        for name in ("late-listener", "openlivedev"):
+            os.environ["E2E_PART"] = name
+            self.assertEqual(e2e.part(), name)
+        os.environ["E2E_PART"] = "late"
+        with self.assertRaises(e2e.Failed):
+            e2e.part()
+
+
+ENV_KEYS = ("E2E_SRT_SAMPLES", "E2E_SRT_INTERVAL", "E2E_LATE_SECONDS", "E2E_UPLINK_DROP_WARN_ONLY", "E2E_PART")
 
 
 class FakeStrom(e2e.Strom):
@@ -134,9 +188,22 @@ class WatchUplink(unittest.TestCase):
         self.sleep, self.wait = e2e.time.sleep, e2e.wait_until
         e2e.time.sleep = lambda s: None
         e2e.wait_until = lambda moment: None
+        self.saved = {k: os.environ.pop(k, None) for k in ENV_KEYS}
 
     def tearDown(self):
         e2e.time.sleep, e2e.wait_until = self.sleep, self.wait
+        for key, value in self.saved.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    def watch(self, strom):
+        """watch_uplink with its output captured, so that no `::warning::` reaches the
+        job log as a real annotation; returns the output."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            strom.watch_uplink("f-1", "step")
+        return out.getvalue()
 
     def peer(self, sent, dropped, connected=True):
         return {"connected": connected, "packets_sent": sent, "packets_sent_dropped": dropped, "rtt_ms": 5.0}
@@ -155,8 +222,52 @@ class WatchUplink(unittest.TestCase):
         self.assertIn("reports no peer any more", str(caught.exception))
 
     def test_a_clean_uplink_passes(self):
-        strom = FakeStrom([self.peer(100, 0), self.peer(20100, 3)])
-        strom.watch_uplink("f-1", "step")
+        out = self.watch(FakeStrom([self.peer(100, 0), self.peer(20100, 3)]))
+        self.assertIn("PASS: step: the uplink stayed connected and dropped 3 of 20000", out)
+
+    # E2E_UPLINK_DROP_WARN_ONLY (until #111 is fixed): only the dropped share is a warning.
+
+    def drops(self):
+        return FakeStrom([self.peer(1200, 1100), self.peer(1200 + 36492, 1100 + 36540)])
+
+    def test_drops_fail_when_the_switch_is_off(self):
+        for value in (None, "false"):
+            if value is not None:
+                os.environ["E2E_UPLINK_DROP_WARN_ONLY"] = value
+            with self.assertRaises(e2e.Failed) as caught:
+                self.watch(self.drops())
+            self.assertIn("step: the uplink dropped too much", str(caught.exception))
+            self.assertIn("100.13 % dropped", str(caught.exception))
+
+    def test_drops_only_warn_with_the_numbers_when_the_switch_is_on(self):
+        os.environ["E2E_UPLINK_DROP_WARN_ONLY"] = "true"
+        out = self.watch(self.drops())
+        self.assertIn("::warning title=e2e app::step: the uplink dropped too much", out)
+        for text in ("packets_sent grew by 36492", "packets_sent_dropped by 36540", "100.13 % dropped", "#111"):
+            self.assertIn(text, out)
+        self.assertNotIn("PASS", out)
+
+    def test_connected_false_nothing_sent_and_a_reconnect_stay_fatal_when_the_switch_is_on(self):
+        os.environ["E2E_UPLINK_DROP_WARN_ONLY"] = "true"
+        cases = {
+            "connected=false": [self.peer(100, 0), self.peer(20100, 0, connected=False)],
+            "sent no packets": [self.peer(100, 0), self.peer(100, 0)],
+            "reconnected": [self.peer(50000, 40000), self.peer(3000, 2900)],
+        }
+        for text, samples in cases.items():
+            with self.assertRaises(e2e.Failed) as caught:
+                self.watch(FakeStrom(samples))
+            self.assertIn(text, str(caught.exception))
+
+    def test_a_peer_that_never_connects_stays_fatal_when_the_switch_is_on(self):
+        os.environ["E2E_UPLINK_DROP_WARN_ONLY"] = "true"
+        e2e_timeout, e2e.CONNECT_TIMEOUT = e2e.CONNECT_TIMEOUT, 0
+        try:
+            with self.assertRaises(e2e.Failed) as caught:
+                self.watch(FakeStrom([]))
+        finally:
+            e2e.CONNECT_TIMEOUT = e2e_timeout
+        self.assertIn("shows no connected peer", str(caught.exception))
 
 
 class LocalOpenLive(unittest.TestCase):

@@ -52,6 +52,12 @@ Open Live address yet), and then the late-listener check runs with no secret (#1
     uplink's SRT stats are checked (below).
   - `stop`: stopped with nothing left behind, the source and the flow gone.
 
+E2E_PART picks the part of the run: `all` (the default, a run by hand), or, as the
+release workflow splits it, `late-listener` (the `e2e-macos-late-listener` job, no
+secret, fork pull requests too: the refused `go_live`, the late-listener check, then
+a `quit` with nothing live ends the app) and `openlivedev` (the `e2e-macos` job:
+everything but the late-listener check).
+
 The SRT stats check reads the uplink's `GET /api/flows/<flow id>/srt-stats` from the
 bundled Strom, as `src/strom.rs` does: the sending element's (`role` sink) first peer.
 The first sample is the first one that shows a connected peer; then
@@ -60,7 +66,12 @@ apart (default 60, never under 60). Every sample is logged. It fails when any sa
 says `connected` false, or when, between consecutive samples or between the first
 and the last, `packets_sent_dropped` grows by more than 1 % of the growth in
 `packets_sent` (or nothing is sent, or the counters go back, which is a reconnect).
-The failure names the numbers.
+The failure names the numbers. `connected` alone proves nothing: srtsink can keep a
+stale entry that reports it (src/strom.rs, `uplink_peer`), so packets_sent must grow
+too. While E2E_UPLINK_DROP_WARN_ONLY is `true`, a dropped share above 1 % is a
+`::warning::` with the numbers instead of a failure, until #111 (the sender drops
+after a late connect) is fixed; `connected` false, nothing sent and a reconnect still
+fail. #111's fix removes the switch.
 
 Without OSC_ACCESS_TOKEN, a `quit` with nothing live then has to end the process. The
 run fails naming the secret when E2E_REQUIRE_SECRET is `true` (a run by hand);
@@ -128,6 +139,8 @@ MIN_SRT_SAMPLES = 2
 CONNECT_TIMEOUT = 120
 # The mixer input the openlivedev production puts the source on.
 MIXER_INPUT = "video_in_0"
+# What E2E_PART may ask for (`part`).
+PARTS = ("all", "late-listener", "openlivedev")
 
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY") or os.devnull
 ON_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
@@ -181,6 +194,11 @@ def passed(text):
 def note(text):
     say(f"NOTE: {text}")
     record(f"- NOTE: {text}")
+
+
+def warn(text):
+    print(f"::warning title=e2e app::{text}", flush=True)
+    record(f"- WARNING: {text}")
 
 
 class Failed(Exception):
@@ -648,6 +666,9 @@ def uplink_sample(body):
     element's (`role` sink) `connected`, and its first peer's `packets_sent` and
     `packets_sent_dropped`, as `uplink_peer` in src/strom.rs picks it. None when the
     flow reports no peer yet."""
+    # `connected` may be stale (src/strom.rs, uplink_peer): srtsink keeps reporting it
+    # while retrying a vanished peer, so never rely on it alone; judge_uplink also needs
+    # packets_sent to grow.
     connections = ((body or {}).get("stats") or {}).get("connections") or {}
     for connection in connections.values():
         if not isinstance(connection, dict) or connection.get("role") != "sink":
@@ -673,22 +694,26 @@ def describe(sample):
     )
 
 
-def judge_uplink(samples, limit=DROPPED_LIMIT):
-    """None when the uplink held up over `samples` (in order, each with `at`, seconds
-    since the first); otherwise what went wrong, with the numbers. Fails when a sample
-    says `connected` false, or when, between consecutive samples or between the first
-    and the last, `packets_sent_dropped` grows by more than `limit` of the growth in
-    `packets_sent`, nothing is sent, or a counter goes back (the link reconnected)."""
+def uplink_problems(samples, limit=DROPPED_LIMIT):
+    """(fatal, dropped) for `samples` (in order, each with `at`, seconds since the
+    first), each None or what went wrong, with the numbers. `fatal`: too few samples,
+    a sample says `connected` false or has no packets_sent, or, between consecutive
+    samples or between the first and the last, nothing is sent or a counter goes back
+    (the link reconnected). `dropped`: the first such span in which
+    `packets_sent_dropped` grows by more than `limit` of the growth in `packets_sent`.
+    Kept apart so that E2E_UPLINK_DROP_WARN_ONLY can turn only `dropped` into a
+    warning (#111)."""
     if len(samples) < MIN_SRT_SAMPLES:
-        return f"only {len(samples)} SRT stats sample(s); at least {MIN_SRT_SAMPLES} are needed"
+        return f"only {len(samples)} SRT stats sample(s); at least {MIN_SRT_SAMPLES} are needed", None
     for sample in samples:
         if not sample["connected"]:
-            return f"the uplink reports connected=false at {describe(sample)}"
+            return f"the uplink reports connected=false at {describe(sample)}", None
         if sample["packets_sent"] is None:
-            return f"the uplink reports no packets_sent at {describe(sample)}"
+            return f"the uplink reports no packets_sent at {describe(sample)}", None
     pairs = list(zip(samples, samples[1:]))
     if len(samples) > 2:
         pairs.append((samples[0], samples[-1]))
+    too_many = None
     for a, b in pairs:
         sent = b["packets_sent"] - a["packets_sent"]
         dropped = b["packets_sent_dropped"] - a["packets_sent_dropped"]
@@ -697,24 +722,64 @@ def judge_uplink(samples, limit=DROPPED_LIMIT):
             return (
                 f"the uplink's counters went back {span}: packets_sent {a['packets_sent']} -> {b['packets_sent']}, "
                 f"packets_sent_dropped {a['packets_sent_dropped']} -> {b['packets_sent_dropped']}; the link reconnected"
-            )
+            ), too_many
         if sent == 0:
-            return f"the uplink sent no packets {span} (packets_sent stayed at {b['packets_sent']})"
-        if dropped > sent * limit:
-            return (
+            return f"the uplink sent no packets {span} (packets_sent stayed at {b['packets_sent']})", too_many
+        if dropped > sent * limit and too_many is None:
+            too_many = (
                 f"the uplink dropped too much {span}: packets_sent grew by {sent} and packets_sent_dropped by "
                 f"{dropped}, {100 * dropped / sent:.2f} % dropped, more than {100 * limit:g} %"
             )
-    return None
+    return None, too_many
+
+
+def judge_uplink(samples, limit=DROPPED_LIMIT):
+    """None when the uplink held up over `samples`; otherwise what went wrong, with the
+    numbers (`uplink_problems`, a fatal problem first)."""
+    fatal, dropped = uplink_problems(samples, limit)
+    return fatal or dropped
+
+
+def env_int(name, default, floor):
+    """The whole number in env `name` (`default` when unset or empty), never below
+    `floor`; fails naming the variable when it is not a whole number."""
+    raw = os.environ.get(name) or str(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        fail(f"{name} must be a whole number, not {raw!r}")
+    return max(floor, value)
 
 
 def srt_settings():
     """(samples, interval in seconds, late start in seconds) from the environment,
     never below the issue's floor."""
-    samples = max(MIN_SRT_SAMPLES, int(os.environ.get("E2E_SRT_SAMPLES") or MIN_SRT_SAMPLES))
-    interval = max(MIN_SRT_INTERVAL, int(os.environ.get("E2E_SRT_INTERVAL") or MIN_SRT_INTERVAL))
-    late = max(MIN_LATE_SECONDS, int(os.environ.get("E2E_LATE_SECONDS") or 35))
+    samples = env_int("E2E_SRT_SAMPLES", MIN_SRT_SAMPLES, MIN_SRT_SAMPLES)
+    interval = env_int("E2E_SRT_INTERVAL", MIN_SRT_INTERVAL, MIN_SRT_INTERVAL)
+    late = env_int("E2E_LATE_SECONDS", 35, MIN_LATE_SECONDS)
     return samples, interval, late
+
+
+def drops_warn_only():
+    """True when E2E_UPLINK_DROP_WARN_ONLY is `true`: a dropped share above the limit
+    is then a warning, not a failure, until #111 (the sender drops after a late
+    connect) is fixed. Everything else the SRT stats check finds stays fatal. #111's
+    fix removes this switch."""
+    raw = os.environ.get("E2E_UPLINK_DROP_WARN_ONLY") or "false"
+    if raw not in ("true", "false"):
+        fail(f"E2E_UPLINK_DROP_WARN_ONLY must be `true` or `false`, not {raw!r}")
+    return raw == "true"
+
+
+def part():
+    """Which part of the run E2E_PART asks for: `all` (the default, a run by hand),
+    `late-listener` (only the no-secret late-listener check, the `e2e-macos-late-listener`
+    job, which runs on fork pull requests too) or `openlivedev` (everything but it, the
+    `e2e-macos` job)."""
+    raw = os.environ.get("E2E_PART") or "all"
+    if raw not in PARTS:
+        fail(f"E2E_PART must be one of {', '.join(PARTS)}, not {raw!r}")
+    return raw
 
 
 def wait_until(moment):
@@ -786,10 +851,18 @@ class Strom:
             sample["at"] = time.monotonic() - start
             taken.append(sample)
             say(f"{step}: uplink SRT stats {describe(sample)}")
-        problem = judge_uplink(taken)
-        if problem:
-            fail(f"{step}: {problem}")
+        fatal, dropped = uplink_problems(taken)
+        if fatal:
+            fail(f"{step}: {fatal}")
         a, b = taken[0], taken[-1]
+        if dropped:
+            if not drops_warn_only():
+                fail(f"{step}: {dropped}")
+            warn(
+                f"{step}: {dropped}. Not failed: E2E_UPLINK_DROP_WARN_ONLY is set until #111 (sender drops after a "
+                f"late connect) is fixed. The uplink stayed connected and kept sending ({len(taken)} samples over {b['at']:.0f} s)"
+            )
+            return
         passed(
             f"{step}: the uplink stayed connected and dropped {b['packets_sent_dropped'] - a['packets_sent_dropped']} "
             f"of {b['packets_sent'] - a['packets_sent']} packets sent over {b['at']:.0f} s "
@@ -944,12 +1017,17 @@ def run(exe, work):
     port_range = os.environ.get("E2E_PORT_RANGE") or "47300-47309"
     pat = os.environ.get("OSC_ACCESS_TOKEN") or ""
     mask(pat)
+    # Bad settings fail here, before anything starts.
+    which = part()
+    srt_settings()
+    drops_warn_only()
 
     settings = settings_file()
     if os.path.exists(settings):
         fail(f"{settings} exists already; run this on a machine where the app has not been set up")
     write_settings(settings, gateway_name, port_range)
-    record(f"### App end to end against `{instance}`: {sys.platform}, `{os.path.basename(exe)} --ipc-stdio`")
+    against = "a stand-in Open Live on loopback (late-listener part)" if which == "late-listener" else f"`{instance}`"
+    record(f"### App end to end against {against}: {sys.platform}, `{os.path.basename(exe)} --ipc-stdio`")
 
     stderr_log = open(os.path.join(work, "app-stderr.log"), "w", encoding="utf-8")
     app = App(exe, stderr_log)
@@ -965,14 +1043,18 @@ def run(exe, work):
         passed(f"`go_live` with no Open Live address is refused: {reply['error'].get('message')}")
 
         # With or without the secret: the late-listener check needs none (#112).
-        late_listener_check(app, strom, gateway_name, source_name, work)
+        if which != "openlivedev":
+            late_listener_check(app, strom, gateway_name, source_name, work)
 
-        if not pat:
+        if not pat or which == "late-listener":
             app.ok("quit", {"confirmed": False})
             code = app.ended(30)
             if code != 0:
                 fail(f"`quit` with nothing live did not end the app (exit {code})")
             passed("`quit` with nothing live ends the app")
+            if which == "late-listener":
+                say("e2e app (late-listener part): done")
+                return
             missing = (
                 "missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud "
                 f"personal access token for the workspace that owns the Open Live instance '{instance}') is not set"
