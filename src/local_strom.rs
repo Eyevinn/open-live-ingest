@@ -702,9 +702,11 @@ mod tests {
         Command::new("ps").arg("-p").arg("1").output().is_ok()
     }
 
-    /// A process named `name`, started from `dir`, that runs until it is stopped. It
-    /// stands in for a Strom or a gateway. The test fails here, saying so, if it
-    /// exits at once rather than later on an assertion that cannot tell why.
+    /// A process named `name`, started from `dir`, that runs until it is stopped or
+    /// 60 s have passed, so a test that fails before stopping it leaves nothing
+    /// running for long. It stands in for a Strom or a gateway. The test fails here,
+    /// saying so, if it exits at once rather than later on an assertion that cannot
+    /// tell why.
     #[cfg(unix)]
     fn spawn_named(dir: &Path, name: &str) -> std::process::Child {
         let fake = write_stand_in(dir, name);
@@ -716,16 +718,22 @@ mod tests {
         child
     }
 
-    /// On Linux, a shell script named `name` that sleeps in a loop. The kernel names
-    /// a process after the file it executed, so `ps -o comm=` shows `name`, as long as
-    /// the script never `exec`s. A copy of `sleep` would not do: on Ubuntu 26.04
+    /// On Linux, a shell script named `name` that sleeps in a loop for as many seconds
+    /// as its first argument says (60 if none). The kernel names a process after the
+    /// file it executed, so `ps -o comm=` shows `name`, as long as the script never
+    /// `exec`s. A copy of `sleep` would not do: on Ubuntu 26.04
     /// `sleep` is the uutils coreutils multicall binary, which picks the utility from
     /// the name it was started under and exits at once as `strom`.
     #[cfg(target_os = "linux")]
     fn write_stand_in(dir: &Path, name: &str) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let fake = dir.join(name);
-        std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        let script = concat!(
+            "#!/bin/sh\n",
+            "n=0\n",
+            "while [ \"$n\" -lt \"${1:-60}\" ]; do sleep 1; n=$((n + 1)); done\n",
+        );
+        std::fs::write(&fake, script).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         fake
     }
@@ -743,9 +751,10 @@ mod tests {
         fake
     }
 
-    /// Runs `fake` (with `60` for `sleep`; a script ignores it). A file just
-    /// written may be briefly "text file busy" while another test thread forks with
-    /// its write handle still open, so that is retried.
+    /// Runs `fake` with `60`, the seconds the stand-in (`sleep` or the script) runs
+    /// before it exits by itself. A file just written may be briefly "text file busy"
+    /// while another test thread forks with its write handle still open, so that is
+    /// retried.
     #[cfg(unix)]
     fn spawn_retrying(fake: &Path) -> std::process::Child {
         let started = Instant::now();
