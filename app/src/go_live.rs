@@ -44,7 +44,11 @@ const TEST_PATTERN: &str = "test";
 #[serde(rename_all = "snake_case")]
 pub enum RowState {
     Registering,
+    /// Starting, or Strom not answering: no word yet on the uplink.
     Connecting,
+    /// The flow runs and its uplink waits for a receiver: Open Live receives it only
+    /// while a production using the source is active.
+    Waiting,
     Live,
     Failed,
     Stopping,
@@ -59,7 +63,7 @@ struct Row {
     input: String,
     state: RowState,
     message: Option<Message>,
-    /// Since when it has been connecting with nothing delivered.
+    /// Since when it has been connecting or waiting with nothing delivered.
     connecting_since: Option<Instant>,
     bitrate_kbps: Option<u64>,
 }
@@ -140,16 +144,17 @@ impl Rows {
     ) -> Option<Event> {
         let new = !self.rows.iter().any(|r| r.input == input);
         let row = self.row(input);
-        if state == RowState::Connecting {
+        if matches!(state, RowState::Connecting | RowState::Waiting) {
             row.connecting_since.get_or_insert(now);
         } else {
             row.connecting_since = None;
         }
-        // A connecting row keeps the hint it already has.
+        // A connecting or waiting row keeps the hint it already has.
         let message = match (state, message) {
             (RowState::Connecting, None) if row.state == RowState::Connecting => {
                 row.message.clone()
             }
+            (RowState::Waiting, _) if row.state == RowState::Waiting => row.message.clone(),
             (_, message) => message,
         };
         if !new && row.state == state && row.message == message {
@@ -189,6 +194,19 @@ impl Rows {
                 for started in inputs {
                     out.extend(self.set(&started.name, RowState::Connecting, None, now));
                 }
+                // Where each input's uplink goes, and the address registered with Open
+                // Live, passphrases already masked by the library.
+                out.push(Event::new(
+                    "summary",
+                    json!({
+                        "inputs": inputs.iter().map(|r| json!({
+                            "input": r.name,
+                            "port": r.port,
+                            "uplink": r.uplink,
+                            "registered": r.address,
+                        })).collect::<Vec<Value>>()
+                    }),
+                ));
             }
             E::Input { input, state } => {
                 let (state, message) = match state {
@@ -197,9 +215,24 @@ impl Rows {
                         RowState::Failed,
                         Some(messages::for_input_failure(input, reason)),
                     ),
-                    InputState::Starting | InputState::Waiting | InputState::Unreachable => {
-                        (RowState::Connecting, None)
+                    InputState::Waiting => {
+                        // Already 30 s with nothing delivered: the longer line at once.
+                        let waited = self
+                            .rows
+                            .iter()
+                            .find(|r| r.input == *input)
+                            .and_then(|r| r.connecting_since)
+                            .is_some_and(|since| {
+                                now.duration_since(since) >= NOTHING_DELIVERED_AFTER
+                            });
+                        let failure = if waited {
+                            Failure::WaitingNothingDelivered
+                        } else {
+                            Failure::WaitingForProduction
+                        };
+                        (RowState::Waiting, Some(failure.message()))
                     }
+                    InputState::Starting | InputState::Unreachable => (RowState::Connecting, None),
                 };
                 out.extend(self.set(input, state, message, now));
             }
@@ -208,16 +241,27 @@ impl Rows {
                     let row = self.row(&stats.input);
                     row.bitrate_kbps = stats.uplink.map(|u| u.bitrate_kbps);
                 }
-                // A row connecting for 30 s with nothing delivered says why that may be.
+                // A row connecting or waiting for 30 s with nothing delivered says why
+                // that may be.
                 let hint = Failure::NothingDelivered.message();
+                let waiting = Failure::WaitingForProduction.message();
+                let waiting_hint = Failure::WaitingNothingDelivered.message();
                 for row in &mut self.rows {
                     let waited = row
                         .connecting_since
                         .is_some_and(|since| now.duration_since(since) >= NOTHING_DELIVERED_AFTER);
-                    if waited && row.message.is_none() {
-                        row.message = Some(hint.clone());
-                        out.push(row.event());
+                    if !waited {
+                        continue;
                     }
+                    let message = match row.state {
+                        RowState::Connecting if row.message.is_none() => &hint,
+                        RowState::Waiting if row.message.as_ref() == Some(&waiting) => {
+                            &waiting_hint
+                        }
+                        _ => continue,
+                    };
+                    row.message = Some(message.clone());
+                    out.push(row.event());
                 }
                 // Open Live reached again this tick: its banner clears itself.
                 if !std::mem::take(&mut self.unreachable_this_tick)
@@ -261,7 +305,10 @@ impl Rows {
                 for at in 0..self.rows.len() {
                     if matches!(
                         self.rows[at].state,
-                        RowState::Registering | RowState::Connecting | RowState::Live
+                        RowState::Registering
+                            | RowState::Connecting
+                            | RowState::Waiting
+                            | RowState::Live
                     ) {
                         total += 1;
                         let input = self.rows[at].input.clone();
@@ -296,7 +343,7 @@ impl Rows {
         out
     }
 
-    /// The inputs still being sent: registering, connecting or live. What the quit
+    /// The inputs still being sent: registering, connecting, waiting or live. What the quit
     /// question counts (section 8).
     pub fn sending(&self) -> usize {
         self.rows
@@ -304,7 +351,10 @@ impl Rows {
             .filter(|r| {
                 matches!(
                     r.state,
-                    RowState::Registering | RowState::Connecting | RowState::Live
+                    RowState::Registering
+                        | RowState::Connecting
+                        | RowState::Waiting
+                        | RowState::Live
                 )
             })
             .count()
@@ -416,7 +466,7 @@ impl GoLive {
         self.lock().phase != Phase::Idle
     }
 
-    /// How many inputs the session is sending: registering, connecting or live.
+    /// How many inputs the session is sending: registering, connecting, waiting or live.
     pub fn inputs_live(&self) -> usize {
         self.sending.load(Ordering::SeqCst)
     }
@@ -663,7 +713,9 @@ mod tests {
                 .map(|n| SummaryRow {
                     name: n.to_string(),
                     port: 47110,
-                    address: "srt://:47110?mode=listener".to_string(),
+                    address: "srt://:47110?mode=listener&passphrase=***".to_string(),
+                    uplink: "srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***"
+                        .to_string(),
                 })
                 .collect(),
         }
@@ -685,8 +737,9 @@ mod tests {
 
     const CAM: &str = "Venue — Camera";
 
-    /// Strom starting, registering, connecting, live: each change is one `input`
-    /// event, and nothing is sent for what did not change.
+    /// Strom starting, registering, connecting, waiting, live: each change is one
+    /// `input` event, and nothing is sent for what did not change. The summary tells
+    /// the page where each uplink goes.
     #[test]
     fn a_session_starting_reads_as_the_rows_states() {
         let mut rows = rows();
@@ -724,6 +777,15 @@ mod tests {
                 json!({"event": "strom", "data": {"state": "ready"}}),
                 json!({"event": "input", "data": {"input": CAM, "state": "registering", "message": null, "action": null}}),
                 json!({"event": "input", "data": {"input": CAM, "state": "connecting", "message": null, "action": null}}),
+                json!({"event": "summary", "data": {"inputs": [{
+                    "input": CAM,
+                    "port": 47110,
+                    "uplink": "srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***",
+                    "registered": "srt://:47110?mode=listener&passphrase=***",
+                }]}}),
+                json!({"event": "input", "data": {"input": CAM, "state": "waiting",
+                    "message": "Waiting for Open Live: put this source in a production and activate it.",
+                    "action": "open_studio"}}),
                 json!({"event": "input", "data": {"input": CAM, "state": "live", "message": null, "action": null}}),
             ]
         );
@@ -798,14 +860,21 @@ mod tests {
         // Said once, and kept while it stays connecting.
         let again = rows.on_event(&stats(CAM, None), t + Duration::from_secs(40));
         assert_eq!(json_of(&again).len(), 1);
-        let still = rows.on_event(
+        // Waiting for a receiver after that: the production line, and the UDP hint.
+        let waiting = json_of(&rows.on_event(
             &E::Input {
                 input: CAM.to_string(),
                 state: InputState::Waiting,
             },
             t + Duration::from_secs(41),
+        ));
+        assert_eq!(waiting[0]["data"]["state"], "waiting");
+        assert_eq!(
+            waiting[0]["data"]["message"],
+            "Waiting for Open Live: put this source in a production and activate it. If that production is already active, check that this network allows outgoing UDP."
         );
-        assert!(still.is_empty(), "{still:?}");
+        let still = rows.on_event(&stats(CAM, None), t + Duration::from_secs(45));
+        assert_eq!(json_of(&still).len(), 1, "only stats: {still:?}");
         let live = json_of(&rows.on_event(
             &E::Input {
                 input: CAM.to_string(),
@@ -815,6 +884,93 @@ mod tests {
         ));
         assert_eq!(live[0]["data"]["state"], "live");
         assert_eq!(live[0]["data"]["message"], Value::Null);
+    }
+
+    /// Waiting for a receiver says a production using the source must be active in
+    /// Open Live, distinct from starting and from losing contact with Strom. After
+    /// 30 s with nothing delivered it adds the UDP hint, once.
+    #[test]
+    fn a_waiting_row_says_a_production_must_be_active() {
+        let mut rows = rows();
+        let t = Instant::now();
+        rows.on_event(&summary(&[CAM]), t);
+        let input = |state| E::Input {
+            input: CAM.to_string(),
+            state,
+        };
+        let waiting = json_of(&rows.on_event(&input(InputState::Waiting), t));
+        assert_eq!(
+            waiting,
+            vec![
+                json!({"event": "input", "data": {"input": CAM, "state": "waiting",
+                "message": "Waiting for Open Live: put this source in a production and activate it.",
+                "action": "open_studio"}})
+            ]
+        );
+        assert!(waiting[0]["data"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("production"));
+        // Still waiting: nothing new.
+        assert!(rows
+            .on_event(&input(InputState::Waiting), t + Duration::from_secs(5))
+            .is_empty());
+        assert_eq!(rows.sending(), 1);
+
+        // Lost contact with Strom: back to connecting, without the waiting line.
+        let lost =
+            json_of(&rows.on_event(&input(InputState::Unreachable), t + Duration::from_secs(10)));
+        assert_eq!(
+            lost,
+            vec![
+                json!({"event": "input", "data": {"input": CAM, "state": "connecting",
+                "message": null, "action": null}})
+            ]
+        );
+        rows.on_event(&input(InputState::Waiting), t + Duration::from_secs(15));
+
+        // 30 s since the summary with nothing delivered: the UDP hint joins it, once.
+        let late = json_of(&rows.on_event(&stats(CAM, None), t + Duration::from_secs(30)));
+        assert_eq!(late[0]["event"], "input");
+        assert_eq!(late[0]["data"]["state"], "waiting");
+        assert_eq!(
+            late[0]["data"]["message"],
+            "Waiting for Open Live: put this source in a production and activate it. If that production is already active, check that this network allows outgoing UDP."
+        );
+        let again = rows.on_event(&stats(CAM, None), t + Duration::from_secs(35));
+        assert_eq!(json_of(&again).len(), 1, "only stats: {again:?}");
+        assert!(rows
+            .on_event(&input(InputState::Waiting), t + Duration::from_secs(36))
+            .is_empty());
+
+        // Starting reads as connecting with no line of its own either.
+        let mut fresh = super::tests::rows();
+        let starting = json_of(&fresh.on_event(&input(InputState::Starting), t));
+        assert_eq!(starting[0]["data"]["state"], "connecting");
+        assert_eq!(starting[0]["data"]["message"], Value::Null);
+    }
+
+    /// The summary tells the page the caller uplink, where the gateway sends, and the
+    /// address registered with Open Live, passphrases masked.
+    #[test]
+    fn the_summary_shows_the_uplink_address() {
+        let mut rows = rows();
+        let out = json_of(&rows.on_event(&summary(&[CAM]), Instant::now()));
+        let summary = out.iter().find(|e| e["event"] == "summary").unwrap();
+        let row = &summary["data"]["inputs"][0];
+        assert_eq!(row["input"], CAM);
+        let uplink = row["uplink"].as_str().unwrap();
+        assert!(
+            uplink.starts_with("srt://strom.example.com:47110?"),
+            "{uplink}"
+        );
+        assert!(uplink.contains("mode=caller"), "{uplink}");
+        assert!(uplink.contains("latency=200"), "{uplink}");
+        assert!(uplink.contains("passphrase=***"), "{uplink}");
+        assert_eq!(
+            row["registered"],
+            "srt://:47110?mode=listener&passphrase=***"
+        );
     }
 
     /// Open Live unreachable while live is a banner that clears itself on the next
@@ -1274,7 +1430,7 @@ port_range = "47110-47112"
         assert_eq!(runtime().block_on(go.stop_other()), Ok(()));
     }
 
-    /// What the quit question counts: the inputs registering, connecting or live, not
+    /// What the quit question counts: the inputs registering, connecting, waiting or live, not
     /// the failed, stopped or absent ones.
     #[test]
     fn the_inputs_being_sent_are_counted_for_the_quit_question() {

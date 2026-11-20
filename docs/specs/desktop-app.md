@@ -349,7 +349,8 @@ unknown command or bad arguments is an error reply, never a panic.
 | `event` | `data` | From library event (#71/#72) |
 |---|---|---|
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
-| `input` | `{input, state, message?, action?}` | per-input registering / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
+| `input` | `{input, state, message?, action?}` | per-input registering / connecting / waiting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry. `waiting`: the flow runs and the uplink waits for a receiver, with the line that a production using the source must be active in Open Live; `connecting` is starting or lost contact with Strom |
+| `summary` | `{inputs: [{input, port, uplink, registered}]}` | the start summary: `uplink` is where the gateway sends (in caller mode `srt://<host>:<port>?mode=caller&latency=<ms>`), `registered` the address registered with Open Live; passphrases masked |
 | `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
 | `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |
 | `stopping` | `{done, total}` | teardown progress |

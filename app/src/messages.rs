@@ -147,6 +147,12 @@ pub enum Failure {
     AlreadyLive,
     /// An input runs but nothing has reached the cloud for 30 seconds.
     NothingDelivered,
+    /// An input runs and its uplink waits for a receiver: Open Live receives a
+    /// source only while a production using it is active.
+    WaitingForProduction,
+    /// As [`Failure::WaitingForProduction`], still with nothing delivered after 30
+    /// seconds: the production may be active and the network blocking the uplink.
+    WaitingNothingDelivered,
     /// Open Live refused the gateway token on the heartbeat. A banner.
     GatewayTokenRefused,
     /// The settings file has a problem.
@@ -257,6 +263,14 @@ impl Failure {
             Failure::NothingDelivered => Message::new(
                 "Nothing has reached the cloud yet. Check that this network allows outgoing UDP.",
                 None,
+            ),
+            Failure::WaitingForProduction => Message::new(
+                "Waiting for Open Live: put this source in a production and activate it.",
+                Some(OpenStudio),
+            ),
+            Failure::WaitingNothingDelivered => Message::new(
+                "Waiting for Open Live: put this source in a production and activate it. If that production is already active, check that this network allows outgoing UDP.",
+                Some(OpenStudio),
             ),
             Failure::GatewayTokenRefused => Message::new(
                 "Studio can't see this venue's status (gateway token refused). Your cameras are still sending.",
@@ -865,6 +879,20 @@ mod tests {
             Failure::NothingDelivered.message(),
             "Nothing has reached the cloud yet. Check that this network allows outgoing UDP.",
             None,
+        );
+    }
+
+    #[test]
+    fn waiting_for_an_active_production() {
+        assert_message(
+            Failure::WaitingForProduction.message(),
+            "Waiting for Open Live: put this source in a production and activate it.",
+            Some(Action::OpenStudio),
+        );
+        assert_message(
+            Failure::WaitingNothingDelivered.message(),
+            "Waiting for Open Live: put this source in a production and activate it. If that production is already active, check that this network allows outgoing UDP.",
+            Some(Action::OpenStudio),
         );
     }
 

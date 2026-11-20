@@ -188,6 +188,11 @@ body.live #what {
   opacity: 0.8;
 }
 
+#go-rows .address {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
 footer button.link {
   margin-left: 1rem;
 }

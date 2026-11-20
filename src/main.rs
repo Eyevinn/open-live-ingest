@@ -277,14 +277,17 @@ fn render(event: &Event) -> Option<String> {
             format!("  removed Strom flow {name:?}, {why}\n")
         }
         Event::Summary { inputs } => {
-            let mut out = format!("\n{:<36} {:<6} REGISTERED ADDRESS\n", "INPUT", "PORT");
+            // Two labelled addresses per input: where the uplink is sent, and the
+            // address registered with Open Live (its receiving end).
+            let mut out = format!("\n{:<36} {:<6} ADDRESSES\n", "INPUT", "PORT");
             for row in inputs {
                 out += &format!(
-                    "{:<36} {:<6} {}\n",
+                    "{:<36} {:<6} sends to:   {}\n",
                     run::truncate(&row.name, 36),
                     row.port,
-                    row.address
+                    row.uplink
                 );
+                out += &format!("{:<43} registered: {}\n", "", row.address);
             }
             out += "\nAssign these in Studio and activate the production; they read as inactive until\n";
             out += "something is receiving them. Ctrl-C stops and removes them.\n\n";
@@ -588,13 +591,25 @@ mod tests {
                 name: "Venue — a camera with a name far too long for the column".to_string(),
                 port: 47110,
                 address: "srt://:47110?mode=listener".to_string(),
+                uplink: "srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***"
+                    .to_string(),
             }],
         })
         .unwrap();
-        let row = summary.lines().nth(2).unwrap();
+        let lines: Vec<&str> = summary.lines().collect();
         assert_eq!(
-            row,
-            "Venue — a camera with a name far to… 47110  srt://:47110?mode=listener"
+            lines[1],
+            "INPUT                                PORT   ADDRESSES"
+        );
+        // The uplink, where the gateway sends, is on the input's line; the address
+        // registered with Open Live under it, both labelled.
+        assert_eq!(
+            lines[2],
+            "Venue — a camera with a name far to… 47110  sends to:   srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***"
+        );
+        assert_eq!(
+            lines[3],
+            "                                            registered: srt://:47110?mode=listener"
         );
     }
 
