@@ -478,7 +478,8 @@ jobs:
   #
   # Every Mach-O in the app is signed with the hardened runtime, and strom,
   # open-live-ingest and open-live-ingest-app with the entitlements in
-  # .github/scripts/open-live-ingest.entitlements.
+  # .github/scripts/open-live-ingest.entitlements; strom also with
+  # com.apple.security.cs.allow-jit, for GStreamer's ORC (#113).
   # The identity depends on the repository secrets (#25):
   #   - APPLE_DEVELOPER_ID_P12 set: its Developer ID Application certificate is imported
   #     into a temporary keychain, which the last step deletes on every outcome, and the
@@ -651,15 +652,19 @@ jobs:
       #   CLI and strom next to it and the icon in Resources; no Mach-O load command or
       #   rpath names /opt/homebrew or /usr/local, every Mach-O has the hardened runtime,
       #   strom, open-live-ingest and open-live-ingest-app have the camera and
-      #   microphone entitlements, and the strict deep codesign verify passes.
-      # - the signature and entitlements of the main executable and the CLI, for the log.
+      #   microphone entitlements, strom alone has com.apple.security.cs.allow-jit, and
+      #   the strict deep codesign verify passes.
+      # - the signature and entitlements of the main executable, the CLI and strom, for
+      #   the log.
       # - the app and the CLI start under the hardened runtime from the mounted DMG
       #   (dyld and library validation load them) and report the bundle's version.
       # - the bundled Strom reports 0.8.1 or later.
       # - the bundled Strom starts under the hardened runtime with the bundle's
       #   GStreamer, as the gateway starts it: the plugin scanner builds the registry,
-      #   device discovery answers, and nothing in its log says a library or plugin
-      #   failed to load (library validation, a bad signature).
+      #   device discovery answers, a test-pattern flow through videoconvert, videoscale
+      #   and audioconvert runs, and nothing in its log says a library or plugin failed
+      #   to load (library validation, a bad signature) or that ORC could not JIT
+      #   (`ORC: ERROR`, allow-jit, #113).
       - name: Check the DMG
         run: |
           set -euo pipefail
@@ -675,6 +680,7 @@ jobs:
           .github/scripts/build-macos-app.sh --check "$mnt/$APP"
           codesign -dv --entitlements - "$contents/MacOS/open-live-ingest-app"
           codesign -dv --entitlements - "$contents/MacOS/open-live-ingest"
+          codesign -dv --entitlements - "$contents/MacOS/strom"
           bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$contents/Info.plist")"
           for exe in open-live-ingest-app open-live-ingest; do
             got="$("$contents/MacOS/$exe" --version)" \
@@ -717,6 +723,52 @@ jobs:
           devices="$(curl -fsS -m 60 "http://127.0.0.1:$port/api/discovery/devices?category=video_source")" \
             || { echo "device discovery failed"; cat "$log"; exit 1; }
           echo "Strom device discovery: $devices"
+          # ORC's JIT (#113): a test pattern through videoconvert, videoscale and
+          # audioconvert, whose inner loops are ORC programs, so ORC compiles them; the
+          # flow must start and still run 5 s later, or the log check below proves nothing.
+          flow_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+          jq -n --arg id "$flow_id" '
+            def el($id; $type; $props; $x; $y):
+              {id: $id, element_type: $type, properties: $props, position: [$x, $y]};
+            def ln($from; $to): {from: $from, to: $to};
+            {
+              id: $id, name: "orc-jit-check",
+              elements: [
+                el("vsrc"; "videotestsrc"; {"is-live": true, pattern: "smpte"}; 0; 0),
+                el("vcaps"; "capsfilter";
+                   {caps: "video/x-raw,format=I420,width=1280,height=720,framerate=30/1"}; 120; 0),
+                el("vconv"; "videoconvert"; {}; 240; 0),
+                el("vscale"; "videoscale"; {}; 360; 0),
+                el("vout"; "capsfilter"; {caps: "video/x-raw,format=BGRA,width=640,height=360"}; 480; 0),
+                el("vsink"; "fakesink"; {}; 600; 0),
+                el("asrc"; "audiotestsrc"; {"is-live": true, wave: "sine"}; 0; 150),
+                el("acaps"; "capsfilter"; {caps: "audio/x-raw,format=S16LE,rate=48000,channels=2"}; 120; 150),
+                el("aconv"; "audioconvert"; {}; 240; 150),
+                el("aout"; "capsfilter"; {caps: "audio/x-raw,format=F32LE"}; 360; 150),
+                el("asink"; "fakesink"; {}; 480; 150)
+              ],
+              links: [
+                ln("vsrc:src"; "vcaps:sink"), ln("vcaps:src"; "vconv:sink"),
+                ln("vconv:src"; "vscale:sink"), ln("vscale:src"; "vout:sink"),
+                ln("vout:src"; "vsink:sink"),
+                ln("asrc:src"; "acaps:sink"), ln("acaps:src"; "aconv:sink"),
+                ln("aconv:src"; "aout:sink"), ln("aout:src"; "asink:sink")
+              ]
+            }' >"$data/orc-flow.json"
+          curl -fsS -m 30 -H 'Content-Type: application/json' --data-binary "@$data/orc-flow.json" \
+            "http://127.0.0.1:$port/api/flows" >/dev/null \
+            || { echo "the bundled Strom did not take the test-pattern flow"; cat "$log"; exit 1; }
+          started="$(curl -fsS -m 60 -X POST "http://127.0.0.1:$port/api/flows/$flow_id/start")" \
+            || { echo "the bundled Strom did not start the test-pattern flow"; cat "$log"; exit 1; }
+          jq -e '.flow.running == true' <<<"$started" >/dev/null \
+            || { echo "the test-pattern flow is not running: $started"; cat "$log"; exit 1; }
+          sleep 5
+          flow="$(curl -fsS -m 10 "http://127.0.0.1:$port/api/flows/$flow_id")" \
+            || { echo "cannot read the test-pattern flow back"; cat "$log"; exit 1; }
+          jq -e '.flow.running == true' <<<"$flow" >/dev/null \
+            || { echo "the test-pattern flow stopped running: $flow"; cat "$log"; exit 1; }
+          echo "OK: the bundled Strom ran a test-pattern flow for 5 s"
+          curl -fsS -m 30 -X POST "http://127.0.0.1:$port/api/flows/$flow_id/stop" >/dev/null || true
           kill "$strom_pid"; wait "$strom_pid" || true; strom_pid=""
           echo "--- strom log (tail) ---"; tail -n 60 "$log"
           test -s "$data/gstreamer-registry.bin" \
@@ -724,6 +776,10 @@ jobs:
           if grep -nE 'not valid for use in process|Library Validation|Failed to load plugin|code signature|Code Signature' "$log"; then
             echo "the bundled Strom could not load bundled code under the hardened runtime"; exit 1
           fi
+          if grep -nF 'ORC: ERROR' "$log"; then
+            echo "ORC could not compile in the bundled Strom: is strom signed with com.apple.security.cs.allow-jit? (#113)"; exit 1
+          fi
+          echo "OK: no ORC: ERROR in strom.log, ORC's JIT runs under the hardened runtime"
           echo "OK: the bundled Strom runs under the hardened runtime and loads the bundle's GStreamer"
 
       # The last line is what sets the job output `notarized`: it is reached only when
