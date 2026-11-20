@@ -19,6 +19,8 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
+      - .github/scripts/e2e-app.py
+      - .github/scripts/test_e2e_app.py
       - .github/scripts/fetch-strom-msi.sh
       - .github/scripts/open-live-ingest.entitlements
       - app/**
@@ -843,6 +845,87 @@ jobs:
             echo "No temporary keychain to delete"
           fi
 
+  # The no-secret half of the DMG's end to end (#112): the uplink's SRT stats with a
+  # receiver that comes up late. The app executable the DMG carries, started with
+  # `--ipc-stdio`, is pointed (`self_hosted`) at a stand-in Open Live on loopback and
+  # goes live with the test pattern; a local SRT listener (srt-live-transmit, from
+  # Homebrew's `srt`) starts at least 30 s later. The uplink's srt-stats are sampled
+  # twice, 60 s apart, and the job fails, with the numbers in the log, when
+  # packets_sent_dropped grows by more than 1 % of packets_sent (a warning only while
+  # E2E_UPLINK_DROP_WARN_ONLY is set, #111), the uplink reports connected=false, sends
+  # nothing or reconnects. The check itself is unit tested first
+  # (.github/scripts/test_e2e_app.py). What it does: .github/scripts/e2e-app.py
+  # (E2E_PART late-listener).
+  #
+  # Its own job so that it runs on every pull request that builds the DMG, forks
+  # included: it reads no secret and touches no shared instance, so it has no fork
+  # guard and no `e2e-openlivedev` concurrency group. Never on a tag ref.
+  e2e-macos-late-listener:
+    needs: macos-app
+    if: github.ref_type != 'tag'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      APP: Open Live Ingest.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DMG }}
+      - name: Unit tests of the uplink SRT stats check
+        run: python3 -I .github/scripts/test_e2e_app.py
+      - name: Install the local SRT listener (srt-live-transmit)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install srt
+          command -v srt-live-transmit
+      - name: Go live to a stand-in Open Live, late SRT listener, Stop
+        env:
+          E2E_PART: late-listener
+          # The receiver comes up this long after Go live, and the uplink is sampled
+          # this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
+        run: |
+          set -euo pipefail
+          # As in e2e-macos: drop traffic to the bundled Strom's port (8080) on every
+          # interface but loopback before the app can start it.
+          sudo pfctl -f /etc/pf.conf
+          echo 'block drop in quick on ! lo0 proto { tcp udp } from any to any port 8080' \
+            | sudo pfctl -a com.apple/oli-e2e -f -
+          sudo pfctl -E 2>&1 | grep -v '^Token' || true
+          if ! sudo pfctl -a com.apple/oli-e2e -sr 2>/dev/null | grep -q 'port = 8080'; then
+            echo "::error title=e2e app::the pf rule for Strom's port did not load"
+            exit 1
+          fi
+          if ! sudo pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+            echo "::error title=e2e app::pf is not enabled"
+            exit 1
+          fi
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
+          python3 -I .github/scripts/e2e-app.py "$mnt/$APP/Contents/MacOS/open-live-ingest-app"
+      - name: App log
+        if: always()
+        run: |
+          log="$HOME/Library/Logs/open-live-ingest/app.log"
+          if [[ -f "$log" ]]; then cat "$log"; else echo "no app log at $log"; fi
+          strom_log="$(find "$HOME/Library/Application Support/open-live-ingest" -name strom.log 2>/dev/null | head -n 1)"
+          if [[ -n "$strom_log" ]]; then echo "--- $strom_log (tail) ---"; tail -n 100 "$strom_log"; fi
+          srt_log="$RUNNER_TEMP/oli-app-e2e/srt-listener.log"
+          if [[ -f "$srt_log" ]]; then echo "--- $srt_log (tail) ---"; tail -n 50 "$srt_log"; fi
+
   # The agent-run end to end (OL-59i, #100; spec section 14), on the DMG `macos-app`
   # has just built and checked: the app executable the DMG carries, started with
   # `--ipc-stdio` (the app core with no window and no webview), is fed the same
@@ -850,6 +933,14 @@ jobs:
   # `openlivedev`: Go live, the source in Open Live, Stop, the source and flow gone,
   # Go live again with no 409, quit while live removes them. What it checks and how:
   # .github/scripts/e2e-app.py.
+  #
+  # The uplink's SRT stats while live (#112): with the secret, the openlivedev
+  # production that takes the source is activated at least 30 s after Go live, and
+  # the uplink's srt-stats are sampled twice, 60 s apart. The job fails, with the
+  # numbers in the log, when packets_sent_dropped grows by more than 1 % of
+  # packets_sent (a warning only while E2E_UPLINK_DROP_WARN_ONLY is set, #111) or the
+  # uplink reports connected=false. The no-secret variant of the same check is the
+  # `e2e-macos-late-listener` job.
   #
   # Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
   # token for the workspace that owns `openlivedev` (the same secret as the
@@ -869,7 +960,7 @@ jobs:
       github.ref_type != 'tag' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     concurrency:
@@ -889,6 +980,17 @@ jobs:
           # A run by hand needs the secret; a pull request run without it warns and
           # passes after the checks that need none.
           E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+          # Everything but the late-listener check, which e2e-macos-late-listener runs.
+          E2E_PART: openlivedev
+          # The SRT stats check (#112): the receiver comes up this long after Go
+          # live, and the uplink is sampled this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
         run: |
           set -euo pipefail
           # The bundled Strom the app starts has an unauthenticated API and listens

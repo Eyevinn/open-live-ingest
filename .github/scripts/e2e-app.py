@@ -18,7 +18,12 @@ In order, each logged and written to the step summary:
      OPEN_LIVE_INSTANCE (default openlivedev) from the workspace the reply lists.
      Then What to send: `set_inputs` with the test pattern ticked.
   3. `go_live`: the source `<gateway name> — Test pattern` appears in Open Live, and
-     Strom runs a flow of that name.
+     Strom runs a flow of that name. Then the late receiver (#112): at least
+     E2E_LATE_SECONDS (default 35, never under 30) after Go live, a production named
+     `<gateway name> — production` is created with the source on `video_in_0` and
+     activated, so the cloud Strom's listener comes up only now, as in #110. Once it
+     is active, the uplink's SRT stats are checked (below), then the production is
+     deactivated and deleted.
   4. `stop`: the page's `stopped` event, with no error and nothing left behind; the
      source is gone from Open Live and the flow from Strom. When nothing answers at
      Strom's address any more, the app must have said it stopped the Strom it started
@@ -35,14 +40,50 @@ SRT port range the instance does not publish, as the Advanced section would. The
 app's own settings file is used (HOME is not moved), because the pasted token goes to
 the login keychain, which lives under HOME.
 
-Without OSC_ACCESS_TOKEN, step 1 still runs, and so does a `go_live` that has to be
-refused (no Open Live address yet) and a `quit` that ends the process. The run then
-fails naming the secret when E2E_REQUIRE_SECRET is `true` (a run by hand); otherwise
-(a pull request run) it ends with a warning naming the secret and exits 0.
+Before step 2, with or without OSC_ACCESS_TOKEN, a `go_live` has to be refused (no
+Open Live address yet), and then the late-listener check runs with no secret (#112):
+  - `self_hosted` points the app at a stand-in Open Live on loopback (LocalOpenLive:
+    the four source routes and server-info, publishing Strom host 127.0.0.1 and one
+    free SRT port), and `set_inputs` ticks the test pattern.
+  - `go_live`: the source appears there and Strom runs its flow; the uplink calls a
+    port where nothing listens yet.
+  - At least E2E_LATE_SECONDS after Go live, a local SRT listener starts on that port
+    (`srt-live-transmit`, from Homebrew's `srt`, or SRT_LIVE_TRANSMIT), and the
+    uplink's SRT stats are checked (below).
+  - `stop`: stopped with nothing left behind, the source and the flow gone.
+
+E2E_PART picks the part of the run: `all` (the default, a run by hand), or, as the
+release workflow splits it, `late-listener` (the `e2e-macos-late-listener` job, no
+secret, fork pull requests too: the refused `go_live`, the late-listener check, then
+a `quit` with nothing live ends the app) and `openlivedev` (the `e2e-macos` job:
+everything but the late-listener check).
+
+The SRT stats check reads the uplink's `GET /api/flows/<flow id>/srt-stats` from the
+bundled Strom, as `src/strom.rs` does: the sending element's (`role` sink) first peer.
+The first sample is the first one that shows a connected peer; then
+E2E_SRT_SAMPLES - 1 more (default 2 in all, never fewer), E2E_SRT_INTERVAL seconds
+apart (default 60, never under 60). Every sample is logged. It fails when any sample
+says `connected` false, or when, between consecutive samples or between the first
+and the last, `packets_sent_dropped` grows by more than 1 % of the growth in
+`packets_sent` (or nothing is sent, or the counters go back, which is a reconnect).
+The failure names the numbers. `connected` alone proves nothing: srtsink can keep a
+stale entry that reports it (src/strom.rs, `uplink_peer`), so packets_sent must grow
+too. While E2E_UPLINK_DROP_WARN_ONLY is `true`, a dropped share above 1 % is a
+`::warning::` with the numbers instead of a failure, until #111 (the sender drops
+after a late connect) is fixed; `connected` false, nothing sent and a reconnect still
+fail. #111's fix removes the switch.
+
+Without OSC_ACCESS_TOKEN, a `quit` with nothing live then has to end the process. The
+run fails naming the secret when E2E_REQUIRE_SECRET is `true` (a run by hand);
+otherwise (a pull request run) it ends with a warning naming the secret and exits 0.
 
 Whatever happens, the exit path closes the app (stdin closed: its bounded teardown)
-and deletes any source still carrying the run's gateway name. Sources named
-`oli-app-e2e-` left by an earlier run that was killed are removed before step 3.
+and deletes any source and production still carrying the run's gateway name, and
+stops the local SRT listener. Sources and productions named `oli-app-e2e-` left by an
+earlier run that was killed are removed before step 3.
+
+The check itself is unit tested, with no app and no network beyond loopback:
+`python3 -I .github/scripts/test_e2e_app.py`.
 
 Secrets and the bundled Strom (the reason is #83's, e2e-audio-device.sh): the app is
 started with OSC_ACCESS_TOKEN and GH_TOKEN removed from its environment. The app
@@ -67,12 +108,16 @@ core never serialises one), so the app's lines are logged.
 import json
 import os
 import queue
+import re
+import shutil
+import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOKEN_EXCHANGE = "https://token.svc.prod.osaas.io/servicetoken"
 SERVICE_ID = "eyevinn-open-live"
@@ -83,6 +128,19 @@ PREFIX = "oli-app-e2e-"
 STROM_URL = "http://127.0.0.1:8080"
 # Never handed to the app, so never to the Strom it starts (#83).
 WITHHELD_ENV = ("OSC_ACCESS_TOKEN", "GH_TOKEN")
+# The uplink fails the run when it drops more than this share of what it sends (#112).
+DROPPED_LIMIT = 0.01
+# How late the receiver comes up after Go live, at least: #110 hit it after 30 s.
+MIN_LATE_SECONDS = 30
+# How far apart the SRT stats samples are, at least, and how many, at least.
+MIN_SRT_INTERVAL = 60
+MIN_SRT_SAMPLES = 2
+# How long the uplink has, once its receiver is up, to show a connected peer.
+CONNECT_TIMEOUT = 120
+# The mixer input the openlivedev production puts the source on.
+MIXER_INPUT = "video_in_0"
+# What E2E_PART may ask for (`part`).
+PARTS = ("all", "late-listener", "openlivedev")
 
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY") or os.devnull
 ON_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
@@ -136,6 +194,11 @@ def passed(text):
 def note(text):
     say(f"NOTE: {text}")
     record(f"- NOTE: {text}")
+
+
+def warn(text):
+    print(f"::warning title=e2e app::{text}", flush=True)
+    record(f"- WARNING: {text}")
 
 
 class Failed(Exception):
@@ -324,12 +387,39 @@ def http(method, url, headers=None, body=None, timeout=30):
         return status, None
 
 
-class OpenLive:
+class SourceList:
+    """What the run asks of an Open Live's sources; `sources` and `delete` are the
+    subclass's."""
+
+    def ours(self, gateway_name):
+        prefix = f"{gateway_name} — "
+        return [s for s in self.sources() if str(s.get("name", "")).startswith(prefix)]
+
+    def wait_for_source(self, name, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = [s for s in self.sources() if s.get("name") == name]
+            if found:
+                return found[0]
+            time.sleep(2)
+        fail(f"no source named '{name}' appeared in Open Live within {timeout} s")
+
+    def wait_gone(self, gateway_name, timeout):
+        deadline = time.monotonic() + timeout
+        left = self.ours(gateway_name)
+        while left and time.monotonic() < deadline:
+            time.sleep(2)
+            left = self.ours(gateway_name)
+        return left
+
+
+class OpenLive(SourceList):
     def __init__(self, url, pat):
         self.url = url.rstrip("/")
         self.pat = pat
         self.token = None
         self.expires = 0.0
+        self.productions = []
 
     def _bearer(self):
         if self.token is None or time.time() > self.expires - 60:
@@ -352,30 +442,350 @@ class OpenLive:
             fail(f"GET /api/v1/sources failed with HTTP {status}")
         return body
 
-    def ours(self, gateway_name):
-        prefix = f"{gateway_name} — "
-        return [s for s in self.sources() if str(s.get("name", "")).startswith(prefix)]
-
     def delete(self, source_id):
         status, _ = http("DELETE", f"{self.url}/api/v1/sources/{source_id}", self._bearer())
         return status in (200, 202, 204, 404)
 
-    def wait_for_source(self, name, timeout):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            found = [s for s in self.sources() if s.get("name") == name]
-            if found:
-                return found[0]
-            time.sleep(2)
-        fail(f"no source named '{name}' appeared in Open Live within {timeout} s")
+    # Productions: only what the late-receiver check needs (#112).
 
-    def wait_gone(self, gateway_name, timeout):
+    def all_productions(self):
+        status, body = http("GET", f"{self.url}/api/v1/productions", self._bearer())
+        if status != 200 or not isinstance(body, list):
+            fail(f"GET /api/v1/productions failed with HTTP {status}")
+        return body
+
+    def production(self, production_id):
+        status, body = http("GET", f"{self.url}/api/v1/productions/{production_id}", self._bearer())
+        if status != 200 or not isinstance(body, dict):
+            fail(f"GET /api/v1/productions/{production_id} failed with HTTP {status}")
+        return body
+
+    def create_production(self, name, source_id):
+        """A production with the source on MIXER_INPUT, inactive; its id. Remembered,
+        so the run's exit path removes it whatever happens."""
+        status, body = http("POST", f"{self.url}/api/v1/productions", self._bearer(), {"name": name})
+        if status not in (200, 201) or not isinstance(body, dict) or not body.get("_id"):
+            fail(f"creating production '{name}' failed with HTTP {status}")
+        production_id = body["_id"]
+        self.productions.append(production_id)
+        status, _ = http(
+            "POST",
+            f"{self.url}/api/v1/productions/{production_id}/sources",
+            self._bearer(),
+            {"sourceId": source_id, "mixerInput": MIXER_INPUT},
+        )
+        if status not in (200, 201):
+            fail(f"assigning source {source_id} to production {production_id} failed with HTTP {status}")
+        return production_id
+
+    def activate(self, production_id, timeout):
+        """Activates the production and waits until Open Live says it is active."""
+        status, _ = http("POST", f"{self.url}/api/v1/productions/{production_id}/activate", self._bearer(), {})
+        if status != 200:
+            fail(f"activating production {production_id} failed with HTTP {status}")
         deadline = time.monotonic() + timeout
-        left = self.ours(gateway_name)
-        while left and time.monotonic() < deadline:
-            time.sleep(2)
-            left = self.ours(gateway_name)
-        return left
+        state = "activating"
+        while time.monotonic() < deadline:
+            state = self.production(production_id).get("status")
+            if state == "active":
+                return
+            if state != "activating":
+                fail(f"production {production_id} did not activate: its status went to '{state}'")
+            time.sleep(5)
+        fail(f"production {production_id} was still '{state}' after {timeout} s")
+
+    def remove_production(self, production_id):
+        """Deactivates and deletes; True when it is gone. Deactivating an inactive
+        production is harmless, and Open Live joins a deactivation already running."""
+        url = f"{self.url}/api/v1/productions/{production_id}"
+        http("POST", f"{url}/deactivate", self._bearer(), {}, timeout=180)
+        status, _ = http("DELETE", url, self._bearer())
+        gone = status in (200, 202, 204, 404)
+        if gone and production_id in self.productions:
+            self.productions.remove(production_id)
+        return gone
+
+
+class LocalOpenLive(SourceList):
+    """A stand-in for a self-hosted Open Live on loopback, for the no-secret late
+    listener check (#112): `GET /api/v1/server-info` publishes Strom host 127.0.0.1
+    and the one SRT port `srt_port`, and `/api/v1/sources` lists, creates, patches and
+    deletes sources the way the gateway uses them. A source registered with port 0
+    (`srt://:0?mode=listener`, "assign me one") is given `srt_port`. No key."""
+
+    def __init__(self, srt_port):
+        self.srt_port = srt_port
+        self.lock = threading.Lock()
+        self.stored = {}
+        self.next_id = 1
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _reply(self, status, body=None):
+                raw = b"" if body is None else json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _body(self):
+                length = int(self.headers.get("content-length") or 0)
+                try:
+                    return json.loads(self.rfile.read(length) or b"null")
+                except ValueError:
+                    return None
+
+            def do_GET(self):
+                if self.path == "/api/v1/server-info":
+                    self._reply(200, owner.server_info())
+                elif self.path == "/api/v1/sources":
+                    self._reply(200, owner.sources())
+                else:
+                    self._reply(404, {"error": "not found"})
+
+            def do_POST(self):
+                body = self._body()
+                if self.path != "/api/v1/sources" or not isinstance(body, dict):
+                    self._reply(404 if self.path != "/api/v1/sources" else 400, {"error": "no"})
+                    return
+                self._reply(201, owner.create(body))
+
+            def do_PATCH(self):
+                body = self._body()
+                source_id = self.path.rsplit("/", 1)[-1]
+                if not self.path.startswith("/api/v1/sources/") or not isinstance(body, dict):
+                    self._reply(400, {"error": "no"})
+                    return
+                patched = owner.patch(source_id, body)
+                self._reply(200 if patched else 404, patched or {"error": "not found"})
+
+            def do_DELETE(self):
+                if not self.path.startswith("/api/v1/sources/"):
+                    self._reply(404, {"error": "not found"})
+                    return
+                self._reply(204 if owner.delete(self.path.rsplit("/", 1)[-1]) else 404)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def server_info(self):
+        return {"stromHost": "127.0.0.1", "srtPorts": [self.srt_port], "srtPortState": "reserved"}
+
+    def _with_port(self, source):
+        source["address"] = re.sub(r"^srt://:0(?=\?|$)", f"srt://:{self.srt_port}", str(source.get("address", "")))
+        return source
+
+    def sources(self):
+        with self.lock:
+            return [dict(s) for s in self.stored.values()]
+
+    def create(self, body):
+        with self.lock:
+            source = self._with_port(dict(body, id=f"src-{self.next_id}"))
+            self.next_id += 1
+            self.stored[source["id"]] = source
+            return dict(source)
+
+    def patch(self, source_id, body):
+        with self.lock:
+            if source_id not in self.stored:
+                return None
+            source = self._with_port(dict(self.stored[source_id], **body, id=source_id))
+            self.stored[source_id] = source
+            return dict(source)
+
+    def delete(self, source_id):
+        with self.lock:
+            return self.stored.pop(source_id, None) is not None
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def free_udp_port():
+    """A UDP port nothing on loopback uses right now: the stand-in Open Live publishes
+    it, and the late listener binds it."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class LateListener:
+    """A local SRT listener (srt-live-transmit, from Homebrew's `srt`), started late on
+    purpose: the receiver the uplink calls comes up only after Go live (#112)."""
+
+    def __init__(self, port, log_path):
+        self.exe = os.environ.get("SRT_LIVE_TRANSMIT") or shutil.which("srt-live-transmit")
+        if not self.exe:
+            fail("missing tool: srt-live-transmit is not on PATH (brew install srt), and SRT_LIVE_TRANSMIT is not set")
+        self.port = port
+        self.log_path = log_path
+        self.proc = None
+
+    def start(self):
+        self.log = open(self.log_path, "w", encoding="utf-8")
+        self.proc = subprocess.Popen(
+            [self.exe, f"srt://127.0.0.1:{self.port}?mode=listener", "file://con"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=self.log,
+        )
+        time.sleep(1)
+        self.check_running("just after it started")
+
+    def check_running(self, when):
+        if self.proc is not None and self.proc.poll() is not None:
+            self.log.flush()
+            with open(self.log_path, encoding="utf-8", errors="replace") as f:
+                tail = f.read()[-2000:]
+            fail(f"the local SRT listener on 127.0.0.1:{self.port} exited ({self.proc.returncode}) {when}: {tail.strip()}")
+
+    def stop(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+        if self.proc is not None:
+            self.log.close()
+
+
+# --- the uplink's SRT stats (#112) -----------------------------------------------------
+
+
+def uplink_sample(body):
+    """From a `GET /api/flows/<id>/srt-stats` body, the uplink's state: the sending
+    element's (`role` sink) `connected`, and its first peer's `packets_sent` and
+    `packets_sent_dropped`, as `uplink_peer` in src/strom.rs picks it. None when the
+    flow reports no peer yet."""
+    # `connected` may be stale (src/strom.rs, uplink_peer): srtsink keeps reporting it
+    # while retrying a vanished peer, so never rely on it alone; judge_uplink also needs
+    # packets_sent to grow.
+    connections = ((body or {}).get("stats") or {}).get("connections") or {}
+    for connection in connections.values():
+        if not isinstance(connection, dict) or connection.get("role") != "sink":
+            continue
+        callers = connection.get("callers") or []
+        if not callers:
+            return None
+        peer = callers[0]
+        return {
+            "connected": connection.get("connected") is True,
+            "packets_sent": peer.get("packets_sent"),
+            "packets_sent_dropped": peer.get("packets_sent_dropped") or 0,
+            "rtt_ms": peer.get("rtt_ms"),
+        }
+    return None
+
+
+def describe(sample):
+    return (
+        f"+{sample['at']:.0f} s: connected={str(sample['connected']).lower()}, "
+        f"packets_sent={sample['packets_sent']}, packets_sent_dropped={sample['packets_sent_dropped']}, "
+        f"rtt_ms={sample.get('rtt_ms')}"
+    )
+
+
+def uplink_problems(samples, limit=DROPPED_LIMIT):
+    """(fatal, dropped) for `samples` (in order, each with `at`, seconds since the
+    first), each None or what went wrong, with the numbers. `fatal`: too few samples,
+    a sample says `connected` false or has no packets_sent, or, between consecutive
+    samples or between the first and the last, nothing is sent or a counter goes back
+    (the link reconnected). `dropped`: the first such span in which
+    `packets_sent_dropped` grows by more than `limit` of the growth in `packets_sent`.
+    Kept apart so that E2E_UPLINK_DROP_WARN_ONLY can turn only `dropped` into a
+    warning (#111)."""
+    if len(samples) < MIN_SRT_SAMPLES:
+        return f"only {len(samples)} SRT stats sample(s); at least {MIN_SRT_SAMPLES} are needed", None
+    for sample in samples:
+        if not sample["connected"]:
+            return f"the uplink reports connected=false at {describe(sample)}", None
+        if sample["packets_sent"] is None:
+            return f"the uplink reports no packets_sent at {describe(sample)}", None
+    pairs = list(zip(samples, samples[1:]))
+    if len(samples) > 2:
+        pairs.append((samples[0], samples[-1]))
+    too_many = None
+    for a, b in pairs:
+        sent = b["packets_sent"] - a["packets_sent"]
+        dropped = b["packets_sent_dropped"] - a["packets_sent_dropped"]
+        span = f"between +{a['at']:.0f} s and +{b['at']:.0f} s ({b['at'] - a['at']:.0f} s)"
+        if sent < 0 or dropped < 0:
+            return (
+                f"the uplink's counters went back {span}: packets_sent {a['packets_sent']} -> {b['packets_sent']}, "
+                f"packets_sent_dropped {a['packets_sent_dropped']} -> {b['packets_sent_dropped']}; the link reconnected"
+            ), too_many
+        if sent == 0:
+            return f"the uplink sent no packets {span} (packets_sent stayed at {b['packets_sent']})", too_many
+        if dropped > sent * limit and too_many is None:
+            too_many = (
+                f"the uplink dropped too much {span}: packets_sent grew by {sent} and packets_sent_dropped by "
+                f"{dropped}, {100 * dropped / sent:.2f} % dropped, more than {100 * limit:g} %"
+            )
+    return None, too_many
+
+
+def judge_uplink(samples, limit=DROPPED_LIMIT):
+    """None when the uplink held up over `samples`; otherwise what went wrong, with the
+    numbers (`uplink_problems`, a fatal problem first)."""
+    fatal, dropped = uplink_problems(samples, limit)
+    return fatal or dropped
+
+
+def env_int(name, default, floor):
+    """The whole number in env `name` (`default` when unset or empty), never below
+    `floor`; fails naming the variable when it is not a whole number."""
+    raw = os.environ.get(name) or str(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        fail(f"{name} must be a whole number, not {raw!r}")
+    return max(floor, value)
+
+
+def srt_settings():
+    """(samples, interval in seconds, late start in seconds) from the environment,
+    never below the issue's floor."""
+    samples = env_int("E2E_SRT_SAMPLES", MIN_SRT_SAMPLES, MIN_SRT_SAMPLES)
+    interval = env_int("E2E_SRT_INTERVAL", MIN_SRT_INTERVAL, MIN_SRT_INTERVAL)
+    late = env_int("E2E_LATE_SECONDS", 35, MIN_LATE_SECONDS)
+    return samples, interval, late
+
+
+def drops_warn_only():
+    """True when E2E_UPLINK_DROP_WARN_ONLY is `true`: a dropped share above the limit
+    is then a warning, not a failure, until #111 (the sender drops after a late
+    connect) is fixed. Everything else the SRT stats check finds stays fatal. #111's
+    fix removes this switch."""
+    raw = os.environ.get("E2E_UPLINK_DROP_WARN_ONLY") or "false"
+    if raw not in ("true", "false"):
+        fail(f"E2E_UPLINK_DROP_WARN_ONLY must be `true` or `false`, not {raw!r}")
+    return raw == "true"
+
+
+def part():
+    """Which part of the run E2E_PART asks for: `all` (the default, a run by hand),
+    `late-listener` (only the no-secret late-listener check, the `e2e-macos-late-listener`
+    job, which runs on fork pull requests too) or `openlivedev` (everything but it, the
+    `e2e-macos` job)."""
+    raw = os.environ.get("E2E_PART") or "all"
+    if raw not in PARTS:
+        fail(f"E2E_PART must be one of {', '.join(PARTS)}, not {raw!r}")
+    return raw
+
+
+def wait_until(moment):
+    left = moment - time.monotonic()
+    if left > 0:
+        time.sleep(left)
 
 
 class Strom:
@@ -400,6 +810,64 @@ class Strom:
                     return flow
             time.sleep(2)
         fail(f"Strom at {self.url} runs no flow named '{name}' after {timeout} s")
+
+    def uplink(self, flow_id):
+        """The uplink's state (`uplink_sample`), or None when the flow reports no peer
+        yet. Fails when Strom does not answer."""
+        try:
+            status, body = http("GET", f"{self.url}/api/flows/{flow_id}/srt-stats", timeout=10)
+        except (urllib.error.URLError, OSError) as err:
+            fail(f"GET srt-stats of flow {flow_id} from Strom at {self.url} failed: {err}")
+        if status == 404:
+            return None
+        if status != 200:
+            fail(f"GET srt-stats of flow {flow_id} failed with HTTP {status}")
+        return uplink_sample(body)
+
+    def watch_uplink(self, flow_id, step, still_up=lambda when: None):
+        """The SRT stats check (#112): waits up to CONNECT_TIMEOUT for a connected peer,
+        then takes the rest of the samples E2E_SRT_INTERVAL apart, logs each and judges
+        them. `still_up` checks the receiver is still there before each sample."""
+        samples, interval, _ = srt_settings()
+        deadline = time.monotonic() + CONNECT_TIMEOUT
+        first = None
+        while time.monotonic() < deadline:
+            first = self.uplink(flow_id)
+            if first is not None and first["connected"]:
+                break
+            time.sleep(2)
+        if first is None or not first["connected"]:
+            fail(f"{step}: the uplink of flow {flow_id} shows no connected peer {CONNECT_TIMEOUT} s after its receiver came up (last: {first})")
+        start = time.monotonic()
+        first["at"] = 0.0
+        taken = [first]
+        say(f"{step}: uplink SRT stats {describe(first)}")
+        for n in range(1, samples):
+            wait_until(start + n * interval)
+            still_up(f"before sample {n + 1}")
+            sample = self.uplink(flow_id)
+            if sample is None:
+                fail(f"{step}: the uplink of flow {flow_id} reports no peer any more at +{time.monotonic() - start:.0f} s")
+            sample["at"] = time.monotonic() - start
+            taken.append(sample)
+            say(f"{step}: uplink SRT stats {describe(sample)}")
+        fatal, dropped = uplink_problems(taken)
+        if fatal:
+            fail(f"{step}: {fatal}")
+        a, b = taken[0], taken[-1]
+        if dropped:
+            if not drops_warn_only():
+                fail(f"{step}: {dropped}")
+            warn(
+                f"{step}: {dropped}. Not failed: E2E_UPLINK_DROP_WARN_ONLY is set until #111 (sender drops after a "
+                f"late connect) is fixed. The uplink stayed connected and kept sending ({len(taken)} samples over {b['at']:.0f} s)"
+            )
+            return
+        passed(
+            f"{step}: the uplink stayed connected and dropped {b['packets_sent_dropped'] - a['packets_sent_dropped']} "
+            f"of {b['packets_sent'] - a['packets_sent']} packets sent over {b['at']:.0f} s "
+            f"({len(taken)} samples; at most {100 * DROPPED_LIMIT:g} % allowed)"
+        )
 
     def check_gone(self, flow_id, step, app, since):
         """The flow is gone from Strom. When nothing answers at Strom's address, the app
@@ -484,6 +952,62 @@ def stopped_cleanly(data, step):
         fail(f"{step}: the app says it left inputs behind: {data['left_behind']}")
 
 
+def late_listener_check(app, strom, gateway_name, source_name, work):
+    """The no-secret late-listener check (#112): Go live to a stand-in Open Live on
+    loopback, start a local SRT listener at least E2E_LATE_SECONDS later, check the
+    uplink's SRT stats, Stop. See the header."""
+    step = "Late listener (no secret)"
+    _, _, late = srt_settings()
+    srt_port = free_udp_port()
+    listener = LateListener(srt_port, os.path.join(work, "srt-listener.log"))
+    local = LocalOpenLive(srt_port)
+    try:
+        where = app.ok("self_hosted", {"url": local.url, "api_key": ""}, timeout=60)
+        if not where.get("where", {}).get("ready"):
+            fail(f"{step}: Where to send is not done after `self_hosted`: {where.get('where', {}).get('problem')}")
+        passed(f"{step}: Where to send is the stand-in Open Live at {local.url} (Strom host 127.0.0.1, SRT port {srt_port})")
+        tick_the_test_pattern(app)
+
+        live_at = time.monotonic()
+        _, flow, since = go_live(app, local, strom, source_name, step)
+        say(f"{step}: nothing listens on 127.0.0.1:{srt_port} yet; the listener starts {late} s after Go live")
+        wait_until(live_at + late)
+        listener.start()
+        passed(f"{step}: the local SRT listener is up on 127.0.0.1:{srt_port}, {time.monotonic() - live_at:.0f} s after Go live")
+        strom.watch_uplink(flow.get("id"), step, listener.check_running)
+        listener.check_running("after the last sample")
+
+        app.ok("stop")
+        stopped_cleanly(app.event("stopped", 120), f"{step}: Stop")
+        left = local.wait_gone(gateway_name, 30)
+        if left:
+            fail(f"{step}: Stop left {len(left)} source(s) of '{gateway_name}' in the stand-in Open Live")
+        passed(f"{step}: Stop reports stopped, nothing left behind, and the source is gone")
+        strom.check_gone(flow.get("id"), f"{step}: Stop", app, since)
+    finally:
+        listener.stop()
+        local.close()
+
+
+def late_receiver_check(open_live, strom, source, flow, live_at, gateway_name):
+    """The openlivedev late-receiver check (#112): the production that takes the
+    source is activated at least E2E_LATE_SECONDS after Go live, so the cloud Strom's
+    listener comes up late; then the uplink's SRT stats are checked, and the
+    production is removed."""
+    step = "Late receiver (openlivedev)"
+    _, _, late = srt_settings()
+    production_id = open_live.create_production(f"{gateway_name} — production", source.get("id"))
+    passed(f"{step}: production {production_id} has the source on {MIXER_INPUT}; it activates {late} s after Go live")
+    wait_until(live_at + late)
+    activated_at = time.monotonic()
+    open_live.activate(production_id, 300)
+    passed(f"{step}: production {production_id} is active, {time.monotonic() - live_at:.0f} s after Go live (activation took {time.monotonic() - activated_at:.0f} s)")
+    strom.watch_uplink(flow.get("id"), step)
+    if not open_live.remove_production(production_id):
+        fail(f"{step}: production {production_id} could not be deleted")
+    passed(f"{step}: production {production_id} is deactivated and deleted")
+
+
 def run(exe, work):
     instance = os.environ.get("OPEN_LIVE_INSTANCE") or "openlivedev"
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
@@ -493,29 +1017,44 @@ def run(exe, work):
     port_range = os.environ.get("E2E_PORT_RANGE") or "47300-47309"
     pat = os.environ.get("OSC_ACCESS_TOKEN") or ""
     mask(pat)
+    # Bad settings fail here, before anything starts.
+    which = part()
+    srt_settings()
+    drops_warn_only()
 
     settings = settings_file()
     if os.path.exists(settings):
         fail(f"{settings} exists already; run this on a machine where the app has not been set up")
     write_settings(settings, gateway_name, port_range)
-    record(f"### App end to end against `{instance}`: {sys.platform}, `{os.path.basename(exe)} --ipc-stdio`")
+    against = "a stand-in Open Live on loopback (late-listener part)" if which == "late-listener" else f"`{instance}`"
+    record(f"### App end to end against {against}: {sys.platform}, `{os.path.basename(exe)} --ipc-stdio`")
 
     stderr_log = open(os.path.join(work, "app-stderr.log"), "w", encoding="utf-8")
     app = App(exe, stderr_log)
     open_live = None
+    # The settings leave [strom] at its default, as a first-time user does.
+    strom = Strom(STROM_URL)
     try:
         list_devices(app)
 
-        if not pat:
-            reply = app.call("go_live", timeout=120)
-            if "error" not in reply:
-                fail("`go_live` with no Open Live address was not refused")
-            passed(f"`go_live` with no Open Live address is refused: {reply['error'].get('message')}")
+        reply = app.call("go_live", timeout=120)
+        if "error" not in reply:
+            fail("`go_live` with no Open Live address was not refused")
+        passed(f"`go_live` with no Open Live address is refused: {reply['error'].get('message')}")
+
+        # With or without the secret: the late-listener check needs none (#112).
+        if which != "openlivedev":
+            late_listener_check(app, strom, gateway_name, source_name, work)
+
+        if not pat or which == "late-listener":
             app.ok("quit", {"confirmed": False})
             code = app.ended(30)
             if code != 0:
                 fail(f"`quit` with nothing live did not end the app (exit {code})")
             passed("`quit` with nothing live ends the app")
+            if which == "late-listener":
+                say("e2e app (late-listener part): done")
+                return
             missing = (
                 "missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud "
                 f"personal access token for the workspace that owns the Open Live instance '{instance}') is not set"
@@ -541,17 +1080,21 @@ def run(exe, work):
         tick_the_test_pattern(app)
 
         open_live = OpenLive(url, pat)
+        for production in open_live.all_productions():
+            name = str(production.get("name", ""))
+            if name.startswith(PREFIX) and not name.startswith(f"{gateway_name} — "):
+                say(f"removing stale production {production.get('_id')} from an earlier run")
+                open_live.remove_production(production.get("_id"))
         for source in open_live.sources():
             name = str(source.get("name", ""))
             if name.startswith(PREFIX) and not name.startswith(f"{gateway_name} — "):
                 say(f"removing stale source {source.get('id')} from an earlier run")
                 open_live.delete(source.get("id"))
 
-        # The settings leave [strom] at its default, as a first-time user does.
-        strom = Strom(STROM_URL)
-
-        # 3. Go live.
-        _, flow, since = go_live(app, open_live, strom, source_name, "Go live")
+        # 3. Go live, then the late receiver: the production is activated only now.
+        live_at = time.monotonic()
+        source, flow, since = go_live(app, open_live, strom, source_name, "Go live")
+        late_receiver_check(open_live, strom, source, flow, live_at, gateway_name)
 
         # 4. Stop.
         app.ok("stop")
@@ -597,6 +1140,12 @@ def run(exe, work):
         app.close()
         stderr_log.close()
         if open_live is not None:
+            for production_id in list(open_live.productions):
+                try:
+                    say(f"removing leftover production {production_id}")
+                    open_live.remove_production(production_id)
+                except (Failed, urllib.error.URLError, OSError) as err:
+                    say(f"could not remove production {production_id}: {err}")
             try:
                 for source in open_live.ours(gateway_name):
                     say(f"removing leftover source {source.get('id')}")
