@@ -19,6 +19,8 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
+      - .github/scripts/e2e-app.py
+      - .github/scripts/test_e2e_app.py
       - .github/scripts/fetch-strom-msi.sh
       - .github/scripts/open-live-ingest.entitlements
       - app/**
@@ -478,7 +480,8 @@ jobs:
   #
   # Every Mach-O in the app is signed with the hardened runtime, and strom,
   # open-live-ingest and open-live-ingest-app with the entitlements in
-  # .github/scripts/open-live-ingest.entitlements.
+  # .github/scripts/open-live-ingest.entitlements; strom also with
+  # com.apple.security.cs.allow-jit, for GStreamer's ORC (#113).
   # The identity depends on the repository secrets (#25):
   #   - APPLE_DEVELOPER_ID_P12 set: its Developer ID Application certificate is imported
   #     into a temporary keychain, which the last step deletes on every outcome, and the
@@ -651,15 +654,19 @@ jobs:
       #   CLI and strom next to it and the icon in Resources; no Mach-O load command or
       #   rpath names /opt/homebrew or /usr/local, every Mach-O has the hardened runtime,
       #   strom, open-live-ingest and open-live-ingest-app have the camera and
-      #   microphone entitlements, and the strict deep codesign verify passes.
-      # - the signature and entitlements of the main executable and the CLI, for the log.
+      #   microphone entitlements, strom alone has com.apple.security.cs.allow-jit, and
+      #   the strict deep codesign verify passes.
+      # - the signature and entitlements of the main executable, the CLI and strom, for
+      #   the log.
       # - the app and the CLI start under the hardened runtime from the mounted DMG
       #   (dyld and library validation load them) and report the bundle's version.
       # - the bundled Strom reports 0.8.1 or later.
       # - the bundled Strom starts under the hardened runtime with the bundle's
       #   GStreamer, as the gateway starts it: the plugin scanner builds the registry,
-      #   device discovery answers, and nothing in its log says a library or plugin
-      #   failed to load (library validation, a bad signature).
+      #   device discovery answers, a test-pattern flow through videoconvert, videoscale
+      #   and audioconvert runs, and nothing in its log says a library or plugin failed
+      #   to load (library validation, a bad signature) or that ORC could not JIT
+      #   (`ORC: ERROR`, allow-jit, #113).
       - name: Check the DMG
         run: |
           set -euo pipefail
@@ -675,6 +682,7 @@ jobs:
           .github/scripts/build-macos-app.sh --check "$mnt/$APP"
           codesign -dv --entitlements - "$contents/MacOS/open-live-ingest-app"
           codesign -dv --entitlements - "$contents/MacOS/open-live-ingest"
+          codesign -dv --entitlements - "$contents/MacOS/strom"
           bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$contents/Info.plist")"
           for exe in open-live-ingest-app open-live-ingest; do
             got="$("$contents/MacOS/$exe" --version)" \
@@ -717,6 +725,52 @@ jobs:
           devices="$(curl -fsS -m 60 "http://127.0.0.1:$port/api/discovery/devices?category=video_source")" \
             || { echo "device discovery failed"; cat "$log"; exit 1; }
           echo "Strom device discovery: $devices"
+          # ORC's JIT (#113): a test pattern through videoconvert, videoscale and
+          # audioconvert, whose inner loops are ORC programs, so ORC compiles them; the
+          # flow must start and still run 5 s later, or the log check below proves nothing.
+          flow_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+          jq -n --arg id "$flow_id" '
+            def el($id; $type; $props; $x; $y):
+              {id: $id, element_type: $type, properties: $props, position: [$x, $y]};
+            def ln($from; $to): {from: $from, to: $to};
+            {
+              id: $id, name: "orc-jit-check",
+              elements: [
+                el("vsrc"; "videotestsrc"; {"is-live": true, pattern: "smpte"}; 0; 0),
+                el("vcaps"; "capsfilter";
+                   {caps: "video/x-raw,format=I420,width=1280,height=720,framerate=30/1"}; 120; 0),
+                el("vconv"; "videoconvert"; {}; 240; 0),
+                el("vscale"; "videoscale"; {}; 360; 0),
+                el("vout"; "capsfilter"; {caps: "video/x-raw,format=BGRA,width=640,height=360"}; 480; 0),
+                el("vsink"; "fakesink"; {}; 600; 0),
+                el("asrc"; "audiotestsrc"; {"is-live": true, wave: "sine"}; 0; 150),
+                el("acaps"; "capsfilter"; {caps: "audio/x-raw,format=S16LE,rate=48000,channels=2"}; 120; 150),
+                el("aconv"; "audioconvert"; {}; 240; 150),
+                el("aout"; "capsfilter"; {caps: "audio/x-raw,format=F32LE"}; 360; 150),
+                el("asink"; "fakesink"; {}; 480; 150)
+              ],
+              links: [
+                ln("vsrc:src"; "vcaps:sink"), ln("vcaps:src"; "vconv:sink"),
+                ln("vconv:src"; "vscale:sink"), ln("vscale:src"; "vout:sink"),
+                ln("vout:src"; "vsink:sink"),
+                ln("asrc:src"; "acaps:sink"), ln("acaps:src"; "aconv:sink"),
+                ln("aconv:src"; "aout:sink"), ln("aout:src"; "asink:sink")
+              ]
+            }' >"$data/orc-flow.json"
+          curl -fsS -m 30 -H 'Content-Type: application/json' --data-binary "@$data/orc-flow.json" \
+            "http://127.0.0.1:$port/api/flows" >/dev/null \
+            || { echo "the bundled Strom did not take the test-pattern flow"; cat "$log"; exit 1; }
+          started="$(curl -fsS -m 60 -X POST "http://127.0.0.1:$port/api/flows/$flow_id/start")" \
+            || { echo "the bundled Strom did not start the test-pattern flow"; cat "$log"; exit 1; }
+          jq -e '.flow.running == true' <<<"$started" >/dev/null \
+            || { echo "the test-pattern flow is not running: $started"; cat "$log"; exit 1; }
+          sleep 5
+          flow="$(curl -fsS -m 10 "http://127.0.0.1:$port/api/flows/$flow_id")" \
+            || { echo "cannot read the test-pattern flow back"; cat "$log"; exit 1; }
+          jq -e '.flow.running == true' <<<"$flow" >/dev/null \
+            || { echo "the test-pattern flow stopped running: $flow"; cat "$log"; exit 1; }
+          echo "OK: the bundled Strom ran a test-pattern flow for 5 s"
+          curl -fsS -m 30 -X POST "http://127.0.0.1:$port/api/flows/$flow_id/stop" >/dev/null || true
           kill "$strom_pid"; wait "$strom_pid" || true; strom_pid=""
           echo "--- strom log (tail) ---"; tail -n 60 "$log"
           test -s "$data/gstreamer-registry.bin" \
@@ -724,6 +778,10 @@ jobs:
           if grep -nE 'not valid for use in process|Library Validation|Failed to load plugin|code signature|Code Signature' "$log"; then
             echo "the bundled Strom could not load bundled code under the hardened runtime"; exit 1
           fi
+          if grep -nF 'ORC: ERROR' "$log"; then
+            echo "ORC could not compile in the bundled Strom: is strom signed with com.apple.security.cs.allow-jit? (#113)"; exit 1
+          fi
+          echo "OK: no ORC: ERROR in strom.log, ORC's JIT runs under the hardened runtime"
           echo "OK: the bundled Strom runs under the hardened runtime and loads the bundle's GStreamer"
 
       # The last line is what sets the job output `notarized`: it is reached only when
@@ -763,6 +821,87 @@ jobs:
             echo "No temporary keychain to delete"
           fi
 
+  # The no-secret half of the DMG's end to end (#112): the uplink's SRT stats with a
+  # receiver that comes up late. The app executable the DMG carries, started with
+  # `--ipc-stdio`, is pointed (`self_hosted`) at a stand-in Open Live on loopback and
+  # goes live with the test pattern; a local SRT listener (srt-live-transmit, from
+  # Homebrew's `srt`) starts at least 30 s later. The uplink's srt-stats are sampled
+  # twice, 60 s apart, and the job fails, with the numbers in the log, when
+  # packets_sent_dropped grows by more than 1 % of packets_sent (a warning only while
+  # E2E_UPLINK_DROP_WARN_ONLY is set, #111), the uplink reports connected=false, sends
+  # nothing or reconnects. The check itself is unit tested first
+  # (.github/scripts/test_e2e_app.py). What it does: .github/scripts/e2e-app.py
+  # (E2E_PART late-listener).
+  #
+  # Its own job so that it runs on every pull request that builds the DMG, forks
+  # included: it reads no secret and touches no shared instance, so it has no fork
+  # guard and no `e2e-openlivedev` concurrency group. Never on a tag ref.
+  e2e-macos-late-listener:
+    needs: macos-app
+    if: github.ref_type != 'tag'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      APP: Open Live Ingest.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DMG }}
+      - name: Unit tests of the uplink SRT stats check
+        run: python3 -I .github/scripts/test_e2e_app.py
+      - name: Install the local SRT listener (srt-live-transmit)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install srt
+          command -v srt-live-transmit
+      - name: Go live to a stand-in Open Live, late SRT listener, Stop
+        env:
+          E2E_PART: late-listener
+          # The receiver comes up this long after Go live, and the uplink is sampled
+          # this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
+        run: |
+          set -euo pipefail
+          # As in e2e-macos: drop traffic to the bundled Strom's port (8080) on every
+          # interface but loopback before the app can start it.
+          sudo pfctl -f /etc/pf.conf
+          echo 'block drop in quick on ! lo0 proto { tcp udp } from any to any port 8080' \
+            | sudo pfctl -a com.apple/oli-e2e -f -
+          sudo pfctl -E 2>&1 | grep -v '^Token' || true
+          if ! sudo pfctl -a com.apple/oli-e2e -sr 2>/dev/null | grep -q 'port = 8080'; then
+            echo "::error title=e2e app::the pf rule for Strom's port did not load"
+            exit 1
+          fi
+          if ! sudo pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+            echo "::error title=e2e app::pf is not enabled"
+            exit 1
+          fi
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
+          python3 -I .github/scripts/e2e-app.py "$mnt/$APP/Contents/MacOS/open-live-ingest-app"
+      - name: App log
+        if: always()
+        run: |
+          log="$HOME/Library/Logs/open-live-ingest/app.log"
+          if [[ -f "$log" ]]; then cat "$log"; else echo "no app log at $log"; fi
+          strom_log="$(find "$HOME/Library/Application Support/open-live-ingest" -name strom.log 2>/dev/null | head -n 1)"
+          if [[ -n "$strom_log" ]]; then echo "--- $strom_log (tail) ---"; tail -n 100 "$strom_log"; fi
+          srt_log="$RUNNER_TEMP/oli-app-e2e/srt-listener.log"
+          if [[ -f "$srt_log" ]]; then echo "--- $srt_log (tail) ---"; tail -n 50 "$srt_log"; fi
+
   # The agent-run end to end (OL-59i, #100; spec section 14), on the DMG `macos-app`
   # has just built and checked: the app executable the DMG carries, started with
   # `--ipc-stdio` (the app core with no window and no webview), is fed the same
@@ -770,6 +909,14 @@ jobs:
   # `openlivedev`: Go live, the source in Open Live, Stop, the source and flow gone,
   # Go live again with no 409, quit while live removes them. What it checks and how:
   # .github/scripts/e2e-app.py.
+  #
+  # The uplink's SRT stats while live (#112): with the secret, the openlivedev
+  # production that takes the source is activated at least 30 s after Go live, and
+  # the uplink's srt-stats are sampled twice, 60 s apart. The job fails, with the
+  # numbers in the log, when packets_sent_dropped grows by more than 1 % of
+  # packets_sent (a warning only while E2E_UPLINK_DROP_WARN_ONLY is set, #111) or the
+  # uplink reports connected=false. The no-secret variant of the same check is the
+  # `e2e-macos-late-listener` job.
   #
   # Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
   # token for the workspace that owns `openlivedev` (the same secret as the
@@ -789,7 +936,7 @@ jobs:
       github.ref_type != 'tag' &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: read
     concurrency:
@@ -809,6 +956,17 @@ jobs:
           # A run by hand needs the secret; a pull request run without it warns and
           # passes after the checks that need none.
           E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+          # Everything but the late-listener check, which e2e-macos-late-listener runs.
+          E2E_PART: openlivedev
+          # The SRT stats check (#112): the receiver comes up this long after Go
+          # live, and the uplink is sampled this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
         run: |
           set -euo pipefail
           # The bundled Strom the app starts has an unauthenticated API and listens
