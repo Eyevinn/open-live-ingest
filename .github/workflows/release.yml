@@ -662,11 +662,21 @@ jobs:
       #   (dyld and library validation load them) and report the bundle's version.
       # - the bundled Strom reports 0.8.1 or later.
       # - the bundled Strom starts under the hardened runtime with the bundle's
-      #   GStreamer, as the gateway starts it: the plugin scanner builds the registry,
-      #   device discovery answers, a test-pattern flow through videoconvert, videoscale
-      #   and audioconvert runs, and nothing in its log says a library or plugin failed
-      #   to load (library validation, a bad signature) or that ORC could not JIT
-      #   (`ORC: ERROR`, allow-jit, #113).
+      #   GStreamer and GLib environment, as the gateway starts it (LocatedStrom::gst_env
+      #   in src/local_strom.rs, mirrored here): the plugin scanner builds the registry
+      #   and device discovery answers.
+      # - two flows run in it at once, and both must still run 5 s after starting:
+      #   a test pattern through videoconvert, videoscale and audioconvert, whose inner
+      #   loops are ORC programs, so ORC JITs them (allow-jit, #113); and the gateway's
+      #   own test-pattern flow (Source::Test, x264 and the SRT uplink).
+      # - with both flows running, the Strom process has no library or module mapped
+      #   from outside the app other than macOS's own (lsof: DYLD_PRINT_LIBRARIES is
+      #   ignored under the hardened runtime), though this runner has Homebrew's
+      #   GStreamer and GLib installed. ORC's JIT buffers (orcexec.* in $HOME or
+      #   $TMPDIR) are flagged with a warning annotation, not failed on.
+      # - nothing in its log says a library, plugin or GIO module failed to load
+      #   (library validation, a bad signature), names a Homebrew path, or says ORC
+      #   could not JIT (`ORC: ERROR`, #113).
       - name: Check the DMG
         run: |
           set -euo pipefail
@@ -711,6 +721,8 @@ jobs:
           GST_PLUGIN_SCANNER="$contents/Helpers/gst-plugin-scanner" \
           GST_REGISTRY_1_0="$data/gstreamer-registry.bin" \
           GST_REGISTRY="$data/gstreamer-registry.bin" \
+          GIO_MODULE_DIR="$contents/PlugIns/gio" GIO_EXTRA_MODULES="" \
+          XDG_DATA_DIRS="$contents/Resources" \
           GST_DEBUG="*:2" \
             "$contents/MacOS/strom" --headless --port "$port" --data-dir "$data" >"$log" 2>&1 &
           strom_pid=$!
@@ -725,11 +737,13 @@ jobs:
           devices="$(curl -fsS -m 60 "http://127.0.0.1:$port/api/discovery/devices?category=video_source")" \
             || { echo "device discovery failed"; cat "$log"; exit 1; }
           echo "Strom device discovery: $devices"
+
           # ORC's JIT (#113): a test pattern through videoconvert, videoscale and
           # audioconvert, whose inner loops are ORC programs, so ORC compiles them; the
-          # flow must start and still run 5 s later, or the log check below proves nothing.
-          flow_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
-          jq -n --arg id "$flow_id" '
+          # flow must start and still run 5 s later (it runs on while the gateway's flow
+          # below starts and the lsof check runs), or the log check below proves nothing.
+          orc_flow_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+          jq -n --arg id "$orc_flow_id" '
             def el($id; $type; $props; $x; $y):
               {id: $id, element_type: $type, properties: $props, position: [$x, $y]};
             def ln($from; $to): {from: $from, to: $to};
@@ -759,30 +773,116 @@ jobs:
             }' >"$data/orc-flow.json"
           curl -fsS -m 30 -H 'Content-Type: application/json' --data-binary "@$data/orc-flow.json" \
             "http://127.0.0.1:$port/api/flows" >/dev/null \
-            || { echo "the bundled Strom did not take the test-pattern flow"; cat "$log"; exit 1; }
-          started="$(curl -fsS -m 60 -X POST "http://127.0.0.1:$port/api/flows/$flow_id/start")" \
-            || { echo "the bundled Strom did not start the test-pattern flow"; cat "$log"; exit 1; }
+            || { echo "the bundled Strom did not take the ORC test-pattern flow"; cat "$log"; exit 1; }
+          started="$(curl -fsS -m 60 -X POST "http://127.0.0.1:$port/api/flows/$orc_flow_id/start")" \
+            || { echo "the bundled Strom did not start the ORC test-pattern flow"; cat "$log"; exit 1; }
           jq -e '.flow.running == true' <<<"$started" >/dev/null \
-            || { echo "the test-pattern flow is not running: $started"; cat "$log"; exit 1; }
+            || { echo "the ORC test-pattern flow is not running: $started"; cat "$log"; exit 1; }
+
+          # The flow `up --test` builds (src/flow.rs, Source::Test, default [video]),
+          # with a listener uplink so it needs no peer.
+          test_flow_id=0f3b6a52-6c1e-4e8a-9d0b-114000000001
+          flow_json="$RUNNER_TEMP/test-pattern-flow.json"
+          cat >"$flow_json" <<EOF
+          {
+            "id": "$test_flow_id",
+            "name": "dmg-check test pattern",
+            "elements": [
+              {"id": "testvideo", "element_type": "videotestsrc",
+               "properties": {"is-live": true, "pattern": "smpte"}, "position": [0.0, 0.0]},
+              {"id": "testvideocaps", "element_type": "capsfilter",
+               "properties": {"caps": "video/x-raw,width=1280,height=720,framerate=25/1"}, "position": [120.0, 0.0]},
+              {"id": "testaudio", "element_type": "audiotestsrc",
+               "properties": {"is-live": true, "wave": "sine", "freq": 1000.0}, "position": [0.0, 150.0]},
+              {"id": "testaudiocaps", "element_type": "capsfilter",
+               "properties": {"caps": "audio/x-raw,rate=48000,channels=2"}, "position": [120.0, 150.0]}
+            ],
+            "blocks": [
+              {"id": "encoder", "block_definition_id": "builtin.videoenc", "name": "Encoder",
+               "properties": {"codec": "h264", "encoder_preference": "auto", "bitrate": 6000,
+                              "quality_preset": "ultrafast", "tune": "zerolatency",
+                              "rate_control": "cbr", "keyframe_interval": 25},
+               "position": {"x": 250.0, "y": 0.0}},
+              {"id": "uplink", "block_definition_id": "builtin.mpegtssrt_output", "name": "SRT Uplink",
+               "properties": {"srt_uri": "srt://:18090?mode=listener&latency=200", "latency": 200,
+                              "num_video_tracks": 1, "num_audio_tracks": 1},
+               "position": {"x": 500.0, "y": 0.0}}
+            ],
+            "links": [
+              {"from": "testvideo:src", "to": "testvideocaps:sink"},
+              {"from": "testvideocaps:src", "to": "encoder:video_in"},
+              {"from": "testaudio:src", "to": "testaudiocaps:sink"},
+              {"from": "testaudiocaps:src", "to": "uplink:audio_in_0"},
+              {"from": "encoder:encoded_out", "to": "uplink:video_in"}
+            ]
+          }
+          EOF
+          api="http://127.0.0.1:$port/api/flows"
+          curl -fsS -m 30 -H 'Content-Type: application/json' --data-binary "@$flow_json" "$api" >/dev/null \
+            || { echo "creating the test-pattern flow failed"; cat "$log"; exit 1; }
+          curl -fsS -m 60 -X POST "$api/$test_flow_id/start" >/dev/null \
+            || { echo "starting the test-pattern flow failed"; cat "$log"; exit 1; }
+          running=false
+          for _ in $(seq 1 30); do
+            if [[ "$(curl -fsS -m 5 "$api/$test_flow_id" | jq -r '.flow.running // .running // false')" == true ]]; then
+              running=true; break
+            fi
+            sleep 1
+          done
+          $running || { echo "the test-pattern flow is not running"; cat "$log"; exit 1; }
           sleep 5
-          flow="$(curl -fsS -m 10 "http://127.0.0.1:$port/api/flows/$flow_id")" \
-            || { echo "cannot read the test-pattern flow back"; cat "$log"; exit 1; }
+          flow="$(curl -fsS -m 10 "http://127.0.0.1:$port/api/flows/$orc_flow_id")" \
+            || { echo "cannot read the ORC test-pattern flow back"; cat "$log"; exit 1; }
           jq -e '.flow.running == true' <<<"$flow" >/dev/null \
-            || { echo "the test-pattern flow stopped running: $flow"; cat "$log"; exit 1; }
-          echo "OK: the bundled Strom ran a test-pattern flow for 5 s"
-          curl -fsS -m 30 -X POST "http://127.0.0.1:$port/api/flows/$flow_id/stop" >/dev/null || true
+            || { echo "the ORC test-pattern flow stopped running: $flow"; cat "$log"; exit 1; }
+          echo "OK: the bundled Strom ran the ORC test-pattern flow for 5 s"
+
+          # Every file mapped into Strom (lsof's "txt"): the executable, its libraries,
+          # modules it loaded, and the dyld shared cache macOS's own libraries live in.
+          # orcexec.* files are ORC's JIT buffers: on macOS ORC (0.4.44) maps a temp file
+          # in $HOME twice, writable and executable, even with allow-jit (#113), so they
+          # hold code the bundled liborc generated, not code loaded from outside. They
+          # are flagged (a warning annotation) and must sit in $HOME or $TMPDIR, but do
+          # not fail the check; anything else outside the app and macOS still does.
+          app_real="$(cd "$mnt/$APP" && pwd -P)"
+          mapped="$(lsof -n -P -p "$strom_pid" -a -d txt -Fn | sed -n 's/^n//p')" \
+            || { echo "lsof failed on the bundled Strom"; exit 1; }
+          echo "--- files mapped into the bundled Strom ---"; printf '%s\n' "$mapped"
+          grep -qE "^($app_real|$mnt/$APP)/Contents/PlugIns/gstreamer/" <<<"$mapped" \
+            || { echo "lsof shows no bundled plugin mapped into Strom, so this check saw nothing"; exit 1; }
+          outside="$(grep -vE "^($app_real|$mnt/$APP)/|^/usr/lib/|^/System/" <<<"$mapped" \
+            | grep -E '/opt/homebrew|/usr/local|\.(dylib|so)$|\.framework/|/orcexec\.' || true)"
+          orcexec="$(grep -E '/orcexec\.[^/]*$' <<<"$outside" || true)"
+          if [[ -n "$orcexec" ]]; then
+            echo "::warning title=ORC JIT buffers mapped into the bundled Strom::$(tr '\n' ' ' <<<"$orcexec")"
+            echo "flagged: ORC JIT buffers (orcexec.*) mapped into Strom:"; printf '%s\n' "$orcexec"
+            tmp_real="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P || echo /private/tmp)"
+            stray="$(grep -vE "^($HOME|${TMPDIR%/}|$tmp_real)/orcexec\.[^/]*$" <<<"$orcexec" || true)"
+            if [[ -n "$stray" ]]; then
+              echo "orcexec.* mapped from outside \$HOME and \$TMPDIR:"; printf '%s\n' "$stray"; exit 1
+            fi
+            outside="$(grep -vE '/orcexec\.[^/]*$' <<<"$outside" || true)"
+          fi
+          if [[ -n "$outside" ]]; then
+            echo "the bundled Strom loaded these from outside $APP:"; printf '%s\n' "$outside"; exit 1
+          fi
+          curl -fsS -m 30 -X POST "$api/$test_flow_id/stop" >/dev/null || true
+          curl -fsS -m 30 -X POST "$api/$orc_flow_id/stop" >/dev/null || true
           kill "$strom_pid"; wait "$strom_pid" || true; strom_pid=""
           echo "--- strom log (tail) ---"; tail -n 60 "$log"
           test -s "$data/gstreamer-registry.bin" \
             || { echo "the bundled Strom built no GStreamer registry"; exit 1; }
-          if grep -nE 'not valid for use in process|Library Validation|Failed to load plugin|code signature|Code Signature' "$log"; then
-            echo "the bundled Strom could not load bundled code under the hardened runtime"; exit 1
+          if grep -nE 'not valid for use in process|Library Validation|Failed to load plugin|Failed to load module|code signature|Code Signature' "$log"; then
+            echo "the bundled Strom could not load bundled code under the hardened runtime, or tried to load a GIO module"; exit 1
+          fi
+          if grep -nE '/opt/homebrew|/usr/local/(lib|opt|Cellar|share)' "$log"; then
+            echo "the bundled Strom reached for files of a Homebrew install"; exit 1
           fi
           if grep -nF 'ORC: ERROR' "$log"; then
             echo "ORC could not compile in the bundled Strom: is strom signed with com.apple.security.cs.allow-jit? (#113)"; exit 1
           fi
           echo "OK: no ORC: ERROR in strom.log, ORC's JIT runs under the hardened runtime"
-          echo "OK: the bundled Strom runs under the hardened runtime and loads the bundle's GStreamer"
+          echo "OK: the bundled Strom runs a test-pattern flow under the hardened runtime with only the bundle's GStreamer and GLib"
 
       # The last line is what sets the job output `notarized`: it is reached only when
       # notarizing, stapling and both checks here succeeded.

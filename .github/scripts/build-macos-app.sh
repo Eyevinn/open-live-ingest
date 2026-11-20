@@ -17,8 +17,8 @@
 # Cargo.toml; it is never written here. The asset is checked against the SHA-256
 # digest GitHub records for it (Strom publishes no checksum file of its own).
 #
-# Layout, which src/local_strom.rs expects for a bundled Strom (BUNDLE_PLUGIN_DIR and
-# BUNDLE_PLUGIN_SCANNER, relative to Contents):
+# Layout, which src/local_strom.rs expects for a bundled Strom (BUNDLE_PLUGIN_DIR,
+# BUNDLE_PLUGIN_SCANNER and BUNDLE_GIO_MODULE_DIR, relative to Contents):
 #
 #   Open Live Ingest.app/Contents/
 #     Info.plist                       CFBundleExecutable open-live-ingest-app
@@ -27,6 +27,8 @@
 #     MacOS/strom
 #     Frameworks/                      GStreamer, GLib and the rest of the closure (files only)
 #     PlugIns/gstreamer/               GStreamer plugins
+#     PlugIns/gio/                     GIO_MODULE_DIR of the bundled Strom, kept empty so
+#                                      GLib loads no GIO module from Homebrew's prefix
 #     Helpers/gst-plugin-scanner
 #     Resources/AppIcon.icns           from app/icons/AppIcon.icns (CFBundleIconFile)
 #
@@ -92,10 +94,11 @@ set -euo pipefail
 APP_NAME="Open Live Ingest.app"
 STROM_REPO="Eyevinn/strom"
 FRAMEWORKS_REL="Frameworks"
-# These two must match BUNDLE_PLUGIN_DIR and BUNDLE_PLUGIN_SCANNER in src/local_strom.rs
-# (a unit test there reads them from this file).
+# These three must match BUNDLE_PLUGIN_DIR, BUNDLE_PLUGIN_SCANNER and
+# BUNDLE_GIO_MODULE_DIR in src/local_strom.rs (a unit test there reads them from this file).
 PLUGIN_DIR_REL="PlugIns/gstreamer"
 SCANNER_REL="Helpers/gst-plugin-scanner"
+GIO_MODULE_DIR_REL="PlugIns/gio"
 # The nested-code locations of a bundle (see the layout above).
 NESTED_CODE_DIRS="Frameworks PlugIns Helpers MacOS"
 FORBIDDEN_RE='/opt/homebrew|/usr/local'
@@ -197,6 +200,7 @@ check_bundle() {
     [[ -s "$app/Contents/Resources/${icon%.icns}.icns" ]] \
         || die "CFBundleIconFile names $icon, but Contents/Resources has no ${icon%.icns}.icns"
     say "OK: CFBundleExecutable is $APP_EXEC, the CLI and strom are next to it, the icon is there"
+    [[ -d "$app/Contents/$GIO_MODULE_DIR_REL" ]] || die "Contents/$GIO_MODULE_DIR_REL is missing"
     grep -qF "$app/Contents/$PLUGIN_DIR_REL/" <<<"$list" || die "Contents/$PLUGIN_DIR_REL holds no plugins"
     while IFS= read -r f; do
         load_cmds="$(otool -L "$f")" || die "otool -L failed on ${f#"$app"/}"
@@ -404,7 +408,7 @@ app="$(cd "$out_dir" && pwd -P)/$APP_NAME"
 rm -rf "$app"
 contents="$app/Contents"
 mkdir -p "$contents/MacOS" "$contents/$FRAMEWORKS_REL" "$contents/$PLUGIN_DIR_REL" \
-    "$contents/$(dirname "$SCANNER_REL")" "$contents/Resources"
+    "$contents/$GIO_MODULE_DIR_REL" "$contents/$(dirname "$SCANNER_REL")" "$contents/Resources"
 say "Assembling $app"
 
 install -m 0755 "$app_bin" "$contents/MacOS/$APP_EXEC"
