@@ -7,10 +7,15 @@
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
 use strom_types::api::{
-    FlowListResponse, FlowResponse, SrtCallerStats, SrtRole, SrtStats, SrtStatsResponse, SystemInfo,
+    FlowListResponse, FlowResponse, SrtRole, SrtStats, SrtStatsResponse, SystemInfo,
 };
 use strom_types::discovery::DeviceResponse;
-use strom_types::{Flow, FlowId};
+use strom_types::Flow;
+
+/// Strom's types a caller of this client handles without depending on `strom-types`
+/// itself: a flow's id, and the uplink peer [`StromClient::srt_uplink`] answers with.
+pub use strom_types::api::SrtCallerStats;
+pub use strom_types::FlowId;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
