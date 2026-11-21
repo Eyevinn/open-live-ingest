@@ -395,6 +395,7 @@ unknown command or bad arguments is an error reply, never a panic.
 |---|---|---|
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
 | `input` | `{input, state, message?, action?}` | per-input registering / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
+| `summary` | `{inputs: [{input, port, uplink, registered}]}` | the start summary: `uplink` is where the gateway sends (in caller mode `srt://<host>:<port>?mode=caller&latency=<ms>`), `registered` the address registered with Open Live; passphrases masked |
 | `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
 | `status` | `{inputs: [{input, productions: null \| [{name, state, slots: []}], link: {state: "not_sending" \| "connecting" \| "connected" \| "unknown", dropped_pct, rtt_ms}}]}` | the status lines of §5.1, every 4 s while live; not a library event (the app polls Open Live and the local Strom itself). `productions` is `null` when unknown, `[]` when none holds the source |
 | `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |

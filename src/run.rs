@@ -1103,7 +1103,8 @@ async fn remove_flow(strom: &StromClient, flow_id: &FlowId) -> Result<()> {
     strom.delete_flow(flow_id).await
 }
 
-/// The inputs that started, with the address each registered, passphrase masked.
+/// The inputs that started, with the address each registered and the address its
+/// uplink goes to, passphrases masked.
 fn summary(live: &[Live]) -> Event {
     Event::Summary {
         inputs: live
@@ -1112,6 +1113,7 @@ fn summary(live: &[Live]) -> Event {
                 name: l.input.name.clone(),
                 port: l.input.endpoint.port,
                 address: mask_passphrase(&l.input.endpoint.cloud_uri()),
+                uplink: mask_passphrase(&l.input.endpoint.venue_uri()),
             })
             .collect(),
     }

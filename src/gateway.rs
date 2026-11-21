@@ -102,8 +102,12 @@ pub enum Event {
 pub struct SummaryRow {
     pub name: String,
     pub port: u16,
-    /// The address registered with Open Live, passphrase masked.
+    /// The address registered with Open Live, passphrase masked: where Open Live's
+    /// Strom receives (in caller mode its listener, such as `srt://:47110?mode=listener`).
     pub address: String,
+    /// Where the gateway's Strom sends the uplink, passphrase masked (in caller mode
+    /// `srt://<cloud host>:<port>?mode=caller&latency=<ms>`).
+    pub uplink: String,
 }
 
 /// One input in a [`Event::Stats`].

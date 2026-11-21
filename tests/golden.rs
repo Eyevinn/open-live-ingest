@@ -535,8 +535,9 @@ fn devices_and_devices_json_print_as_before() {
 const UP_START: &str = "\
 Bringing up 1 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 6 Mbps in total.
 
-INPUT                                PORT   REGISTERED ADDRESS
-Venue — Test pattern                 47110  srt://:47110?mode=listener&passphrase=***
+INPUT                                PORT   ADDRESSES
+Venue — Test pattern                 47110  sends to:   srt://cloud.example.com:47110?mode=caller&latency=200&passphrase=***
+                                            registered: srt://:47110?mode=listener&passphrase=***
 
 Assign these in Studio and activate the production; they read as inactive until
 something is receiving them. Ctrl-C stops and removes them.
@@ -548,8 +549,9 @@ const UP_RESTART: &str = "\
 Bringing up 1 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 6 Mbps in total.
   removed Strom flow \"Venue — Test pattern\", left over from an earlier run
 
-INPUT                                PORT   REGISTERED ADDRESS
-Venue — Test pattern                 47110  srt://:47110?mode=listener&passphrase=***
+INPUT                                PORT   ADDRESSES
+Venue — Test pattern                 47110  sends to:   srt://cloud.example.com:47110?mode=caller&latency=200&passphrase=***
+                                            registered: srt://:47110?mode=listener&passphrase=***
 
 Assign these in Studio and activate the production; they read as inactive until
 something is receiving them. Ctrl-C stops and removes them.
@@ -680,8 +682,9 @@ fn up_status_and_down_print_as_before() {
 const UP_THEN_STOP: &str = "\
 Bringing up 1 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 6 Mbps in total.
 
-INPUT                                PORT   REGISTERED ADDRESS
-Venue — Test pattern                 47110  srt://:47110?mode=listener&passphrase=***
+INPUT                                PORT   ADDRESSES
+Venue — Test pattern                 47110  sends to:   srt://cloud.example.com:47110?mode=caller&latency=200&passphrase=***
+                                            registered: srt://:47110?mode=listener&passphrase=***
 
 Assign these in Studio and activate the production; they read as inactive until
 something is receiving them. Ctrl-C stops and removes them.
@@ -857,8 +860,9 @@ fn source_names(state: &Arc<Mutex<OpenLiveState>>) -> Vec<String> {
 const UP_EVERY_DEVICE: &str = "\
 Bringing up 1 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 6 Mbps in total.
 
-INPUT                                PORT   REGISTERED ADDRESS
-Venue — FaceTime HD Camera           47110  srt://:47110?mode=listener&passphrase=***
+INPUT                                PORT   ADDRESSES
+Venue — FaceTime HD Camera           47110  sends to:   srt://cloud.example.com:47110?mode=caller&latency=200&passphrase=***
+                                            registered: srt://:47110?mode=listener&passphrase=***
 
 Assign these in Studio and activate the production; they read as inactive until
 something is receiving them. Ctrl-C stops and removes them.
@@ -869,9 +873,11 @@ something is receiving them. Ctrl-C stops and removes them.
 const UP_SAVED_SELECTION: &str = "\
 Bringing up 2 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 12 Mbps in total.
 
-INPUT                                PORT   REGISTERED ADDRESS
-Venue — Test pattern                 47110  srt://:47110?mode=listener&passphrase=***
-Venue — Stage left                   47111  srt://:47111?mode=listener&passphrase=***
+INPUT                                PORT   ADDRESSES
+Venue — Test pattern                 47110  sends to:   srt://cloud.example.com:47110?mode=caller&latency=200&passphrase=***
+                                            registered: srt://:47110?mode=listener&passphrase=***
+Venue — Stage left                   47111  sends to:   srt://cloud.example.com:47111?mode=caller&latency=200&passphrase=***
+                                            registered: srt://:47111?mode=listener&passphrase=***
 
 Assign these in Studio and activate the production; they read as inactive until
 something is receiving them. Ctrl-C stops and removes them.

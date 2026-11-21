@@ -204,6 +204,19 @@ impl Rows {
                 for started in inputs {
                     out.extend(self.set(&started.name, RowState::Connecting, None, now));
                 }
+                // Where each input's uplink goes, and the address registered with Open
+                // Live, passphrases already masked by the library.
+                out.push(Event::new(
+                    "summary",
+                    json!({
+                        "inputs": inputs.iter().map(|r| json!({
+                            "input": r.name,
+                            "port": r.port,
+                            "uplink": r.uplink,
+                            "registered": r.address,
+                        })).collect::<Vec<Value>>()
+                    }),
+                ));
             }
             E::Input { input, state } => {
                 let waiting = *state == InputState::Waiting;
@@ -819,7 +832,9 @@ mod tests {
                 .map(|n| SummaryRow {
                     name: n.to_string(),
                     port: 47110,
-                    address: "srt://:47110?mode=listener".to_string(),
+                    address: "srt://:47110?mode=listener&passphrase=***".to_string(),
+                    uplink: "srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***"
+                        .to_string(),
                 })
                 .collect(),
         }
@@ -844,7 +859,8 @@ mod tests {
     const CAM: &str = "Venue — Camera";
 
     /// Strom starting, registering, connecting, live: each change is one `input`
-    /// event, and nothing is sent for what did not change.
+    /// event, and nothing is sent for what did not change. The summary tells the page
+    /// where each uplink goes.
     #[test]
     fn a_session_starting_reads_as_the_rows_states() {
         let mut rows = rows();
@@ -882,8 +898,37 @@ mod tests {
                 json!({"event": "strom", "data": {"state": "ready"}}),
                 json!({"event": "input", "data": {"input": CAM, "state": "registering", "message": null, "action": null}}),
                 json!({"event": "input", "data": {"input": CAM, "state": "connecting", "message": null, "action": null}}),
+                json!({"event": "summary", "data": {"inputs": [{
+                    "input": CAM,
+                    "port": 47110,
+                    "uplink": "srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***",
+                    "registered": "srt://:47110?mode=listener&passphrase=***",
+                }]}}),
                 json!({"event": "input", "data": {"input": CAM, "state": "live", "message": null, "action": null}}),
             ]
+        );
+    }
+
+    /// #116 item 2: the summary tells the page the caller uplink, where the gateway
+    /// sends, and the address registered with Open Live, passphrases masked.
+    #[test]
+    fn the_summary_shows_the_uplink_address() {
+        let mut rows = rows();
+        let out = json_of(&rows.on_event(&summary(&[CAM]), Instant::now()));
+        let summary = out.iter().find(|e| e["event"] == "summary").unwrap();
+        let row = &summary["data"]["inputs"][0];
+        assert_eq!(row["input"], CAM);
+        let uplink = row["uplink"].as_str().unwrap();
+        assert!(
+            uplink.starts_with("srt://strom.example.com:47110?"),
+            "{uplink}"
+        );
+        assert!(uplink.contains("mode=caller"), "{uplink}");
+        assert!(uplink.contains("latency=200"), "{uplink}");
+        assert!(uplink.contains("passphrase=***"), "{uplink}");
+        assert_eq!(
+            row["registered"],
+            "srt://:47110?mode=listener&passphrase=***"
         );
     }
 

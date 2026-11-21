@@ -445,6 +445,20 @@ function renderRows() {
     if (typeof row.bitrate_kbps === "number" && row.state === "live") {
       item.append(" " + (row.bitrate_kbps / 1000).toFixed(1) + " Mbps");
     }
+    // Where the uplink goes (the caller address), and the address registered with
+    // Open Live as secondary text. Passphrases arrive masked.
+    if (row.uplink) {
+      const address = document.createElement("span");
+      address.className = "detail address selectable";
+      address.textContent = "Sending to " + row.uplink;
+      item.append(address);
+      if (row.registered) {
+        const registered = document.createElement("span");
+        registered.className = "detail address selectable";
+        registered.textContent = "Registered in Open Live as " + row.registered;
+        item.append(registered);
+      }
+    }
     if (row.message) {
       const detail = document.createElement("span");
       detail.className = "detail";
@@ -515,6 +529,17 @@ function wireGoLive() {
   document.addEventListener("oli:input", (event) => {
     const old = rows.get(event.detail.input) || {};
     rows.set(event.detail.input, { ...old, ...event.detail });
+    renderRows();
+  });
+  document.addEventListener("oli:summary", (event) => {
+    for (const started of event.detail.inputs) {
+      const old = rows.get(started.input) || { input: started.input };
+      rows.set(started.input, {
+        ...old,
+        uplink: started.uplink,
+        registered: started.registered,
+      });
+    }
     renderRows();
   });
   document.addEventListener("oli:stats", (event) => {
