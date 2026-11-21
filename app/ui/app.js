@@ -308,6 +308,8 @@ async function listDevices(showAll) {
 
 const STATE_TEXT = {
   registering: "Registering",
+  armed: "Armed",
+  waiting_for_production: "Waiting for production",
   connecting: "Connecting",
   live: "Live",
   failed: "Failed",

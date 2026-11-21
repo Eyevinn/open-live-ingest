@@ -17,6 +17,7 @@ use crate::config::{self, format_ports, mask_passphrase, Config, UplinkMode, Vid
 use crate::credential::OscCredential;
 use crate::devices;
 use crate::flow::{self, Input};
+use crate::gate::{self, Verdict};
 use crate::gateway::{Event, Events, InputState as State, InputStats, SummaryRow, UplinkStats};
 use crate::heartbeat::{self, Heartbeat};
 use crate::local_strom::{self, LocalStrom};
@@ -39,6 +40,15 @@ use strom_types::FlowId;
 use tracing::{info, warn};
 
 const TICK: Duration = Duration::from_secs(10);
+
+/// How often an armed session (`Sending::WhileLive`) asks Open Live for its
+/// productions: well inside the 5 s from a production going live to its uplink
+/// starting that #126 AC1 asks for.
+const GATE_POLL: Duration = Duration::from_secs(2);
+
+/// The same while a production holding one of the sources is activating, which on
+/// Open Live takes well under a second.
+const GATE_POLL_ACTIVATING: Duration = Duration::from_secs(1);
 
 /// Quiet polls before an uplink that was delivering is reported inactive.
 /// Hysteresis: every status flip rewrites the Open Live source, and CouchDB keeps a
@@ -378,6 +388,15 @@ struct Live {
     connect_warning: Option<String>,
     /// The last SRT sample with a peer, for the heartbeat. None while nothing receives.
     uplink: Option<SrtCallerStats>,
+    /// Whether the input's flow is meant to run. Always, unless the session is armed
+    /// (`Sending::WhileLive`): then only while a production holding its source is live.
+    sending: bool,
+    /// Why the last start of an armed input's uplink failed, so a failure that
+    /// persists is logged and told once; it is retried at every look.
+    gate_error: Option<String>,
+    /// The live productions last told (`Event::SlotAddedWhileLive`) to have been
+    /// given the source while live.
+    added_while_live: Vec<String>,
 }
 
 // `Unreachable` is not evidence that the feed stopped: the source's status is left
@@ -390,7 +409,7 @@ impl State {
     fn flow_state(&self) -> heartbeat::FlowState {
         match self {
             State::Starting | State::Waiting | State::OnAir => heartbeat::FlowState::Playing,
-            State::Unreachable | State::Failed { .. } => heartbeat::FlowState::Idle,
+            State::Armed | State::Unreachable | State::Failed { .. } => heartbeat::FlowState::Idle,
         }
     }
 }
@@ -485,14 +504,15 @@ fn stats_of(live: &[Live]) -> Event {
 
 /// Brings every chosen device up and keeps it registered until `stop` resolves, then
 /// removes what it started: the flows always, the Open Live sources as `sources`
-/// says. `stop` says why it is stopping, which decides how long the teardown may
-/// take. `credential`, when given, is the Open Source Cloud credential to register
-/// with instead of the one the settings point at.
+/// says. `sending` says whether each input's uplink runs all along or only while a
+/// production holding its source is live. `stop` says why it is stopping, which
+/// decides how long the teardown may take. `credential`, when given, is the Open
+/// Source Cloud credential to register with instead of the one the settings point at.
 pub async fn up(
     cfg: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
-    sources: Sources,
+    (sources, sending): (Sources, Sending),
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
@@ -514,6 +534,9 @@ pub async fn up(
     } = inputs;
     if test_pattern && !audio_pairings.is_empty() {
         bail!("--audio pairs an audio source with a camera, and --test streams no camera; the test pattern carries its own tone");
+    }
+    if sending == Sending::WhileLive && !cfg.open_live.register {
+        bail!("sending only while a production is live needs registration with Open Live, and [open_live] register is off");
     }
     let gateway_id = cfg.gateway.resolved_id();
     let source_gateway_id = source_gateway_id(&cfg)?;
@@ -628,7 +651,7 @@ pub async fn up(
         &cloud,
         &gateway_id,
         source_gateway_id.as_deref(),
-        inputs,
+        (inputs, sending),
         &mut registered,
         events,
     )
@@ -646,6 +669,14 @@ pub async fn up(
         }
     };
 
+    // Armed inputs say so before the summary, so a row never reads as connecting.
+    for l in live.iter_mut().filter(|l| l.state == State::Armed) {
+        events.emit(Event::Input {
+            input: l.input.name.clone(),
+            state: State::Armed,
+        });
+        l.shown = Some(State::Armed);
+    }
     events.emit(summary(&live));
     let reporter = Reporter::start(&cfg, strom_version, &live, events)?;
 
@@ -712,9 +743,11 @@ pub async fn up(
 }
 
 /// Registers the inputs (when the ports are Open Live's), clears what stands in their
-/// way, and starts a flow for each. Every source registered on the way is recorded
-/// in `registered` as soon as it exists, so that the caller can remove them all
-/// again when this fails, part way through or with no input started.
+/// way, and starts a flow for each, unless `sending` arms them instead: then no flow
+/// starts here, and each input is [`State::Armed`] until a production holding its
+/// source is live. Every source registered on the way is recorded in `registered`
+/// as soon as it exists, so that the caller can remove them all again when this
+/// fails, part way through or with no input started.
 #[allow(clippy::too_many_arguments)]
 async fn start_inputs(
     cfg: &Config,
@@ -723,7 +756,7 @@ async fn start_inputs(
     cloud: &Cloud,
     gateway_id: &str,
     source_gateway_id: Option<&str>,
-    mut inputs: Vec<Input>,
+    (mut inputs, sending): (Vec<Input>, Sending),
     registered: &mut HashMap<String, Registered>,
     events: &Events,
 ) -> Result<Vec<Live>> {
@@ -765,17 +798,22 @@ async fn start_inputs(
             Some(r) => (Some(r.source_id.clone()), r.warning.clone()),
             None => (None, None),
         };
-        match start(
-            strom,
-            &flow_id,
-            &flow::build(gateway_id, &input, &cfg.video),
-        )
-        .await
-        {
+        let armed = sending == Sending::WhileLive;
+        let started = if armed {
+            Ok(())
+        } else {
+            start(
+                strom,
+                &flow_id,
+                &flow::build(gateway_id, &input, &cfg.video),
+            )
+            .await
+        };
+        match started {
             Ok(()) => live.push(Live {
                 input,
                 flow_id,
-                state: State::Starting,
+                state: if armed { State::Armed } else { State::Starting },
                 shown: None,
                 last_bytes: None,
                 quiet_polls: 0,
@@ -786,6 +824,9 @@ async fn start_inputs(
                 source_id,
                 connect_warning,
                 uplink: None,
+                sending: !armed,
+                gate_error: None,
+                added_while_live: Vec::new(),
             }),
             // One camera failing must not stop the rest of the venue coming up.
             Err(err) => {
@@ -1203,7 +1244,9 @@ pub fn truncate(s: &str, width: usize) -> String {
 }
 
 /// One tick every few seconds, sequentially over every input: no shared state, no
-/// task per input, and one Open Live list call per tick.
+/// task per input, and one Open Live list call per tick. An armed session also looks
+/// at the productions every [`GATE_POLL`], and starts or stops each input's uplink
+/// as they say ([`look_at_productions`]).
 // Called once, from `up`, with what `up` holds; a struct to carry them buys nothing.
 #[allow(clippy::too_many_arguments)]
 async fn run_until_stopped(
@@ -1219,10 +1262,37 @@ async fn run_until_stopped(
 ) -> Result<Stop> {
     let mut ticker = tokio::time::interval(TICK);
     tokio::pin!(stop);
+    // Armed inputs are those not sending from the start; `up` refuses to arm without
+    // an Open Live client.
+    let gated = open_live.filter(|_| live.iter().any(|l| !l.sending));
+    let mut watch = gate::Watch::new();
+    let mut unreadable = false;
+    let next_look = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(next_look);
     loop {
         tokio::select! {
+            () = &mut next_look, if gated.is_some() => {
+                let client = gated.expect("guarded");
+                let soon = look_at_productions(
+                    strom,
+                    client,
+                    gateway_id,
+                    &cfg.video,
+                    live,
+                    (&mut watch, &mut unreadable),
+                    events,
+                )
+                .await;
+                if let Some(reporter) = reporter {
+                    reporter.publish(live);
+                }
+                tell_changes(live, events);
+                let wait = if soon { GATE_POLL_ACTIVATING } else { GATE_POLL };
+                next_look.as_mut().reset(tokio::time::Instant::now() + wait);
+            }
             _ = ticker.tick() => {
-                for l in live.iter_mut() {
+                // An armed input with no production live has no flow to look at.
+                for l in live.iter_mut().filter(|l| l.sending) {
                     l.state = match poll_flow(strom, gateway_id, &cfg.video, l, events).await {
                         Ok(state) => state,
                         Err(err) => {
@@ -1248,21 +1318,164 @@ async fn run_until_stopped(
                         });
                     }
                 }
-                // Only changes are told, so the CLI appends a line per change rather
-                // than redrawing a screen: it is read over SSH, in tmux, and in a log
-                // file after the fact.
-                for l in live.iter_mut() {
-                    if l.shown.as_ref() != Some(&l.state) {
-                        events.emit(Event::Input {
-                            input: l.input.name.clone(),
-                            state: l.state.clone(),
-                        });
-                        l.shown = Some(l.state.clone());
-                    }
-                }
+                tell_changes(live, events);
                 events.emit(stats_of(live));
             }
             stop = &mut stop => return Ok(stop),
+        }
+    }
+}
+
+/// Tells each input's state that changed since it was last told. Only changes are
+/// told, so the CLI appends a line per change rather than redrawing a screen: it is
+/// read over SSH, in tmux, and in a log file after the fact.
+fn tell_changes(live: &mut [Live], events: &Events) {
+    for l in live.iter_mut() {
+        if l.shown.as_ref() != Some(&l.state) {
+            events.emit(Event::Input {
+                input: l.input.name.clone(),
+                state: l.state.clone(),
+            });
+            l.shown = Some(l.state.clone());
+        }
+    }
+}
+
+/// One look at the productions for an armed session: each input's uplink is started
+/// when a production holding its source is live, and stopped (its source kept) when
+/// none is any more. Idempotent: an input already in the state the productions ask
+/// for is left alone, however many productions hold it. Returns whether a production
+/// holding one of the sources is activating, so the next look comes sooner.
+///
+/// The productions not being readable changes nothing: a running uplink keeps
+/// running and an armed one stays armed, retried at the next look. `watch` and
+/// `unreadable` are kept by the caller between looks.
+async fn look_at_productions(
+    strom: &StromClient,
+    client: &OpenLiveClient,
+    gateway_id: &str,
+    video: &Video,
+    live: &mut [Live],
+    (watch, unreadable): (&mut gate::Watch, &mut bool),
+    events: &Events,
+) -> bool {
+    let list = match client.list_productions().await {
+        Ok(list) => {
+            if std::mem::take(unreadable) {
+                info!("the Open Live productions are readable again");
+            }
+            list
+        }
+        Err(err) => {
+            // The tick's own source update warns the operator about Open Live.
+            if !std::mem::replace(unreadable, true) {
+                warn!(err = %format_args!("{err:#}"), "could not read the Open Live productions; every uplink stays as it is, retrying");
+            }
+            return false;
+        }
+    };
+    watch.observe(&list);
+    let mut soon = false;
+    for l in live.iter_mut() {
+        let verdict = match &l.source_id {
+            Some(id) => watch.verdict(&list, id),
+            None => Verdict::default(),
+        };
+        soon |= verdict.activating;
+        if verdict.added_while_live != l.added_while_live {
+            if !verdict.added_while_live.is_empty() {
+                warn!(input = %l.input.name, productions = ?verdict.added_while_live, "the source was put in a production while it was live; Open Live has no receiver for it until the production is deactivated and reactivated");
+            }
+            l.added_while_live = verdict.added_while_live.clone();
+            events.emit(Event::SlotAddedWhileLive {
+                input: l.input.name.clone(),
+                productions: verdict.added_while_live.clone(),
+            });
+        }
+        match (verdict.send(), l.sending) {
+            (true, false) => send_uplink(strom, gateway_id, video, l, &verdict, events).await,
+            (false, true) => arm_again(strom, l, events).await,
+            // A start that failed, for a production no longer live: armed again.
+            (false, false) if l.gate_error.take().is_some() => l.state = State::Armed,
+            _ => {}
+        }
+    }
+    soon
+}
+
+/// Starts an armed input's uplink: a production holding its source is live.
+async fn send_uplink(
+    strom: &StromClient,
+    gateway_id: &str,
+    video: &Video,
+    l: &mut Live,
+    verdict: &Verdict,
+    events: &Events,
+) {
+    if l.gate_error.is_none() {
+        info!(input = %l.input.name, productions = ?verdict.live_in, "a production holding the source is live, starting the uplink");
+        events.emit(Event::ProductionLive {
+            input: l.input.name.clone(),
+            productions: verdict.live_in.clone(),
+        });
+    }
+    l.forget_uplink();
+    match ensure_started(strom, gateway_id, video, l).await {
+        Ok(()) => {
+            l.sending = true;
+            l.gate_error = None;
+            l.state = State::Starting;
+        }
+        Err(err) => {
+            let reason = format!("{err:#}");
+            if l.gate_error.as_deref() != Some(reason.as_str()) {
+                warn!(input = %l.input.name, err = %reason, "could not start the uplink, retrying at the next look");
+            }
+            l.state = State::Failed {
+                reason: reason.clone(),
+            };
+            l.gate_error = Some(reason);
+        }
+    }
+}
+
+/// The input's flow running, whether it was there already (running or not) or had to
+/// be created.
+async fn ensure_started(
+    strom: &StromClient,
+    gateway_id: &str,
+    video: &Video,
+    l: &Live,
+) -> Result<()> {
+    match strom.get_flow(&l.flow_id).await? {
+        Some(flow) if flow.running => Ok(()),
+        Some(_) => {
+            if strom.start_flow(&l.flow_id).await? {
+                Ok(())
+            } else {
+                bail!("Strom did not report the flow running after start")
+            }
+        }
+        None => start(strom, &l.flow_id, &flow::build(gateway_id, &l.input, video)).await,
+    }
+}
+
+/// Stops an armed input's uplink and arms it again: no production holding its source
+/// is live any more. The flow goes, the source stays. A flow Strom would not remove
+/// is retried at the next look, and polled as usual meanwhile.
+async fn arm_again(strom: &StromClient, l: &mut Live, events: &Events) {
+    match remove_flow(strom, &l.flow_id).await {
+        Ok(()) => {
+            info!(input = %l.input.name, "no production holding the source is live, stopped the uplink");
+            l.sending = false;
+            l.state = State::Armed;
+            l.forget_uplink();
+            events.emit(Event::NoProductionLive {
+                input: l.input.name.clone(),
+            });
+        }
+        Err(err) => {
+            warn!(input = %l.input.name, err = %format_args!("{err:#}"), "could not stop the uplink, retrying at the next look");
         }
     }
 }
@@ -1406,6 +1619,17 @@ impl Live {
     fn forget_counters(&mut self) {
         self.last_counters = None;
         self.stalled_polls = 0;
+    }
+
+    /// Everything measured on the uplink, stall restarts included: for a flow the
+    /// productions start or stop, whose next connection owes nothing to the last.
+    fn forget_uplink(&mut self) {
+        self.forget_counters();
+        self.last_bytes = None;
+        self.uplink = None;
+        self.quiet_polls = 0;
+        self.stall_restarts = 0;
+        self.stall_given_up = false;
     }
 }
 
@@ -1556,6 +1780,20 @@ pub enum Sources {
     /// live (the desktop app). Other sources carrying the prefix (a label renamed, an
     /// input not in this run) are still swept. `down` removes them all.
     Keep,
+}
+
+/// When a session sends each input's uplink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sending {
+    /// From the start until the stop: `up`.
+    #[default]
+    Always,
+    /// Only while a production holding the input's Open Live source is live
+    /// ([`gate`]): the session registers (or keeps) the sources and arms, and starts
+    /// and stops each uplink as the productions go `active` and back. Needs
+    /// registration with Open Live. The desktop app's Go live; `up
+    /// --wait-for-production`.
+    WhileLive,
 }
 
 /// How long teardown may take when Windows is ending the process, leaving a second
@@ -2937,6 +3175,9 @@ mod tests {
             source_id: source_id.map(str::to_string),
             connect_warning: None,
             uplink,
+            sending: true,
+            gate_error: None,
+            added_while_live: Vec::new(),
         }
     }
 

@@ -30,7 +30,7 @@
 use open_live_ingest::config::{Config, UplinkMode};
 use open_live_ingest::flow;
 use open_live_ingest::gateway::{Event, InputState};
-use open_live_ingest::run::Stop;
+use open_live_ingest::run::{Sources, Stop};
 use open_live_ingest::session::{Inputs, Receiver, Session, SessionHandle};
 use open_live_ingest::strom::StromClient;
 use serde_json::{json, Value};
@@ -608,6 +608,324 @@ async fn a_kept_session_sweeps_the_other_sources_of_its_gateway_when_ending() {
         .await;
 }
 
+/// A production document as Open Live lists it, holding `sources` in slots
+/// `video_in_0`, `video_in_1`, ….
+fn production(id: &str, name: &str, status: &str, sources: &[&str]) -> Value {
+    json!({
+        "_id": id,
+        "_rev": "1-x",
+        "type": "production",
+        "name": name,
+        "status": status,
+        "sources": sources.iter().enumerate()
+            .map(|(n, s)| json!({ "sourceId": s, "mixerInput": format!("video_in_{n}") }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Reads events until one matches `wanted`, and returns them all. A failure fails
+/// the test.
+async fn until_event(
+    events: &mut Receiver,
+    what: &str,
+    wanted: impl Fn(&Event) -> bool,
+    within: Duration,
+) -> Vec<Event> {
+    let mut seen = Vec::new();
+    let wait = async {
+        while let Some(event) = events.recv().await {
+            if let Event::Failed { reason } | Event::InputFailed { reason, .. } = &event {
+                panic!("failed: {reason}");
+            }
+            let found = wanted(&event);
+            seen.push(event);
+            if found {
+                return;
+            }
+        }
+        panic!("the session ended before {what}: {seen:?}");
+    };
+    if tokio::time::timeout(within, wait).await.is_err() {
+        panic!("no {what} within {within:?}: {seen:?}");
+    }
+    seen
+}
+
+/// Waits until `check` holds of the fake Strom, polling, for at most `within`.
+async fn until_strom(
+    state: &Mutex<StromState>,
+    what: &str,
+    check: impl Fn(&StromState) -> bool,
+    within: Duration,
+) {
+    let started = tokio::time::Instant::now();
+    while !check(&state.lock().unwrap()) {
+        assert!(started.elapsed() < within, "{what} not within {within:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// #130 (OL-63c): Go live arms. The source is registered and no flow runs; the
+/// uplink starts once a production holding the source is `active` (not while it is
+/// inactive or activating), well within 5 s; it stops, the source kept, when the
+/// production is deactivated; it starts again when it is reactivated; and Stop
+/// while armed removes nothing but its (absent) flow, keeping the source.
+#[tokio::test]
+async fn an_armed_session_sends_only_while_a_production_holding_its_source_is_live() {
+    no_terminal_and_a_scratch_user_dir();
+    let strom_state = Arc::new(Mutex::new(StromState::default()));
+    let strom = fake_strom(strom_state.clone());
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+    let name = "Session test — Test pattern";
+    let set = |status: &str, source: &str| {
+        open_live_state.lock().unwrap().productions =
+            vec![production("prod-1", "Morning Show", status, &[source])];
+    };
+
+    let (handle, mut events) = Session::start_armed(
+        registering_settings(&strom, &open_live, "gw-session-armed"),
+        Inputs::test_pattern(),
+        None,
+        Sources::Keep,
+    );
+    let seen = until_event(
+        &mut events,
+        "the summary",
+        |e| matches!(e, Event::Summary { .. }),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        seen.contains(&Event::Input {
+            input: name.to_string(),
+            state: InputState::Armed
+        }),
+        "{seen:?}"
+    );
+    let (source, _) = source_named(&open_live_state, name).expect("no source registered");
+    assert_eq!(strom_state.lock().unwrap().created, 0, "a flow was started");
+
+    // Held, but inactive, then activating: still nothing sent.
+    set("inactive", &source);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    set("activating", &source);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(strom_state.lock().unwrap().created, 0, "sent before active");
+
+    // Active: the uplink starts within 5 s.
+    set("active", &source);
+    let activated = tokio::time::Instant::now();
+    until_strom(
+        &strom_state,
+        "the flow running",
+        |s| s.created == 1 && s.flows.iter().any(|f| f["running"] == true),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(activated.elapsed() < Duration::from_secs(5));
+    until_event(
+        &mut events,
+        "ProductionLive",
+        |e| matches!(e, Event::ProductionLive { input, productions } if input == name && productions == &["Morning Show".to_string()]),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // The productions unreadable for a while: the uplink is left as it is.
+    open_live_state.lock().unwrap().productions_fail = true;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        strom_state.lock().unwrap().flows.len(),
+        1,
+        "the flow was disturbed"
+    );
+    open_live_state.lock().unwrap().productions_fail = false;
+
+    // Deactivated: the flow goes, the source stays, and the input is armed again.
+    set("inactive", &source);
+    until_event(
+        &mut events,
+        "NoProductionLive",
+        |e| matches!(e, Event::NoProductionLive { input } if input == name),
+        Duration::from_secs(5),
+    )
+    .await;
+    until_event(
+        &mut events,
+        "Armed again",
+        |e| {
+            matches!(
+                e,
+                Event::Input {
+                    state: InputState::Armed,
+                    ..
+                }
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        strom_state.lock().unwrap().flows.is_empty(),
+        "the flow is still there"
+    );
+    {
+        let ol = open_live_state.lock().unwrap();
+        assert_eq!(ol.deleted, 0, "the source was deleted");
+        assert!(
+            ol.sources.iter().any(|s| s["id"] == source.as_str()),
+            "the source is gone"
+        );
+    }
+
+    // Reactivated: a new flow, without restarting the session.
+    set("active", &source);
+    until_strom(
+        &strom_state,
+        "the flow again",
+        |s| s.created == 2 && s.flows.len() == 1,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Deactivated again, then Stop while armed: no flow, the source kept.
+    set("inactive", &source);
+    until_strom(
+        &strom_state,
+        "the flow gone",
+        |s| s.flows.is_empty(),
+        Duration::from_secs(5),
+    )
+    .await;
+    let rest = stop(handle, &mut events).await;
+    assert_torn_down(&rest, name);
+    assert!(
+        rest.contains(&Event::SourceRetained {
+            input: name.to_string()
+        }),
+        "{rest:?}"
+    );
+    let strom_now = strom_state.lock().unwrap();
+    assert!(strom_now.flows.is_empty());
+    assert_eq!(strom_now.created, 2);
+    let ol = open_live_state.lock().unwrap();
+    assert_eq!(ol.deleted, 0, "the source was deleted");
+    assert_eq!(ol.sources.len(), 1);
+    assert_eq!(ol.sources[0]["id"], source.as_str());
+}
+
+/// Several productions holding the source: one start however many go live, the
+/// uplink kept while any still is, and stopped once none is. A production given the
+/// source while live is named (#128).
+#[tokio::test]
+async fn an_armed_session_starts_once_for_several_productions_and_names_a_late_slot() {
+    no_terminal_and_a_scratch_user_dir();
+    let strom_state = Arc::new(Mutex::new(StromState::default()));
+    let strom = fake_strom(strom_state.clone());
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+    let name = "Session test — Test pattern";
+
+    let (handle, mut events) = Session::start_armed(
+        registering_settings(&strom, &open_live, "gw-session-armed-two"),
+        Inputs::test_pattern(),
+        None,
+        Sources::Keep,
+    );
+    until_event(
+        &mut events,
+        "the summary",
+        |e| matches!(e, Event::Summary { .. }),
+        Duration::from_secs(30),
+    )
+    .await;
+    let (source, _) = source_named(&open_live_state, name).expect("no source registered");
+    let set = |a: &str, b: &str, b_holds: bool| {
+        let b_sources: &[&str] = if b_holds { &[source.as_str()] } else { &[] };
+        open_live_state.lock().unwrap().productions = vec![
+            production("prod-a", "Show A", a, &[source.as_str()]),
+            production("prod-b", "Show B", b, b_sources),
+        ];
+    };
+
+    // B live without the source, A inactive: nothing sent.
+    set("inactive", "active", false);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(strom_state.lock().unwrap().created, 0);
+    // The source is put in B while B is live: sent, and B named.
+    set("inactive", "active", true);
+    until_event(
+        &mut events,
+        "SlotAddedWhileLive",
+        |e| matches!(e, Event::SlotAddedWhileLive { productions, .. } if productions == &["Show B".to_string()]),
+        Duration::from_secs(5),
+    )
+    .await;
+    until_strom(
+        &strom_state,
+        "the flow",
+        |s| s.flows.len() == 1,
+        Duration::from_secs(5),
+    )
+    .await;
+    // A goes live too: no second start.
+    set("active", "active", true);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // B deactivated: still live in A, the flow kept; B no longer named.
+    set("active", "inactive", true);
+    until_event(
+        &mut events,
+        "the late slot cleared",
+        |e| matches!(e, Event::SlotAddedWhileLive { productions, .. } if productions.is_empty()),
+        Duration::from_secs(5),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    {
+        let s = strom_state.lock().unwrap();
+        assert_eq!(s.created, 1, "started more than once");
+        assert_eq!(s.flows.len(), 1, "stopped while a production was live");
+    }
+    // Neither live: stopped.
+    set("inactive", "inactive", true);
+    until_strom(
+        &strom_state,
+        "the flow gone",
+        |s| s.flows.is_empty(),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let rest = stop(handle, &mut events).await;
+    assert_torn_down(&rest, name);
+    let ol = open_live_state.lock().unwrap();
+    assert_eq!(ol.deleted, 0);
+    assert_eq!(ol.sources.len(), 1);
+}
+
+/// Arming needs Open Live's productions: with registration off the session ends at
+/// once, starting nothing.
+#[tokio::test]
+async fn an_armed_session_without_open_live_fails_at_once() {
+    no_terminal_and_a_scratch_user_dir();
+    let strom_state = Arc::new(Mutex::new(StromState::default()));
+    let strom = fake_strom(strom_state.clone());
+    let (handle, mut events) = Session::start_armed(
+        settings(&strom, "gw-session-armed-none", "47320-47329"),
+        Inputs::test_pattern(),
+        None,
+        Sources::Keep,
+    );
+    let seen = to_the_end(&mut events, Duration::from_secs(30)).await;
+    assert!(handle.wait().await.is_err());
+    let Some(Event::Failed { reason }) = seen.last() else {
+        panic!("{seen:?}");
+    };
+    assert!(reason.contains("[open_live] register is off"), "{reason}");
+    assert_eq!(strom_state.lock().unwrap().created, 0);
+}
+
 /// #72 AC2, against a real Strom; see the module documentation.
 #[tokio::test]
 #[ignore = "needs a real Strom at OLI_TEST_STROM_URL (default http://127.0.0.1:8080)"]
@@ -860,6 +1178,10 @@ struct OpenLiveState {
     deleted: usize,
     /// The `status` of every PATCH, in order.
     patched: Vec<String>,
+    /// What `GET /api/v1/productions` lists, CouchDB documents as Open Live returns.
+    productions: Vec<Value>,
+    /// Answer the production list with a 503.
+    productions_fail: bool,
 }
 
 fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
@@ -875,6 +1197,10 @@ fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
                 }),
             ),
             ("GET", "/api/v1/sources", _) => (200, Value::Array(s.sources.clone())),
+            ("GET", "/api/v1/productions", _) if s.productions_fail => {
+                (503, json!({ "error": "Database unavailable" }))
+            }
+            ("GET", "/api/v1/productions", _) => (200, Value::Array(s.productions.clone())),
             ("POST", "/api/v1/sources", _) => {
                 if s.refuse_create_after.is_some_and(|n| s.created >= n) {
                     return (500, json!({ "error": "database unavailable" }));

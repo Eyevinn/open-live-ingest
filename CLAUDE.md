@@ -19,6 +19,8 @@ no media pipeline; Strom does the media.
 - `src/credential.rs`: the OSC credential kept in the keychain, refreshed during a session.
 - `src/devices.rs`: from Strom's device list to inputs with names and ports.
 - `src/run.rs`: `up`, `down`, `status`, `devices`.
+- `src/gate.rs`: when an armed session sends: the productions holding a source, and a slot added
+  to a live production. Pure.
 - `src/setup.rs`: interactive setup. Binary only: it prompts on the terminal.
 - `src/local_strom.rs`: adopt a running Strom, or start and later stop a headless one.
 - `app/`: the desktop app. `app/src/main.rs` and `window.rs` are the window (tao), the system

@@ -152,6 +152,15 @@ pub enum Failure {
     /// The uplink waits for Open Live, and every production holding the input's
     /// source, named in `names`, is not running.
     ProductionsInactive { names: Vec<String> },
+    /// Armed: no production holds the input's source (or the productions are not
+    /// known), so nothing is sent yet.
+    ArmedNoProduction,
+    /// Armed: the productions holding the input's source, named in `names`, are not
+    /// live, so nothing is sent until one is.
+    ArmedWaiting { names: Vec<String> },
+    /// The live productions named in `names` were given the input's source while
+    /// live: Open Live has no receiver for it until they are reactivated (#128).
+    SlotAddedWhileLive { names: Vec<String> },
     /// Open Live refused the gateway token on the heartbeat. A banner.
     GatewayTokenRefused,
     /// The settings file has a problem.
@@ -161,6 +170,15 @@ pub enum Failure {
     WebView2Missing,
     /// Anything not recognised.
     Unmatched,
+}
+
+/// Production names in quotes, comma separated.
+fn quoted_names(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The installer's line when WebView2 is missing (section 10's last row).
@@ -275,6 +293,30 @@ impl Failure {
                 };
                 Message::new(
                     format!("Waiting for Open Live: {which} {are} inactive. Activate {it} in Studio."),
+                    Some(OpenStudio),
+                )
+            }
+            Failure::ArmedNoProduction => Message::new(
+                "Ready. Nothing is sent until a production that holds this source is activated in Studio.",
+                Some(OpenStudio),
+            ),
+            Failure::ArmedWaiting { names } => {
+                let which = match names.as_slice() {
+                    [one] => format!("production \"{one}\" is"),
+                    _ => format!("one of productions {} is", quoted_names(names)),
+                };
+                Message::new(
+                    format!("Ready. Sending starts when {which} activated in Studio."),
+                    Some(OpenStudio),
+                )
+            }
+            Failure::SlotAddedWhileLive { names } => {
+                let (which, it, them) = match names.as_slice() {
+                    [one] => (format!("Production \"{one}\""), "it", "the production"),
+                    _ => (format!("Productions {}", quoted_names(names)), "they", "them"),
+                };
+                Message::new(
+                    format!("{which} got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate {them} in Studio; until then {it} cannot show this input."),
                     Some(OpenStudio),
                 )
             }
@@ -915,6 +957,56 @@ mod tests {
             "Waiting for Open Live: productions \"Morning Show\", \"Rehearsal\" are inactive. Activate one in Studio.",
             Some(Action::OpenStudio),
         );
+    }
+
+    #[test]
+    fn armed_rows_say_what_sending_waits_for() {
+        assert_message(
+            Failure::ArmedNoProduction.message(),
+            "Ready. Nothing is sent until a production that holds this source is activated in Studio.",
+            Some(Action::OpenStudio),
+        );
+        assert_message(
+            Failure::ArmedWaiting {
+                names: vec!["Morning Show".to_string()],
+            }
+            .message(),
+            "Ready. Sending starts when production \"Morning Show\" is activated in Studio.",
+            Some(Action::OpenStudio),
+        );
+        assert_message(
+            Failure::ArmedWaiting {
+                names: vec!["Morning Show".to_string(), "Rehearsal".to_string()],
+            }
+            .message(),
+            "Ready. Sending starts when one of productions \"Morning Show\", \"Rehearsal\" is activated in Studio.",
+            Some(Action::OpenStudio),
+        );
+    }
+
+    /// #128's verdict: a slot added to a live production has no receiver until the
+    /// production is reactivated, and the row says so.
+    #[test]
+    fn a_slot_added_while_live_asks_for_a_reactivation() {
+        assert_message(
+            Failure::SlotAddedWhileLive {
+                names: vec!["Morning Show".to_string()],
+            }
+            .message(),
+            "Production \"Morning Show\" got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate the production in Studio; until then it cannot show this input.",
+            Some(Action::OpenStudio),
+        );
+        let two = Failure::SlotAddedWhileLive {
+            names: vec!["A".to_string(), "B".to_string()],
+        }
+        .message();
+        assert!(
+            two.message
+                .starts_with("Productions \"A\", \"B\" got this source"),
+            "{}",
+            two.message
+        );
+        assert!(two.message.contains("reactivate them"), "{}", two.message);
     }
 
     #[test]

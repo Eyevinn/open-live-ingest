@@ -18,12 +18,16 @@ In order, each logged and written to the step summary:
      OPEN_LIVE_INSTANCE (default openlivedev) from the workspace the reply lists.
      Then What to send: `set_inputs` with the test pattern ticked.
   3. `go_live`: the source `<gateway name> — Test pattern` appears in Open Live, and
-     Strom runs a flow of that name. Then the late receiver (#112): at least
-     E2E_LATE_SECONDS (default 35, never under 30) after Go live, a production named
-     `<gateway name> — production` is created with the source on `video_in_0` and
-     activated, so the cloud Strom's listener comes up only now, as in #110. Once it
-     is active, the uplink's SRT stats are checked (below), then the production is
-     deactivated and deleted.
+     the session arms (#130): its row is Armed and Strom runs no flow of that name,
+     because no production holding the source is live. Then the late receiver
+     (#112): a production named `<gateway name> — production` is created with the
+     source on `video_in_0`; the row waits for it and still nothing is sent. At least
+     E2E_LATE_SECONDS (default 35, never under 30) after Go live it is activated, so
+     the cloud Strom's listener comes up only now, as in #110; while it is
+     `activating` Strom runs no flow of the source, and once Open Live says it is
+     `active` the flow has to run within 5 s. The uplink's SRT stats are checked
+     (below), then the production is deactivated: the flow goes within 15 s and the
+     source is kept. The production stays, inactive, for step 5.
   4. `stop`: the page's `stopped` event, with no error and nothing left behind; the
      flow is gone from Strom, and the source is kept in Open Live with its id (#115),
      the only one of the run's gateway name. When nothing answers at
@@ -31,6 +35,10 @@ In order, each logged and written to the step summary:
      (a `strom` event with state `stopped`); a Strom that died by itself fails.
   5. `go_live` again: no input fails (an Open Live 409 would fail it) and the kept
      source is reused with the same id, so a production slot holding it stays valid.
+     The row waits for the production, which still holds the source, and no flow
+     runs; the production is activated again and the flow runs within 5 s of it
+     being `active`, without restarting the app; the new connect gets the same
+     uplink SRT stats check as the first one (#130 AC2).
   6. Quitting while live, as the close button does: `quit` asks (`quit_requested`),
      then `quit` with `confirmed: true` (the question's Stop and quit) stops and ends
      the process; the flow is gone from Strom and the source is kept, with the same id.
@@ -44,13 +52,20 @@ the login keychain, which lives under HOME.
 Before step 2, with or without OSC_ACCESS_TOKEN, a `go_live` has to be refused (no
 Open Live address yet), and then the late-listener check runs with no secret (#112):
   - `self_hosted` points the app at a stand-in Open Live on loopback (LocalOpenLive:
-    the four source routes and server-info, publishing Strom host 127.0.0.1 and one
-    free SRT port), and `set_inputs` ticks the test pattern.
-  - `go_live`: the source appears there and Strom runs its flow; the uplink calls a
-    port where nothing listens yet.
-  - At least E2E_LATE_SECONDS after Go live, a local SRT listener starts on that port
-    (`srt-live-transmit`, from Homebrew's `srt`, or SRT_LIVE_TRANSMIT), and the
-    uplink's SRT stats are checked (below).
+    the four source routes, server-info publishing Strom host 127.0.0.1 and one free
+    SRT port, and `GET /api/v1/productions` listing the productions the run puts
+    there), and `set_inputs` ticks the test pattern.
+  - `go_live`: the source appears there and the session arms (#130): the stand-in
+    lists no production, so the row is Armed and Strom runs no flow of the source.
+    The stand-in then lists a production holding the source on `video_in_0`,
+    `inactive` (the row waits for it) and then `activating`; still no flow. Then it
+    reports it `active`, and the flow has to run within 5 s; the uplink calls a port
+    where nothing listens yet.
+  - At least E2E_LATE_SECONDS after the flow started, a local SRT listener starts on
+    that port (`srt-live-transmit`, from Homebrew's `srt`, or SRT_LIVE_TRANSMIT), and
+    the uplink's SRT stats are checked (below): the late listener has to connect.
+  - The stand-in reports the production `inactive` again: the flow goes within 15 s,
+    the source is kept and the row waits for the production again.
   - `stop`: stopped with nothing left behind, the flow gone and the source kept with
     its id (#115).
 
@@ -144,6 +159,20 @@ CONNECT_TIMEOUT = 120
 MIXER_INPUT = "video_in_0"
 # What E2E_PART may ask for (`part`).
 PARTS = ("all", "late-listener", "openlivedev")
+# Once a production holding the source is `active`, its uplink flow runs within this
+# many seconds (#130 AC1).
+FLOW_START_TIMEOUT = 5
+# Once none is live any more, the flow is gone within this many seconds (#130 AC2:
+# the session looks at the productions every 2 s).
+FLOW_GONE_TIMEOUT = 15
+# How long an armed session is watched for a flow it must not start: three of its
+# looks at the productions, 2 s apart.
+ARMED_HOLD = 7
+# How long a row has to show what it waits for: the app reads the productions for the
+# rows every 4 s (app/src/status.rs).
+ROW_TIMEOUT = 20
+# The row states of an armed input (app/src/go_live.rs, RowState).
+ARMED = ("armed", "waiting_for_production")
 
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY") or os.devnull
 ON_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
@@ -375,6 +404,31 @@ class App:
             if m.get("event") == "input" and (m.get("data") or {}).get("state") == "failed"
         ]
 
+    def row_state(self, input_name, since):
+        """The state the last `input` event since line `since` gave the row of
+        `input_name`, or None when there was none."""
+        state = None
+        for m in self.seen[since:]:
+            data = m.get("data") or {}
+            if m.get("event") == "input" and data.get("input") == input_name:
+                state = data.get("state")
+        return state
+
+    def wait_row(self, input_name, states, since, step, timeout=ROW_TIMEOUT):
+        """Waits until the row of `input_name`, as told since line `since`, is in one
+        of `states`; returns that state."""
+        self.drain()
+        deadline = time.monotonic() + timeout
+        while True:
+            state = self.row_state(input_name, since)
+            if state in states:
+                return state
+            left = deadline - time.monotonic()
+            if left <= 0:
+                fail(f"{step}: the row of '{input_name}' is '{state}', not {' or '.join(states)}, after {timeout} s")
+            if self._take(left) is None:
+                fail(f"{step}: the app ended (exit {self.proc.wait()}) with the row of '{input_name}' '{state}'")
+
 
 # --- HTTP ------------------------------------------------------------------------------
 
@@ -480,8 +534,9 @@ class OpenLive(SourceList):
             fail(f"assigning source {source_id} to production {production_id} failed with HTTP {status}")
         return production_id
 
-    def activate(self, production_id, timeout):
-        """Activates the production and waits until Open Live says it is active."""
+    def activate(self, production_id, timeout, while_activating=lambda: None):
+        """Activates the production and waits until Open Live says it is active;
+        `while_activating` runs at every look that still finds it activating."""
         status, _ = http("POST", f"{self.url}/api/v1/productions/{production_id}/activate", self._bearer(), {})
         if status != 200:
             fail(f"activating production {production_id} failed with HTTP {status}")
@@ -493,8 +548,23 @@ class OpenLive(SourceList):
                 return
             if state != "activating":
                 fail(f"production {production_id} did not activate: its status went to '{state}'")
-            time.sleep(5)
+            while_activating()
+            time.sleep(1)
         fail(f"production {production_id} was still '{state}' after {timeout} s")
+
+    def deactivate(self, production_id, timeout):
+        """Deactivates the production and waits until Open Live says it is inactive."""
+        status, _ = http("POST", f"{self.url}/api/v1/productions/{production_id}/deactivate", self._bearer(), {}, timeout=180)
+        if status not in (200, 202, 204):
+            fail(f"deactivating production {production_id} failed with HTTP {status}")
+        deadline = time.monotonic() + timeout
+        state = None
+        while time.monotonic() < deadline:
+            state = self.production(production_id).get("status")
+            if state == "inactive":
+                return
+            time.sleep(2)
+        fail(f"production {production_id} was still '{state}' {timeout} s after its deactivation")
 
     def remove_production(self, production_id):
         """Deactivates and deletes; True when it is gone. Deactivating an inactive
@@ -513,13 +583,18 @@ class LocalOpenLive(SourceList):
     listener check (#112): `GET /api/v1/server-info` publishes Strom host 127.0.0.1
     and the one SRT port `srt_port`, and `/api/v1/sources` lists, creates, patches and
     deletes sources the way the gateway uses them. A source registered with port 0
-    (`srt://:0?mode=listener`, "assign me one") is given `srt_port`. No key."""
+    (`srt://:0?mode=listener`, "assign me one") is given `srt_port`.
+    `GET /api/v1/productions` lists the productions the run puts there with
+    `put_production`, in the shape Open Live returns them (`_id`, `name`, `status`,
+    `sources` of `sourceId` and `mixerInput`), so the run decides when a production
+    holding the source goes live (#130). No key."""
 
     def __init__(self, srt_port):
         self.srt_port = srt_port
         self.lock = threading.Lock()
         self.stored = {}
         self.next_id = 1
+        self.stored_productions = {}
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -546,6 +621,8 @@ class LocalOpenLive(SourceList):
                     self._reply(200, owner.server_info())
                 elif self.path == "/api/v1/sources":
                     self._reply(200, owner.sources())
+                elif self.path == "/api/v1/productions":
+                    self._reply(200, owner.productions())
                 else:
                     self._reply(404, {"error": "not found"})
 
@@ -604,6 +681,21 @@ class LocalOpenLive(SourceList):
     def delete(self, source_id):
         with self.lock:
             return self.stored.pop(source_id, None) is not None
+
+    def productions(self):
+        with self.lock:
+            return [json.loads(json.dumps(p)) for p in self.stored_productions.values()]
+
+    def put_production(self, production_id, name, source_id, status):
+        """Lists a production holding `source_id` on MIXER_INPUT, in `status`
+        (`inactive`, `activating`, `active`), replacing one of the same id."""
+        with self.lock:
+            self.stored_productions[production_id] = {
+                "_id": production_id,
+                "name": name,
+                "status": status,
+                "sources": [{"sourceId": source_id, "mixerInput": MIXER_INPUT}],
+            }
 
     def close(self):
         self.server.shutdown()
@@ -804,14 +896,52 @@ class Strom:
             return None
         return body.get("flows") or []
 
-    def wait_for_flow(self, name, timeout):
+    def flow_named(self, name):
+        """The flow named `name`, None when there is none, or "unreachable" when
+        nothing answers at Strom's address."""
+        flows = self.flows()
+        if flows is None:
+            return "unreachable"
+        return next((f for f in flows if f.get("name") == name), None)
+
+    def wait_for_flow(self, name, timeout, step=None, every=2):
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            for flow in self.flows() or []:
-                if flow.get("name") == name:
-                    return flow
-            time.sleep(2)
-        fail(f"Strom at {self.url} runs no flow named '{name}' after {timeout} s")
+        while True:
+            flow = self.flow_named(name)
+            if isinstance(flow, dict):
+                return flow
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(every, max(0.0, deadline - time.monotonic())))
+        fail(f"{step + ': ' if step else ''}Strom at {self.url} runs no flow named '{name}' after {timeout} s")
+
+    def no_flow(self, name, seconds, step):
+        """For `seconds`, Strom runs no flow named `name` (an armed session sends
+        nothing, #130). Fails when one shows up, or when nothing answers at Strom's
+        address the whole time, which would prove nothing."""
+        deadline = time.monotonic() + seconds
+        answered = False
+        while True:
+            flow = self.flow_named(name)
+            if isinstance(flow, dict):
+                fail(f"{step}: Strom runs flow {flow.get('id')} for '{name}' while no production holding the source is live")
+            answered |= flow is None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+        if not answered:
+            fail(f"{step}: nothing answered at {self.url} for {seconds} s, so the absence of a flow proves nothing")
+
+    def wait_flow_gone(self, name, timeout, step):
+        """Waits until Strom, still answering, runs no flow named `name`."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.flow_named(name) is None:
+                return
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+        fail(f"{step}: Strom at {self.url} still runs a flow named '{name}' {timeout} s after no production holding the source is live")
 
     def uplink(self, flow_id):
         """The uplink's state (`uplink_sample`), or None when the flow reports no peer
@@ -932,8 +1062,10 @@ def tick_the_test_pattern(app):
     passed(f"What to send: `set_inputs` saved the test pattern (ticked: {ticked}, prefix '{what.get('name_prefix')}')")
 
 
-def go_live(app, open_live, strom, source_name, step):
-    """Go live; returns the source, the flow and the app line the session began at."""
+def go_live(app, open_live, strom, source_name, step, waits_for=ARMED):
+    """Go live; returns the source and the app line the session began at. The session
+    arms (#130): the row comes to one of `waits_for` and Strom runs no flow of the
+    source over ARMED_HOLD, since no production holding it is live."""
     since = len(app.seen)
     reply = app.call("go_live", timeout=120)
     if "error" in reply:
@@ -942,9 +1074,31 @@ def go_live(app, open_live, strom, source_name, step):
     if app.failed_rows(since):
         fail(f"{step}: an input failed: {app.failed_rows(since)}")
     passed(f"{step}: source '{source_name}' ({source.get('id')}) is in Open Live (streamType {source.get('streamType')}, status {source.get('status')})")
-    flow = strom.wait_for_flow(source_name, 60)
-    passed(f"{step}: Strom runs flow {flow.get('id')} for it")
-    return source, flow, since
+    state = app.wait_row(source_name, waits_for, since, step)
+    strom.no_flow(source_name, ARMED_HOLD, step)
+    passed(f"{step}: the session is armed: the row is '{state}' and Strom runs no flow for it over {ARMED_HOLD} s")
+    return source, since
+
+
+def sends_once_live(strom, source_name, step, live_at):
+    """Once a production holding the source is `active` (at `live_at`), Strom runs
+    the source's flow within FLOW_START_TIMEOUT (#130 AC1). The flow, and when it was
+    seen."""
+    flow = strom.wait_for_flow(source_name, FLOW_START_TIMEOUT, step, every=0.25)
+    seen_at = time.monotonic()
+    passed(f"{step}: Strom runs flow {flow.get('id')} {seen_at - live_at:.1f} s after the production is active (at most {FLOW_START_TIMEOUT} s)")
+    return flow, seen_at
+
+
+def stops_once_not_live(strom, open_live, gateway_name, source, source_name, step):
+    """Once no production holding the source is live, the flow goes within
+    FLOW_GONE_TIMEOUT and the source is kept (#130 AC2)."""
+    gone_from = time.monotonic()
+    strom.wait_flow_gone(source_name, FLOW_GONE_TIMEOUT, step)
+    kept = [s.get("id") for s in open_live.ours(gateway_name)]
+    if kept != [source.get("id")]:
+        fail(f"{step}: expected source {source.get('id')} kept as the only one of '{gateway_name}', found {kept}")
+    passed(f"{step}: the flow is gone from Strom {time.monotonic() - gone_from:.1f} s later and source {source.get('id')} is kept")
 
 
 def stopped_cleanly(data, step):
@@ -955,9 +1109,11 @@ def stopped_cleanly(data, step):
 
 
 def late_listener_check(app, strom, gateway_name, source_name, work):
-    """The no-secret late-listener check (#112): Go live to a stand-in Open Live on
-    loopback, start a local SRT listener at least E2E_LATE_SECONDS later, check the
-    uplink's SRT stats, Stop. See the header."""
+    """The no-secret late-listener check (#112, #130): Go live to a stand-in Open Live
+    on loopback, armed until the stand-in reports a production holding the source
+    `active`; a local SRT listener starts at least E2E_LATE_SECONDS after the flow
+    did; the uplink's SRT stats are checked; the production goes `inactive` again and
+    the flow goes; Stop. See the header."""
     step = "Late listener (no secret)"
     _, _, late = srt_settings()
     srt_port = free_udp_port()
@@ -970,16 +1126,38 @@ def late_listener_check(app, strom, gateway_name, source_name, work):
         passed(f"{step}: Where to send is the stand-in Open Live at {local.url} (Strom host 127.0.0.1, SRT port {srt_port})")
         tick_the_test_pattern(app)
 
-        live_at = time.monotonic()
-        source, flow, since = go_live(app, local, strom, source_name, step)
-        say(f"{step}: nothing listens on 127.0.0.1:{srt_port} yet; the listener starts {late} s after Go live")
-        wait_until(live_at + late)
+        # Go live: no production holds the source, so the row is Armed and nothing runs.
+        source, since = go_live(app, local, strom, source_name, step, waits_for=("armed",))
+
+        # A production holds it, inactive, then activating: the row waits, nothing runs.
+        production_id = "prod-e2e-1"
+        production = f"{gateway_name} — production"
+        local.put_production(production_id, production, source.get("id"), "inactive")
+        app.wait_row(source_name, ("waiting_for_production",), since, step)
+        strom.no_flow(source_name, ARMED_HOLD, f"{step}: production inactive")
+        passed(f"{step}: production '{production}' holds the source on {MIXER_INPUT}, inactive: the row waits for it and Strom runs no flow")
+        local.put_production(production_id, production, source.get("id"), "activating")
+        strom.no_flow(source_name, ARMED_HOLD, f"{step}: production activating")
+        passed(f"{step}: production activating: Strom still runs no flow for the source over {ARMED_HOLD} s")
+
+        # Active: the flow runs within 5 s, calling a port where nothing listens yet.
+        local.put_production(production_id, production, source.get("id"), "active")
+        flow, started_at = sends_once_live(strom, source_name, f"{step}: production active", time.monotonic())
+        app.wait_row(source_name, ("connecting", "live"), since, f"{step}: production active")
+        say(f"{step}: nothing listens on 127.0.0.1:{srt_port} yet; the listener starts {late} s after the flow did")
+        wait_until(started_at + late)
         listener.start()
-        passed(f"{step}: the local SRT listener is up on 127.0.0.1:{srt_port}, {time.monotonic() - live_at:.0f} s after Go live")
+        passed(f"{step}: the local SRT listener is up on 127.0.0.1:{srt_port}, {time.monotonic() - started_at:.0f} s after the flow started")
         strom.watch_uplink(flow.get("id"), step, listener.check_running)
         listener.check_running("after the last sample")
 
-        # Stop: the flow goes, the source stays with its id (#115).
+        # Inactive again: the flow goes, the source stays, the row waits again.
+        again_from = len(app.seen)
+        local.put_production(production_id, production, source.get("id"), "inactive")
+        stops_once_not_live(strom, local, gateway_name, source, source_name, f"{step}: production inactive again")
+        app.wait_row(source_name, ("waiting_for_production",), again_from, f"{step}: production inactive again")
+
+        # Stop: the source stays with its id (#115).
         app.ok("stop")
         stopped_cleanly(app.event("stopped", 120), f"{step}: Stop")
         kept = local.ours(gateway_name)
@@ -992,23 +1170,45 @@ def late_listener_check(app, strom, gateway_name, source_name, work):
         local.close()
 
 
-def late_receiver_check(open_live, strom, source, flow, live_at, gateway_name):
-    """The openlivedev late-receiver check (#112): the production that takes the
+def late_receiver_check(app, open_live, strom, source, source_name, live_at, gateway_name):
+    """The openlivedev late-receiver check (#112, #130): the production that takes the
     source is activated at least E2E_LATE_SECONDS after Go live, so the cloud Strom's
-    listener comes up late; then the uplink's SRT stats are checked, and the
-    production is removed."""
+    listener comes up late; the session sends nothing while it activates and starts
+    the flow once it is active; the uplink's SRT stats are checked; the production is
+    deactivated, the flow goes and the source is kept. Returns the production id (it
+    stays, inactive, for Go live again) and the flow."""
     step = "Late receiver (openlivedev)"
     _, _, late = srt_settings()
+    since = len(app.seen)
     production_id = open_live.create_production(f"{gateway_name} — production", source.get("id"))
-    passed(f"{step}: production {production_id} has the source on {MIXER_INPUT}; it activates {late} s after Go live")
+    app.wait_row(source_name, ("waiting_for_production",), since, step)
+    strom.no_flow(source_name, ARMED_HOLD, f"{step}: production inactive")
+    passed(f"{step}: production {production_id} has the source on {MIXER_INPUT}, inactive: the row waits for it and Strom runs no flow; it activates {late} s after Go live")
     wait_until(live_at + late)
     activated_at = time.monotonic()
-    open_live.activate(production_id, 300)
-    passed(f"{step}: production {production_id} is active, {time.monotonic() - live_at:.0f} s after Go live (activation took {time.monotonic() - activated_at:.0f} s)")
+    open_live.activate(production_id, 300, lambda: strom.no_flow(source_name, 0, f"{step}: production activating"))
+    active_at = time.monotonic()
+    passed(f"{step}: production {production_id} is active, {active_at - live_at:.0f} s after Go live (activation took {active_at - activated_at:.0f} s, no flow while it activated)")
+    flow, _ = sends_once_live(strom, source_name, step, active_at)
+    app.wait_row(source_name, ("connecting", "live"), since, step)
     strom.watch_uplink(flow.get("id"), step)
-    if not open_live.remove_production(production_id):
-        fail(f"{step}: production {production_id} could not be deleted")
-    passed(f"{step}: production {production_id} is deactivated and deleted")
+    open_live.deactivate(production_id, 180)
+    stops_once_not_live(strom, open_live, gateway_name, source, source_name, f"{step}: production deactivated")
+    return production_id, flow
+
+
+def reactivated_check(app, open_live, strom, production_id, source_name, since):
+    """#130 AC2: reactivating the production that still holds the kept source, with
+    the app still running, gives a new clean connect. No flow while it activates, the
+    flow within FLOW_START_TIMEOUT once it is active, the row connecting or live, and
+    the same uplink SRT stats check as the first connect (`watch_uplink`). Returns
+    the flow."""
+    step = "Go live again: production reactivated"
+    open_live.activate(production_id, 300, lambda: strom.no_flow(source_name, 0, f"{step} (activating)"))
+    flow, _ = sends_once_live(strom, source_name, step, time.monotonic())
+    app.wait_row(source_name, ("connecting", "live"), since, step)
+    strom.watch_uplink(flow.get("id"), step)
+    return flow
 
 
 def run(exe, work):
@@ -1094,10 +1294,11 @@ def run(exe, work):
                 say(f"removing stale source {source.get('id')} from an earlier run")
                 open_live.delete(source.get("id"))
 
-        # 3. Go live, then the late receiver: the production is activated only now.
+        # 3. Go live, armed: no production holds the source yet. Then the late
+        # receiver: the production is created and activated only now.
         live_at = time.monotonic()
-        source, flow, since = go_live(app, open_live, strom, source_name, "Go live")
-        late_receiver_check(open_live, strom, source, flow, live_at, gateway_name)
+        source, since = go_live(app, open_live, strom, source_name, "Go live", waits_for=("armed",))
+        production_id, flow = late_receiver_check(app, open_live, strom, source, source_name, live_at, gateway_name)
 
         # 4. Stop: the flow goes, the source stays (#115).
         app.ok("stop")
@@ -1111,14 +1312,16 @@ def run(exe, work):
 
         # 5. Go live again: no 409, and the kept source reused with its id. The source
         # is there from the start, so go_live() checks the rows before the session has
-        # registered anything; they are checked again once the flow runs, which is
-        # after registration.
-        again, flow, since = go_live(app, open_live, strom, source_name, "Go live again (no 409)")
+        # registered anything; they are checked again once the row is armed, which is
+        # after registration. The production still holds the source, inactive: the
+        # row waits for it, and activating it again starts the flow (#130 AC2).
+        again, since = go_live(app, open_live, strom, source_name, "Go live again (no 409)", waits_for=("waiting_for_production",))
         if app.failed_rows(since):
             fail(f"Go live again (no 409): an input failed: {app.failed_rows(since)}")
         if again.get("id") != source.get("id"):
             fail(f"Go live again: the source id changed from {source.get('id')} to {again.get('id')}")
         passed(f"Go live again: the same source {source.get('id')} is reused, so a production slot holding it stays valid")
+        flow = reactivated_check(app, open_live, strom, production_id, source_name, since)
 
         # 6. Quit while live.
         app.ok("quit", {"confirmed": False})
