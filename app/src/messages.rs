@@ -147,12 +147,11 @@ pub enum Failure {
     AlreadyLive,
     /// An input runs but nothing has reached the cloud for 30 seconds.
     NothingDelivered,
-    /// An input runs and its uplink waits for a receiver: Open Live receives a
-    /// source only while a production using it is active.
-    WaitingForProduction,
-    /// As [`Failure::WaitingForProduction`], still with nothing delivered after 30
-    /// seconds: the production may be active and the network blocking the uplink.
-    WaitingNothingDelivered,
+    /// The uplink waits for Open Live, and no production holds the input's source.
+    NoProductionHolds,
+    /// The uplink waits for Open Live, and every production holding the input's
+    /// source, named in `names`, is not running.
+    ProductionsInactive { names: Vec<String> },
     /// Open Live refused the gateway token on the heartbeat. A banner.
     GatewayTokenRefused,
     /// The settings file has a problem.
@@ -264,14 +263,21 @@ impl Failure {
                 "Nothing has reached the cloud yet. Check that this network allows outgoing UDP.",
                 None,
             ),
-            Failure::WaitingForProduction => Message::new(
-                "Waiting for Open Live: put this source in a production and activate it.",
+            Failure::NoProductionHolds => Message::new(
+                "Waiting for Open Live: no production holds this source. Put it in a production in Studio and activate it.",
                 Some(OpenStudio),
             ),
-            Failure::WaitingNothingDelivered => Message::new(
-                "Waiting for Open Live: put this source in a production and activate it. If that production is already active, check that this network allows outgoing UDP.",
-                Some(OpenStudio),
-            ),
+            Failure::ProductionsInactive { names } => {
+                let quoted: Vec<String> = names.iter().map(|n| format!("\"{n}\"")).collect();
+                let (which, are, it) = match quoted.as_slice() {
+                    [one] => (format!("production {one}"), "is", "it"),
+                    _ => (format!("productions {}", quoted.join(", ")), "are", "one"),
+                };
+                Message::new(
+                    format!("Waiting for Open Live: {which} {are} inactive. Activate {it} in Studio."),
+                    Some(OpenStudio),
+                )
+            }
             Failure::GatewayTokenRefused => Message::new(
                 "Studio can't see this venue's status (gateway token refused). Your cameras are still sending.",
                 Some(Advanced),
@@ -883,15 +889,30 @@ mod tests {
     }
 
     #[test]
-    fn waiting_for_an_active_production() {
+    fn waiting_with_no_production_holding_the_source() {
         assert_message(
-            Failure::WaitingForProduction.message(),
-            "Waiting for Open Live: put this source in a production and activate it.",
+            Failure::NoProductionHolds.message(),
+            "Waiting for Open Live: no production holds this source. Put it in a production in Studio and activate it.",
+            Some(Action::OpenStudio),
+        );
+    }
+
+    #[test]
+    fn waiting_on_inactive_productions_names_them() {
+        assert_message(
+            Failure::ProductionsInactive {
+                names: vec!["Morning Show".to_string()],
+            }
+            .message(),
+            "Waiting for Open Live: production \"Morning Show\" is inactive. Activate it in Studio.",
             Some(Action::OpenStudio),
         );
         assert_message(
-            Failure::WaitingNothingDelivered.message(),
-            "Waiting for Open Live: put this source in a production and activate it. If that production is already active, check that this network allows outgoing UDP.",
+            Failure::ProductionsInactive {
+                names: vec!["Morning Show".to_string(), "Rehearsal".to_string()],
+            }
+            .message(),
+            "Waiting for Open Live: productions \"Morning Show\", \"Rehearsal\" are inactive. Activate one in Studio.",
             Some(Action::OpenStudio),
         );
     }

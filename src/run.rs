@@ -56,8 +56,9 @@ async fn connect_strom(cfg: &Config, events: &Events) -> Result<(LocalStrom, Str
 }
 
 /// The Open Live client `up` registers with: with the app's Open Source Cloud
-/// credential when one is given, otherwise with the one the settings point at.
-fn open_live_client(
+/// credential when one is given, otherwise with the one the settings point at. None
+/// when the settings say not to register with Open Live.
+pub fn open_live_client(
     cfg: &Config,
     credential: Option<&OscCredential>,
 ) -> Result<Option<OpenLiveClient>> {
@@ -424,6 +425,8 @@ fn stats_of(live: &[Live]) -> Event {
             .iter()
             .map(|l| InputStats {
                 input: l.input.name.clone(),
+                flow_id: l.flow_id,
+                source_id: l.source_id.clone(),
                 state: l.state.clone(),
                 uplink: l.uplink.as_ref().map(|sample| {
                     let uplink = heartbeat::Uplink::from_srt(sample);

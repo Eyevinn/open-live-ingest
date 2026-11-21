@@ -309,7 +309,6 @@ async function listDevices(showAll) {
 const STATE_TEXT = {
   registering: "Registering",
   connecting: "Connecting",
-  waiting: "Waiting",
   live: "Live",
   failed: "Failed",
   stopping: "Stopping",
@@ -383,6 +382,56 @@ function clearGoProblem() {
   byId("go-problem").hidden = true;
 }
 
+// The status lines under a row (spec, section 5): the productions holding the input's
+// source, their state and the slot, and the link. `productions` is null when unknown.
+function productionLine(productions) {
+  if (productions === null || productions === undefined) {
+    return "Production: unknown";
+  }
+  if (productions.length === 0) {
+    return "Production: none holds this source";
+  }
+  return (
+    "Production: " +
+    productions
+      .map(
+        (p) =>
+          p.name +
+          " (" +
+          p.state +
+          "), " +
+          (p.slots.length === 1 ? "slot " : "slots ") +
+          p.slots.join(", "),
+      )
+      .join("; ")
+  );
+}
+
+const LINK_TEXT = {
+  not_sending: "not sending",
+  connecting: "connecting",
+  connected: "connected",
+  unknown: "unknown",
+};
+
+function linkLine(link) {
+  let text = "Link: " + (LINK_TEXT[link.state] || link.state);
+  if (typeof link.dropped_pct === "number") {
+    text += ", " + link.dropped_pct.toFixed(1) + " % dropped";
+  }
+  if (typeof link.rtt_ms === "number") {
+    text += ", RTT " + Math.round(link.rtt_ms) + " ms";
+  }
+  return text;
+}
+
+function statusLine(text) {
+  const line = document.createElement("span");
+  line.className = "status-line";
+  line.textContent = text;
+  return line;
+}
+
 function renderRows() {
   const list = byId("go-rows");
   list.replaceChildren();
@@ -419,6 +468,10 @@ function renderRows() {
         detail.append(" ", button);
       }
       item.append(detail);
+    }
+    if (row.status && live) {
+      item.append(statusLine(productionLine(row.status.productions)));
+      item.append(statusLine(linkLine(row.status.link)));
     }
     list.append(item);
   }
@@ -498,6 +551,15 @@ function wireGoLive() {
     }
     renderRows();
   });
+  document.addEventListener("oli:status", (event) => {
+    for (const status of event.detail.inputs) {
+      const row = rows.get(status.input);
+      if (row) {
+        row.status = status;
+      }
+    }
+    renderRows();
+  });
   document.addEventListener("oli:notice", (event) => {
     if (event.detail.clear) {
       notices.delete(event.detail.clear);
@@ -514,6 +576,7 @@ function wireGoLive() {
     setLive(false);
     byId("go-button").disabled = false;
     byId("go-strom").textContent = "";
+    renderRows();
     notices.clear();
     renderNotices();
     if (event.detail.error) {

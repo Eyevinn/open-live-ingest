@@ -271,7 +271,9 @@ fn tail_of_log(path: &Path) -> String {
 ///     MacOS/strom
 ///     Frameworks/                  GStreamer and GLib libraries
 ///     PlugIns/gstreamer/           GStreamer plugins
+///     PlugIns/gio/                 GIO modules (none)
 ///     Helpers/gst-plugin-scanner   the plugin scanner
+///     Resources/                   the icon; GLib's shared data directory
 /// ```
 ///
 /// No directory in those places may have a dot in its name: `codesign` takes such a
@@ -279,7 +281,8 @@ fn tail_of_log(path: &Path) -> String {
 ///
 /// The paths below are relative to `Contents`, the parent of the directory holding
 /// the executables. `.github/scripts/build-macos-app.sh` puts the files exactly
-/// there (`PLUGIN_DIR_REL`, `SCANNER_REL`); a test below keeps the two in step.
+/// there (`PLUGIN_DIR_REL`, `SCANNER_REL`, `GIO_MODULE_DIR_REL`); a test below keeps
+/// the two in step.
 ///
 /// A `strom` next to the gateway counts as bundled only when this directory exists
 /// relative to it. That is what tells the app apart from a plain install such as
@@ -291,6 +294,16 @@ pub const BUNDLE_PLUGIN_SCANNER: &str = "Helpers/gst-plugin-scanner";
 /// The GStreamer registry of a bundled Strom, kept in the managed Strom's data
 /// directory so it never shares a registry with another GStreamer on the machine.
 pub const BUNDLE_REGISTRY_FILE: &str = "gstreamer-registry.bin";
+/// See [`BUNDLE_PLUGIN_DIR`]. Where the bundled GLib looks for GIO modules
+/// (`GIO_MODULE_DIR`): a directory of the bundle's own, kept empty. Left unset, GLib
+/// looks in the module directory of the prefix it was built for, which is Homebrew's,
+/// and loads whatever it finds there into Strom. No flow of ours needs a GIO module:
+/// the SRT uplink encrypts with libsrt's own crypto, not through GIO's TLS.
+pub const BUNDLE_GIO_MODULE_DIR: &str = "PlugIns/gio";
+/// See [`BUNDLE_PLUGIN_DIR`]. The only directory the bundled GLib searches for shared
+/// data such as GSettings schemas (`XDG_DATA_DIRS`), instead of its default of
+/// `/usr/local/share` and `/usr/share`.
+pub const BUNDLE_DATA_DIR: &str = "Resources";
 
 #[cfg(not(windows))]
 const INSTALL_HINT: &str =
@@ -342,11 +355,14 @@ impl LocatedStrom {
         }
     }
 
-    /// The GStreamer environment for starting this Strom. Empty unless it is the
-    /// bundled one: a Strom on `PATH`, set explicitly, or next to the gateway outside
-    /// a bundle brings its own GStreamer.
-    /// For the bundled one, plugins and the scanner come from the bundle only, and
-    /// the registry lives in `data_dir`, so a Homebrew GStreamer is never mixed in.
+    /// The GStreamer and GLib environment for starting this Strom. Empty unless it is
+    /// the bundled one: a Strom on `PATH`, set explicitly, or next to the gateway
+    /// outside a bundle brings its own GStreamer.
+    /// For the bundled one, plugins and the scanner come from the bundle only, the
+    /// registry lives in `data_dir`, GIO modules come from the bundle's empty module
+    /// directory and from nowhere else, and GLib's shared data from the bundle, so a
+    /// Homebrew GStreamer or GLib is never mixed in. gst-plugin-scanner inherits this
+    /// environment from Strom.
     pub fn gst_env(&self, data_dir: &Path) -> Vec<(&'static str, OsString)> {
         let StromOrigin::Bundled { contents } = &self.origin else {
             return Vec::new();
@@ -354,6 +370,8 @@ impl LocatedStrom {
         let plugins = contents.join(BUNDLE_PLUGIN_DIR).into_os_string();
         let scanner = contents.join(BUNDLE_PLUGIN_SCANNER).into_os_string();
         let registry = data_dir.join(BUNDLE_REGISTRY_FILE).into_os_string();
+        let gio_modules = contents.join(BUNDLE_GIO_MODULE_DIR).into_os_string();
+        let data = contents.join(BUNDLE_DATA_DIR).into_os_string();
         vec![
             ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.clone()),
             ("GST_PLUGIN_SYSTEM_PATH", plugins),
@@ -363,6 +381,9 @@ impl LocatedStrom {
             ("GST_PLUGIN_SCANNER", scanner),
             ("GST_REGISTRY_1_0", registry.clone()),
             ("GST_REGISTRY", registry),
+            ("GIO_MODULE_DIR", gio_modules),
+            ("GIO_EXTRA_MODULES", OsString::new()),
+            ("XDG_DATA_DIRS", data),
         ]
     }
 }
@@ -1121,6 +1142,8 @@ mod tests {
         let plugins = contents.join("PlugIns/gstreamer");
         let scanner = contents.join("Helpers/gst-plugin-scanner");
         let registry = data_dir.join("gstreamer-registry.bin");
+        let gio_modules = contents.join("PlugIns/gio");
+        let data = contents.join("Resources");
         for (key, want) in [
             ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.as_os_str()),
             ("GST_PLUGIN_SYSTEM_PATH", plugins.as_os_str()),
@@ -1130,11 +1153,19 @@ mod tests {
             ("GST_PLUGIN_SCANNER", scanner.as_os_str()),
             ("GST_REGISTRY_1_0", registry.as_os_str()),
             ("GST_REGISTRY", registry.as_os_str()),
+            ("GIO_MODULE_DIR", gio_modules.as_os_str()),
+            ("GIO_EXTRA_MODULES", OsStr::new("")),
+            ("XDG_DATA_DIRS", data.as_os_str()),
         ] {
             assert_eq!(env.get(key).map(OsString::as_os_str), Some(want), "{key}");
         }
-        assert_eq!(env.len(), 8);
-        for key in ["GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SCANNER_1_0"] {
+        assert_eq!(env.len(), 11);
+        for key in [
+            "GST_PLUGIN_SYSTEM_PATH_1_0",
+            "GST_PLUGIN_SCANNER_1_0",
+            "GIO_MODULE_DIR",
+            "XDG_DATA_DIRS",
+        ] {
             assert!(Path::new(&env[key]).starts_with(&contents), "{key}");
         }
         assert!(Path::new(&env["GST_REGISTRY_1_0"]).starts_with(&data_dir));
@@ -1285,6 +1316,10 @@ mod tests {
     fn the_app_script_puts_plugins_and_scanner_where_we_look() {
         assert_eq!(app_script_value("PLUGIN_DIR_REL"), BUNDLE_PLUGIN_DIR);
         assert_eq!(app_script_value("SCANNER_REL"), BUNDLE_PLUGIN_SCANNER);
+        assert_eq!(
+            app_script_value("GIO_MODULE_DIR_REL"),
+            BUNDLE_GIO_MODULE_DIR
+        );
     }
 
     /// `codesign` accepts nested code only in a bundle's code locations, and takes a
@@ -1295,10 +1330,11 @@ mod tests {
         for (path, location) in [
             (BUNDLE_PLUGIN_DIR, "PlugIns"),
             (BUNDLE_PLUGIN_SCANNER, "Helpers"),
+            (BUNDLE_GIO_MODULE_DIR, "PlugIns"),
         ] {
             let parts: Vec<&str> = path.split('/').collect();
             assert_eq!(parts[0], location, "{path}");
-            let dirs = if path == BUNDLE_PLUGIN_DIR {
+            let dirs = if path != BUNDLE_PLUGIN_SCANNER {
                 &parts[..]
             } else {
                 &parts[..parts.len() - 1]
