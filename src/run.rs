@@ -45,6 +45,37 @@ const TICK: Duration = Duration::from_secs(10);
 /// revision per write, so one quiet poll must not flap the verdict.
 const QUIET_TOLERANCE: u32 = 3;
 
+/// Stalled polls in a row (see [`judge`]) before the first restart of a flow (#111).
+/// Two ticks: a short loss burst at connect, which SRT repairs with retransmissions
+/// rather than drops, is over by then; a receiver that has stopped acknowledging is
+/// not. The first sample after a connect has no baseline, so a connection that stalls
+/// from the start is restarted about three ticks (30 s) after it connected.
+const STALLED_POLLS: u32 = 2;
+
+/// The longest run of stalled polls waited for before a restart. Each restart that
+/// does not bring a delivering interval back doubles the wait (20 s, 40 s, 80 s,
+/// 160 s), up to this: three minutes.
+const MAX_STALLED_POLLS: u32 = 18;
+
+/// Restarts in a row that never reached a delivering interval before the gateway
+/// gives up restarting. A receiver that is broken for good would otherwise have the
+/// camera, the encoder and the receiver's queue reset for as long as `up` runs. After
+/// this the input stays Waiting, with one warning, until it delivers again.
+const MAX_RESTARTS: u32 = 4;
+
+/// Packets a poll interval must have sent to be judged at all, so a near-idle sample
+/// (a flow still starting) never counts.
+const STALL_MIN_SENT: u64 = 500;
+
+/// The share of an interval's packets the sender must have dropped for it to count
+/// as stalled. #111's stall drops all of them ("dropped ≈ sent"); a congested uplink
+/// with less capacity than the stream can drop a large share and still deliver a
+/// degraded, live picture, and must not be torn down.
+const STALL_DROP_PERCENT: u64 = 90;
+
+/// Where the receiver-side fault behind a stall is tracked.
+const STALL_UPSTREAM_ISSUE: &str = "https://github.com/Eyevinn/strom/issues/1277";
+
 /// The local Strom, adopted or started, and a client for it. Held for as long as the
 /// command runs: dropping it stops a Strom we started.
 async fn connect_strom(cfg: &Config, events: &Events) -> Result<(LocalStrom, StromClient)> {
@@ -330,6 +361,17 @@ struct Live {
     shown: Option<State>,
     last_bytes: Option<u64>,
     quiet_polls: u32,
+    /// The uplink connection's packet counters at the last poll, to judge the next
+    /// interval against.
+    last_counters: Option<Counters>,
+    /// Polls in a row whose interval was [`Interval::Stalled`].
+    stalled_polls: u32,
+    /// Restarts for a stall since the uplink last delivered. Survives the restart
+    /// itself, so the wait before the next one can grow and the count can be capped.
+    stall_restarts: u32,
+    /// Whether the gateway has given up restarting this input's stalled uplink, so the
+    /// warning saying so is emitted once.
+    stall_given_up: bool,
     source_id: Option<String>,
     /// The `connect.warning` Open Live last reported for the source, so one that
     /// persists is logged once per run rather than every tick.
@@ -737,6 +779,10 @@ async fn start_inputs(
                 shown: None,
                 last_bytes: None,
                 quiet_polls: 0,
+                last_counters: None,
+                stalled_polls: 0,
+                stall_restarts: 0,
+                stall_given_up: false,
                 source_id,
                 connect_warning,
                 uplink: None,
@@ -1177,12 +1223,13 @@ async fn run_until_stopped(
         tokio::select! {
             _ = ticker.tick() => {
                 for l in live.iter_mut() {
-                    l.state = match poll_flow(strom, gateway_id, &cfg.video, l).await {
+                    l.state = match poll_flow(strom, gateway_id, &cfg.video, l, events).await {
                         Ok(state) => state,
                         Err(err) => {
                             warn!(input = %l.input.name, err = %format_args!("{err:#}"), "lost contact with Strom, retrying next tick");
                             l.last_bytes = None;
                             l.uplink = None;
+                            l.forget_counters();
                             State::Unreachable
                         }
                     };
@@ -1226,6 +1273,7 @@ async fn poll_flow(
     gateway_id: &str,
     video: &Video,
     l: &mut Live,
+    events: &Events,
 ) -> Result<State> {
     let running = match strom.get_flow(&l.flow_id).await? {
         Some(flow) => flow.running,
@@ -1239,24 +1287,70 @@ async fn poll_flow(
         }
     };
     if !running {
-        l.last_bytes = None;
-        l.uplink = None;
-        return Ok(if strom.start_flow(&l.flow_id).await? {
-            State::Starting
-        } else {
-            State::Failed {
-                reason: "Strom did not report the flow running after start".to_string(),
-            }
-        });
+        return start_again(strom, l).await;
     }
 
     let Some(sample) = strom.srt_uplink(&l.flow_id).await? else {
         l.last_bytes = None;
         l.uplink = None;
         l.quiet_polls = 0;
+        l.forget_counters();
         return Ok(State::Waiting);
     };
     l.uplink = Some(sample.clone());
+
+    // A connected uplink whose sender drops about as much as it sends delivers
+    // nothing, while its bytes still move. That is what a late connect into an Open
+    // Live production did in #111: the receiver stops acknowledging, and the sender
+    // drops at the stream rate until the connection breaks, or for good. A fresh
+    // connection into the then-active production came back clean, so the flow is
+    // restarted, with a growing wait and a cap. The receiver's fault itself is not
+    // fixed here (Eyevinn/strom#1277).
+    let counters = Counters::of(&sample);
+    match judge(l.last_counters, counters) {
+        Interval::Stalled => l.stalled_polls = l.stalled_polls.saturating_add(1),
+        Interval::Delivering => {
+            l.stalled_polls = 0;
+            if l.stall_restarts > 0 || l.stall_given_up {
+                info!(input = %l.input.name, "uplink delivering again after a stall");
+            }
+            l.stall_restarts = 0;
+            l.stall_given_up = false;
+        }
+        Interval::Unjudged => l.stalled_polls = 0,
+    }
+    l.last_counters = Some(counters);
+    if l.stalled_polls > 0 {
+        if l.stalled_polls >= polls_before_restart(l.stall_restarts) {
+            if l.stall_restarts < MAX_RESTARTS {
+                l.stall_restarts += 1;
+                let secs = u64::from(l.stalled_polls) * TICK.as_secs();
+                warn!(input = %l.input.name, sent = counters.sent, dropped = counters.dropped, restart = l.stall_restarts, "uplink stalled: the receiver is not acknowledging, restarting the flow");
+                events.emit(Event::Warning {
+                    message: format!(
+                        "{}: the uplink dropped {STALL_DROP_PERCENT} % or more of what it sent over the last {secs} s (sent {}, dropped {} on this connection), so the receiver is not taking it; restarting the flow to connect again (restart {} of {MAX_RESTARTS})",
+                        l.input.name, counters.sent, counters.dropped, l.stall_restarts,
+                    ),
+                });
+                strom.stop_flow(&l.flow_id).await?;
+                return start_again(strom, l).await;
+            }
+            if !l.stall_given_up {
+                l.stall_given_up = true;
+                warn!(input = %l.input.name, "uplink still stalled after {MAX_RESTARTS} restarts, no more restarts");
+                events.emit(Event::Warning {
+                    message: format!(
+                        "{}: the uplink still drops what it sends after {MAX_RESTARTS} restarts, so the receiver is not taking it. No more restarts: the input stays waiting until the receiver takes the feed again. This is a receiver-side fault, see {STALL_UPSTREAM_ISSUE}",
+                        l.input.name,
+                    ),
+                });
+            }
+        }
+        // Bytes move, but nothing arrives: not delivering, whatever the hysteresis.
+        l.last_bytes = sample.bytes_sent;
+        l.quiet_polls = QUIET_TOLERANCE;
+        return Ok(State::Waiting);
+    }
     // Bytes moving between two polls is the test, not growth: a reconnect resets the
     // counter. The first sample has nothing to compare against and proves nothing.
     let delivering = l.last_bytes.is_some_and(|before| {
@@ -1275,6 +1369,91 @@ async fn poll_flow(
             State::Waiting
         },
     )
+}
+
+/// Starts a flow that is not running, forgetting what was measured on its last run.
+async fn start_again(strom: &StromClient, l: &mut Live) -> Result<State> {
+    l.last_bytes = None;
+    l.uplink = None;
+    l.forget_counters();
+    Ok(if strom.start_flow(&l.flow_id).await? {
+        State::Starting
+    } else {
+        State::Failed {
+            reason: "Strom did not report the flow running after start".to_string(),
+        }
+    })
+}
+
+/// An uplink connection's cumulative packet counters. libsrt keeps them per
+/// connection, so they start again from zero when the caller reconnects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Counters {
+    sent: u64,
+    dropped: u64,
+}
+
+impl Counters {
+    fn of(sample: &SrtCallerStats) -> Self {
+        Self {
+            sent: sample.packets_sent.unwrap_or(0),
+            dropped: sample.packets_sent_dropped.unwrap_or(0),
+        }
+    }
+}
+
+impl Live {
+    fn forget_counters(&mut self) {
+        self.last_counters = None;
+        self.stalled_polls = 0;
+    }
+}
+
+/// What one poll interval of an uplink connection shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Interval {
+    /// Nothing to judge: no earlier sample on this connection, counters that went
+    /// down (libsrt reconnected, so this is a new connection), or fewer than
+    /// [`STALL_MIN_SENT`] packets sent.
+    Unjudged,
+    /// Enough was sent and most of it left the sender. A lossy link counts: it still
+    /// delivers a picture.
+    Delivering,
+    /// Enough was sent and the sender dropped [`STALL_DROP_PERCENT`] or more of it
+    /// before transmission: the receiver is not taking the stream.
+    Stalled,
+}
+
+/// Judges the interval between two polls of the same uplink connection. A healthy
+/// link drops none (every run in #120 and on #111, late connects included) and
+/// #111's stall drops all of them; the threshold sits near the stall, so a link
+/// that is congested but still delivering is not mistaken for one.
+fn judge(before: Option<Counters>, now: Counters) -> Interval {
+    let Some(before) = before else {
+        return Interval::Unjudged;
+    };
+    let (Some(sent), Some(dropped)) = (
+        now.sent.checked_sub(before.sent),
+        now.dropped.checked_sub(before.dropped),
+    ) else {
+        return Interval::Unjudged;
+    };
+    if sent < STALL_MIN_SENT {
+        Interval::Unjudged
+    } else if dropped.saturating_mul(100) >= sent.saturating_mul(STALL_DROP_PERCENT) {
+        Interval::Stalled
+    } else {
+        Interval::Delivering
+    }
+}
+
+/// Stalled polls in a row to wait for before the next restart, after `restarts`
+/// restarts that brought no delivering interval back: [`STALLED_POLLS`], doubled per
+/// restart, at most [`MAX_STALLED_POLLS`].
+fn polls_before_restart(restarts: u32) -> u32 {
+    STALLED_POLLS
+        .saturating_mul(1u32.checked_shl(restarts).unwrap_or(u32::MAX))
+        .min(MAX_STALLED_POLLS)
 }
 
 /// Creates or updates each input's Open Live source. One list call proves the API is
@@ -2315,6 +2494,7 @@ fn signal_stop(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     fn sample_status() -> StatusReport {
         StatusReport {
@@ -2750,6 +2930,10 @@ mod tests {
             shown: None,
             last_bytes: None,
             quiet_polls: 0,
+            last_counters: None,
+            stalled_polls: 0,
+            stall_restarts: 0,
+            stall_given_up: false,
             source_id: source_id.map(str::to_string),
             connect_warning: None,
             uplink,
@@ -2836,6 +3020,416 @@ mod tests {
         assert_eq!(inputs[0].uplink.unwrap().dropped, 3);
         assert_eq!(inputs[1].state, State::Waiting);
         assert_eq!(inputs[1].uplink, None);
+    }
+
+    fn counters(sent: u64, dropped: u64) -> Counters {
+        Counters { sent, dropped }
+    }
+
+    /// #111 run B, read 10 s apart: +6,065 sent and +6,065 dropped, RTT steady.
+    /// The receiver has stopped acknowledging; this is a stall.
+    #[test]
+    fn an_uplink_dropping_what_it_sends_is_stalled() {
+        assert_eq!(
+            judge(Some(counters(21_409, 11_406)), counters(27_474, 17_471)),
+            Interval::Stalled
+        );
+        // 90 % dropped is already one.
+        assert_eq!(
+            judge(Some(counters(0, 0)), counters(1_000, 900)),
+            Interval::Stalled
+        );
+    }
+
+    /// #111 run A and the reconnect after run B: nothing dropped. #120's late
+    /// connect through a capped link: a loss burst repaired by retransmission, no
+    /// sender drops. Neither is a stall.
+    #[test]
+    fn a_delivering_uplink_is_not_stalled_even_with_a_connect_burst() {
+        assert_eq!(
+            judge(Some(counters(9_000, 0)), counters(15_376, 0)),
+            Interval::Delivering
+        );
+        assert_eq!(
+            judge(Some(counters(0, 0)), counters(7_882, 0)),
+            Interval::Delivering
+        );
+    }
+
+    /// A venue uplink with less capacity than the stream: the sender drops a large
+    /// share of each interval, but what is left still reaches the receiver as a
+    /// degraded, live picture. That is not #111's "dropped ≈ sent".
+    #[test]
+    fn a_congested_but_delivering_uplink_is_not_stalled() {
+        for dropped in [3_000, 4_200, 5_000, 5_399] {
+            assert_eq!(
+                judge(Some(counters(0, 0)), counters(6_000, dropped)),
+                Interval::Delivering,
+                "{dropped} of 6000 dropped"
+            );
+        }
+        assert_eq!(
+            judge(Some(counters(0, 0)), counters(6_000, 5_400)),
+            Interval::Stalled
+        );
+    }
+
+    #[test]
+    fn stalls_need_a_baseline_on_the_same_connection_and_enough_traffic() {
+        // No earlier sample on this connection.
+        assert_eq!(judge(None, counters(27_474, 17_471)), Interval::Unjudged);
+        // Counters went down: libsrt reconnected, so this is a new connection.
+        assert_eq!(
+            judge(Some(counters(27_474, 17_471)), counters(6_000, 0)),
+            Interval::Unjudged
+        );
+        assert_eq!(
+            judge(Some(counters(27_474, 17_471)), counters(30_000, 10)),
+            Interval::Unjudged
+        );
+        // Too little sent to judge.
+        assert_eq!(
+            judge(Some(counters(100, 0)), counters(500, 400)),
+            Interval::Unjudged
+        );
+        // An absent counter reads as zero.
+        let sample: SrtCallerStats =
+            serde_json::from_value(serde_json::json!({ "bytes_sent": 10 })).unwrap();
+        assert_eq!(Counters::of(&sample), counters(0, 0));
+    }
+
+    #[test]
+    fn the_wait_before_a_restart_doubles_up_to_three_minutes() {
+        let waits: Vec<u32> = (0..7).map(polls_before_restart).collect();
+        assert_eq!(waits, [2, 4, 8, 16, 18, 18, 18]);
+        assert_eq!(polls_before_restart(40), MAX_STALLED_POLLS);
+    }
+
+    /// A fake of the Strom routes `poll_flow` uses, for one flow that runs: each
+    /// srt-stats call answers the next scripted `(sent, dropped)` sample, or no peer
+    /// (404) for `None` or once the script is spent. Every request is recorded.
+    #[derive(Default)]
+    struct FakeStrom {
+        flow: serde_json::Value,
+        running: bool,
+        stats: std::collections::VecDeque<Option<(u64, u64)>>,
+        calls: Vec<String>,
+    }
+
+    async fn fake_strom(state: Arc<Mutex<FakeStrom>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let mut words = head.split_whitespace();
+                let call = format!(
+                    "{} {}",
+                    words.next().unwrap_or(""),
+                    words.next().unwrap_or("")
+                );
+                let (status, body) = {
+                    let mut s = state.lock().unwrap();
+                    s.calls.push(call.clone());
+                    let action = call.rsplit('/').next().unwrap_or("");
+                    let mut flow = s.flow.clone();
+                    match (call.split(' ').next().unwrap_or(""), action) {
+                        ("POST", "start") => {
+                            s.running = true;
+                            flow["running"] = serde_json::json!(true);
+                            ("200 OK", serde_json::json!({ "flow": flow }))
+                        }
+                        ("POST", "stop") => {
+                            s.running = false;
+                            flow["running"] = serde_json::json!(false);
+                            ("200 OK", serde_json::json!({ "flow": flow }))
+                        }
+                        ("GET", "srt-stats") => match s.stats.pop_front().flatten() {
+                            Some((sent, dropped)) => (
+                                "200 OK",
+                                serde_json::json!({
+                                    "flow_id": flow["id"],
+                                    "stats": { "connections": { "uplink:srtsink": {
+                                        "role": "sink", "mode": "caller", "connected": true,
+                                        "callers": [{
+                                            "bytes_sent": sent * 1316,
+                                            "packets_sent": sent,
+                                            "packets_sent_dropped": dropped
+                                        }]
+                                    }}}
+                                }),
+                            ),
+                            None => ("404 Not Found", serde_json::json!({ "error": "no peer" })),
+                        },
+                        ("GET", _) => {
+                            flow["running"] = serde_json::json!(s.running);
+                            ("200 OK", serde_json::json!({ "flow": flow }))
+                        }
+                        _ => ("404 Not Found", serde_json::Value::Null),
+                    }
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Drives `poll_flow` over a scripted srt-stats sequence, one poll per sample,
+    /// as the loop's tick does, and returns each poll's state, the warnings emitted,
+    /// and the stop and start calls Strom saw, in order.
+    struct Script {
+        states: Vec<State>,
+        warnings: Vec<String>,
+        restarts: Vec<String>,
+        live: Live,
+    }
+
+    async fn run_script(initial: State, samples: &[Option<(u64, u64)>]) -> Script {
+        let mut l = live("A", initial, None, None);
+        let video = Video::default();
+        let state = Arc::new(Mutex::new(FakeStrom {
+            flow: serde_json::to_value(flow::build("gw", &l.input, &video)).unwrap(),
+            running: true,
+            stats: samples.iter().copied().collect(),
+            calls: Vec::new(),
+        }));
+        let strom = StromClient::new(&fake_strom(state.clone()).await, None).unwrap();
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let events = {
+            let warnings = warnings.clone();
+            Events::new(move |e| {
+                if let Event::Warning { message } = e {
+                    warnings.lock().unwrap().push(message);
+                }
+            })
+        };
+        let mut states = Vec::new();
+        for _ in samples {
+            let polled = poll_flow(&strom, "gw", &video, &mut l, &events)
+                .await
+                .unwrap();
+            l.state = polled.clone();
+            states.push(polled);
+        }
+        let restarts = state
+            .lock()
+            .unwrap()
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("POST"))
+            .map(|c| c.rsplit('/').next().unwrap().to_string())
+            .collect();
+        let warnings = warnings.lock().unwrap().clone();
+        Script {
+            states,
+            warnings,
+            restarts,
+            live: l,
+        }
+    }
+
+    /// #111 run B's rate: +6,065 sent and +6,065 dropped per poll.
+    const STALL: u64 = 6_065;
+
+    /// A stalled sample `n` polls into a connection.
+    fn stall(n: u64) -> Option<(u64, u64)> {
+        Some((n * STALL, n * STALL))
+    }
+
+    /// A clean sample `n` polls into a connection.
+    fn clean(n: u64) -> Option<(u64, u64)> {
+        Some((n * STALL, 0))
+    }
+
+    /// The stall of #111 on an input that is on air: the first stalled poll
+    /// is already Waiting, the second stops and starts the flow with a warning, and
+    /// the restarted flow reports Starting.
+    #[tokio::test]
+    async fn a_stalled_uplink_is_waiting_then_restarted_with_a_warning() {
+        let run = run_script(
+            State::Waiting,
+            &[
+                clean(1),
+                clean(2),
+                Some((3 * STALL, STALL)),
+                Some((4 * STALL, 2 * STALL)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            run.states,
+            [
+                State::Waiting,
+                State::OnAir,
+                State::Waiting,
+                State::Starting
+            ]
+        );
+        assert_eq!(run.restarts, ["stop", "start"]);
+        assert_eq!(run.warnings.len(), 1, "{:?}", run.warnings);
+        let warning = &run.warnings[0];
+        assert!(warning.contains("Venue — A"), "{warning}");
+        assert!(warning.contains("over the last 20 s"), "{warning}");
+        assert!(warning.contains("restart 1 of 4"), "{warning}");
+        assert_eq!(run.live.stall_restarts, 1);
+        assert_eq!(run.live.last_counters, None);
+    }
+
+    /// One stalled interval followed by a clean one is a burst, not a stall: no
+    /// restart, no warning, and the input is on air again.
+    #[tokio::test]
+    async fn a_stall_followed_by_a_clean_interval_is_not_restarted() {
+        let run = run_script(
+            State::Waiting,
+            &[
+                clean(1),
+                clean(2),
+                Some((3 * STALL, STALL)),
+                Some((4 * STALL, STALL)),
+                Some((5 * STALL, STALL)),
+            ],
+        )
+        .await;
+        assert_eq!(
+            run.states,
+            [
+                State::Waiting,
+                State::OnAir,
+                State::Waiting,
+                State::OnAir,
+                State::OnAir
+            ]
+        );
+        assert!(run.restarts.is_empty(), "{:?}", run.restarts);
+        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+    }
+
+    /// A congested link dropping 70 % of each interval keeps delivering: it stays on
+    /// air and is never restarted.
+    #[tokio::test]
+    async fn a_lossy_but_delivering_uplink_is_never_restarted() {
+        let lossy = |n: u64| Some((n * 6_000, n * 4_200));
+        let run = run_script(State::Waiting, &[lossy(1), lossy(2), lossy(3), lossy(4)]).await;
+        assert_eq!(
+            run.states,
+            [State::Waiting, State::OnAir, State::OnAir, State::OnAir]
+        );
+        assert!(run.restarts.is_empty(), "{:?}", run.restarts);
+        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
+    }
+
+    /// One connection that stalls from its first sample, after the flow (re)starts:
+    /// the no-baseline sample, then `stalled` stalled polls.
+    fn stalled_connection(stalled: u64) -> Vec<Option<(u64, u64)>> {
+        (1..=stalled + 1).map(stall).collect()
+    }
+
+    /// A receiver that never takes the feed: each restart waits twice as long as the
+    /// one before, and after the cap the input stays Waiting, with one warning that
+    /// points at the receiver, and no more restarts.
+    #[tokio::test]
+    async fn a_receiver_that_never_recovers_gets_backed_off_restarts_then_none() {
+        let mut samples = Vec::new();
+        for restart in 0..MAX_RESTARTS {
+            samples.extend(stalled_connection(u64::from(polls_before_restart(restart))));
+        }
+        // Long after the cap: still stalled, still no restart.
+        samples.extend(stalled_connection(40));
+        let run = run_script(State::Waiting, &samples).await;
+
+        let stops = run.restarts.iter().filter(|c| *c == "stop").count();
+        assert_eq!(stops, MAX_RESTARTS as usize, "{:?}", run.restarts);
+        // The restarts landed after 2, 4, 8 and 16 stalled polls of their connection.
+        let starting: Vec<usize> = run
+            .states
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| **s == State::Starting)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(starting, [2, 7, 16, 33]);
+        assert!(run.states[34..].iter().all(|s| *s == State::Waiting));
+
+        assert_eq!(
+            run.warnings.len(),
+            MAX_RESTARTS as usize + 1,
+            "{:?}",
+            run.warnings
+        );
+        assert!(run.warnings[1].contains("over the last 40 s"));
+        assert!(run.warnings[3].contains("over the last 160 s"));
+        let given_up = run.warnings.last().unwrap();
+        assert!(given_up.contains("No more restarts"), "{given_up}");
+        assert!(given_up.contains("strom/issues/1277"), "{given_up}");
+        assert!(run.live.stall_given_up);
+    }
+
+    /// A delivering interval after restarts resets the backoff: the next stall is
+    /// restarted after two polls again, and a given-up input can restart again.
+    #[tokio::test]
+    async fn a_delivering_interval_resets_the_backoff() {
+        let mut samples = stalled_connection(2);
+        samples.extend([
+            stall(1),
+            Some((2 * STALL, STALL)),
+            Some((3 * STALL, STALL)),
+            Some((4 * STALL, 2 * STALL)),
+            Some((5 * STALL, 3 * STALL)),
+        ]);
+        let run = run_script(State::Waiting, &samples).await;
+        assert_eq!(run.restarts, ["stop", "start", "stop", "start"]);
+        assert_eq!(*run.states.last().unwrap(), State::Starting);
+        assert!(
+            run.warnings[1].contains("restart 1 of 4"),
+            "{:?}",
+            run.warnings
+        );
+
+        let mut l = live("A", State::Waiting, None, None);
+        l.stall_restarts = MAX_RESTARTS;
+        l.stall_given_up = true;
+        l.last_counters = Some(counters(0, 0));
+        let video = Video::default();
+        let state = Arc::new(Mutex::new(FakeStrom {
+            flow: serde_json::to_value(flow::build("gw", &l.input, &video)).unwrap(),
+            running: true,
+            stats: [clean(1)].into_iter().collect(),
+            calls: Vec::new(),
+        }));
+        let strom = StromClient::new(&fake_strom(state).await, None).unwrap();
+        poll_flow(&strom, "gw", &video, &mut l, &Events::discard())
+            .await
+            .unwrap();
+        assert_eq!(l.stall_restarts, 0);
+        assert!(!l.stall_given_up);
+    }
+
+    #[test]
+    fn forgetting_the_counters_resets_the_stall_count() {
+        let mut l = live("A", State::Waiting, None, None);
+        l.last_counters = Some(counters(10, 10));
+        l.stalled_polls = 1;
+        l.forget_counters();
+        assert_eq!(l.last_counters, None);
+        assert_eq!(l.stalled_polls, 0);
     }
 
     #[test]
