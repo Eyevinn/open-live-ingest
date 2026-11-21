@@ -1,0 +1,73 @@
+name: E2E audio device
+
+# A device source with a paired audio device, end to end against the `openlivedev`
+# Open Live instance (OL-61b, #70): a v4l2loopback camera and a PulseAudio
+# microphone, the pinned Strom, `up --audio`, a check that the source is registered
+# and carries an audio track, then its removal. The script's header says what is
+# checked and how: .github/scripts/e2e-audio-device.sh.
+#
+# Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
+# token for the workspace that owns `openlivedev`. Without it, a run by hand fails and
+# names the secret; a pull request run still sets up and checks the virtual devices
+# and Strom, then ends with a warning naming the secret and passes, so the missing
+# secret does not turn unrelated pull requests red. A pull request from a fork gets
+# no secrets, so the job is skipped there.
+#
+# Runs by hand, and on a pull request that touches the e2e itself or the code paths
+# it covers (devices, flows, the Strom and Open Live clients, `up`). One run at a
+# time per instance, since every run registers a source on the same shared instance
+# and uses the same SRT port range there. GitHub keeps one run in progress and one
+# pending per group: a third run cancels the pending one, which then shows as
+# cancelled on its pull request (and the team's merge gate reads that as failing).
+# When that happens, re-run the cancelled job once the others have finished.
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: Open Live instance name in the token's OSC workspace
+        default: openlivedev
+  pull_request:
+    paths:
+      - .github/workflows/e2e-audio-device.yml
+      - .github/scripts/e2e-audio-device.sh
+      - src/devices.rs
+      - src/flow.rs
+      - src/strom.rs
+      - src/openlive.rs
+      - src/run.rs
+      - Cargo.toml
+
+concurrency:
+  group: e2e-${{ inputs.instance || 'openlivedev' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Third-party actions are pinned by commit, as in strom-pin.yml: this job holds
+    # the OSC personal access token and the runner has passwordless sudo.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master, 2026-11-15
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked
+      - name: Device source with a paired audio device, against Open Live
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          OPEN_LIVE_INSTANCE: ${{ inputs.instance || 'openlivedev' }}
+          # A run by hand needs the secret; a pull request run without it warns and
+          # passes after the device checks.
+          E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+          # Reads the Strom release (asset and digest) only.
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/e2e-audio-device.sh target/debug/open-live-ingest
