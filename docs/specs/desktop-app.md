@@ -49,6 +49,7 @@ app/Cargo.toml        [package] open-live-ingest-app, publish = false
 app/src/main.rs       window, event loop, menus, IPC dispatcher, quit guard
 app/src/model.rs      UI state: inputs, rows, messages. Pure Rust, unit tested
 app/src/messages.rs   the failure → message table of §10
+app/src/status.rs     the status lines while live (§5.1): productions holding each source, link
 app/src/platform/     macos.rs (applicationShouldTerminate, camera/mic authorisation),
                       windows.rs (WM_QUERYENDSESSION subclass, single-instance mutex)
 app/ui/               index.html, app.css, app.js (static, compiled in with include_bytes!)
@@ -204,8 +205,9 @@ below an unfinished one is visible but disabled.
      rows' pickers (#64 AC5's rule, enforced again by `validate`).
    - Selection is saved on change (§6).
 3. **Go live / Stop.** One button. While live each ticked row shows a state and a one-line reason
-   when failed, plus bitrate. A banner above the rows carries session-wide notices (Open Live
-   unreachable, Studio cannot see the venue). The rest of the window is read-only while live.
+   when failed, plus bitrate, and under it the status lines of §5.1. A banner above the rows
+   carries session-wide notices (Open Live unreachable, Studio cannot see the venue). The rest of
+   the window is read-only while live.
 
 **Advanced** (collapsed): venue name (`gateway.name`), local Strom (URL, manage, binary, API key,
 "Open Strom"), uplink (mode, host, public host, port range, latency, passphrase), video (codec,
@@ -219,6 +221,52 @@ logs, Open Live Ingest on GitHub). Windows: no menu bar; "Show logs" is a link i
 Per-input states shown: `Starting Strom…` (session-wide), `Registering`, `Connecting`, `Live`,
 `Failed: <reason>`, `Stopping`, `Not connected` (a saved device that is not present now; skipped,
 the others go live).
+
+### 5.1 Status lines while live (#126 AC4, #129)
+
+Open Live only receives an input once a production holding its source is activated, so each row
+says what the uplink depends on. Two lines under each row, refreshed every 4 s (`status::POLL`,
+under the 5 s #126 AC4 asks for) by a poller of their own, apart from the session's 10 s tick:
+
+- **Production.** The productions on the instance (`GET /api/v1/productions`) whose
+  `sources[].sourceId` is the input's source id, each with its name, its state (`inactive`,
+  `activating`, `active`, `ended`; a state the app does not know shows as `unknown`) and the slot
+  (`sources[].mixerInput`, `video_in_<n>`) or slots that hold the source:
+  `Production: Morning Show (active), slot video_in_1`. Several are listed in Open Live's order,
+  separated by `;`. None holding it: `Production: none holds this source`. When Open Live does
+  not answer, refuses, or the source is not registered yet: `Production: unknown`. A failed poll
+  never stops or changes the feed, and is logged at `debug` only.
+  The production routes return CouchDB documents, so a production's id is `_id` (as Studio reads
+  it); the client also takes `id`, which is what the OpenAPI document names.
+- **Link.** From the local Strom's `GET /api/flows/<flow id>/srt-stats` for the input's flow (the
+  sending element's first peer, as the session reads it):
+  - `not sending`: no flow, or no SRT peer;
+  - `connecting`: a peer, but `packets_sent` did not grow since the last poll (the first poll of a
+    peer, too, since there is nothing to compare with);
+  - `connected`: `packets_sent` grew; with the share dropped over that interval,
+    `Δpackets_sent_dropped / Δpackets_sent`, as a percentage;
+  - `unknown`: the local Strom did not answer.
+
+  With the smoothed RTT whenever there is a peer: `Link: connected, 0.2 % dropped, RTT 31 ms`.
+
+The input's flow id and source id come from the session's `stats` (`gateway::InputStats`), so
+nothing is polled before the first tick names them. Stop ends the poller with the session; the
+lines go when the page hears `stopped`. Stop keeps each input's source, marked inactive (§4,
+#115), so the next Go live adopts it with the same id, and the Production line names the same
+productions and slots again from the first tick; the source being inactive in between does not
+change which productions hold it.
+
+**Waiting names what is missing** (#116 item 1). A row whose flow waits for a receiver
+(`InputState::Waiting`) is `Connecting`; when the last poll tells why, its line says so (§10):
+no production holds the source, or every production holding it is `inactive` or `ended`. That
+replaces the 30 s "Nothing has reached the cloud yet" line, which is about the network. With a
+holding production `activating` or `active`, or the productions unknown, the row keeps the
+ordinary wording. Starting and Unreachable (lost contact with Strom) are not waiting for Open
+Live and never get the hint.
+
+The library also has `OpenLiveClient::assign_source` (`POST /api/v1/productions/:id/sources`
+with `{sourceId, mixerInput}`, Open Live's `SourceAssignmentInput`; it replaces whatever that slot
+held). The window does not offer it yet: the slot is chosen in Studio.
 
 ## 6. Settings and data model
 
@@ -361,6 +409,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
 | `input` | `{input, state, message?, action?}` | per-input registering / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
 | `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
+| `status` | `{inputs: [{input, productions: null \| [{name, state, slots: []}], link: {state: "not_sending" \| "connecting" \| "connected" \| "unknown", dropped_pct, rtt_ms}}]}` | the status lines of §5.1, every 4 s while live; not a library event (the app polls Open Live and the local Strom itself). `productions` is `null` when unknown, `[]` when none holds the source |
 | `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |
 | `stopping` | `{done, total}` | teardown progress |
 | `stopped` | `{left_behind: [], error}` | teardown finished; anything not removed is named. `error` (`{message, action}`, §10) when the session ended on a failure, else `null` |
@@ -431,6 +480,8 @@ row can be added.
 | Strom's port in use by another program | Port `<port>` is used by another program. Change the local Strom port under Advanced. | Advanced |
 | Another gateway already live (`gateway.pid`) | Open Live Ingest is already live from another window or a terminal. | Stop it |
 | Input connected but nothing delivered for 30 s (bytes not moving, §7 of DESIGN) | Row stays Connecting, with: Nothing has reached the cloud yet. Check that this network allows outgoing UDP. | — |
+| Input waiting for a receiver, and no production holds its source (§5.1) | Row stays Connecting, with: Waiting for Open Live: no production holds this source. Put it in a production in Studio and activate it. | Open Studio |
+| Input waiting for a receiver, and every production holding its source is inactive or ended (§5.1) | Row stays Connecting, with: Waiting for Open Live: production "`<name>`" is inactive. Activate it in Studio. (Several: productions "`<a>`", "`<b>`" are inactive. Activate one in Studio.) | Open Studio |
 | Gateway token refused on the heartbeat | Banner: Studio can't see this venue's status (gateway token refused). Your cameras are still sending. | Advanced |
 | Settings file invalid (hand-edited) | The settings file has a problem: `<first problem>`. | Show file |
 | WebView2 missing (Windows, installer) | Installer: Microsoft Edge WebView2 is required. Install it from Microsoft, then run this installer again. | — |

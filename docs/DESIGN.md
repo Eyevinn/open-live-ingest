@@ -233,7 +233,12 @@ nested bundles. With `strom.binary` at its default, a `strom` next to the runnin
 executable is *bundled* only when the bundle layout is really there: the parent of the executable's
 directory (the bundle's `Contents`) holds `PlugIns/gstreamer`. Only a bundled Strom is started with
 the GStreamer plugin path, scanner and registry pointed into the bundle and the managed data
-directory, so a Homebrew GStreamer on the same Mac is never mixed in. A `strom` next to the
+directory, so a Homebrew GStreamer on the same Mac is never mixed in. The same goes for the bundled
+GLib, which was built for Homebrew's prefix and would otherwise load GIO modules from
+`/opt/homebrew/lib/gio/modules` and look for shared data under `/usr/local/share`: a bundled Strom
+gets `GIO_MODULE_DIR` pointed at an empty `Contents/PlugIns/gio`, `GIO_EXTRA_MODULES` cleared and
+`XDG_DATA_DIRS` set to `Contents/Resources`. The bundle ships no GIO module because no flow of ours
+needs one: the SRT uplink encrypts with libsrt, not with GIO's TLS. A `strom` next to the
 executable without that layout, as `install.sh` leaves it in `/usr/local/bin` or `~/.local/bin`, is
 still preferred over `PATH` but is not bundled: like a Strom from `PATH` or an explicit path, it
 brings its own GStreamer and gets no GStreamer environment. Pointing `GST_PLUGIN_SYSTEM_PATH` at a
