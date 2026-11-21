@@ -21,6 +21,14 @@
 //! Open Live source in place instead, at a stop and at a failed start, reported with
 //! `SourceRetained`; the next session adopts it by name, with the same id.
 //!
+//! A session started with [`Session::start_armed`] registers its inputs but starts
+//! no flow: each input is `Armed` (after `Registering` / `Registered`, before the
+//! `Summary`) until a production holding its source is live. Then `ProductionLive`,
+//! and the input goes through starting, waiting and on air as above; when no
+//! production holding it is live any more, `NoProductionLive` and `Armed` again,
+//! with the source kept. `SlotAddedWhileLive` names the live productions that were
+//! given the source while live, which have no receiver for it until reactivated.
+//!
 //! # Caveats
 //!
 //! - **A panic.** Should the session's task panic, it ends without its teardown: the
@@ -45,7 +53,7 @@ use crate::config::{self, Config};
 use crate::credential::OscCredential;
 use crate::devices::AudioPairing;
 use crate::gateway::{Event, Events};
-use crate::run::{self, Sources, Stop};
+use crate::run::{self, Sending, Sources, Stop};
 use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -100,7 +108,7 @@ impl Session {
     /// the same way, in the background, as long as the runtime keeps running (see
     /// the module documentation's caveats).
     pub fn start(settings: Config, inputs: Inputs) -> (SessionHandle, Receiver) {
-        Self::start_inner(settings, None, inputs, Sources::Remove)
+        Self::start_inner(settings, None, inputs, (Sources::Remove, Sending::Always))
     }
 
     /// [`start`](Self::start), registering with `credential`, the Open Source Cloud
@@ -113,7 +121,12 @@ impl Session {
         inputs: Inputs,
         credential: OscCredential,
     ) -> (SessionHandle, Receiver) {
-        Self::start_inner(settings, Some(credential), inputs, Sources::Remove)
+        Self::start_inner(
+            settings,
+            Some(credential),
+            inputs,
+            (Sources::Remove, Sending::Always),
+        )
     }
 
     /// [`start`](Self::start), or [`start_with`](Self::start_with) when `credential`
@@ -127,14 +140,39 @@ impl Session {
         inputs: Inputs,
         credential: Option<OscCredential>,
     ) -> (SessionHandle, Receiver) {
-        Self::start_inner(settings, credential, inputs, Sources::Keep)
+        Self::start_inner(
+            settings,
+            credential,
+            inputs,
+            (Sources::Keep, Sending::Always),
+        )
+    }
+
+    /// Starts a session that arms rather than sends ([`Sending::WhileLive`]): it
+    /// registers each input's source (or adopts the one a stop kept), and starts an
+    /// input's uplink only while a production holding its source is live, stopping it
+    /// again, the source kept, when none is. Each input is [`InputState::Armed`]
+    /// meanwhile, and [`Event::ProductionLive`] / [`Event::NoProductionLive`] mark
+    /// each start and stop. `sources` says what the session's own stop does with the
+    /// sources, as for the other starts. Needs registration with Open Live: settings
+    /// with `[open_live] register` off end the session at once with
+    /// [`Event::Failed`].
+    ///
+    /// [`InputState::Armed`]: crate::gateway::InputState::Armed
+    pub fn start_armed(
+        settings: Config,
+        inputs: Inputs,
+        credential: Option<OscCredential>,
+        sources: Sources,
+    ) -> (SessionHandle, Receiver) {
+        Self::start_inner(settings, credential, inputs, (sources, Sending::WhileLive))
     }
 
     fn start_inner(
         settings: Config,
         credential: Option<OscCredential>,
         inputs: Inputs,
-        sources: Sources,
+        sources: (Sources, Sending),
     ) -> (SessionHandle, Receiver) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel::<Stop>();
@@ -184,7 +222,7 @@ async fn run(
     settings: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
-    sources: Sources,
+    sources: (Sources, Sending),
     events: &Events,
     stop: impl std::future::Future<Output = Stop> + Send,
 ) -> Result<()> {

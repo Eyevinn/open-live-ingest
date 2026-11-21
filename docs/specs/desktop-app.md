@@ -147,6 +147,46 @@ packaging/windows/    open-live-ingest.nsi
 
 ### Go live and Stop
 
+Go live **arms** (#130, OL-63c): the session registers each input's source, or adopts the one an
+earlier Stop kept (same id, #115), and starts no flow. An input's uplink runs only while a
+production holding its source is live, and airing stays the director's call in Studio. The
+session reads `GET /api/v1/productions` every 2 s while armed (`run::GATE_POLL`; every 1 s while a
+production holding one of the sources is `activating`), on a clock of its own apart from the 10 s
+tick, and per input:
+
+- a production holding the source is **`active`** (#128's verdict: a production with no sender
+  reaches `active` on its own within its activation window, so arming does not deadlock it, and a
+  connect into an already active production is clean): the flow is created and started
+  (`ProductionLive`), and the input goes starting → waiting → on air as before, the stall detect
+  and restart of #127 included;
+- none is any more (every one holding it `inactive`, `ended`, `activating` or unknown, or the
+  source taken out of it): the flow is removed and the input is `Armed` again (`NoProductionLive`).
+  The source stays registered, and the next tick marks it inactive.
+
+Both are idempotent: what the productions ask for is compared with whether the flow runs, so
+several productions holding the source start it once and stop it only when none of them is live.
+The productions not being readable changes nothing: a running uplink keeps running, an armed one
+stays armed, and the next look tries again (logged once, not every look). A start that fails
+(Strom refusing the flow) shows the row failed and is retried at every look while the production
+is live. Stop leaves Armed: it removes any running flow and keeps each source, as before. A camera
+that cannot be opened is therefore found when a production goes live, not at Go live.
+
+**A slot added to a live production** gets no receiver until the production is deactivated and
+reactivated (#128). The session tells it from two looks in a row (the production `active` both
+times, the source in it only the second time; never at the first look, when a slot in an active
+production may well have been there at activation) and names those productions
+(`SlotAddedWhileLive`) until they leave `active` or drop the source. The uplink still runs, for
+any other production holding the source; the row says the director has to deactivate and
+reactivate the production (§10).
+
+Without registration with Open Live (`[open_live] register` off) there are no productions to wait
+for, and Go live sends at once, as before (`Session::start_keeping_sources`). Eyevinn/open-live's
+`docs/specs/studio-gateways.md` Phase 2 START/STOP, a command from Studio over the gateway's
+connection, could later replace the polling.
+
+The CLI's `up` keeps sending from the start. `up --wait-for-production` arms as the app does
+(`Session::start_armed` with `Sources::Remove`, so Ctrl-C still removes its sources).
+
 ```mermaid
 sequenceDiagram
     actor P as Person
@@ -163,19 +203,29 @@ sequenceDiagram
     alt problems
         App-->>UI: error (one line + action, §10)
     else ok
-        App->>Lib: Session::start_keeping_sources(settings, inputs, credential)
+        App->>Lib: Session::start_armed(settings, inputs, credential, Sources::Keep)
         Lib->>S: probe strom.url; start headless if unreachable (strom.pid)
         Lib-->>App: Event: Strom starting / ready
         Lib->>OL: adopt each input's source by name (same id, same port), or register it (caller mode: port 0 → assigned port)
-        Lib->>S: create + start one flow per input (derived flow id)
-        Lib-->>App: Event per input: registering → connecting → live
+        Lib-->>App: Event per input: registering → armed
+        App-->>UI: {"event":"input", state "armed" / "waiting_for_production"}
+        loop every 2 s while armed (1 s while activating)
+            Lib->>OL: GET /api/v1/productions
+            alt a production holding the source is active
+                Lib->>S: create + start the input's flow (derived flow id)
+                Lib-->>App: ProductionLive, then starting → waiting → on air
+            else none holding it is active any more
+                Lib->>S: remove the input's flow (the source stays)
+                Lib-->>App: NoProductionLive, then armed
+            end
+        end
         App-->>UI: {"event":"input", ...} per change, {"event":"stats"} every tick
     end
     P->>UI: Stop (or quit, §8)
     UI->>App: {"cmd":"stop"}
     App->>Lib: SessionHandle::stop()
     Lib->>OL: heartbeat "stopping"
-    Lib->>S: remove flows; stop the Strom we started
+    Lib->>S: remove flows (an armed input has none); stop the Strom we started
     Lib->>OL: keep each input's source, marked inactive; sweep other sources of the prefix
     Lib-->>App: Event: removed … / kept … / stopped
     App-->>UI: {"event":"stopped"}
@@ -218,9 +268,15 @@ Defaults are today's `Config::default()` values; nothing here is needed for AC1.
 Cut, Copy, Paste, Select All: needed for Cmd-V into the token and key fields), Window, Help (Show
 logs, Open Live Ingest on GitHub). Windows: no menu bar; "Show logs" is a link in the window footer.
 
-Per-input states shown: `Starting Strom…` (session-wide), `Registering`, `Connecting`, `Live`,
-`Failed: <reason>`, `Stopping`, `Not connected` (a saved device that is not present now; skipped,
-the others go live).
+Per-input states shown: `Starting Strom…` (session-wide), `Registering`, `Armed` (registered,
+sending nothing: no production holds the source, or the productions are not known yet),
+`Waiting for production` (armed, and productions hold the source, none of them live yet),
+`Connecting`, `Live`, `Failed: <reason>`, `Stopping`, `Not connected` (a saved device that is not
+present now; skipped, the others go live). Armed and Waiting for production come from the
+session's `Armed` state and the §5.1 poll's productions; a production going live turns the row to
+Connecting through the session's own states (§4, Go live and Stop). The button stays Go live /
+Stop: Stop also ends an armed session. An armed row is not counted as sending by the quit
+question (§8), which then reads "You are going live".
 
 ### 5.1 Status lines while live (#126 AC4, #129)
 
@@ -407,7 +463,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `event` | `data` | From library event (#71/#72) |
 |---|---|---|
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
-| `input` | `{input, state, message?, action?}` | per-input registering / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
+| `input` | `{input, state, message?, action?}` | per-input registering / armed / waiting_for_production / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
 | `summary` | `{inputs: [{input, port, uplink, registered}]}` | the start summary: `uplink` is where the gateway sends (in caller mode `srt://<host>:<port>?mode=caller&latency=<ms>`), `registered` the address registered with Open Live; passphrases masked |
 | `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
 | `status` | `{inputs: [{input, productions: null \| [{name, state, slots: []}], link: {state: "not_sending" \| "connecting" \| "connected" \| "unknown", dropped_pct, rtt_ms}}]}` | the status lines of §5.1, every 4 s while live; not a library event (the app polls Open Live and the local Strom itself). `productions` is `null` when unknown, `[]` when none holds the source |
@@ -483,6 +539,9 @@ row can be added.
 | Input connected but nothing delivered for 30 s (bytes not moving, §7 of DESIGN) | Row stays Connecting, with: Nothing has reached the cloud yet. Check that this network allows outgoing UDP. | — |
 | Input waiting for a receiver, and no production holds its source (§5.1) | Row stays Connecting, with: Waiting for Open Live: no production holds this source. Put it in a production in Studio and activate it. | Open Studio |
 | Input waiting for a receiver, and every production holding its source is inactive or ended (§5.1) | Row stays Connecting, with: Waiting for Open Live: production "`<name>`" is inactive. Activate it in Studio. (Several: productions "`<a>`", "`<b>`" are inactive. Activate one in Studio.) | Open Studio |
+| Armed, and no production holds the input's source (or the productions are unknown) (§4, §5) | Row Armed, with: Ready. Nothing is sent until a production that holds this source is activated in Studio. | Open Studio |
+| Armed, and productions hold the source but none is live (§4, §5) | Row Waiting for production, with: Ready. Sending starts when production "`<name>`" is activated in Studio. (Several: when one of productions "`<a>`", "`<b>`" is activated in Studio.) | Open Studio |
+| The source was put in a production while that production was live (`SlotAddedWhileLive`, #128) | Row Connecting, with: Production "`<name>`" got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate the production in Studio; until then it cannot show this input. | Open Studio |
 | Gateway token refused on the heartbeat | Banner: Studio can't see this venue's status (gateway token refused). Your cameras are still sending. | Advanced |
 | Settings file invalid (hand-edited) | The settings file has a problem: `<first problem>`. | Show file |
 | WebView2 missing (Windows, installer) | Installer: Microsoft Edge WebView2 is required. Install it from Microsoft, then run this installer again. | — |

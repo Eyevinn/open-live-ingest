@@ -33,6 +33,7 @@ open-live-ingest up --audio "FaceTime=USB Microphone"  # send an audio source wi
 open-live-ingest up --all         # include virtual devices, skipped by default
 open-live-ingest up --test        # a test pattern and tone, to commission the link
 open-live-ingest up --reconfigure # ask for every setting again
+open-live-ingest up --wait-for-production  # send each input only while a production holding it is active
 open-live-ingest status           # what is running, from Strom and Open Live directly
 open-live-ingest down             # stop and remove the flows and sources
 open-live-ingest devices          # the cameras and audio sources Strom can see

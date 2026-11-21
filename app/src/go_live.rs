@@ -5,9 +5,10 @@
 //! lists, each failure one line from `messages` (section 10): the settings file, at
 //! least one input ticked, no other gateway live on this machine (`gateway.pid`, a CLI
 //! `up` or another app), camera and microphone access (macOS), and a Strom left behind
-//! by a crash reclaimed rather than adopted. Then it starts [`Session`] and turns its
-//! events into the page's: one row per input with its state and bitrate, banners for
-//! session-wide notices, and teardown progress. Stop runs the session's own teardown
+//! by a crash reclaimed rather than adopted. Then it starts [`Session`], armed
+//! ([`Session::start_armed`]: each uplink runs only while a production holding its
+//! source is live), and turns its events into the page's: one row per input with its
+//! state and bitrate, banners for session-wide notices, and teardown progress. Stop runs the session's own teardown
 //! ([`SessionHandle::request_stop`]) and the rows show it.
 //!
 //! [`Rows`] is the mapping from library events to page events, pure apart from the
@@ -22,7 +23,7 @@ use open_live_ingest::config::{self, Config};
 use open_live_ingest::gateway::{self, Events, InputState};
 use open_live_ingest::keychain::SecretStore;
 use open_live_ingest::local_strom;
-use open_live_ingest::run::{self, Stop};
+use open_live_ingest::run::{self, Sources, Stop};
 use open_live_ingest::session::{Inputs, Session, SessionHandle};
 use open_live_ingest::strom::StromClient;
 use serde::Serialize;
@@ -47,6 +48,11 @@ const TEST_PATTERN: &str = "test";
 #[serde(rename_all = "snake_case")]
 pub enum RowState {
     Registering,
+    /// Registered and armed, sending nothing: no production holds its source (or the
+    /// productions are not known yet).
+    Armed,
+    /// Armed, and productions hold its source, but none of them is live yet.
+    WaitingForProduction,
     Connecting,
     Live,
     Failed,
@@ -72,6 +78,10 @@ struct Row {
 }
 
 impl Row {
+    fn is_armed(&self) -> bool {
+        matches!(self.state, RowState::Armed | RowState::WaitingForProduction)
+    }
+
     fn event(&self) -> Event {
         Event::new(
             "input",
@@ -104,6 +114,10 @@ pub struct Rows {
     rows: Vec<Row>,
     /// Per input, what its row says while waiting, from the last status poll.
     hints: HashMap<String, Message>,
+    /// Per input, the productions holding its source, from the last status poll.
+    held: HashMap<String, status::Productions>,
+    /// Per input, the live productions that got its source while live (#128).
+    added_while_live: HashMap<String, Message>,
     notices: Vec<&'static str>,
     /// Open Live could not be reached in the tick now ending.
     unreachable_this_tick: bool,
@@ -117,6 +131,8 @@ impl Rows {
             ctx,
             rows: Vec::new(),
             hints: HashMap::new(),
+            held: HashMap::new(),
+            added_while_live: HashMap::new(),
             notices: Vec::new(),
             unreachable_this_tick: false,
             stopping: None,
@@ -202,6 +218,14 @@ impl Rows {
             }
             E::Summary { inputs } => {
                 for started in inputs {
+                    // An armed row is told its state before the summary.
+                    if self
+                        .rows
+                        .iter()
+                        .any(|r| r.input == started.name && r.is_armed())
+                    {
+                        continue;
+                    }
                     out.extend(self.set(&started.name, RowState::Connecting, None, now));
                 }
                 // Where each input's uplink goes, and the address registered with Open
@@ -218,6 +242,29 @@ impl Rows {
                     }),
                 ));
             }
+            E::Input {
+                input,
+                state: InputState::Armed,
+            } => {
+                let (state, message) = self.armed(input);
+                out.extend(self.set(input, state, Some(message), now));
+                out.extend(self.show_hint(input, false));
+            }
+            E::SlotAddedWhileLive { input, productions } => {
+                if productions.is_empty() {
+                    self.added_while_live.remove(input);
+                } else {
+                    self.added_while_live.insert(
+                        input.clone(),
+                        Failure::SlotAddedWhileLive {
+                            names: productions.clone(),
+                        }
+                        .message(),
+                    );
+                }
+                let waiting = self.row(input).waiting;
+                out.extend(self.show_hint(input, waiting));
+            }
             E::Input { input, state } => {
                 let waiting = *state == InputState::Waiting;
                 let (state, message) = match state {
@@ -229,6 +276,7 @@ impl Rows {
                     InputState::Starting | InputState::Waiting | InputState::Unreachable => {
                         (RowState::Connecting, None)
                     }
+                    InputState::Armed => unreachable!("matched above"),
                 };
                 out.extend(self.set(input, state, message, now));
                 out.extend(self.show_hint(input, waiting));
@@ -291,7 +339,11 @@ impl Rows {
                 for at in 0..self.rows.len() {
                     if matches!(
                         self.rows[at].state,
-                        RowState::Registering | RowState::Connecting | RowState::Live
+                        RowState::Registering
+                            | RowState::Armed
+                            | RowState::WaitingForProduction
+                            | RowState::Connecting
+                            | RowState::Live
                     ) {
                         total += 1;
                         let input = self.rows[at].input.clone();
@@ -335,6 +387,18 @@ impl Rows {
                 Some(hint) => self.hints.insert(s.input.clone(), hint),
                 None => self.hints.remove(&s.input),
             };
+            self.held.insert(s.input.clone(), s.productions.clone());
+        }
+        // An armed row names what it waits for, as the productions now say.
+        let armed: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.is_armed())
+            .map(|r| r.input.clone())
+            .collect();
+        for input in armed {
+            let (state, message) = self.armed(&input);
+            out.extend(self.set(&input, state, Some(message), Instant::now()));
         }
         let waiting: Vec<String> = self
             .rows
@@ -349,14 +413,36 @@ impl Rows {
         out
     }
 
+    /// An armed row's state and line, from the productions the last status poll
+    /// found holding its source: waiting for one of them to go live, or for one to
+    /// hold it at all.
+    fn armed(&self, input: &str) -> (RowState, Message) {
+        match self.held.get(input) {
+            Some(status::Productions::Held(holders)) if !holders.is_empty() => (
+                RowState::WaitingForProduction,
+                Failure::ArmedWaiting {
+                    names: holders.iter().map(|h| h.name.clone()).collect(),
+                }
+                .message(),
+            ),
+            _ => (RowState::Armed, Failure::ArmedNoProduction.message()),
+        }
+    }
+
     /// A row that waits for Open Live says what it waits for, when the productions
     /// tell; that replaces the 30 s "nothing delivered" line, which is about the
     /// network. Once it no longer waits, or the hint no longer applies, the hint goes.
+    /// A production that got the source while live (#128) is said first, while the
+    /// row connects at all: that production cannot receive it.
     fn show_hint(&mut self, input: &str, waiting: bool) -> Option<Event> {
+        let late = self.added_while_live.get(input).cloned();
         let hint = self.hints.get(input).cloned();
         let row = self.row(input);
         row.waiting = waiting;
-        let want = hint.filter(|_| waiting && row.state == RowState::Connecting);
+        let connecting = row.state == RowState::Connecting;
+        let want = late
+            .filter(|_| connecting)
+            .or(hint.filter(|_| waiting && connecting));
         match want {
             Some(hint) if row.message.as_ref() != Some(&hint) => {
                 row.message = Some(hint);
@@ -574,9 +660,14 @@ impl GoLive {
                 let poller = status_poller(&settings, credential.as_ref());
                 // Stop (and quitting while live) leaves the sources in Open Live, so
                 // the next Go live adopts them with the same id and a production slot
-                // holding one keeps working (#115).
-                let (handle, events) =
-                    Session::start_keeping_sources(settings, Inputs::default(), credential);
+                // holding one keeps working (#115). Go live arms: each uplink runs only
+                // while a production holding its source is live (#130). Without Open
+                // Live there are no productions to wait for, so it sends at once.
+                let (handle, events) = if settings.open_live.register {
+                    Session::start_armed(settings, Inputs::default(), credential, Sources::Keep)
+                } else {
+                    Session::start_keeping_sources(settings, Inputs::default(), credential)
+                };
                 // Under the same lock as the phase, so a Stop from now on reaches it.
                 guard.phase = Phase::Live;
                 guard.handle = Some(handle);
@@ -1043,6 +1134,138 @@ mod tests {
         let running = json_of(&rows.on_status(&[status_of(CAM, held(ProductionState::Active))]));
         assert_eq!(running[0]["data"]["message"], Value::Null);
         assert_eq!(running[0]["data"]["state"], "connecting");
+    }
+
+    /// #130: Go live arms. An armed row says it is ready and what sending waits for:
+    /// a production to hold the source, then one of those to go live. The summary
+    /// does not turn it into connecting; the production going live does, through the
+    /// session's own states, and deactivating arms it again.
+    #[test]
+    fn an_armed_row_waits_for_a_production_then_connects_and_arms_again() {
+        let mut rows = rows();
+        let t = Instant::now();
+        let armed = json_of(&rows.on_event(&input(InputState::Armed), t));
+        assert_eq!(
+            armed,
+            vec![json!({"event": "input", "data": {
+                "input": CAM,
+                "state": "armed",
+                "message": "Ready. Nothing is sent until a production that holds this source is activated in Studio.",
+                "action": "open_studio",
+            }})]
+        );
+        assert!(
+            json_of(&rows.on_event(&summary(&[CAM]), t))
+                .iter()
+                .all(|e| e["event"] == "summary"),
+            "the summary changed an armed row"
+        );
+        assert_eq!(rows.sending(), 0, "armed is not sending");
+
+        // A production holds the source, inactive: waiting for it.
+        let out = json_of(&rows.on_status(&[status_of(CAM, held(ProductionState::Inactive))]));
+        assert_eq!(out[0]["data"]["state"], "waiting_for_production");
+        assert_eq!(
+            out[0]["data"]["message"],
+            "Ready. Sending starts when production \"Morning Show\" is activated in Studio."
+        );
+        assert_eq!(out.last().unwrap()["event"], "status");
+        // Said once while it stays so.
+        let again = rows.on_status(&[status_of(CAM, held(ProductionState::Inactive))]);
+        assert_eq!(json_of(&again).len(), 1);
+        // No longer held: armed again.
+        let out = json_of(&rows.on_status(&[status_of(CAM, status::Productions::Held(vec![]))]));
+        assert_eq!(out[0]["data"]["state"], "armed");
+
+        // Live: the session starts the uplink and the row connects, then goes live.
+        rows.on_status(&[status_of(CAM, held(ProductionState::Active))]);
+        let starting = json_of(&rows.on_event(&input(InputState::Starting), t));
+        assert_eq!(starting[0]["data"]["state"], "connecting");
+        assert_eq!(starting[0]["data"]["message"], Value::Null);
+        assert_eq!(rows.sending(), 1);
+        let live = json_of(&rows.on_event(&input(InputState::OnAir), t));
+        assert_eq!(live[0]["data"]["state"], "live");
+
+        // Deactivated: armed again, waiting for the production it still sits in.
+        rows.on_status(&[status_of(CAM, held(ProductionState::Inactive))]);
+        rows.on_event(
+            &E::NoProductionLive {
+                input: CAM.to_string(),
+            },
+            t,
+        );
+        let again = json_of(&rows.on_event(&input(InputState::Armed), t));
+        assert_eq!(again[0]["data"]["state"], "waiting_for_production");
+        assert_eq!(rows.sending(), 0);
+    }
+
+    /// Stop while armed: the armed row counts in the teardown's progress and ends
+    /// stopped, as a sending one does.
+    #[test]
+    fn stop_while_armed_shows_progress_in_the_rows() {
+        let mut rows = rows();
+        let t = Instant::now();
+        rows.on_event(&input(InputState::Armed), t);
+        rows.on_event(&summary(&[CAM]), t);
+        let stopping = json_of(&rows.on_event(&E::Stopping, t));
+        assert_eq!(stopping[0]["data"]["state"], "stopping");
+        assert_eq!(
+            stopping[1],
+            json!({"event": "stopping", "data": {"done": 0, "total": 1}})
+        );
+        let removed = json_of(&rows.on_event(
+            &E::FlowRemoved {
+                input: CAM.to_string(),
+            },
+            t,
+        ));
+        assert_eq!(removed[0]["data"]["state"], "stopped");
+        assert_eq!(
+            removed[1],
+            json!({"event": "stopping", "data": {"done": 1, "total": 1}})
+        );
+    }
+
+    /// #128's verdict: a production given the source while live has no receiver for
+    /// it. The connecting row says the director has to deactivate and reactivate it,
+    /// ahead of any other line, and the line goes once the session says it no longer
+    /// applies.
+    #[test]
+    fn a_slot_added_while_live_tells_the_director_to_reactivate() {
+        let mut rows = rows();
+        let t = Instant::now();
+        rows.on_event(&input(InputState::Armed), t);
+        rows.on_event(&input(InputState::Starting), t);
+        rows.on_event(&input(InputState::Waiting), t);
+        let late = json_of(&rows.on_event(
+            &E::SlotAddedWhileLive {
+                input: CAM.to_string(),
+                productions: vec!["Morning Show".to_string()],
+            },
+            t,
+        ));
+        assert_eq!(late[0]["data"]["state"], "connecting");
+        assert_eq!(
+            late[0]["data"]["message"],
+            "Production \"Morning Show\" got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate the production in Studio; until then it cannot show this input."
+        );
+        assert_eq!(late[0]["data"]["action"], "open_studio");
+        // The status poll does not replace it, nor does the 30 s line.
+        assert_eq!(
+            json_of(&rows.on_status(&[status_of(CAM, held(ProductionState::Active))])).len(),
+            1
+        );
+        assert!(rows.on_event(&input(InputState::Waiting), t).is_empty());
+        // Cleared.
+        let cleared = json_of(&rows.on_event(
+            &E::SlotAddedWhileLive {
+                input: CAM.to_string(),
+                productions: vec![],
+            },
+            t,
+        ));
+        assert_eq!(cleared[0]["data"]["message"], Value::Null);
+        assert_eq!(cleared[0]["data"]["state"], "connecting");
     }
 
     /// Open Live not answering is unknown: no hint, nothing replaced, nothing fails.

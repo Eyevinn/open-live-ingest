@@ -57,6 +57,23 @@ pub enum Event {
     HeartbeatStarted { gateway_id: String },
     /// An input's state changed, as the last poll found it.
     Input { input: String, state: InputState },
+    /// An armed input (`run::Uplink::WhileLive`): `productions`, which hold its
+    /// source, are live, so its uplink is being started.
+    ProductionLive {
+        input: String,
+        productions: Vec<String>,
+    },
+    /// An armed input whose uplink ran: no production holding its source is live any
+    /// more, so its flow was removed and it is armed again. Its source is kept.
+    NoProductionLive { input: String },
+    /// The live productions, by name, that were given an armed input's source while
+    /// they were live: Open Live has no receiver for such a slot until the production
+    /// is deactivated and reactivated. Sent whenever the list changes, empty once none
+    /// is left.
+    SlotAddedWhileLive {
+        input: String,
+        productions: Vec<String>,
+    },
     /// The Open Source Cloud credential cannot be renewed and stops working at `at`
     /// (Unix seconds), within the session about to start or already past. Sent before
     /// going live. After that time Open Live refuses the gateway's requests while the
@@ -139,6 +156,9 @@ pub struct UplinkStats {
 /// What the last poll found out about an input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputState {
+    /// Registered, with no flow: the session sends only while a production holding
+    /// the source is live (`run::Uplink::WhileLive`), and none is.
+    Armed,
     /// Start requested, first poll pending.
     Starting,
     /// The flow runs but nothing is receiving the uplink. Normal until the source is
@@ -157,6 +177,9 @@ impl InputState {
     /// The state in a few words, as the CLI prints it.
     pub fn describe(&self) -> String {
         match self {
+            InputState::Armed => {
+                "armed, sends once a production holding its source is live".to_string()
+            }
             InputState::Starting => "starting".to_string(),
             InputState::Waiting => "waiting for a receiver".to_string(),
             InputState::OnAir => "on air, the far end is receiving".to_string(),

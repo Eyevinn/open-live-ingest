@@ -16,6 +16,7 @@ pub mod config;
 pub mod credential;
 pub mod devices;
 pub mod flow;
+pub mod gate;
 pub mod gateway;
 pub mod heartbeat;
 pub mod keychain;

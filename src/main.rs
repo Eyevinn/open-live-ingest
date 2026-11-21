@@ -72,6 +72,13 @@ enum Command {
         /// Ask for every setting again, even the ones already stored.
         #[arg(long)]
         reconfigure: bool,
+
+        /// Register the inputs, but send each one only while a production holding
+        /// its source is active in Open Live, as the desktop app does: its uplink
+        /// starts when such a production is activated and stops when none is. Needs
+        /// registration with Open Live.
+        #[arg(long)]
+        wait_for_production: bool,
     },
     /// Stop a running gateway and remove its flows and Open Live sources.
     Down,
@@ -116,6 +123,7 @@ async fn main() -> Result<()> {
         audio: Vec::new(),
         test: false,
         reconfigure: false,
+        wait_for_production: false,
     });
 
     match command {
@@ -144,6 +152,7 @@ async fn main() -> Result<()> {
             audio,
             test,
             reconfigure,
+            wait_for_production,
         } => {
             if setup::configure(&mut cfg, reconfigure).await? {
                 config::save(&path, &cfg)?;
@@ -157,6 +166,11 @@ async fn main() -> Result<()> {
                     selection: devices,
                     audio,
                     test_pattern: test,
+                },
+                if wait_for_production {
+                    run::Sending::WhileLive
+                } else {
+                    run::Sending::Always
                 },
             )
             .await
@@ -192,8 +206,11 @@ async fn main() -> Result<()> {
 /// `up`: a session, its events printed as they arrive, stopped on Ctrl-C or SIGTERM
 /// (or, on Windows, the console closing). Returns how the session ended, so the exit
 /// code is the one `up` has always had.
-async fn up(cfg: config::Config, inputs: Inputs) -> Result<()> {
-    let (mut session, mut events) = Session::start(cfg, inputs);
+async fn up(cfg: config::Config, inputs: Inputs, sending: run::Sending) -> Result<()> {
+    let (mut session, mut events) = match sending {
+        run::Sending::Always => Session::start(cfg, inputs),
+        run::Sending::WhileLive => Session::start_armed(cfg, inputs, None, run::Sources::Remove),
+    };
     let print = reporter();
     // The signal handlers go in once the inputs are up, as they did when `up` polled
     // them from its loop: until then a Ctrl-C ends the process the default way.
@@ -297,6 +314,17 @@ fn render(event: &Event) -> Option<String> {
             format!("Status is pushed to Open Live as gateway {gateway_id}.\n")
         }
         Event::Input { input, state } => format!("  {input} — {}\n", state.describe()),
+        Event::ProductionLive { input, productions } => {
+            let quoted: Vec<String> = productions.iter().map(|p| format!("{p:?}")).collect();
+            let which = match quoted.as_slice() {
+                [one] => format!("production {one} is"),
+                _ => format!("productions {} are", quoted.join(", ")),
+            };
+            format!("  {input} — {which} live, starting the uplink\n")
+        }
+        Event::NoProductionLive { input } => {
+            format!("  {input} — no production holding its source is live, uplink stopped\n")
+        }
         Event::Stopping => "\nStopping.\n".to_string(),
         Event::FlowRemoved { input } => format!("  {input} — flow stopped and removed\n"),
         Event::SourceRemoved { input } => {
@@ -322,6 +350,7 @@ fn render(event: &Event) -> Option<String> {
         | Event::ConnectWarning { .. }
         | Event::InputFailed { .. }
         | Event::Warning { .. }
+        | Event::SlotAddedWhileLive { .. }
         | Event::OscSignInEnds { .. }
         | Event::Stats { .. }
         | Event::Stopped
@@ -561,6 +590,37 @@ mod tests {
                 "  Venue — Camera — on air, the far end is receiving\n".to_string(),
             ),
             (
+                Event::Input {
+                    input: "Venue — Camera".to_string(),
+                    state: InputState::Armed,
+                },
+                "  Venue — Camera — armed, sends once a production holding its source is live\n"
+                    .to_string(),
+            ),
+            (
+                Event::ProductionLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string()],
+                },
+                "  Venue — Camera — production \"Morning Show\" is live, starting the uplink\n"
+                    .to_string(),
+            ),
+            (
+                Event::ProductionLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string(), "Rehearsal".to_string()],
+                },
+                "  Venue — Camera — productions \"Morning Show\", \"Rehearsal\" are live, starting the uplink\n"
+                    .to_string(),
+            ),
+            (
+                Event::NoProductionLive {
+                    input: "Venue — Camera".to_string(),
+                },
+                "  Venue — Camera — no production holding its source is live, uplink stopped\n"
+                    .to_string(),
+            ),
+            (
                 Event::SourceKept {
                     input: "Venue — Camera".to_string(),
                     reason: "HTTP 409 Conflict".to_string(),
@@ -645,6 +705,10 @@ mod tests {
                 source_id: "s".to_string(),
             },
             Event::Stats { inputs: Vec::new() },
+            Event::SlotAddedWhileLive {
+                input: "x".to_string(),
+                productions: vec!["p".to_string()],
+            },
             Event::Stopped,
             Event::Failed {
                 reason: "y".to_string(),
