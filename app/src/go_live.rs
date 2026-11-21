@@ -572,11 +572,11 @@ impl GoLive {
                     .uses_keychain()
                     .then(|| OscCredential::Keychain(keychain));
                 let poller = status_poller(&settings, credential.as_ref());
-                let inputs = Inputs::default();
-                let (handle, events) = match credential {
-                    Some(credential) => Session::start_with(settings, inputs, credential),
-                    None => Session::start(settings, inputs),
-                };
+                // Stop (and quitting while live) leaves the sources in Open Live, so
+                // the next Go live adopts them with the same id and a production slot
+                // holding one keeps working (#115).
+                let (handle, events) =
+                    Session::start_keeping_sources(settings, Inputs::default(), credential);
                 // Under the same lock as the phase, so a Stop from now on reaches it.
                 guard.phase = Phase::Live;
                 guard.handle = Some(handle);

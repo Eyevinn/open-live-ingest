@@ -17,6 +17,10 @@
 //! start removes what it had registered before [`Event::Failed`]: the sources it
 //! created in Open Live are reported with `SourceRemoved` (or `SourceKept`).
 //!
+//! A session started with [`Session::start_keeping_sources`] leaves each input's
+//! Open Live source in place instead, at a stop and at a failed start, reported with
+//! `SourceRetained`; the next session adopts it by name, with the same id.
+//!
 //! # Caveats
 //!
 //! - **A panic.** Should the session's task panic, it ends without its teardown: the
@@ -41,7 +45,7 @@ use crate::config::{self, Config};
 use crate::credential::OscCredential;
 use crate::devices::AudioPairing;
 use crate::gateway::{Event, Events};
-use crate::run::{self, Stop};
+use crate::run::{self, Sources, Stop};
 use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -96,7 +100,7 @@ impl Session {
     /// the same way, in the background, as long as the runtime keeps running (see
     /// the module documentation's caveats).
     pub fn start(settings: Config, inputs: Inputs) -> (SessionHandle, Receiver) {
-        Self::start_inner(settings, None, inputs)
+        Self::start_inner(settings, None, inputs, Sources::Remove)
     }
 
     /// [`start`](Self::start), registering with `credential`, the Open Source Cloud
@@ -109,13 +113,28 @@ impl Session {
         inputs: Inputs,
         credential: OscCredential,
     ) -> (SessionHandle, Receiver) {
-        Self::start_inner(settings, Some(credential), inputs)
+        Self::start_inner(settings, Some(credential), inputs, Sources::Remove)
+    }
+
+    /// [`start`](Self::start), or [`start_with`](Self::start_with) when `credential`
+    /// is given, but a stop (and a failed start) leaves each input's Open Live
+    /// source in place, marked inactive, rather than removing it
+    /// ([`Sources::Keep`]). The next session with the same settings adopts it by
+    /// name and keeps its id, so a production slot that references it stays valid
+    /// across Stop and Go live. The flows are removed as always.
+    pub fn start_keeping_sources(
+        settings: Config,
+        inputs: Inputs,
+        credential: Option<OscCredential>,
+    ) -> (SessionHandle, Receiver) {
+        Self::start_inner(settings, credential, inputs, Sources::Keep)
     }
 
     fn start_inner(
         settings: Config,
         credential: Option<OscCredential>,
         inputs: Inputs,
+        sources: Sources,
     ) -> (SessionHandle, Receiver) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel::<Stop>();
@@ -128,7 +147,7 @@ impl Session {
             // A dropped handle is a stop too: the session must not outlive its owner
             // with flows and sources nobody can remove.
             let stop = async move { stop_rx.await.unwrap_or(Stop::Interrupt) };
-            let outcome = run(settings, credential, inputs, &events, stop).await;
+            let outcome = run(settings, credential, inputs, sources, &events, stop).await;
             events.emit(match &outcome {
                 Ok(()) => Event::Stopped,
                 Err(err) => Event::Failed {
@@ -165,6 +184,7 @@ async fn run(
     settings: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
+    sources: Sources,
     events: &Events,
     stop: impl std::future::Future<Output = Stop> + Send,
 ) -> Result<()> {
@@ -173,7 +193,7 @@ async fn run(
         Some(_) => config::validate_with(&settings, true)?,
         None => config::validate(&settings)?,
     }
-    run::up(settings, credential, inputs, events, stop).await
+    run::up(settings, credential, inputs, sources, events, stop).await
 }
 
 /// A running session. See [`Session::start`].
@@ -193,8 +213,9 @@ impl SessionHandle {
         }
     }
 
-    /// Stops the session and removes what it started, as `up` does on Ctrl-C, taking
-    /// as long as that takes. Returns how the session ended: an error when it could
+    /// Stops the session and removes what it started, as `up` does on Ctrl-C (its
+    /// sources only when it was not started to keep them), taking as long as that
+    /// takes. Returns how the session ended: an error when it could
     /// not start, as [`Event::Failed`] said.
     pub async fn stop(self) -> Result<()> {
         self.stop_with(Stop::Interrupt).await

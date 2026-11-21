@@ -25,14 +25,15 @@ In order, each logged and written to the step summary:
      is active, the uplink's SRT stats are checked (below), then the production is
      deactivated and deleted.
   4. `stop`: the page's `stopped` event, with no error and nothing left behind; the
-     source is gone from Open Live and the flow from Strom. When nothing answers at
+     flow is gone from Strom, and the source is kept in Open Live with its id (#115),
+     the only one of the run's gateway name. When nothing answers at
      Strom's address any more, the app must have said it stopped the Strom it started
      (a `strom` event with state `stopped`); a Strom that died by itself fails.
-  5. `go_live` again: no input fails (an Open Live 409 on a source left behind would
-     fail it) and the source appears again.
+  5. `go_live` again: no input fails (an Open Live 409 would fail it) and the kept
+     source is reused with the same id, so a production slot holding it stays valid.
   6. Quitting while live, as the close button does: `quit` asks (`quit_requested`),
      then `quit` with `confirmed: true` (the question's Stop and quit) stops and ends
-     the process; the source is gone from Open Live and the flow from Strom.
+     the process; the flow is gone from Strom and the source is kept, with the same id.
 
 Before step 2 the settings file the app reads is written with a gateway name unique
 to the run (the source prefix, so cleanup finds exactly this run's sources) and the
@@ -50,7 +51,8 @@ Open Live address yet), and then the late-listener check runs with no secret (#1
   - At least E2E_LATE_SECONDS after Go live, a local SRT listener starts on that port
     (`srt-live-transmit`, from Homebrew's `srt`, or SRT_LIVE_TRANSMIT), and the
     uplink's SRT stats are checked (below).
-  - `stop`: stopped with nothing left behind, the source and the flow gone.
+  - `stop`: stopped with nothing left behind, the flow gone and the source kept with
+    its id (#115).
 
 E2E_PART picks the part of the run: `all` (the default, a run by hand), or, as the
 release workflow splits it, `late-listener` (the `e2e-macos-late-listener` job, no
@@ -78,9 +80,10 @@ run fails naming the secret when E2E_REQUIRE_SECRET is `true` (a run by hand);
 otherwise (a pull request run) it ends with a warning naming the secret and exits 0.
 
 Whatever happens, the exit path closes the app (stdin closed: its bounded teardown)
-and deletes any source and production still carrying the run's gateway name, and
-stops the local SRT listener. Sources and productions named `oli-app-e2e-` left by an
-earlier run that was killed are removed before step 3.
+and deletes any source and production still carrying the run's gateway name (the
+source the app keeps included), and stops the local SRT listener. Sources and
+productions named `oli-app-e2e-` left by an earlier run that was killed are removed
+before step 3.
 
 The check itself is unit tested, with no app and no network beyond loopback:
 `python3 -I .github/scripts/test_e2e_app.py`.
@@ -410,14 +413,6 @@ class SourceList:
                 return found[0]
             time.sleep(2)
         fail(f"no source named '{name}' appeared in Open Live within {timeout} s")
-
-    def wait_gone(self, gateway_name, timeout):
-        deadline = time.monotonic() + timeout
-        left = self.ours(gateway_name)
-        while left and time.monotonic() < deadline:
-            time.sleep(2)
-            left = self.ours(gateway_name)
-        return left
 
 
 class OpenLive(SourceList):
@@ -976,7 +971,7 @@ def late_listener_check(app, strom, gateway_name, source_name, work):
         tick_the_test_pattern(app)
 
         live_at = time.monotonic()
-        _, flow, since = go_live(app, local, strom, source_name, step)
+        source, flow, since = go_live(app, local, strom, source_name, step)
         say(f"{step}: nothing listens on 127.0.0.1:{srt_port} yet; the listener starts {late} s after Go live")
         wait_until(live_at + late)
         listener.start()
@@ -984,12 +979,13 @@ def late_listener_check(app, strom, gateway_name, source_name, work):
         strom.watch_uplink(flow.get("id"), step, listener.check_running)
         listener.check_running("after the last sample")
 
+        # Stop: the flow goes, the source stays with its id (#115).
         app.ok("stop")
         stopped_cleanly(app.event("stopped", 120), f"{step}: Stop")
-        left = local.wait_gone(gateway_name, 30)
-        if left:
-            fail(f"{step}: Stop left {len(left)} source(s) of '{gateway_name}' in the stand-in Open Live")
-        passed(f"{step}: Stop reports stopped, nothing left behind, and the source is gone")
+        kept = local.ours(gateway_name)
+        if [s.get("id") for s in kept] != [source.get("id")]:
+            fail(f"{step}: Stop: expected source {source.get('id')} kept as the only one of '{gateway_name}' in the stand-in Open Live, found {[s.get('id') for s in kept]}")
+        passed(f"{step}: Stop reports stopped, nothing left behind, and source {source.get('id')} is kept (status {kept[0].get('status')})")
         strom.check_gone(flow.get("id"), f"{step}: Stop", app, since)
     finally:
         listener.stop()
@@ -1103,23 +1099,26 @@ def run(exe, work):
         source, flow, since = go_live(app, open_live, strom, source_name, "Go live")
         late_receiver_check(open_live, strom, source, flow, live_at, gateway_name)
 
-        # 4. Stop.
+        # 4. Stop: the flow goes, the source stays (#115).
         app.ok("stop")
         data = app.event("stopped", 120)
         stopped_cleanly(data, "Stop")
-        left = open_live.wait_gone(gateway_name, 30)
-        if left:
-            fail(f"Stop: {len(left)} source(s) of '{gateway_name}' are still in Open Live")
-        passed("Stop: the app reports stopped, nothing left behind, and the source is gone from Open Live")
+        kept = [s.get("id") for s in open_live.ours(gateway_name)]
+        if kept != [source.get("id")]:
+            fail(f"Stop: expected source {source.get('id')} kept as the only one of '{gateway_name}' in Open Live, found {kept}")
+        passed(f"Stop: the app reports stopped, nothing left behind, and source {source.get('id')} is kept in Open Live")
         strom.check_gone(flow.get("id"), "Stop", app, since)
 
-        # 5. Go live again: no 409. Open Live answers 409 when a source of the same
-        # name is still registered, and the app shows that as an `input` row with
-        # state `failed`. go_live() checks those rows once, as soon as the source is
-        # back. That is enough only because step 4 has already checked that no source
-        # of this gateway was left behind (wait_gone); do not loosen step 4 without
-        # making this check wait for the rows to settle.
-        _, flow, since = go_live(app, open_live, strom, source_name, "Go live again (no 409)")
+        # 5. Go live again: no 409, and the kept source reused with its id. The source
+        # is there from the start, so go_live() checks the rows before the session has
+        # registered anything; they are checked again once the flow runs, which is
+        # after registration.
+        again, flow, since = go_live(app, open_live, strom, source_name, "Go live again (no 409)")
+        if app.failed_rows(since):
+            fail(f"Go live again (no 409): an input failed: {app.failed_rows(since)}")
+        if again.get("id") != source.get("id"):
+            fail(f"Go live again: the source id changed from {source.get('id')} to {again.get('id')}")
+        passed(f"Go live again: the same source {source.get('id')} is reused, so a production slot holding it stays valid")
 
         # 6. Quit while live.
         app.ok("quit", {"confirmed": False})
@@ -1137,10 +1136,10 @@ def run(exe, work):
         if len(stops) < 2:
             fail("Quit while live: the app ended without a `stopped` event for the second session")
         stopped_cleanly(stops[-1]["data"], "Quit while live")
-        left = open_live.wait_gone(gateway_name, 30)
-        if left:
-            fail(f"Quit while live: {len(left)} source(s) of '{gateway_name}' are still in Open Live")
-        passed("Quit while live: Stop and quit ended the app and the source is gone from Open Live")
+        kept = [s.get("id") for s in open_live.ours(gateway_name)]
+        if kept != [source.get("id")]:
+            fail(f"Quit while live: expected source {source.get('id')} kept as the only one of '{gateway_name}' in Open Live, found {kept}")
+        passed(f"Quit while live: Stop and quit ended the app and source {source.get('id')} is kept in Open Live")
         strom.check_gone(flow.get("id"), "Quit while live", app, since)
         say("e2e app: all checks passed")
     finally:

@@ -442,13 +442,15 @@ fn stats_of(live: &[Live]) -> Event {
 }
 
 /// Brings every chosen device up and keeps it registered until `stop` resolves, then
-/// removes what it started. `stop` says why it is stopping, which decides how long
-/// the teardown may take. `credential`, when given, is the Open Source Cloud
-/// credential to register with instead of the one the settings point at.
+/// removes what it started: the flows always, the Open Live sources as `sources`
+/// says. `stop` says why it is stopping, which decides how long the teardown may
+/// take. `credential`, when given, is the Open Source Cloud credential to register
+/// with instead of the one the settings point at.
 pub async fn up(
     cfg: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
+    sources: Sources,
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
@@ -572,8 +574,11 @@ pub async fn up(
     // From here on sources may be registered with Open Live before any flow runs.
     // A startup that fails after that removes them again before returning the
     // error, so a failed start leaves nothing behind (what `Event::Failed`
-    // promises). Flows need nothing extra: `start` removes one that does not come up.
+    // promises), unless the sources are kept. Flows need nothing extra: `start`
+    // removes one that does not come up.
     let mut registered = HashMap::new();
+    // Every input of this run, started or not: the sources a stop keeps (`Sources::Keep`).
+    let names: BTreeSet<String> = inputs.iter().map(|i| i.name.clone()).collect();
     let started = start_inputs(
         &cfg,
         &strom,
@@ -590,7 +595,10 @@ pub async fn up(
         Ok(live) => live,
         Err(err) => {
             if let Some(client) = &open_live {
-                remove_registered(client, &registered, events).await;
+                match sources {
+                    Sources::Remove => remove_registered(client, &registered, events).await,
+                    Sources::Keep => keep_registered(&registered, events),
+                }
             }
             return Err(err);
         }
@@ -623,7 +631,15 @@ pub async fn up(
             if let Some(reporter) = reporter {
                 reporter.stop().await;
             }
-            teardown(&strom, open_live.as_ref(), &cfg.gateway.name, &live, events).await;
+            teardown(
+                &strom,
+                open_live.as_ref(),
+                &cfg.gateway.name,
+                &live,
+                (sources, &names),
+                events,
+            )
+            .await;
         }
         Stop::Ending => {
             // Windows ends the process shortly after, so nothing waits on anything else.
@@ -640,6 +656,7 @@ pub async fn up(
                     open_live.as_ref(),
                     &cfg.gateway.name,
                     &live,
+                    (sources, &names),
                     deadline,
                     events
                 )
@@ -757,6 +774,18 @@ async fn remove_registered(
                 input: r.input.clone(),
             });
         }
+    }
+}
+
+/// A failed startup that keeps its sources: says so for each it registered, so the
+/// next run adopts them by name.
+fn keep_registered(registered: &HashMap<String, Registered>, events: &Events) {
+    let mut sources: Vec<&Registered> = registered.values().collect();
+    sources.sort_by(|a, b| a.input.cmp(&b.input));
+    for r in sources {
+        events.emit(Event::SourceRetained {
+            input: r.input.clone(),
+        });
     }
 }
 
@@ -1335,6 +1364,21 @@ pub enum Stop {
     Ending,
 }
 
+/// What a stop does with the Open Live sources the run registered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Sources {
+    /// Remove them, and every other source carrying this gateway's name prefix: `up`
+    /// owns what it started.
+    #[default]
+    Remove,
+    /// Leave each input's source in Open Live, marked inactive, for the next run to
+    /// adopt by name ([`plan_port`]'s `Keep`, `reconcile_sources`): its id stays the
+    /// same, so a production slot that references it keeps working after Stop and Go
+    /// live (the desktop app). Other sources carrying the prefix (a label renamed, an
+    /// input not in this run) are still swept. `down` removes them all.
+    Keep,
+}
+
 /// How long teardown may take when Windows is ending the process, leaving a second
 /// of the five Windows allows for stopping the managed Strom. That second is enough
 /// only because `LocalStrom`'s drop ends a managed Strom at once on Windows
@@ -1377,28 +1421,87 @@ async fn remove_source_reported(
     gone
 }
 
-/// Stops and removes everything the run created.
+/// Leaves one input's Open Live source in place for the next run and says so. A
+/// source that may still read `active` is marked inactive first: nothing is sending
+/// to it any more. Returns whether that went through (or was not needed).
+async fn keep_source_reported(
+    client: &OpenLiveClient,
+    id: &str,
+    l: &Live,
+    events: &Events,
+) -> bool {
+    let mut done = true;
+    if matches!(l.state, State::OnAir | State::Unreachable) {
+        let idle = SourcePayload::new(
+            &l.input.name,
+            &l.input.endpoint.cloud_uri(),
+            false,
+            l.input.endpoint.latency_ms,
+            None,
+        );
+        if let Err(err) = client.patch_source(id, &idle).await {
+            warn!(input = %l.input.name, err = %format_args!("{err:#}"), "could not mark the kept source inactive");
+            events.emit(Event::Warning {
+                message: format!(
+                    "could not mark the source of {} inactive ({err:#})",
+                    l.input.name
+                ),
+            });
+            done = false;
+        }
+    }
+    events.emit(Event::SourceRetained {
+        input: l.input.name.clone(),
+    });
+    done
+}
+
+/// What the sweep after a teardown leaves alone: when the sources are kept, those of
+/// this run's inputs, by id and by name (`names`, every input of the run, including
+/// any that failed to start).
+fn kept_by_this_run(live: &[Live], sources: Sources, names: &BTreeSet<String>) -> BTreeSet<String> {
+    match sources {
+        Sources::Remove => BTreeSet::new(),
+        Sources::Keep => live
+            .iter()
+            .filter_map(|l| l.source_id.clone())
+            .chain(names.iter().cloned())
+            .collect(),
+    }
+}
+
+/// Stops and removes everything the run created; its sources only when `sources`
+/// says so.
 async fn teardown(
     strom: &StromClient,
     open_live: Option<&OpenLiveClient>,
     gateway_name: &str,
     live: &[Live],
+    (sources, names): (Sources, &BTreeSet<String>),
     events: &Events,
 ) {
     // Sources Open Live refused to remove, already reported, so the sweep below does
-    // not try them again and print the same refusal twice.
-    let mut kept = BTreeSet::new();
+    // not try them again and print the same refusal twice; and the ones kept.
+    let mut kept = kept_by_this_run(live, sources, names);
     for l in live {
         remove_flow_reported(strom, l, events).await;
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
-            if !remove_source_reported(client, id, l, events).await {
-                kept.insert(id.clone());
+            match sources {
+                Sources::Remove => {
+                    if !remove_source_reported(client, id, l, events).await {
+                        kept.insert(id.clone());
+                    }
+                }
+                Sources::Keep => {
+                    keep_source_reported(client, id, l, events).await;
+                }
             }
         }
     }
-    // Anything of ours still there goes too: a source recreated by a race, or one
-    // whose id we never learned. Matched on the name prefix, so sources belonging to
-    // another gateway or made by hand are never touched.
+    // Anything else of ours still there goes too: a source recreated by a race, one
+    // whose id we never learned, or one under a name no longer in use. Matched on the
+    // name prefix, so sources belonging to another gateway or made by hand are never
+    // touched.
     if let Some(client) = open_live {
         sweep_sources(client, gateway_name, &kept, events).await;
     }
@@ -1412,27 +1515,43 @@ async fn teardown_within(
     open_live: Option<&OpenLiveClient>,
     gateway_name: &str,
     live: &[Live],
+    (sources, names): (Sources, &BTreeSet<String>),
     deadline: tokio::time::Instant,
     events: &Events,
 ) {
     // Send, so that `up` can run on a spawned task (`session::Session::start`).
     type Job<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
-    // What each job removes, and the source id when it is a source.
-    let mut what: Vec<(String, Option<String>)> = Vec::new();
+    // What each job does, the source id when it removes a source, and whether it is a
+    // removal: a kept source's inactive mark not done in time is left for the next
+    // run's first tick, which sets the status anyway.
+    let mut what: Vec<(String, Option<String>, bool)> = Vec::new();
     let mut jobs: Vec<Job> = Vec::new();
     for l in live {
-        what.push((format!("flow of {}", l.input.name), None));
+        what.push((format!("flow of {}", l.input.name), None, true));
         jobs.push(Box::pin(remove_flow_reported(strom, l, events)));
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
-            what.push((format!("source of {}", l.input.name), Some(id.clone())));
-            jobs.push(Box::pin(remove_source_reported(client, id, l, events)));
+            match sources {
+                Sources::Remove => {
+                    what.push((
+                        format!("source of {}", l.input.name),
+                        Some(id.clone()),
+                        true,
+                    ));
+                    jobs.push(Box::pin(remove_source_reported(client, id, l, events)));
+                }
+                Sources::Keep => {
+                    what.push((format!("source of {}", l.input.name), None, false));
+                    jobs.push(Box::pin(keep_source_reported(client, id, l, events)));
+                }
+            }
         }
     }
-    let mut kept = BTreeSet::new();
+    let mut kept = kept_by_this_run(live, sources, names);
     let mut left = Vec::new();
-    for ((label, id), done) in what.into_iter().zip(join_until(deadline, jobs).await) {
+    for ((label, id, removal), done) in what.into_iter().zip(join_until(deadline, jobs).await) {
         match done {
             Some(true) => {}
+            _ if !removal => {}
             Some(false) => {
                 kept.extend(id);
                 left.push(label);
@@ -1563,8 +1682,8 @@ async fn remove_source(client: &OpenLiveClient, id: &str, name: &str, events: &E
     }
 }
 
-/// Removes every source carrying this gateway's name prefix, except the ids in
-/// `skip`. Returns how many.
+/// Removes every source carrying this gateway's name prefix, except those whose id
+/// or name is in `skip`. Returns how many.
 async fn sweep_sources(
     client: &OpenLiveClient,
     gateway_name: &str,
@@ -1582,7 +1701,7 @@ async fn sweep_sources(
     let mut removed = 0;
     for source in sources
         .iter()
-        .filter(|s| s.name.starts_with(&prefix) && !skip.contains(&s.id))
+        .filter(|s| s.name.starts_with(&prefix) && !skip.contains(&s.id) && !skip.contains(&s.name))
     {
         if remove_source(client, &source.id, &source.name, events).await {
             events.emit(Event::SourceRemoved {

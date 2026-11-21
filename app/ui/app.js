@@ -586,7 +586,7 @@ function wireGoLive() {
         message:
           "Still in Studio, held by an active production: " +
           event.detail.left_behind.join(", ") +
-          ". Deactivate it in Studio; the next Go live removes them.",
+          ". Deactivate it in Studio; the next Stop, or open-live-ingest down, removes them.",
         action: "open_studio",
       });
     }
