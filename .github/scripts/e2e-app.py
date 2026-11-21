@@ -37,7 +37,8 @@ In order, each logged and written to the step summary:
      source is reused with the same id, so a production slot holding it stays valid.
      The row waits for the production, which still holds the source, and no flow
      runs; the production is activated again and the flow runs within 5 s of it
-     being `active`, without restarting the app (#130 AC2).
+     being `active`, without restarting the app; the new connect gets the same
+     uplink SRT stats check as the first one (#130 AC2).
   6. Quitting while live, as the close button does: `quit` asks (`quit_requested`),
      then `quit` with `confirmed: true` (the question's Stop and quit) stops and ends
      the process; the flow is gone from Strom and the source is kept, with the same id.
@@ -1196,6 +1197,20 @@ def late_receiver_check(app, open_live, strom, source, source_name, live_at, gat
     return production_id, flow
 
 
+def reactivated_check(app, open_live, strom, production_id, source_name, since):
+    """#130 AC2: reactivating the production that still holds the kept source, with
+    the app still running, gives a new clean connect. No flow while it activates, the
+    flow within FLOW_START_TIMEOUT once it is active, the row connecting or live, and
+    the same uplink SRT stats check as the first connect (`watch_uplink`). Returns
+    the flow."""
+    step = "Go live again: production reactivated"
+    open_live.activate(production_id, 300, lambda: strom.no_flow(source_name, 0, f"{step} (activating)"))
+    flow, _ = sends_once_live(strom, source_name, step, time.monotonic())
+    app.wait_row(source_name, ("connecting", "live"), since, step)
+    strom.watch_uplink(flow.get("id"), step)
+    return flow
+
+
 def run(exe, work):
     instance = os.environ.get("OPEN_LIVE_INSTANCE") or "openlivedev"
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
@@ -1306,10 +1321,7 @@ def run(exe, work):
         if again.get("id") != source.get("id"):
             fail(f"Go live again: the source id changed from {source.get('id')} to {again.get('id')}")
         passed(f"Go live again: the same source {source.get('id')} is reused, so a production slot holding it stays valid")
-        step = "Go live again: production reactivated"
-        open_live.activate(production_id, 300, lambda: strom.no_flow(source_name, 0, f"{step} (activating)"))
-        flow, _ = sends_once_live(strom, source_name, step, time.monotonic())
-        app.wait_row(source_name, ("connecting", "live"), since, step)
+        flow = reactivated_check(app, open_live, strom, production_id, source_name, since)
 
         # 6. Quit while live.
         app.ok("quit", {"confirmed": False})

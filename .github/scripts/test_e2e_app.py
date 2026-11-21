@@ -2,7 +2,7 @@
 """Unit tests of the uplink SRT stats check in e2e-app.py (#112), of the stand-in
 Open Live the no-secret late-listener check sends to, and of the armed-session checks
 (#130: no flow until a production holding the source is active, the flow within 5 s
-once it is, the row states). No app and no network beyond loopback:
+once it is, the row states, the SRT stats check after reactivation). No app and no network beyond loopback:
 
     python3 -I .github/scripts/test_e2e_app.py
 """
@@ -435,6 +435,93 @@ class Rows(unittest.TestCase):
         with contextlib.redirect_stdout(out), self.assertRaises(e2e.Failed) as caught:
             app.wait_row("gw — Test pattern", e2e.ARMED, 0, "Go live", timeout=0.2)
         self.assertIn("Go live: the row of 'gw — Test pattern' is 'connecting', not armed or waiting_for_production", str(caught.exception))
+
+
+class FakeOpenLive:
+    """Open Live's activate, with no network: `while_activating` runs once, as for a
+    production that is still activating at the first look."""
+
+    def __init__(self):
+        self.activated = []
+
+    def activate(self, production_id, timeout, while_activating=lambda: None):
+        while_activating()
+        self.activated.append(production_id)
+
+
+class ReactivatedStrom(ScriptedStrom):
+    """Flows from a script, and the uplink SRT stats from canned samples."""
+
+    def __init__(self, script, samples):
+        super().__init__(script)
+        self.samples = list(samples)
+        self.watched = []
+
+    def uplink(self, flow_id):
+        self.watched.append(flow_id)
+        return self.samples.pop(0)
+
+
+class Reactivated(unittest.TestCase):
+    """#130 AC2: the reconnect after reactivation gets the same SRT stats check as
+    the first connect."""
+
+    FLOW = {"id": "f-2", "name": "gw — Test pattern"}
+
+    def setUp(self):
+        self.clock = Clock()
+        self.saved = (e2e.time.monotonic, e2e.time.sleep, e2e.wait_until)
+        e2e.time.monotonic, e2e.time.sleep = self.clock.monotonic, self.clock.sleep
+        e2e.wait_until = lambda moment: None
+        self.env = {k: os.environ.pop(k, None) for k in ENV_KEYS}
+
+    def tearDown(self):
+        e2e.time.monotonic, e2e.time.sleep, e2e.wait_until = self.saved
+        for key, value in self.env.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    def check(self, samples):
+        strom = ReactivatedStrom([[], [], [self.FLOW]], samples)
+        open_live = FakeOpenLive()
+        app = FakeApp([row("waiting_for_production"), row("connecting")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            flow = e2e.reactivated_check(app, open_live, strom, "p-1", "gw — Test pattern", 0)
+        return flow, strom, open_live, out.getvalue()
+
+    def peer(self, sent, dropped, connected=True):
+        return {"connected": connected, "packets_sent": sent, "packets_sent_dropped": dropped, "rtt_ms": 5.0}
+
+    def test_a_clean_reconnect_is_watched_on_the_new_flow(self):
+        flow, strom, open_live, out = self.check([self.peer(100, 0), self.peer(20100, 3)])
+        self.assertEqual(flow, self.FLOW)
+        self.assertEqual(open_live.activated, ["p-1"])
+        self.assertEqual(set(strom.watched), {"f-2"})
+        self.assertIn("PASS: Go live again: production reactivated: Strom runs flow f-2", out)
+        self.assertIn("PASS: Go live again: production reactivated: the uplink stayed connected and dropped 3 of 20000", out)
+
+    def test_drops_after_the_reconnect_fail(self):
+        with self.assertRaises(e2e.Failed) as caught:
+            self.check([self.peer(100, 0), self.peer(10100, 5000)])
+        self.assertIn("Go live again: production reactivated: the uplink dropped too much", str(caught.exception))
+
+    def test_a_reconnect_that_never_gets_a_peer_fails(self):
+        timeout, e2e.CONNECT_TIMEOUT = e2e.CONNECT_TIMEOUT, 0
+        try:
+            with self.assertRaises(e2e.Failed) as caught:
+                self.check([])
+        finally:
+            e2e.CONNECT_TIMEOUT = timeout
+        self.assertIn("Go live again: production reactivated: the uplink of flow f-2 shows no connected peer", str(caught.exception))
+
+    def test_a_flow_while_reactivating_fails(self):
+        strom = ReactivatedStrom([[self.FLOW]], [])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(e2e.Failed) as caught:
+            e2e.reactivated_check(FakeApp([]), FakeOpenLive(), strom, "p-1", "gw — Test pattern", 0)
+        self.assertIn("Go live again: production reactivated (activating): Strom runs flow f-2", str(caught.exception))
+        self.assertEqual(strom.watched, [])
 
 
 if __name__ == "__main__":
