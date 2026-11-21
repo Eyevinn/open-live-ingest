@@ -173,9 +173,10 @@ impl Rows {
         } else {
             row.connecting_since = None;
         }
-        // A connecting row keeps the hint it already has.
+        // A connecting row keeps the hint it already has, and a live row the
+        // late-slot line (#128).
         let message = match (state, message) {
-            (RowState::Connecting, None) if row.state == RowState::Connecting => {
+            (RowState::Connecting | RowState::Live, None) if row.state == state => {
                 row.message.clone()
             }
             (_, message) => message,
@@ -433,15 +434,17 @@ impl Rows {
     /// tell; that replaces the 30 s "nothing delivered" line, which is about the
     /// network. Once it no longer waits, or the hint no longer applies, the hint goes.
     /// A production that got the source while live (#128) is said first, while the
-    /// row connects at all: that production cannot receive it.
+    /// row sends at all (connecting, or live for another production): that
+    /// production cannot receive it.
     fn show_hint(&mut self, input: &str, waiting: bool) -> Option<Event> {
         let late = self.added_while_live.get(input).cloned();
         let hint = self.hints.get(input).cloned();
         let row = self.row(input);
         row.waiting = waiting;
         let connecting = row.state == RowState::Connecting;
+        let sending = connecting || row.state == RowState::Live;
         let want = late
-            .filter(|_| connecting)
+            .filter(|_| sending)
             .or(hint.filter(|_| waiting && connecting));
         match want {
             Some(hint) if row.message.as_ref() != Some(&hint) => {
@@ -1266,6 +1269,44 @@ mod tests {
         ));
         assert_eq!(cleared[0]["data"]["message"], Value::Null);
         assert_eq!(cleared[0]["data"]["state"], "connecting");
+    }
+
+    /// A row already live for one production is told too when another production
+    /// gets its source while live (#128): the director of that one cannot show it.
+    /// It stays live, and the line goes once the session says it no longer applies.
+    #[test]
+    fn a_slot_added_while_live_is_told_on_a_row_live_for_another_production() {
+        let mut rows = rows();
+        let t = Instant::now();
+        rows.on_event(&input(InputState::Armed), t);
+        rows.on_event(&input(InputState::Starting), t);
+        rows.on_event(&input(InputState::OnAir), t);
+        let late = json_of(&rows.on_event(
+            &E::SlotAddedWhileLive {
+                input: CAM.to_string(),
+                productions: vec!["Evening Show".to_string()],
+            },
+            t,
+        ));
+        assert_eq!(late.len(), 1);
+        assert_eq!(late[0]["data"]["state"], "live");
+        assert_eq!(
+            late[0]["data"]["message"],
+            "Production \"Evening Show\" got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate the production in Studio; until then it cannot show this input."
+        );
+        assert_eq!(late[0]["data"]["action"], "open_studio");
+        // Still on air at the next poll: the line stays.
+        let again = json_of(&rows.on_event(&input(InputState::OnAir), t));
+        assert!(again.is_empty(), "{again:?}");
+        let cleared = json_of(&rows.on_event(
+            &E::SlotAddedWhileLive {
+                input: CAM.to_string(),
+                productions: vec![],
+            },
+            t,
+        ));
+        assert_eq!(cleared[0]["data"]["state"], "live");
+        assert_eq!(cleared[0]["data"]["message"], Value::Null);
     }
 
     /// Open Live not answering is unknown: no hint, nothing replaced, nothing fails.

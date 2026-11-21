@@ -855,14 +855,13 @@ async fn an_armed_session_starts_once_for_several_productions_and_names_a_late_s
     assert_eq!(strom_state.lock().unwrap().created, 0);
     // The source is put in B while B is live: sent, and B named.
     set("inactive", "active", true);
-    let seen = until_event(
+    until_event(
         &mut events,
         "SlotAddedWhileLive",
         |e| matches!(e, Event::SlotAddedWhileLive { productions, .. } if productions == &["Show B".to_string()]),
         Duration::from_secs(5),
     )
     .await;
-    let _ = seen;
     until_strom(
         &strom_state,
         "the flow",

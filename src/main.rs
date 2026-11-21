@@ -315,13 +315,23 @@ fn render(event: &Event) -> Option<String> {
         }
         Event::Input { input, state } => format!("  {input} — {}\n", state.describe()),
         Event::ProductionLive { input, productions } => {
-            let quoted: Vec<String> = productions.iter().map(|p| format!("{p:?}")).collect();
-            let which = match quoted.as_slice() {
+            let which = match quoted(productions).as_slice() {
                 [one] => format!("production {one} is"),
-                _ => format!("productions {} are", quoted.join(", ")),
+                many => format!("productions {} are", many.join(", ")),
             };
             format!("  {input} — {which} live, starting the uplink\n")
         }
+        // #128: the operator relays it to the director, who has to reactivate.
+        Event::SlotAddedWhileLive { input, productions } => match quoted(productions).as_slice() {
+            [] => format!("  {input} — no live production waits for a reactivation any more\n"),
+            [one] => format!(
+                "  {input} — production {one} got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate it in Studio\n"
+            ),
+            many => format!(
+                "  {input} — productions {} got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate them in Studio\n",
+                many.join(", ")
+            ),
+        },
         Event::NoProductionLive { input } => {
             format!("  {input} — no production holding its source is live, uplink stopped\n")
         }
@@ -350,12 +360,16 @@ fn render(event: &Event) -> Option<String> {
         | Event::ConnectWarning { .. }
         | Event::InputFailed { .. }
         | Event::Warning { .. }
-        | Event::SlotAddedWhileLive { .. }
         | Event::OscSignInEnds { .. }
         | Event::Stats { .. }
         | Event::Stopped
         | Event::Failed { .. } => return None,
     })
+}
+
+/// Production names as the lines quote them.
+fn quoted(productions: &[String]) -> Vec<String> {
+    productions.iter().map(|p| format!("{p:?}")).collect()
 }
 
 /// The line for a source Open Live would not remove, `reason` being its refusal.
@@ -614,6 +628,30 @@ mod tests {
                     .to_string(),
             ),
             (
+                Event::SlotAddedWhileLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string()],
+                },
+                "  Venue — Camera — production \"Morning Show\" got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate it in Studio\n"
+                    .to_string(),
+            ),
+            (
+                Event::SlotAddedWhileLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string(), "Rehearsal".to_string()],
+                },
+                "  Venue — Camera — productions \"Morning Show\", \"Rehearsal\" got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate them in Studio\n"
+                    .to_string(),
+            ),
+            (
+                Event::SlotAddedWhileLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec![],
+                },
+                "  Venue — Camera — no live production waits for a reactivation any more\n"
+                    .to_string(),
+            ),
+            (
                 Event::NoProductionLive {
                     input: "Venue — Camera".to_string(),
                 },
@@ -705,10 +743,6 @@ mod tests {
                 source_id: "s".to_string(),
             },
             Event::Stats { inputs: Vec::new() },
-            Event::SlotAddedWhileLive {
-                input: "x".to_string(),
-                productions: vec!["p".to_string()],
-            },
             Event::Stopped,
             Event::Failed {
                 reason: "y".to_string(),

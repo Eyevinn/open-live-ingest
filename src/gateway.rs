@@ -57,7 +57,7 @@ pub enum Event {
     HeartbeatStarted { gateway_id: String },
     /// An input's state changed, as the last poll found it.
     Input { input: String, state: InputState },
-    /// An armed input (`run::Uplink::WhileLive`): `productions`, which hold its
+    /// An armed input (`run::Sending::WhileLive`): `productions`, which hold its
     /// source, are live, so its uplink is being started.
     ProductionLive {
         input: String,
@@ -157,7 +157,7 @@ pub struct UplinkStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputState {
     /// Registered, with no flow: the session sends only while a production holding
-    /// the source is live (`run::Uplink::WhileLive`), and none is.
+    /// the source is live (`run::Sending::WhileLive`), and none is.
     Armed,
     /// Start requested, first poll pending.
     Starting,
