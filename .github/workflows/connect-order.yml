@@ -1,0 +1,107 @@
+name: Connect order
+
+# The connect-order measurement of OL-64-0 (#136; docs/specs/ios-app.md section 14 Q13
+# and Q8): an SRT caller with the phone defaults of spec section 11, from a macOS
+# runner into an SRT listener source on an Open Live instance (default `openlivedev`),
+# 60 s with the production active first (run A) and 60 s with the caller dialling
+# first (run B), the sender's SRT stats read twice a minute apart, and whether the
+# cloud input decodes. What it does and how: .github/scripts/connect-order.py; the
+# sender: .github/scripts/srt-sender.c. The results go on #133 by hand, from the
+# `comment.md` the run uploads.
+#
+# A measurement, not a check: run by hand only, never on a push, a pull request or a
+# tag, and nothing in the release path depends on it.
+#
+# Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
+# token for the workspace that owns the instance (the same secret as release.yml's
+# e2e-macos job). Without it the run fails at its first step, naming the secret, and
+# nothing is created on the instance. One run at a time per instance, shared with
+# e2e-macos (`e2e-openlivedev`).
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: "Open Live instance name in the token's workspace"
+        required: false
+        default: openlivedev
+        type: string
+      runs:
+        description: "Runs, in order: A (production first), B (caller first)"
+        required: false
+        default: "A,B"
+        type: string
+      seconds:
+        description: "Seconds between the two stats readings (at least 60)"
+        required: false
+        default: "60"
+        type: string
+      caller_lead:
+        description: "Run B: seconds the caller dials before the production is activated (at least 10)"
+        required: false
+        default: "30"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-openlivedev
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: The secret is set
+        env:
+          HAS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN != '' }}
+        run: |
+          if [[ "$HAS_TOKEN" != "true" ]]; then
+            echo "::error title=connect-order::the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud personal access token for the workspace that owns the Open Live instance) is not set; nothing was measured"
+            exit 1
+          fi
+          echo "OSC_ACCESS_TOKEN is set"
+
+      - uses: actions/checkout@v4
+
+      - name: Unit tests of the measurement
+        run: python3 -I .github/scripts/test_connect_order.py
+
+      - name: Install ffmpeg and libsrt
+        run: |
+          set -euo pipefail
+          brew install ffmpeg srt pkg-config
+          ffmpeg -hide_banner -version | head -n 1
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -E ' libx264 | aac ' \
+            || { echo "ffmpeg has no libx264 or aac encoder"; exit 1; }
+          echo "libsrt $(pkg-config --modversion srt)"
+
+      - name: Build the SRT sender
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/connect-order"
+          mkdir -p "$out"
+          # shellcheck disable=SC2046
+          cc -O2 -Wall -Wextra -o "$out/srt-sender" .github/scripts/srt-sender.c \
+            $(pkg-config --cflags --libs srt) -lpthread
+          echo "CO_SENDER=$out/srt-sender" >> "$GITHUB_ENV"
+          echo "CO_OUT=$out" >> "$GITHUB_ENV"
+          echo "CO_LIBSRT_VERSION=$(pkg-config --modversion srt)" >> "$GITHUB_ENV"
+
+      - name: Run A (production first) and run B (caller first)
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          OPEN_LIVE_INSTANCE: ${{ inputs.instance }}
+          CO_RUNS: ${{ inputs.runs }}
+          CO_SECONDS: ${{ inputs.seconds }}
+          CO_CALLER_LEAD: ${{ inputs.caller_lead }}
+        run: python3 -I .github/scripts/connect-order.py
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: connect-order
+          path: ${{ runner.temp }}/connect-order/*.*
+          if-no-files-found: ignore
