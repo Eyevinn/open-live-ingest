@@ -1,7 +1,7 @@
 # ADR-002: iOS app toolkit: the library on iOS, a C ABI to Swift, and own media code over libsrt
 
 **Date**: 2026-11-22
-**Status**: Proposed
+**Status**: Accepted
 
 Spec: [`docs/specs/ios-app.md`](../specs/ios-app.md). Epic: #133 (OL-64). Model:
 [ADR-001](ADR-001-desktop-app-toolkit.md).
@@ -58,7 +58,9 @@ Constraints:
   `tokio-tungstenite` with `rustls-tls-webpki-roots`, `tokio`, `serde`; `aarch64-apple-ios` and
   `aarch64-apple-ios-sim` are tier-2 Rust targets with `std`. Two `cfg`s need widening:
   `security-framework` is `target_os = "macos"` only, and `config::user_dir()` sends iOS to the
-  XDG branch. `local_strom` and the pidfile code compile on iOS but are never called there.
+  XDG branch. `local_strom` compiles on iOS but is never called there. The pidfile code is
+  not: `run::up` calls `running_gateway()` and `Pidfile::write` on every run (`run.rs`), before
+  any Strom is touched, so it moves behind the seam (§1).
 - **The desktop app already defines a message protocol** between a UI and the Rust core
   (`docs/specs/desktop-app.md` §9.1: `{id, cmd, args}` / `{id, ok | error}` / `{event, data}`),
   driven over stdin/stdout too (`--ipc-stdio`, §9.3a). It is the natural shape for a second UI.
@@ -71,12 +73,18 @@ The iOS app links this repo's library, built for `aarch64-apple-ios` (device) an
 `aarch64-apple-ios-sim` (simulator, for CI). Everything that is not media is the desktop's code,
 unchanged: `osc`, `credential`, `keychain`, `openlive`, `gate`, `heartbeat`, `session`, `config`.
 
-`run::up` stops calling `StromClient` directly and becomes generic over a `Media` trait with six
-operations (version, start, stop, restart, running, uplink stats; spec §4). `StromMedia` is
-today's code moved behind it, behaviour unchanged and pinned by the existing golden and session
-tests. `ExternalMedia` hands start / stop / restart to the host and answers state and stats from
-what the host reports. The seam carries `strom-types`' `SrtCallerStats`, so stall detection and
-the Link line are shared too.
+`run::up` stops calling `StromClient` directly and becomes generic over a `Media` trait with seven
+operations (version, input resolution, start, stop, restart, running, uplink stats; spec §4),
+each declared `fn op(&self, ..) -> impl Future<Output = ..> + Send` so `run::up` stays spawnable
+and clippy-clean without `async-trait`. `StromMedia` is today's code moved behind it, behaviour
+unchanged and pinned by the existing golden and session tests: its `resolve_inputs` runs today's
+device code (`video_devices`, `audio_devices`, `devices::choose_saved` / `choose` / `pair_audio`;
+`devices::inputs_for` stays shared, after the cloud's ports are known), and its constructor does the single-instance pidfile check and write that `run::up`
+does today (`running_gateway()`, `Pidfile::write`), so the CLI and the desktop app behave as
+before and the phone writes no pidfile. `ExternalMedia` resolves inputs from the settings'
+`[[input]]` as Swift picked them, hands start / stop / restart to the host over its own channel,
+and answers state and stats from what the host reports. The seam carries `strom-types`'
+`SrtCallerStats`, so stall detection and the Link line are shared too.
 
 The repo rule "Strom owns the media plane; the gateway owns no media" is amended to: **the library
 owns no media**. On a computer Strom does it, as before, behind the same process boundary; on the

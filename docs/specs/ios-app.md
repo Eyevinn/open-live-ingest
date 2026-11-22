@@ -1,7 +1,7 @@
 # Spec: Open Live Ingest for iPhone (iOS)
 
 **Epic**: #133 (OL-64)
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-11-22
 **Decision record**: [ADR-002](../decisions/ADR-002-ios-app-toolkit.md) (the library on iOS, the
 Swift binding, and the media and SRT stack on the phone)
@@ -26,7 +26,7 @@ What an app of our own adds is the Open Live side: no address or port typed, the
 for the person, kept at Stop and reused at the next Go live (#115), and the uplink held back until a
 production holding the source is live.
 
-Out of scope (from #133 and by proposal, §14): sending while the app is in the background, several
+Out of scope (from #133 and as decided, §14): sending while the app is in the background, several
 cameras from one phone, a return feed or talkback, destinations other than Open Live, iPad- and
 Mac-Catalyst-specific layouts, Android, the App Store listing (TestFlight first, #133 item 5).
 
@@ -39,7 +39,7 @@ Mac-Catalyst-specific layouts, Android, the App Store listing (TestFlight first,
 | Binding | A new crate `mobile/`: a hand-written C ABI of four functions carrying the desktop app's JSON message envelope (desktop §9.1). No UniFFI, no cbindgen | ADR-002 §2, §8 |
 | Media on the phone | Own Swift over AVFoundation, VideoToolbox and AudioToolbox; own MPEG-TS muxer; libsrt built from source at a pinned tag with mbedTLS. HaishinKit not added | ADR-002 §3, §5 |
 | Sign-in | The library's PKCE loopback sign-in (`osc::sign_in`), the page shown in `ASWebAuthenticationSession`; personal access token paste as the fallback | §6 |
-| Credential | iOS Keychain through the existing `keychain::OsKeychain` (`security-framework`, widened to iOS) | §7 |
+| Credential | iOS Keychain through the existing `keychain::OsKeychain` (`security-framework`, widened to iOS); on iOS it writes with `set_generic_password_options` and `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` | §7 |
 | Background, calls | The uplink pauses; the session stays armed and the source is kept, marked inactive; resumes in the foreground. No background modes | §9 |
 | Wi-Fi / cellular | On a path change the SRT caller reconnects on the new path; no restart of the session | §9 |
 | Distribution | TestFlight upload job in `release.yml`, guarded by the presence of the App Store Connect secrets, like `macos-app`'s Developer ID guard | §12 |
@@ -79,42 +79,72 @@ Today `run::up` and everything it calls take a `StromClient` and call it directl
 (`src/run.rs`: `start` → `create_flow` + `start_flow`, `remove_flow` → `stop_flow` +
 `delete_flow`, `ensure_started` / `poll_flow` → `get_flow`, `poll_flow` → `srt_uplink`,
 `start_again` → `start_flow`, `clear_conflicting_flows` → `list_flows`, `up` → `version`, and
-`connect_strom` → `local_strom::ensure_running`). The gate (`gate.rs`), source registration and
+`connect_strom` → `local_strom::ensure_running`), and it picks the inputs through Strom
+(`video_devices`, `audio_devices`, then `devices::choose_saved` / `choose` / `pair_audio` /
+`inputs_for`). Before any of that it refuses a second live session and records this one
+(`running_gateway()`, `Pidfile::write`). The gate (`gate.rs`), source registration and
 adoption (`reconcile_sources`, `plan_port`, `assign_ports_from_open_live`), the heartbeat and the
-teardown never touch media; they only need "start this input's uplink to this endpoint", "stop
-it", "is it running", and "its SRT counters".
+teardown never touch media; they only need "which inputs are there", "start this input's uplink
+to this endpoint", "stop it", "is it running", and "its SRT counters".
 
 The seam is exactly that, and nothing more:
 
 ```rust
 /// What the session asks of whatever does the media. Not object-safe on purpose:
-/// `run::up` is generic over it, so no `async-trait` and no boxing.
+/// `run::up` is generic over it, so no `async-trait` and no boxing. Each method
+/// returns `impl Future<Output = ..> + Send` rather than being an `async fn`: a bare
+/// `async fn` in a `pub trait` trips rustc's `async_fn_in_trait` lint, which CI's
+/// `cargo clippy --all-targets -- -D warnings` makes an error, and its future has no
+/// `Send` bound, so `Session::start_inner`'s `tokio::spawn` of `run::up` would not
+/// compile. Stable Rust, still no `async-trait`.
 pub trait Media: Send + Sync {
     /// Once, before any input: Strom's version for the heartbeat, `None` on the phone.
-    async fn version(&self) -> Option<String>;
+    fn version(&self) -> impl Future<Output = Option<String>> + Send;
+    /// Once, before any port is asked for: which cameras go live (or the test
+    /// pattern) and the camera -> audio pairing, as `run::up` resolves them today.
+    /// Warnings (a saved device not connected) go out as `events` as today.
+    fn resolve_inputs(&self, cfg: &Config, inputs: Inputs, events: &Events)
+        -> impl Future<Output = Result<ResolvedInputs>> + Send;
     /// Starts the input's uplink: capture, encode, MPEG-TS, SRT caller to `endpoint.venue_uri()`.
-    async fn start(&self, input: &InputPlan, endpoint: &Endpoint, video: &Video) -> Result<()>;
+    fn start(&self, input: &InputPlan, endpoint: &Endpoint, video: &Video)
+        -> impl Future<Output = Result<()>> + Send;
     /// Stops and forgets it. Stopping one that does not run is not an error.
-    async fn stop(&self, input: &InputPlan) -> Result<()>;
+    fn stop(&self, input: &InputPlan) -> impl Future<Output = Result<()>> + Send;
     /// Restarts a running uplink (the #127 stall restart). Strom: stop_flow + start_flow.
-    async fn restart(&self, input: &InputPlan) -> Result<bool>;
+    fn restart(&self, input: &InputPlan) -> impl Future<Output = Result<bool>> + Send;
     /// Whether it runs, as the session's state machine reads a flow today.
-    async fn running(&self, input: &InputPlan) -> Result<Option<bool>>;
+    fn running(&self, input: &InputPlan) -> impl Future<Output = Result<Option<bool>>> + Send;
     /// The SRT sender's cumulative counters, `None` before a peer exists.
-    async fn uplink(&self, input: &InputPlan) -> Result<Option<SrtCallerStats>>;
+    fn uplink(&self, input: &InputPlan)
+        -> impl Future<Output = Result<Option<SrtCallerStats>>> + Send;
 }
 ```
 
 - **`StromMedia`** wraps `LocalStrom` + `StromClient` and is today's code moved, not changed:
-  flow ids stay derived (UUIDv5 over gateway id + input id), `clear_conflicting_flows` and the
-  Strom start / adopt / reclaim of `local_strom` happen in its constructor. `tests/golden.rs`,
-  `tests/session.rs` and every unit test in `run.rs` pass unchanged; that is the acceptance check
-  for the refactor.
+  flow ids stay derived (UUIDv5 over gateway id + input id), and its constructor does, in today's
+  order, the single-instance check and pidfile write (`running_gateway()` → `AlreadyRunning`,
+  then `Pidfile::write`, the guard held by `StromMedia` and removed when it drops), then
+  `clear_conflicting_flows` and the Strom start / adopt / reclaim of `local_strom`. So the CLI
+  and the desktop app behave as today (a second `up` or Go live is refused, #95's reclaim still
+  sees a starting gateway), and the phone, which never builds a `StromMedia`, writes no pidfile.
+  Its `resolve_inputs` is today's device code unchanged (`video_devices`, `audio_devices`,
+  `devices::choose_saved` / `choose` / `pair_audio`). `tests/golden.rs`, `tests/session.rs` and
+  every unit test in `run.rs` pass unchanged; that is the acceptance check for the refactor.
 - **`ExternalMedia`** holds, per input, the last state and counters the host reported, and hands
-  each `start` / `stop` / `restart` to the host as an event (§8.3, `media`). `running` and
-  `uplink` answer from the last report. It is plain Rust and is tested with a fake host in
-  `tests/session.rs`, through the same armed-session scenarios #132 added (production goes
-  `active` → `start`; leaves `active` → `stop`; Stop → `stop` and the source kept).
+  each `start` / `stop` / `restart` to the host over its own channel: `ExternalMedia::new()`
+  returns it with a receiver of media requests, which `mobile/` turns into `media` events
+  (§8.2). They are not a new `gateway::Event` variant, so the CLI's exhaustive event rendering
+  in `main.rs` is untouched. `running` and `uplink` answer from the last report. Its
+  `resolve_inputs` uses `cfg.inputs` as Swift picked them: one camera per `[[input]]`, `device`
+  the AVFoundation unique id, `audio` the microphone's port UID, no lookup. It is plain Rust and
+  is tested with a fake host in `tests/session.rs`, through the same armed-session scenarios #132
+  added (production goes `active` → `start`; leaves `active` → `stop`; Stop → `stop` and the
+  source kept).
+- **The armed entry point with a backend** is `Session::start_armed_with(media, settings, inputs,
+  credential, sources)`, generic over `M: Media + 'static`. `Session::start_armed` (and `start`,
+  `start_with`, `start_keeping_sources`) keep their signatures and build `StromMedia` inside the
+  session task, as `run::up` connects to Strom today; `mobile/`'s Go live calls
+  `start_armed_with` with an `ExternalMedia`.
 - **`SrtCallerStats` stays the one stats type.** It is `strom-types`' (`bytes_sent`,
   `packets_sent`, `packets_sent_dropped`, `rtt_ms`, `send_rate_mbps`, all optional), so the
   stall detection (`judge`, `Counters`) and the desktop §5.1 Link line work unchanged. The phone
@@ -122,10 +152,14 @@ pub trait Media: Send + Sync {
   `msRTT`, `mbpsSendRate`), cumulative per connection as libsrt keeps them, which is the
   semantics `Counters` already assumes ("they start again from zero when the caller
   reconnects").
-- **Devices are not part of the seam.** On the phone the inputs come from AVFoundation, picked in
-  Swift, and reach the library as one `InputSettings` (`device` = the AVFoundation unique id of
-  the lens, `audio` = the microphone's port UID, `label`). `devices.rs` and `local_strom` are
-  simply not called by `mobile/`.
+- **Device discovery stays on each side of the seam.** On the phone the inputs come from
+  AVFoundation, picked in Swift, and reach the library as one `InputSettings` (`device` = the
+  AVFoundation unique id of the lens, `audio` = the microphone's port UID, `label`), which
+  `ExternalMedia::resolve_inputs` takes as is. `ResolvedInputs` is what `run::up` holds today
+  after device choice: the chosen cameras, whether the test pattern is used, and the camera →
+  audio map. Strom's device lookup and `local_strom` are not called on the phone; what follows
+  resolution stays shared in `run::up` (`resolve_cloud`, `devices::inputs_for` with the cloud's
+  ports, `attach_audio`, `apply_labels`, `check_unique_names`).
 - **`CLAUDE.md` and `DESIGN.md` §1/§3 are amended in OL-64a:** "Strom owns the media plane" stays
   true for the gateway on a computer; on the phone there is no Strom and the iOS app's Swift code
   owns capture, encode, mux and SRT, with the library still owning no media. The process-boundary
@@ -167,7 +201,7 @@ registers a public client (`POST https://app.osaas.io/api/connect/register` with
 `{client_name, redirect_uris: ["http://127.0.0.1/callback"]}`, falling back to the `cli` client
 id), builds the authorize URL (`/api/connect/authorize`, `response_type=code`, PKCE S256, `state`)
 and exchanges the code at `/api/connect/token`. `osc::browser_login_with(open)` already takes the
-"open this page" step as a closure; on iOS that closure emits the `osc_sign_in_page` event (§8.3)
+"open this page" step as a closure; on iOS that closure emits the `osc_sign_in_page` event (§8.2)
 and the Swift side presents the URL in an `ASWebAuthenticationSession`
 (`prefersEphemeralWebBrowserSession = false`, so an existing OSC browser login is reused).
 
@@ -256,13 +290,16 @@ a `Problem` so a hand-copied desktop file cannot silently ask for AV1.
   (`devices::name_prefix`), so two phones named alike would remove each other's sources. A
   unique default prevents that; editing it is allowed (Advanced), and `validate` warns when the
   instance already has sources under the new prefix that this phone did not register.
-- **The Keychain entry** is the existing one (`keychain::SERVICE` = `open-live-ingest`), stored
-  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, so it is never synced or restored to another
-  device.
+- **The Keychain entry** is the existing one (`keychain::SERVICE` = `open-live-ingest`). Today
+  `keychain::OsKeychain::set` calls `set_generic_password`, which sets no accessibility; on iOS
+  OL-64b writes it with `set_generic_password_options` instead, its `PasswordOptions` carrying
+  `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (`SecAccessControl::create_with_protection`),
+  so it is never synced or restored to another device. macOS keeps today's call.
 - **Local state**, completing the repo invariant for this front end: the settings file, the one
   Keychain entry, and `app.log` with one rotated copy (desktop §7's own rotation code, in
-  `Library/Logs`, shared from Advanced → "Share logs" through the share sheet). No pidfiles: iOS
-  runs one instance of an app, and there is no Strom to record.
+  `Library/Logs`, shared from Advanced → "Share logs" through the share sheet). No pidfile: the
+  single-instance check and pidfile write live in `StromMedia`'s constructor (§4), which the phone
+  never builds; iOS runs one instance of an app, and there is no Strom to record.
 
 ## 8. App API (internal: Swift ⇄ Rust core)
 
@@ -315,7 +352,7 @@ arguments is an error reply:
 | `self_hosted` | `{url, api_key}` | view model | `api::check_self_hosted`, `api::save_to` |
 | `set_input` | `{device, audio?, label?}` | view model | `config::input_problems`, `api::save_to` |
 | `set_advanced` | the Advanced values | view model, or `problems[]` | `api::validate`, `api::save_to` |
-| `go_live` | — | `null` (progress as events) | `Session::start_armed(settings, inputs, credential, Sources::Keep)` with `ExternalMedia` |
+| `go_live` | — | `null` (progress as events) | `Session::start_armed_with(ExternalMedia, settings, inputs, credential, Sources::Keep)` (§4) |
 | `stop` | — | `null` | `SessionHandle::stop` |
 | `media_report` | `{input, state: "starting" \| "running" \| "failed" \| "stopped", reason?, stats?: {bytes_sent, packets_sent, packets_sent_dropped, rtt_ms, send_rate_mbps}}` | `null` | `ExternalMedia` (§4); sent by Swift on each change and every 2 s while running |
 | `phone` | `{foreground: bool, interrupted: bool, network: "wifi" \| "cellular" \| "wired" \| "other" \| "none"}` | `null` | §9: pauses / resumes the uplink, notes the network in the status |
@@ -327,7 +364,7 @@ Events: the desktop §9.3 set where it applies (`where`, `osc_sign_in_page`, `in
 | `event` | `data` | Meaning |
 |---|---|---|
 | `osc_signed_in` | `{}` | the loopback callback arrived; Swift cancels the authentication sheet |
-| `media` | `{input, action: "start", uplink: {host, port, latency_ms, passphrase?, pbkeylen?, stream_id?}, video: {width, height, fps, bitrate_kbps, keyframe_interval}, audio: {sample_rate: 48000, channels: 2, bitrate_kbps: 128}}` | `ExternalMedia::start`: open capture, encoders and the SRT caller |
+| `media` | `{input, action: "start", uplink: {host, port, latency_ms, passphrase?, pbkeylen?}, video: {width, height, fps, bitrate_kbps, keyframe_interval}, audio: {sample_rate: 48000, channels: 2, bitrate_kbps: 128}}` | `ExternalMedia::start`: open capture, encoders and the SRT caller |
 | `media` | `{input, action: "stop" \| "restart"}` | `ExternalMedia::stop` / `restart` |
 | `fatal` | `{message}` | a panic was caught at the ABI; the app shows "Something went wrong" and offers Share logs |
 
@@ -446,8 +483,8 @@ sequenceDiagram
   network), `ITSAppUsesNonExemptEncryption = false` with the export-compliance answer recorded in
   OL-64g (TLS and SRT's AES only, standard algorithms), `UIRequiredDeviceCapabilities` `arm64`,
   `LSApplicationCategoryType` `public.app-category.video`, bundle id
-  `com.eyevinn.open-live-ingest.ios` (proposed; the macOS app keeps `com.eyevinn.open-live-ingest`; registered by a human, §14 Q11).
-- **Minimum iOS 17.0** (proposed, §14 Q10).
+  `com.eyevinn.open-live-ingest.ios` (decided; the macOS app keeps `com.eyevinn.open-live-ingest`; registered by a human, §14 Q11).
+- **Minimum iOS 17.0** (decided, §14 Q10).
 
 ## 12. Build, CI and distribution
 
@@ -482,9 +519,9 @@ Standing rule (CTO, 2026-10-22). Counts measured 2026-11-22 from the manifests o
 | What | Where | Decision |
 |---|---|---|
 | Rust crates for iOS | `mobile/` | **None new.** `serde`, `serde_json`, `tokio`, `tracing`, `tracing-subscriber`, `anyhow` are already the gateway's and the desktop app's. reqwest's `rustls-tls` and tokio-tungstenite's `rustls-tls-webpki-roots` build for iOS as they are (no OpenSSL) |
-| `security-framework` | library, iOS | **Already in the tree** (macOS, #76): the dependency's target `cfg` widens from `target_os = "macos"` to `any(target_os = "macos", target_os = "ios")`. Its generic-password calls are the same on iOS. +0 crates |
+| `security-framework` | library, iOS | **Already in the tree** (macOS, #76): the dependency's target `cfg` widens from `target_os = "macos"` to `any(target_os = "macos", target_os = "ios")`. On iOS the write uses its `set_generic_password_options` with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` (§7.1) instead of today's `set_generic_password`; read and delete are the same calls. +0 crates |
 | UniFFI, cbindgen, swift-bridge, `safer-ffi` | — | **Not added.** Four hand-written `extern "C"` functions and a 20-line header (§8.1) carry JSON the desktop already defines; a binding generator would add a macro and build tooling stack (UniFFI: `uniffi_bindgen`, `askama`, `goblin`, `camino`, `cargo_metadata` and more) for a surface that never grows past the envelope |
-| `async-trait` | — | **Not added**: `Media` uses native `async fn` in traits with `run::up` generic over it (§4) |
+| `async-trait` | — | **Not added**: `Media`'s methods return `impl Future<Output = ..> + Send` (stable Rust) with `run::up` generic over it (§4) |
 | libsrt | `ios/Vendor` | **Add, built from source.** SRT is protocol handling and the reason to use the reference implementation is parity with the cloud side's GStreamer `srtsink`/`srtsrc`, which link libsrt. MPL-2.0 (file-level copyleft: we ship it unmodified, the licence and source link go in the app's About). Pinned release tarball, SHA-256 checked in `build-libsrt.sh`; the tag matches the libsrt the cloud Strom's GStreamer is built with (OL-64c records it). Its C++ standard library comes from the OS |
 | mbedTLS | `ios/Vendor` | **Add, built from source**, as libsrt's crypto for the passphrase (AES-CTR, AES key wrap, PBKDF2). Crypto is never reimplemented. Apache-2.0, pinned LTS tarball, digest checked. Chosen over OpenSSL for size (libsrt needs only its cipher and KDF) and because no prebuilt OpenSSL binary is needed |
 | HaishinKit (`SRTHaishinKit` + `HaishinKit`) | — | **Not added** (ADR-002 §5). `Package.swift` of 2.3.1 declares 6 package dependencies (`libaom-xcframework`, `libvpx-xcframework`, `libdatachannel-xcframework`, `libsrt-xcframework`, `swift-docc-plugin`, `Logboard`), all resolved even when only `SRTHaishinKit` is used; `libsrt-xcframework` is a prebuilt `libsrt.xcframework` binary plus `krzyzanowskim/OpenSSL-Package` (a second prebuilt binary). We would use its capture, codec, TS writer and SRT wrapper (a large fraction of the SRT path) but could not build its libsrt or OpenSSL from source without a fork |
@@ -495,40 +532,52 @@ Standing rule (CTO, 2026-10-22). Counts measured 2026-11-22 from the manifests o
 Existing dependencies touched: none removed. `strom-types` stays a library dependency
 (`SrtCallerStats`, and the Strom backend); it is pure serde and builds for iOS.
 
-## 14. Open questions, with the proposed resolution
+## 14. Open questions (resolved, with the decision)
 
-1. **How is the Rust library called from Swift?** A hand-written C ABI of four functions carrying
-   the desktop app's JSON envelope, in a new `mobile/` crate (§8, ADR-002 §2). UniFFI and a
-   Swift reimplementation rejected in ADR-002.
-2. **Which media and SRT stack on the phone, and is HaishinKit the base?** Own Swift over the OS
-   frameworks plus libsrt and mbedTLS built from source; HaishinKit not added (ADR-002 §3, §5,
-   with the measured counts). HaishinKit stays the named fallback if OL-64c/d fail their checks
-   (ADR-002, "Risks").
-3. **Does HaishinKit meet the desktop's latency, passphrase, CBR and stats needs?** Moot under
-   Q2. For the record (2026-11-22, `SRTHaishinKit/Sources/SRT/SRTSocket.swift`): it sets socket
-   options and reads `srt_bstats` into `SRTPerformanceData`, so it would have; the decision rests
-   on the supply chain, not on capability.
-4. **How does OSC sign-in work on iOS?** The library's PKCE loopback sign-in, shown in
-   `ASWebAuthenticationSession`, PAT paste as the always-working fallback; a custom-scheme
-   redirect only if OL-64b finds the loopback path does not work in the sheet and OSC accepts
-   such a registration (§6).
-5. **What happens on background, lock or a phone call?** The uplink pauses, the session stays
-   armed, the source is kept and marked inactive within a 4 s background task; the foreground
-   resumes it through the gate. No background modes (§9).
-6. **Wi-Fi ↔ cellular without a restart?** Reconnect the SRT caller on the new path at once,
-   keeping capture and encoders; no SRT connection migration exists in libsrt 1.5 (§9). Bonding
-   both paths is out of scope.
-7. **Identity of a phone?** `gateway.id` a UUID made at first launch; `gateway.name` defaults to
-   `iPhone <4 hex>` so two phones never share the sweep prefix (§7.1).
-8. **Encode settings and adaptation?** 720p30, H.264 CBR 4000 kbps, 200 ms latency by default,
-   changeable under Advanced; no adaptive bitrate in v1. Revisit the defaults with OL-64-0's
-   numbers; adaptive bitrate is a follow-up issue if cellular drops exceed 1 % at the default.
-9. **One camera per phone?** Yes: one lens and one microphone per session.
+Resolved at the Phase 1.5 spec gate, 2026-11-22. Only Q11 and Q13's device part need a human,
+in one batched request; neither blocks OL-64-0 or OL-64a to OL-64c.
+
+1. **How is the Rust library called from Swift?** **Decided:** a hand-written C ABI of four
+   functions in a new `mobile/` crate, carrying the desktop app's JSON envelope (§8, ADR-002 §2).
+   UniFFI, cbindgen, swift-bridge and a Swift reimplementation are rejected (ADR-002).
+2. **Which media and SRT stack on the phone, and is HaishinKit the base?** **Decided:** own Swift
+   over AVFoundation, VideoToolbox and AudioToolbox, an own TS muxer, and libsrt plus mbedTLS
+   built from pinned, digest-checked source; HaishinKit is not added (ADR-002 §3, §5, with the
+   measured counts). HaishinKit stays the named fallback if OL-64c cannot produce working device
+   and simulator slices; switching to it supersedes ADR-002 (ADR-002, "Risks").
+3. **Does HaishinKit meet the desktop's latency, passphrase, CBR and stats needs?** **Decided:**
+   moot under Q2. For the record (2026-11-22, `SRTHaishinKit/Sources/SRT/SRTSocket.swift`): it
+   sets socket options and reads `srt_bstats` into `SRTPerformanceData`, so it would have; the
+   decision rests on the supply chain, not on capability.
+4. **How does OSC sign-in work on iOS?** **Decided:** the library's PKCE loopback sign-in, shown
+   in `ASWebAuthenticationSession`, with PAT paste as the fallback that always works. OL-64b
+   checks the loopback path on the simulator first; a custom-scheme redirect is used only if that
+   check fails and OSC's registration accepts the scheme. OL-64b records the answer either way
+   (§6).
+5. **What happens on background, lock or a phone call?** **Decided:** the uplink pauses, the
+   session stays armed, the source is kept and PATCHed inactive inside a 4 s background task
+   (`ENDING_TEARDOWN`); returning to the foreground resumes it through the gate.
+   `UIBackgroundModes` stays empty (§9).
+6. **Wi-Fi ↔ cellular without a restart?** **Decided:** reconnect the SRT caller on the new path
+   at once, keeping capture and encoders running; libsrt 1.5 has no SRT connection migration
+   (§9). Bonding both paths is out of scope.
+7. **Identity of a phone?** **Decided:** `gateway.id` is a UUID made at first launch;
+   `gateway.name` defaults to `iPhone <4 hex>` so two phones never share the sweep prefix, and
+   `validate` warns when a renamed prefix collides with existing sources (§7.1).
+8. **Encode settings and adaptation?** **Decided:** 720p30, H.264 High CBR 4000 kbps, 1 s GOP,
+   no B-frames, AAC-LC 48 kHz stereo 128 kbps, 200 ms SRT latency by default, changeable under
+   Advanced; no adaptive bitrate in v1 (§11). OL-64-0's numbers may change these defaults (a
+   settings change, not a design change). An adaptive-bitrate follow-up issue is filed only if
+   cellular drops exceed 1 % at the default.
+9. **One camera per phone?** **Decided:** yes, one lens and one microphone per session.
    `AVCaptureMultiCamSession` is out of scope.
-10. **Minimum iOS?** 17.0: covers iPhone XS/XR and later, and gives the current
-    `AVCaptureConnection.videoRotationAngle` and VideoToolbox CBR APIs without fallbacks.
-11. **Apple distribution credentials?** **Needs a human; blocks only OL-64g's upload step**, not
-    its build or any other ticket.
+10. **Minimum iOS and bundle id?** **Decided:** minimum iOS 17.0: covers iPhone XS/XR and later,
+    and gives the current `AVCaptureConnection.videoRotationAngle` and VideoToolbox CBR APIs
+    without fallbacks. Bundle id `com.eyevinn.open-live-ingest.ios` (§11).
+11. **Apple distribution credentials?** **Decided: human-only** (credentials and an account no
+    agent holds). They block only OL-64g's upload step; OL-64g still ships the unsigned simulator
+    and device builds and the guarded upload path without them. Goes into the single batched
+    escalation together with Q13's device part.
     - *Needed now:* an Apple Distribution certificate (`.p12` + password), the bundle id
       `com.eyevinn.open-live-ingest.ios` registered with the Camera and Microphone capabilities, an App
       Store Connect app record, an App Store provisioning profile for it, and an App Store Connect
@@ -538,25 +587,28 @@ Existing dependencies touched: none removed. `strom-types` stays a library depen
     - *Prevent next time:* request the iOS distribution set together with the Developer ID set
       whenever an Apple deliverable is planned.
     - *Owner of that change:* the Eyevinn Apple Developer account holder who set up #25.
-12. **External TestFlight testers?** Internal testers only in this epic. Adding external testers
-    sends the build through Beta App Review, an outward-facing step for a human after the epic
-    closes (in the closing comment's "What a human does next").
-13. **The "Before building" measurement on a real iPhone.** Split by what needs a device:
-    - *Connect order and strom#1277*: device-independent. OL-64-0 runs it agent-side from a macOS
+12. **External TestFlight testers?** **Decided:** internal testers only in this epic. Adding
+    external testers sends the build through Beta App Review, an outward-facing step for a human
+    after the epic closes, listed in the closing comment's "What a human does next".
+13. **The "Before building" measurement on a real iPhone.** **Decided:** split by what needs a
+    device. OL-64a to OL-64c proceed before the device numbers arrive: the issue's condition
+    (cellular over 1 % drops, or a phone-first stall) can only change encode defaults, adaptation
+    or gate behaviour, none of which touch the library seam, the iOS build or the libsrt
+    cross-build.
+    - *Connect order and strom#1277*: device-independent, agent-run. OL-64-0 runs it from a macOS
       runner with an SRT caller (`ffmpeg` test pattern, H.264 + AAC in TS, the phone defaults of
       §11) into an `openlivedev` SRT listener source: 60 s production-first and 60 s caller-first,
       SRT stats read twice a minute apart. If caller-first stalls, the arm-until-live gate (§4,
       #130) is what prevents it on the phone, and OL-64-0 records that the gate never lets the
-      phone connect first.
-    - *Cellular and Wi-Fi drops from an iPhone*: needs a device and a SIM. **Needs a human**, in the
-      same batched request as Q11: the Larix run of #133 "Before building" (Wi-Fi and cellular,
-      60 s each, stats twice). *Cause category:* hardware no agent holds. *Prevent next time:* a
-      test iPhone on a SIM, reachable by the runner (a self-hosted macOS runner with a
-      USB-attached device), named in the next device-app epic. *Owner:* the CTO. OL-64a to OL-64c
-      do not depend on these numbers and start at once; OL-64d's defaults are revisited when they
-      arrive (Q8).
-14. **Does the phone create the Open Live gateway resource (heartbeat)?** No, as desktop Q10:
-    gateway id and token stay optional under Advanced.
+      phone connect first. OL-64-0 must finish before OL-64d's defaults are frozen.
+    - *Cellular and Wi-Fi drops from an iPhone*: needs a device and a SIM. **Human-only**, in the
+      same batched request as Q11, and blocks no ticket: the Larix run of #133 "Before building"
+      (Wi-Fi and cellular, 60 s each, stats twice). *Cause category:* hardware no agent holds.
+      *Prevent next time:* a test iPhone on a SIM, reachable by the runner (a self-hosted macOS
+      runner with a USB-attached device), named in the next device-app epic. *Owner:* the CTO.
+      OL-64d's defaults are revisited when these numbers arrive (Q8).
+14. **Does the phone create the Open Live gateway resource (heartbeat)?** **Decided:** no, as
+    desktop Q10: gateway id and token stay optional under Advanced.
 
 ## 15. Sub-issue breakdown (cut after this spec merges)
 
