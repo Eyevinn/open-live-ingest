@@ -27,9 +27,10 @@
 //! with Mesa and `GST_GL_PLATFORM=egl GST_GL_WINDOW=surfaceless
 //! EGL_PLATFORM=surfaceless`.
 
-use open_live_ingest::config::{Config, UplinkMode};
+use open_live_ingest::config::{Config, InputSettings, UplinkMode};
 use open_live_ingest::flow;
 use open_live_ingest::gateway::{Event, InputState};
+use open_live_ingest::media::{ExternalMedia, MediaRequest};
 use open_live_ingest::run::{Sources, Stop};
 use open_live_ingest::session::{Inputs, Receiver, Session, SessionHandle};
 use open_live_ingest::strom::StromClient;
@@ -38,6 +39,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
+use strom_types::api::SrtCallerStats;
+use tokio::sync::mpsc;
 
 /// Runs once per test binary, before any session: a scratch user directory, so
 /// the pidfile and settings lookups never touch the real one, and stdin on
@@ -924,6 +927,292 @@ async fn an_armed_session_without_open_live_fails_at_once() {
     };
     assert!(reason.contains("[open_live] register is off"), "{reason}");
     assert_eq!(strom_state.lock().unwrap().created, 0);
+}
+
+/// A port where nothing may connect: the Strom URL of a session whose media the host
+/// does. `assert_untouched` fails if anything connected to it.
+struct NoStrom {
+    listener: TcpListener,
+}
+
+impl NoStrom {
+    fn new() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        NoStrom { listener }
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.listener.local_addr().unwrap())
+    }
+
+    fn assert_untouched(&self) {
+        match self.listener.accept() {
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("something asked the Strom: {other:?}"),
+        }
+    }
+}
+
+/// Armed settings for a phone: registering with the fake Open Live, one camera and
+/// microphone as the app writes them (AVFoundation ids, no lookup), and a Strom URL
+/// nothing may ask.
+fn phone_settings(strom: &str, open_live: &str, gateway_id: &str) -> Config {
+    let mut cfg = registering_settings(strom, open_live, gateway_id);
+    cfg.inputs = vec![InputSettings {
+        device: "com.apple.avfoundation.avcapturedevice.built-in_video:0".to_string(),
+        audio: Some("BuiltInMicrophoneDevice".to_string()),
+        label: Some("iPhone".to_string()),
+    }];
+    cfg
+}
+
+/// The next request the session hands the host, within `within`.
+async fn next_request(
+    requests: &mut mpsc::UnboundedReceiver<MediaRequest>,
+    what: &str,
+    within: Duration,
+) -> MediaRequest {
+    match tokio::time::timeout(within, requests.recv()).await {
+        Ok(Some(request)) => request,
+        Ok(None) => panic!("the session dropped its media before {what}"),
+        Err(_) => panic!("no {what} within {within:?}"),
+    }
+}
+
+/// OL-64a: an armed session whose media the host does (`ExternalMedia`, as on the
+/// phone), with a fake host. The source is registered and nothing is asked of the
+/// host while no production holding it is active; `active` hands the host a start
+/// for the input, with its camera, microphone and endpoint; leaving `active` a stop,
+/// the source kept; `active` again a new start; and Stop a stop, the source kept
+/// (#115). No Strom is asked at any point.
+#[tokio::test]
+async fn an_armed_session_through_external_media_hands_start_and_stop_to_the_host() {
+    no_terminal_and_a_scratch_user_dir();
+    let no_strom = NoStrom::new();
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+    let name = "Session test — iPhone";
+    let set = |status: &str, source: &str| {
+        open_live_state.lock().unwrap().productions =
+            vec![production("prod-1", "Morning Show", status, &[source])];
+    };
+
+    let (media, mut requests) = ExternalMedia::new();
+    let host = media.clone();
+    let (handle, mut events) = Session::start_armed_with(
+        media,
+        phone_settings(&no_strom.url(), &open_live, "gw-session-external"),
+        Inputs::default(),
+        None,
+        Sources::Keep,
+    );
+    let seen = until_event(
+        &mut events,
+        "the summary",
+        |e| matches!(e, Event::Summary { .. }),
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        seen.contains(&Event::Input {
+            input: name.to_string(),
+            state: InputState::Armed
+        }),
+        "{seen:?}"
+    );
+    let (source, address) = source_named(&open_live_state, name).expect("no source registered");
+
+    // Held, but inactive: nothing asked of the host.
+    set("inactive", &source);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        requests.try_recv().is_err(),
+        "the host was asked before active"
+    );
+
+    // Active: the host is asked to start, with what it needs to send.
+    set("active", &source);
+    let MediaRequest::Start { input, video } =
+        next_request(&mut requests, "a start", Duration::from_secs(5)).await
+    else {
+        panic!("not a start");
+    };
+    assert_eq!(input.name, name);
+    let flow::Source::Device {
+        device_id,
+        audio_device,
+        ..
+    } = &input.source
+    else {
+        panic!("not a camera: {:?}", input.source);
+    };
+    assert_eq!(
+        device_id,
+        "com.apple.avfoundation.avcapturedevice.built-in_video:0"
+    );
+    assert_eq!(audio_device.as_deref(), Some("BuiltInMicrophoneDevice"));
+    assert_eq!(input.endpoint.mode, UplinkMode::Caller);
+    assert_eq!(input.endpoint.cloud_host, "cloud.example.com");
+    assert!(
+        address.starts_with(&format!("srt://:{}", input.endpoint.port)),
+        "the uplink port {} is not the registered one: {address}",
+        input.endpoint.port
+    );
+    assert_eq!(input.endpoint.passphrase(), None);
+    assert_eq!(input.endpoint.pbkeylen(), None);
+    assert!(input
+        .endpoint
+        .venue_uri()
+        .starts_with("srt://cloud.example.com:"));
+    assert_eq!(video.bitrate_kbps, Config::default().video.bitrate_kbps);
+    host.report(&input.id, true, None);
+    until_event(
+        &mut events,
+        "ProductionLive",
+        |e| matches!(e, Event::ProductionLive { input, .. } if input == name),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Deactivated: the host is asked to stop; the source stays.
+    set("inactive", &source);
+    let stop_request = next_request(&mut requests, "a stop", Duration::from_secs(5)).await;
+    assert!(
+        matches!(&stop_request, MediaRequest::Stop { input_id } if *input_id == input.id),
+        "{stop_request:?}"
+    );
+    until_event(
+        &mut events,
+        "NoProductionLive",
+        |e| matches!(e, Event::NoProductionLive { input } if input == name),
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        open_live_state.lock().unwrap().deleted,
+        0,
+        "the source was deleted"
+    );
+
+    // Reactivated: started again, without restarting the session.
+    set("active", &source);
+    let again = next_request(&mut requests, "a start again", Duration::from_secs(5)).await;
+    assert!(
+        matches!(&again, MediaRequest::Start { input: i, .. } if i.id == input.id),
+        "{again:?}"
+    );
+    host.report(&input.id, true, None);
+
+    // Stop while sending: the host is asked to stop, and the source is kept.
+    let rest = stop(handle, &mut events).await;
+    assert_torn_down(&rest, name);
+    assert!(
+        rest.contains(&Event::SourceRetained {
+            input: name.to_string()
+        }),
+        "{rest:?}"
+    );
+    let last = next_request(&mut requests, "the stop's stop", Duration::from_secs(5)).await;
+    assert!(
+        matches!(&last, MediaRequest::Stop { input_id } if *input_id == input.id),
+        "{last:?}"
+    );
+    {
+        let ol = open_live_state.lock().unwrap();
+        assert_eq!(ol.deleted, 0, "the source was deleted");
+        assert_eq!(ol.sources.len(), 1);
+        assert_eq!(ol.sources[0]["id"], source.as_str());
+    }
+    no_strom.assert_untouched();
+}
+
+/// OL-64a: the stall restart (#111, #127) through `ExternalMedia`. The host reports
+/// an uplink whose sender drops all it sends, the counters moving; two stalled
+/// intervals after the first sample, the session asks the host to restart it.
+#[tokio::test]
+async fn a_stalled_uplink_through_external_media_is_restarted_by_the_host() {
+    no_terminal_and_a_scratch_user_dir();
+    let no_strom = NoStrom::new();
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+    let name = "Session test — iPhone";
+
+    let (media, mut requests) = ExternalMedia::new();
+    let host = media.clone();
+    let (handle, mut events) = Session::start_armed_with(
+        media,
+        phone_settings(&no_strom.url(), &open_live, "gw-session-external-stall"),
+        Inputs::default(),
+        None,
+        Sources::Keep,
+    );
+    until_event(
+        &mut events,
+        "the summary",
+        |e| matches!(e, Event::Summary { .. }),
+        Duration::from_secs(30),
+    )
+    .await;
+    let (source, _) = source_named(&open_live_state, name).expect("no source registered");
+    open_live_state.lock().unwrap().productions =
+        vec![production("prod-1", "Morning Show", "active", &[&source])];
+    let MediaRequest::Start { input, .. } =
+        next_request(&mut requests, "a start", Duration::from_secs(5)).await
+    else {
+        panic!("not a start");
+    };
+
+    // Connected, and dropping all it sends: #111 run B's rate, reported every second.
+    let reporting = {
+        let host = host.clone();
+        let id = input.id.clone();
+        tokio::spawn(async move {
+            for n in 1u64.. {
+                let sample = SrtCallerStats {
+                    packets_sent: Some(n * 6_065),
+                    packets_sent_dropped: Some(n * 6_065),
+                    bytes_sent: Some(n * 6_065 * 1_316),
+                    ..SrtCallerStats::default()
+                };
+                host.report(&id, true, Some(sample));
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+    };
+    // A baseline poll, then two stalled ones: well within four ticks.
+    let restart = next_request(&mut requests, "a restart", Duration::from_secs(45)).await;
+    reporting.abort();
+    assert!(
+        matches!(&restart, MediaRequest::Restart { input_id } if *input_id == input.id),
+        "{restart:?}"
+    );
+    until_event(
+        &mut events,
+        "the restart's warning",
+        |e| matches!(e, Event::Warning { message } if message.contains("restart 1 of 4")),
+        Duration::from_secs(5),
+    )
+    .await;
+    until_event(
+        &mut events,
+        "Starting again",
+        |e| {
+            matches!(
+                e,
+                Event::Input {
+                    state: InputState::Starting,
+                    ..
+                }
+            )
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let rest = stop(handle, &mut events).await;
+    assert_torn_down(&rest, name);
+    no_strom.assert_untouched();
 }
 
 /// #72 AC2, against a real Strom; see the module documentation.

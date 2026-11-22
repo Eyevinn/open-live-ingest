@@ -2,7 +2,9 @@
 //!
 //! Streams the capture devices on a machine into Open Live. Strom does the media:
 //! capture, encode, mux, SRT. This drives it over HTTP and registers the result with
-//! Open Live. See docs/DESIGN.md for the reasoning.
+//! Open Live. On a phone the app's own code does the media instead, behind the same
+//! seam ([`media::Media`]); the library owns no media either way. See docs/DESIGN.md
+//! for the reasoning.
 //!
 //! Used by the `open-live-ingest` command line tool (`src/main.rs`) and meant for an
 //! app as well, so it makes no process-wide assumptions: it never prints, never reads
@@ -21,6 +23,7 @@ pub mod gateway;
 pub mod heartbeat;
 pub mod keychain;
 pub mod local_strom;
+pub mod media;
 pub mod openlive;
 pub mod osc;
 pub mod run;
