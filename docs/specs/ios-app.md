@@ -105,26 +105,46 @@ pub trait Media: Send + Sync {
     /// Warnings (a saved device not connected) go out as `events` as today.
     fn resolve_inputs(&self, cfg: &Config, inputs: Inputs, events: &Events)
         -> impl Future<Output = Result<ResolvedInputs>> + Send;
-    /// Starts the input's uplink: capture, encode, MPEG-TS, SRT caller to `endpoint.venue_uri()`.
-    fn start(&self, input: &InputPlan, endpoint: &Endpoint, video: &Video)
+    /// Once, after the inputs are known (resolved, ports from the cloud, `inputs_for`)
+    /// and before any is started, where `run::up` calls `clear_conflicting_flows`
+    /// today: clears what would collide with them. `Ok(())` on the phone.
+    fn prepare(&self, inputs: &[flow::Input], events: &Events)
+        -> impl Future<Output = Result<()>> + Send;
+    /// Starts the input's uplink: capture, encode, MPEG-TS, SRT caller to
+    /// `input.endpoint.venue_uri()`.
+    fn start(&self, input: &flow::Input, video: &Video)
         -> impl Future<Output = Result<()>> + Send;
     /// Stops and forgets it. Stopping one that does not run is not an error.
-    fn stop(&self, input: &InputPlan) -> impl Future<Output = Result<()>> + Send;
+    fn stop(&self, input: &flow::Input) -> impl Future<Output = Result<()>> + Send;
     /// Restarts a running uplink (the #127 stall restart). Strom: stop_flow + start_flow.
-    fn restart(&self, input: &InputPlan) -> impl Future<Output = Result<bool>> + Send;
+    fn restart(&self, input: &flow::Input) -> impl Future<Output = Result<bool>> + Send;
     /// Whether it runs, as the session's state machine reads a flow today.
-    fn running(&self, input: &InputPlan) -> impl Future<Output = Result<Option<bool>>> + Send;
+    fn running(&self, input: &flow::Input) -> impl Future<Output = Result<Option<bool>>> + Send;
     /// The SRT sender's cumulative counters, `None` before a peer exists.
-    fn uplink(&self, input: &InputPlan)
+    fn uplink(&self, input: &flow::Input)
         -> impl Future<Output = Result<Option<SrtCallerStats>>> + Send;
 }
 ```
 
+The input type is `flow::Input` (`flow.rs:74`: `id`, `name`, `source`, `endpoint`), which
+`devices::inputs_for` returns (`devices.rs:322`) and `run::up` already holds; its `endpoint`
+carries the uplink, so `start` takes no separate `Endpoint`. `Endpoint`'s `passphrase` and
+`pbkeylen` are private (`config.rs:381-382`) and §8.2's `uplink` needs them, so OL-64a adds the
+read accessors `Endpoint::passphrase()` and `Endpoint::pbkeylen()`, used by `ExternalMedia`.
+
 - **`StromMedia`** wraps `LocalStrom` + `StromClient` and is today's code moved, not changed:
-  flow ids stay derived (UUIDv5 over gateway id + input id), and its constructor does, in today's
-  order, the single-instance check and pidfile write (`running_gateway()` → `AlreadyRunning`,
-  then `Pidfile::write`, the guard held by `StromMedia` and removed when it drops), then
-  `clear_conflicting_flows` and the Strom start / adopt / reclaim of `local_strom`. So the CLI
+  flow ids stay derived with `flow::flow_id(gateway_id, &input.id)` (UUIDv5 over gateway id +
+  input id) and its `start` builds with `flow::build(gateway_id, input, video)`, as today. Its
+  constructor does only, in today's order, the single-instance check and pidfile write
+  (`running_gateway()` → `AlreadyRunning`, then `Pidfile::write`, `run.rs:521-528`; the guard held
+  by `StromMedia` and removed when it drops), then the Strom start / adopt / reclaim of
+  `connect_strom` / `local_strom`. The two argument checks at `run.rs:535-540` (`--audio` with
+  `--test`; sending while live without registration) run in `run::up` before `StromMedia` is
+  built, so a rejected argument never starts Strom. `clear_conflicting_flows` (`run.rs:1174`,
+  over `&[flow::Input]`) cannot run in the constructor, since the inputs exist only after
+  `resolve_inputs`, the cloud's ports and `inputs_for`: it is `StromMedia::prepare`, called by
+  `run::up` where it is called today (`run.rs:790`, after source registration and
+  `free_held_ports`); `ExternalMedia::prepare` returns `Ok(())`. So the CLI
   and the desktop app behave as today (a second `up` or Go live is refused, #95's reclaim still
   sees a starting gateway), and the phone, which never builds a `StromMedia`, writes no pidfile.
   Its `resolve_inputs` is today's device code unchanged (`video_devices`, `audio_devices`,

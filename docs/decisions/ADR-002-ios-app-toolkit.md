@@ -73,14 +73,16 @@ The iOS app links this repo's library, built for `aarch64-apple-ios` (device) an
 `aarch64-apple-ios-sim` (simulator, for CI). Everything that is not media is the desktop's code,
 unchanged: `osc`, `credential`, `keychain`, `openlive`, `gate`, `heartbeat`, `session`, `config`.
 
-`run::up` stops calling `StromClient` directly and becomes generic over a `Media` trait with seven
-operations (version, input resolution, start, stop, restart, running, uplink stats; spec §4),
+`run::up` stops calling `StromClient` directly and becomes generic over a `Media` trait with eight
+operations (version, input resolution, prepare, start, stop, restart, running, uplink stats;
+spec §4) over `flow::Input`,
 each declared `fn op(&self, ..) -> impl Future<Output = ..> + Send` so `run::up` stays spawnable
 and clippy-clean without `async-trait`. `StromMedia` is today's code moved behind it, behaviour
 unchanged and pinned by the existing golden and session tests: its `resolve_inputs` runs today's
 device code (`video_devices`, `audio_devices`, `devices::choose_saved` / `choose` / `pair_audio`;
-`devices::inputs_for` stays shared, after the cloud's ports are known), and its constructor does the single-instance pidfile check and write that `run::up`
-does today (`running_gateway()`, `Pidfile::write`), so the CLI and the desktop app behave as
+`devices::inputs_for` stays shared, after the cloud's ports are known), its `prepare` runs `clear_conflicting_flows` once the inputs are known, and its constructor
+does only the single-instance pidfile check and write that `run::up` does today
+(`running_gateway()`, `Pidfile::write`) and the Strom start / adopt / reclaim, so the CLI and the desktop app behave as
 before and the phone writes no pidfile. `ExternalMedia` resolves inputs from the settings'
 `[[input]]` as Swift picked them, hands start / stop / restart to the host over its own channel,
 and answers state and stats from what the host reports. The seam carries `strom-types`'
