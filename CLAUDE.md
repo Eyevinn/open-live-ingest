@@ -3,7 +3,8 @@ A Cargo workspace of two packages sharing one version and one `Cargo.lock`. The 
 `open-live-ingest` is a library and a thin CLI binary over it; `app/` (`open-live-ingest-app`) is
 the desktop app for macOS and Windows, a second front end over the same library (ADR-001). The
 gateway drives a Strom instance on the same machine and registers sources with Open Live. It owns
-no media pipeline; Strom does the media.
+no media pipeline; Strom does the media. The iOS app (#133, ADR-002) links the same library with no
+Strom: its own Swift code does the media there, behind the `Media` seam (`src/media.rs`).
 
 - `src/lib.rs`: the library. It never prints, reads stdin, calls `std::process::exit` or
   handles a signal (`tests/library_boundary.rs` checks this); progress is `gateway::Event`s.
@@ -18,7 +19,10 @@ no media pipeline; Strom does the media.
   an in-memory store for tests and Linux).
 - `src/credential.rs`: the OSC credential kept in the keychain, refreshed during a session.
 - `src/devices.rs`: from Strom's device list to inputs with names and ports.
-- `src/run.rs`: `up`, `down`, `status`, `devices`.
+- `src/run.rs`: `up`, `down`, `status`, `devices`. `up` is generic over `media::Media`.
+- `src/media.rs`: the seam between the session and the media. `StromMedia` (the local Strom, the
+  single-instance pidfile, flow ids) on a computer; `ExternalMedia` (start/stop/restart handed to
+  the host as requests, state and SRT counters from its reports) on the phone.
 - `src/gate.rs`: when an armed session sends: the productions holding a source, and a slot added
   to a live production. Pure.
 - `src/setup.rs`: interactive setup. Binary only: it prompts on the terminal.
@@ -48,9 +52,13 @@ no media pipeline; Strom does the media.
 - No emojis in log macros (`info!`, `debug!`, `trace!`, `warn!`, `error!`).
 
 ## Strom Integration
-- Strom owns the media plane. Before adding anything to the gateway, check whether a Strom block
-  already does it: encoder selection, SRT reconnect, capture handling, device discovery, and stats
-  all exist there. A Strom bug is fixed in Strom, not worked around here.
+- The library owns no media. On a computer Strom owns the media plane. Before adding anything to
+  the gateway, check whether a Strom block already does it: encoder selection, SRT reconnect,
+  capture handling, device discovery, and stats all exist there. A Strom bug is fixed in Strom, not
+  worked around here. On the phone there is no Strom: the iOS app's Swift code owns capture,
+  encode, mux and SRT (ADR-002), and the library reaches it only through `media::ExternalMedia`.
+- Strom concepts (flow ids, flows, Strom's device lookup, `local_strom`, the pidfile) stay inside
+  `media::StromMedia`; the session code in `run::up` and `media::ExternalMedia` use none of them.
 - Flow, block, link, device, and SRT statistics types come from `strom-types`, pinned in `Cargo.toml`
   to the Strom release the venue runs. Bump the tag on purpose when that Strom is upgraded. Block
   definition ids and property names are still Strom's strings, because they live in each block's

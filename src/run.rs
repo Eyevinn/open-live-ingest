@@ -21,14 +21,15 @@ use crate::gate::{self, Verdict};
 use crate::gateway::{Event, Events, InputState as State, InputStats, SummaryRow, UplinkStats};
 use crate::heartbeat::{self, Heartbeat};
 use crate::local_strom::{self, LocalStrom};
+use crate::media::{Media, ResolvedInputs, StromMedia};
 use crate::openlive::{
     drifted, listener_port, OpenLiveClient, Refused, ServerInfo, Source, SourcePayload,
 };
 use crate::session::Inputs;
-use crate::strom::{self as strom_api, StromClient};
+use crate::strom::StromClient;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::ops::RangeInclusive;
@@ -88,7 +89,10 @@ const STALL_UPSTREAM_ISSUE: &str = "https://github.com/Eyevinn/strom/issues/1277
 
 /// The local Strom, adopted or started, and a client for it. Held for as long as the
 /// command runs: dropping it stops a Strom we started.
-async fn connect_strom(cfg: &Config, events: &Events) -> Result<(LocalStrom, StromClient)> {
+pub(crate) async fn connect_strom(
+    cfg: &Config,
+    events: &Events,
+) -> Result<(LocalStrom, StromClient)> {
     let local = local_strom::ensure_running(cfg, events).await?;
     Ok((
         local,
@@ -502,13 +506,12 @@ fn stats_of(live: &[Live]) -> Event {
     }
 }
 
-/// Brings every chosen device up and keeps it registered until `stop` resolves, then
-/// removes what it started: the flows always, the Open Live sources as `sources`
-/// says. `sending` says whether each input's uplink runs all along or only while a
-/// production holding its source is live. `stop` says why it is stopping, which
-/// decides how long the teardown may take. `credential`, when given, is the Open
-/// Source Cloud credential to register with instead of the one the settings point at.
-pub async fn up(
+/// [`up`] with the media done by the local Strom ([`StromMedia`]), as the CLI and the
+/// desktop app run it. The arguments are checked first, so a rejected one never
+/// starts Strom; then a second live gateway is refused ([`AlreadyRunning`]) and this
+/// one recorded in the pidfile, and Strom is adopted or started. Only a Strom started
+/// here is stopped on the way out, then the pidfile is removed.
+pub async fn up_on_strom(
     cfg: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
@@ -516,99 +519,63 @@ pub async fn up(
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
-    // One live session per settings file: a second loop over the same flows and
-    // sources would fight the first for them.
-    if let Some(pid) = running_gateway() {
-        return Err(AlreadyRunning { pid }.into());
-    }
-    // Recorded at once, not once the inputs are live: a gateway that is still starting
-    // (Strom's readiness wait, registration) is a running gateway too. A second `up`
-    // or the app's Go live refuses it, and the app's Strom reclaim never takes its
-    // Strom for one left behind (#95). Removed again however this returns.
-    let _pidfile = Pidfile::write(events);
-    let Inputs {
-        include_virtual,
-        selection,
-        audio: audio_pairings,
-        test_pattern,
-    } = inputs;
-    if test_pattern && !audio_pairings.is_empty() {
+    check_arguments(&cfg, &inputs, sending)?;
+    let media = StromMedia::start(&cfg, events).await?;
+    let outcome = up(
+        &media,
+        cfg,
+        credential,
+        inputs,
+        (sources, sending),
+        events,
+        stop,
+    )
+    .await;
+    // Only a Strom we started is stopped here; an adopted one is left running. The
+    // pidfile goes after it.
+    drop(media);
+    outcome
+}
+
+/// Refuses what no session can do, before anything is started.
+fn check_arguments(cfg: &Config, inputs: &Inputs, sending: Sending) -> Result<()> {
+    if inputs.test_pattern && !inputs.audio.is_empty() {
         bail!("--audio pairs an audio source with a camera, and --test streams no camera; the test pattern carries its own tone");
     }
     if sending == Sending::WhileLive && !cfg.open_live.register {
         bail!("sending only while a production is live needs registration with Open Live, and [open_live] register is off");
     }
+    Ok(())
+}
+
+/// Brings every chosen input up through `media` and keeps it registered until `stop`
+/// resolves, then removes what it started: the uplinks always, the Open Live sources
+/// as `sources` says. `sending` says whether each input's uplink runs all along or
+/// only while a production holding its source is live. `stop` says why it is
+/// stopping, which decides how long the teardown may take. `credential`, when given,
+/// is the Open Source Cloud credential to register with instead of the one the
+/// settings point at. Whatever `media` holds (a Strom, a pidfile) is the caller's.
+pub async fn up<M: Media>(
+    media: &M,
+    cfg: Config,
+    credential: Option<OscCredential>,
+    inputs: Inputs,
+    (sources, sending): (Sources, Sending),
+    events: &Events,
+    stop: impl Future<Output = Stop>,
+) -> Result<()> {
+    check_arguments(&cfg, &inputs, sending)?;
     let gateway_id = cfg.gateway.resolved_id();
     let source_gateway_id = source_gateway_id(&cfg)?;
-    let (local_strom, strom) = connect_strom(&cfg, events).await?;
-    // Asked once, here, whether or not the heartbeat is on; the heartbeat reuses it.
-    // An older Strom without the route is warned about, never refused.
-    let strom_version = strom.version().await.ok();
-    if let Some(warning) =
-        strom_api::version_warning(strom_api::PINNED_VERSION, strom_version.as_deref())
-    {
-        warn!("{warning}");
-        events.emit(Event::Warning { message: warning });
-    }
+    let strom_version = media.version().await;
     let open_live = open_live_client(&cfg, credential.as_ref())?;
     warn_of_sign_in_end(open_live.as_ref(), events);
 
-    // A saved `[[input]]` selection says what to send, unless a flag picks for this run.
-    let saved = !test_pattern && !include_virtual && selection.is_none() && !cfg.inputs.is_empty();
-    let (chosen, test_pattern) = if test_pattern {
-        (Vec::new(), true)
-    } else {
-        let all = strom
-            .video_devices()
-            .await
-            .context("asking Strom what capture devices it can see")?;
-        if saved {
-            let picked = devices::choose_saved(&all, &cfg.inputs)?;
-            for device in &picked.absent {
-                let message = format!(
-                    "[[input]] device {device:?} is not connected; it is skipped, the others go live"
-                );
-                warn!("{message}");
-                events.emit(Event::Warning { message });
-            }
-            (picked.cameras, picked.test_pattern)
-        } else {
-            (
-                devices::choose(all, include_virtual, selection.as_deref())?,
-                false,
-            )
-        }
-    };
-    if chosen.is_empty() && !test_pattern {
-        if saved {
-            bail!("None of the devices in the settings' [[input]] entries is connected. `open-live-ingest devices` lists what Strom can see; --devices or --all picks for one run.");
-        }
-        bail!("Strom reports no capture devices. Virtual ones are skipped unless --all; --test streams a test pattern instead.");
-    }
-
-    // Resolved and checked here, before any port is asked for or any flow exists.
-    let pairings = if !audio_pairings.is_empty() || chosen.is_empty() {
-        audio_pairings
-    } else {
-        let (pairings, absent) = devices::settings_pairings(&cfg.inputs, &chosen);
-        // A saved selection has said so already, as not connected.
-        for device in absent.into_iter().filter(|_| !saved) {
-            warn!("[[input]] pairs audio with {device:?}, which is not among this run's cameras; skipped");
-            events.emit(Event::Warning {
-                message: format!("[[input]] pairs audio with {device:?}, which is not among this run's cameras; skipped"),
-            });
-        }
-        pairings
-    };
-    let audio = if pairings.is_empty() {
-        BTreeMap::new()
-    } else {
-        let sources = strom
-            .audio_devices()
-            .await
-            .context("asking Strom what audio sources it can see")?;
-        devices::pair_audio(&chosen, &sources, &pairings)?
-    };
+    let ResolvedInputs {
+        cameras: chosen,
+        test_pattern,
+        audio,
+    } = media.resolve_inputs(&cfg, inputs, events).await?;
 
     // Without somewhere to send there is no point starting: the feeds would go nowhere.
     let cloud = resolve_cloud(&cfg, open_live.as_ref(), events).await?;
@@ -646,7 +613,7 @@ pub async fn up(
     let names: BTreeSet<String> = inputs.iter().map(|i| i.name.clone()).collect();
     let started = start_inputs(
         &cfg,
-        &strom,
+        media,
         open_live.as_ref(),
         &cloud,
         &gateway_id,
@@ -681,10 +648,9 @@ pub async fn up(
     let reporter = Reporter::start(&cfg, strom_version, &live, events)?;
 
     let (outcome, stop) = match run_until_stopped(
-        &strom,
+        media,
         open_live.as_ref(),
         reporter.as_ref(),
-        &gateway_id,
         source_gateway_id.as_deref(),
         &cfg,
         &mut live,
@@ -705,7 +671,7 @@ pub async fn up(
                 reporter.stop().await;
             }
             teardown(
-                &strom,
+                media,
                 open_live.as_ref(),
                 &cfg.gateway.name,
                 &live,
@@ -725,7 +691,7 @@ pub async fn up(
             tokio::join!(
                 quiet,
                 teardown_within(
-                    &strom,
+                    media,
                     open_live.as_ref(),
                     &cfg.gateway.name,
                     &live,
@@ -736,9 +702,6 @@ pub async fn up(
             );
         }
     }
-    // Only a Strom we started is stopped here; an adopted one is left running. The
-    // pidfile goes after it, when `_pidfile` drops.
-    drop(local_strom);
     outcome
 }
 
@@ -749,9 +712,9 @@ pub async fn up(
 /// as soon as it exists, so that the caller can remove them all again when this
 /// fails, part way through or with no input started.
 #[allow(clippy::too_many_arguments)]
-async fn start_inputs(
+async fn start_inputs<M: Media>(
     cfg: &Config,
-    strom: &StromClient,
+    media: &M,
     open_live: Option<&OpenLiveClient>,
     cloud: &Cloud,
     gateway_id: &str,
@@ -787,7 +750,7 @@ async fn start_inputs(
         .await?;
     }
 
-    clear_conflicting_flows(strom, gateway_id, &inputs, events).await?;
+    media.prepare(&inputs, events).await?;
 
     let mut live = Vec::new();
     for input in inputs {
@@ -802,12 +765,7 @@ async fn start_inputs(
         let started = if armed {
             Ok(())
         } else {
-            start(
-                strom,
-                &flow_id,
-                &flow::build(gateway_id, &input, &cfg.video),
-            )
-            .await
+            media.start(&input, &cfg.video).await
         };
         match started {
             Ok(()) => live.push(Live {
@@ -1168,53 +1126,7 @@ async fn free_held_ports(
     Ok(())
 }
 
-/// Removes our own leftovers from a run that ended without cleanup, and any other
-/// flow already holding one of the cameras about to be opened. Two pipelines on one
-/// device contend for frames, which presents as stutter rather than as an error.
-async fn clear_conflicting_flows(
-    strom: &StromClient,
-    gateway_id: &str,
-    inputs: &[Input],
-    events: &Events,
-) -> Result<()> {
-    let devices: Vec<&str> = inputs
-        .iter()
-        .filter_map(|i| match &i.source {
-            flow::Source::Device { device_id, .. } => Some(device_id.as_str()),
-            flow::Source::Test { .. } => None,
-        })
-        .collect();
-    for existing in strom.list_flows().await.context("listing Strom's flows")? {
-        let ours = flow::is_ours(&existing, gateway_id);
-        let holds_device = flow::capture_device_of(&existing).is_some_and(|d| devices.contains(&d));
-        if !(ours || holds_device) {
-            continue;
-        }
-        remove_flow(strom, &existing.id).await?;
-        events.emit(Event::ConflictingFlowRemoved {
-            name: existing.name.clone(),
-            ours,
-        });
-    }
-    Ok(())
-}
-
-async fn start(strom: &StromClient, flow_id: &FlowId, desired: &strom_types::Flow) -> Result<()> {
-    strom.create_flow(desired).await?;
-    match strom.start_flow(flow_id).await {
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            strom.delete_flow(flow_id).await.ok();
-            bail!("Strom did not report the flow running after start")
-        }
-        Err(err) => {
-            strom.delete_flow(flow_id).await.ok();
-            Err(err)
-        }
-    }
-}
-
-async fn remove_flow(strom: &StromClient, flow_id: &FlowId) -> Result<()> {
+pub(crate) async fn remove_flow(strom: &StromClient, flow_id: &FlowId) -> Result<()> {
     strom.stop_flow(flow_id).await.ok();
     strom.delete_flow(flow_id).await
 }
@@ -1249,11 +1161,10 @@ pub fn truncate(s: &str, width: usize) -> String {
 /// as they say ([`look_at_productions`]).
 // Called once, from `up`, with what `up` holds; a struct to carry them buys nothing.
 #[allow(clippy::too_many_arguments)]
-async fn run_until_stopped(
-    strom: &StromClient,
+async fn run_until_stopped<M: Media>(
+    media: &M,
     open_live: Option<&OpenLiveClient>,
     reporter: Option<&Reporter>,
-    gateway_id: &str,
     source_gateway_id: Option<&str>,
     cfg: &Config,
     live: &mut [Live],
@@ -1274,9 +1185,8 @@ async fn run_until_stopped(
             () = &mut next_look, if gated.is_some() => {
                 let client = gated.expect("guarded");
                 let soon = look_at_productions(
-                    strom,
+                    media,
                     client,
-                    gateway_id,
                     &cfg.video,
                     live,
                     (&mut watch, &mut unreadable),
@@ -1293,7 +1203,7 @@ async fn run_until_stopped(
             _ = ticker.tick() => {
                 // An armed input with no production live has no flow to look at.
                 for l in live.iter_mut().filter(|l| l.sending) {
-                    l.state = match poll_flow(strom, gateway_id, &cfg.video, l, events).await {
+                    l.state = match poll_input(media, &cfg.video, l, events).await {
                         Ok(state) => state,
                         Err(err) => {
                             warn!(input = %l.input.name, err = %format_args!("{err:#}"), "lost contact with Strom, retrying next tick");
@@ -1350,10 +1260,9 @@ fn tell_changes(live: &mut [Live], events: &Events) {
 /// The productions not being readable changes nothing: a running uplink keeps
 /// running and an armed one stays armed, retried at the next look. `watch` and
 /// `unreadable` are kept by the caller between looks.
-async fn look_at_productions(
-    strom: &StromClient,
+async fn look_at_productions<M: Media>(
+    media: &M,
     client: &OpenLiveClient,
-    gateway_id: &str,
     video: &Video,
     live: &mut [Live],
     (watch, unreadable): (&mut gate::Watch, &mut bool),
@@ -1393,8 +1302,8 @@ async fn look_at_productions(
             });
         }
         match (verdict.send(), l.sending) {
-            (true, false) => send_uplink(strom, gateway_id, video, l, &verdict, events).await,
-            (false, true) => arm_again(strom, l, events).await,
+            (true, false) => send_uplink(media, video, l, &verdict, events).await,
+            (false, true) => arm_again(media, l, events).await,
             // A start that failed, for a production no longer live: armed again.
             (false, false) if l.gate_error.take().is_some() => l.state = State::Armed,
             _ => {}
@@ -1404,9 +1313,8 @@ async fn look_at_productions(
 }
 
 /// Starts an armed input's uplink: a production holding its source is live.
-async fn send_uplink(
-    strom: &StromClient,
-    gateway_id: &str,
+async fn send_uplink<M: Media>(
+    media: &M,
     video: &Video,
     l: &mut Live,
     verdict: &Verdict,
@@ -1420,7 +1328,7 @@ async fn send_uplink(
         });
     }
     l.forget_uplink();
-    match ensure_started(strom, gateway_id, video, l).await {
+    match ensure_started(media, video, l).await {
         Ok(()) => {
             l.sending = true;
             l.gate_error = None;
@@ -1439,32 +1347,27 @@ async fn send_uplink(
     }
 }
 
-/// The input's flow running, whether it was there already (running or not) or had to
-/// be created.
-async fn ensure_started(
-    strom: &StromClient,
-    gateway_id: &str,
-    video: &Video,
-    l: &Live,
-) -> Result<()> {
-    match strom.get_flow(&l.flow_id).await? {
-        Some(flow) if flow.running => Ok(()),
-        Some(_) => {
-            if strom.start_flow(&l.flow_id).await? {
+/// The input's uplink running, whether it was there already (running or not) or had
+/// to be created.
+async fn ensure_started<M: Media>(media: &M, video: &Video, l: &Live) -> Result<()> {
+    match media.running(&l.input).await? {
+        Some(true) => Ok(()),
+        Some(false) => {
+            if media.restart(&l.input).await? {
                 Ok(())
             } else {
                 bail!("Strom did not report the flow running after start")
             }
         }
-        None => start(strom, &l.flow_id, &flow::build(gateway_id, &l.input, video)).await,
+        None => media.start(&l.input, video).await,
     }
 }
 
 /// Stops an armed input's uplink and arms it again: no production holding its source
 /// is live any more. The flow goes, the source stays. A flow Strom would not remove
 /// is retried at the next look, and polled as usual meanwhile.
-async fn arm_again(strom: &StromClient, l: &mut Live, events: &Events) {
-    match remove_flow(strom, &l.flow_id).await {
+async fn arm_again<M: Media>(media: &M, l: &mut Live, events: &Events) {
+    match media.stop(&l.input).await {
         Ok(()) => {
             info!(input = %l.input.name, "no production holding the source is live, stopped the uplink");
             l.sending = false;
@@ -1480,7 +1383,8 @@ async fn arm_again(strom: &StromClient, l: &mut Live, events: &Events) {
     }
 }
 
-/// Makes sure the flow exists and runs, then judges the uplink from its statistics.
+/// [`poll_input`] over a Strom, as the stall tests drive it.
+#[cfg(test)]
 async fn poll_flow(
     strom: &StromClient,
     gateway_id: &str,
@@ -1488,22 +1392,31 @@ async fn poll_flow(
     l: &mut Live,
     events: &Events,
 ) -> Result<State> {
-    let running = match strom.get_flow(&l.flow_id).await? {
-        Some(flow) => flow.running,
+    poll_input(&StromMedia::over(strom, gateway_id), video, l, events).await
+}
+
+/// Makes sure the input's uplink exists and runs, then judges it from its statistics.
+async fn poll_input<M: Media>(
+    media: &M,
+    video: &Video,
+    l: &mut Live,
+    events: &Events,
+) -> Result<State> {
+    match media.running(&l.input).await? {
+        Some(true) => {}
+        Some(false) => return start_again(media, l).await,
         None => {
             // Deleted under us, in Strom's editor or by another tool. Put it back.
             info!(input = %l.input.name, "flow is gone from Strom, recreating it");
-            strom
-                .create_flow(&flow::build(gateway_id, &l.input, video))
-                .await?;
-            false
+            l.last_bytes = None;
+            l.uplink = None;
+            l.forget_counters();
+            media.start(&l.input, video).await?;
+            return Ok(State::Starting);
         }
-    };
-    if !running {
-        return start_again(strom, l).await;
     }
 
-    let Some(sample) = strom.srt_uplink(&l.flow_id).await? else {
+    let Some(sample) = media.uplink(&l.input).await? else {
         l.last_bytes = None;
         l.uplink = None;
         l.quiet_polls = 0;
@@ -1545,8 +1458,7 @@ async fn poll_flow(
                         l.input.name, counters.sent, counters.dropped, l.stall_restarts,
                     ),
                 });
-                strom.stop_flow(&l.flow_id).await?;
-                return start_again(strom, l).await;
+                return start_again(media, l).await;
             }
             if !l.stall_given_up {
                 l.stall_given_up = true;
@@ -1584,12 +1496,13 @@ async fn poll_flow(
     )
 }
 
-/// Starts a flow that is not running, forgetting what was measured on its last run.
-async fn start_again(strom: &StromClient, l: &mut Live) -> Result<State> {
+/// Starts an uplink again (Strom: `stop_flow` + `start_flow`), whether it stalled or
+/// is not running, forgetting what was measured on its last run.
+async fn start_again<M: Media>(media: &M, l: &mut Live) -> Result<State> {
     l.last_bytes = None;
     l.uplink = None;
     l.forget_counters();
-    Ok(if strom.start_flow(&l.flow_id).await? {
+    Ok(if media.restart(&l.input).await? {
         State::Starting
     } else {
         State::Failed {
@@ -1804,8 +1717,8 @@ pub enum Sending {
 pub const ENDING_TEARDOWN: Duration = Duration::from_secs(4);
 
 /// Removes one flow and says so. Returns whether it is gone.
-async fn remove_flow_reported(strom: &StromClient, l: &Live, events: &Events) -> bool {
-    match remove_flow(strom, &l.flow_id).await {
+async fn remove_flow_reported<M: Media>(media: &M, l: &Live, events: &Events) -> bool {
+    match media.stop(&l.input).await {
         Ok(()) => {
             events.emit(Event::FlowRemoved {
                 input: l.input.name.clone(),
@@ -1889,8 +1802,8 @@ fn kept_by_this_run(live: &[Live], sources: Sources, names: &BTreeSet<String>) -
 
 /// Stops and removes everything the run created; its sources only when `sources`
 /// says so.
-async fn teardown(
-    strom: &StromClient,
+async fn teardown<M: Media>(
+    media: &M,
     open_live: Option<&OpenLiveClient>,
     gateway_name: &str,
     live: &[Live],
@@ -1901,7 +1814,7 @@ async fn teardown(
     // not try them again and print the same refusal twice; and the ones kept.
     let mut kept = kept_by_this_run(live, sources, names);
     for l in live {
-        remove_flow_reported(strom, l, events).await;
+        remove_flow_reported(media, l, events).await;
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
             match sources {
                 Sources::Remove => {
@@ -1927,8 +1840,8 @@ async fn teardown(
 /// Teardown for when Windows is ending the process: every flow and source removal
 /// runs at once, and whatever has not finished by `deadline` is named in the log and
 /// left for the next `up` or `down`, which find it by derived id and name prefix.
-async fn teardown_within(
-    strom: &StromClient,
+async fn teardown_within<M: Media>(
+    media: &M,
     open_live: Option<&OpenLiveClient>,
     gateway_name: &str,
     live: &[Live],
@@ -1945,7 +1858,7 @@ async fn teardown_within(
     let mut jobs: Vec<Job> = Vec::new();
     for l in live {
         what.push((format!("flow of {}", l.input.name), None, true));
-        jobs.push(Box::pin(remove_flow_reported(strom, l, events)));
+        jobs.push(Box::pin(remove_flow_reported(media, l, events)));
         if let (Some(client), Some(id)) = (open_live, &l.source_id) {
             match sources {
                 Sources::Remove => {
@@ -2486,12 +2399,12 @@ fn write_pidfile() -> Result<()> {
 
 /// This process's entry in the pidfile for the length of one `up`, from its refusal
 /// check to its return, whichever way it returns.
-struct Pidfile {
+pub(crate) struct Pidfile {
     written: bool,
 }
 
 impl Pidfile {
-    fn write(events: &Events) -> Self {
+    pub(crate) fn write(events: &Events) -> Self {
         let written = match write_pidfile() {
             Ok(()) => true,
             Err(err) => {
@@ -2505,6 +2418,12 @@ impl Pidfile {
             }
         };
         Pidfile { written }
+    }
+
+    /// No entry at all, for a Strom backend in the tests.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        Pidfile { written: false }
     }
 }
 

@@ -27,6 +27,15 @@ orchestration API with no media plane.
 **The gateway talks to both sides, and that is the whole design.** Local Strom over REST to create
 and start the flow; Open Live over HTTPS to register the source.
 
+**The library owns no media** (ADR-002). On a computer Strom owns the media plane, as above. On an
+iPhone (#133) there is no Strom: the iOS app's own Swift code captures, encodes, muxes and sends
+over SRT, and links this library for everything else (sign-in, registration, the gate, the
+heartbeat, the teardown). The session reaches the media only through a narrow seam, `Media`: which
+inputs there are, start an input's uplink to its endpoint, stop it, restart it, whether it runs,
+and its SRT counters. `StromMedia` is the computer's (flows by derived id, Strom's device list, the
+pidfile); `ExternalMedia` hands start, stop and restart to the app and answers from what it
+reports. Flow ids and other Strom concepts stay on the Strom side of the seam.
+
 ### Why a venue-side tool, and not Open Live driving the venue Strom
 
 - Open Live has a single `STROM_URL`. One engine per instance.
@@ -57,6 +66,11 @@ Strom already does these, and a worse copy here would have to be maintained:
 The gateway expresses intent, a bitrate and an encoder preference, and lets Strom satisfy it. A
 transient SRT drop is likewise not its business: restarting a flow over a network blip would turn a
 recoverable gap into an encoder restart.
+
+On the phone the same concerns belong to the iOS app's media code over Apple's frameworks and
+libsrt (ADR-002), not to the library: the library still only says what to send where, and judges
+the uplink from the same SRT counters. Whatever the media side, the gateway never links the Strom
+engine: the process boundary on a computer is unchanged.
 
 **A Strom bug is fixed in Strom.** An earlier version restarted a flow whose SRT socket had frozen
 at `connected` with no bytes moving. That papered over an srtsink fault, and the restart trigger

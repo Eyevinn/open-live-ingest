@@ -33,6 +33,7 @@ pub enum Reachability {
     Unreachable(String),
 }
 
+#[derive(Clone)]
 pub struct StromClient {
     http: reqwest::Client,
     base_url: String,

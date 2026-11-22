@@ -29,6 +29,11 @@
 //! with the source kept. `SlotAddedWhileLive` names the live productions that were
 //! given the source while live, which have no receiver for it until reactivated.
 //!
+//! Every start but [`Session::start_armed_with`] does the media through the local
+//! Strom ([`StromMedia`]), built inside the session task. `start_armed_with` takes the
+//! media backend instead: on a phone an [`ExternalMedia`](crate::media::ExternalMedia)
+//! whose requests the app carries out, with no Strom and no pidfile.
+//!
 //! # Caveats
 //!
 //! - **A panic.** Should the session's task panic, it ends without its teardown: the
@@ -53,6 +58,7 @@ use crate::config::{self, Config};
 use crate::credential::OscCredential;
 use crate::devices::AudioPairing;
 use crate::gateway::{Event, Events};
+use crate::media::{Media, StromMedia};
 use crate::run::{self, Sending, Sources, Stop};
 use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, oneshot};
@@ -108,7 +114,13 @@ impl Session {
     /// the same way, in the background, as long as the runtime keeps running (see
     /// the module documentation's caveats).
     pub fn start(settings: Config, inputs: Inputs) -> (SessionHandle, Receiver) {
-        Self::start_inner(settings, None, inputs, (Sources::Remove, Sending::Always))
+        Self::start_inner::<StromMedia>(
+            None,
+            settings,
+            None,
+            inputs,
+            (Sources::Remove, Sending::Always),
+        )
     }
 
     /// [`start`](Self::start), registering with `credential`, the Open Source Cloud
@@ -121,7 +133,8 @@ impl Session {
         inputs: Inputs,
         credential: OscCredential,
     ) -> (SessionHandle, Receiver) {
-        Self::start_inner(
+        Self::start_inner::<StromMedia>(
+            None,
             settings,
             Some(credential),
             inputs,
@@ -140,7 +153,8 @@ impl Session {
         inputs: Inputs,
         credential: Option<OscCredential>,
     ) -> (SessionHandle, Receiver) {
-        Self::start_inner(
+        Self::start_inner::<StromMedia>(
+            None,
             settings,
             credential,
             inputs,
@@ -165,10 +179,41 @@ impl Session {
         credential: Option<OscCredential>,
         sources: Sources,
     ) -> (SessionHandle, Receiver) {
-        Self::start_inner(settings, credential, inputs, (sources, Sending::WhileLive))
+        Self::start_inner::<StromMedia>(
+            None,
+            settings,
+            credential,
+            inputs,
+            (sources, Sending::WhileLive),
+        )
     }
 
-    fn start_inner(
+    /// [`start_armed`](Self::start_armed) with `media` doing the media instead of
+    /// the local Strom: on a phone, an [`ExternalMedia`] whose requests the app
+    /// carries out. No Strom is started or asked, and no pidfile is written; what
+    /// `media` holds is dropped when the session ends.
+    ///
+    /// [`ExternalMedia`]: crate::media::ExternalMedia
+    pub fn start_armed_with<M: Media + 'static>(
+        media: M,
+        settings: Config,
+        inputs: Inputs,
+        credential: Option<OscCredential>,
+        sources: Sources,
+    ) -> (SessionHandle, Receiver) {
+        Self::start_inner(
+            Some(media),
+            settings,
+            credential,
+            inputs,
+            (sources, Sending::WhileLive),
+        )
+    }
+
+    /// Runs the session on a task of its own: through `media` when one is given,
+    /// otherwise through a [`StromMedia`] built inside the task.
+    fn start_inner<M: Media + 'static>(
+        media: Option<M>,
         settings: Config,
         credential: Option<OscCredential>,
         inputs: Inputs,
@@ -185,7 +230,7 @@ impl Session {
             // A dropped handle is a stop too: the session must not outlive its owner
             // with flows and sources nobody can remove.
             let stop = async move { stop_rx.await.unwrap_or(Stop::Interrupt) };
-            let outcome = run(settings, credential, inputs, sources, &events, stop).await;
+            let outcome = run(media, settings, credential, inputs, sources, &events, stop).await;
             events.emit(match &outcome {
                 Ok(()) => Event::Stopped,
                 Err(err) => Event::Failed {
@@ -218,7 +263,8 @@ impl Session {
     }
 }
 
-async fn run(
+async fn run<M: Media>(
+    media: Option<M>,
     settings: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
@@ -231,7 +277,10 @@ async fn run(
         Some(_) => config::validate_with(&settings, true)?,
         None => config::validate(&settings)?,
     }
-    run::up(settings, credential, inputs, sources, events, stop).await
+    match media {
+        Some(media) => run::up(&media, settings, credential, inputs, sources, events, stop).await,
+        None => run::up_on_strom(settings, credential, inputs, sources, events, stop).await,
+    }
 }
 
 /// A running session. See [`Session::start`].

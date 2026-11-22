@@ -412,6 +412,17 @@ impl Endpoint {
         uri
     }
 
+    /// The SRT passphrase, when the link is encrypted. For a host that does the media
+    /// itself ([`crate::media::ExternalMedia`]); never log it.
+    pub fn passphrase(&self) -> Option<&str> {
+        self.passphrase.as_deref()
+    }
+
+    /// The SRT key length, when set next to a passphrase.
+    pub fn pbkeylen(&self) -> Option<u32> {
+        self.pbkeylen
+    }
+
     fn crypto(&self) -> String {
         let Some(passphrase) = &self.passphrase else {
             return String::new();
