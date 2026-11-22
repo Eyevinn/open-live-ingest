@@ -32,6 +32,9 @@ env:
   DMG: open-live-ingest-macos-aarch64.dmg
   # The artifact name of a notarized DMG on a tag ref; only `release-macos` reads it.
   NOTARIZED_DMG_ARTIFACT: notarized-macos-dmg
+  # The Windows installer `windows-app` builds, and its artifact name; `e2e-windows`
+  # installs it.
+  SETUP: open-live-ingest-x86_64-pc-windows-msvc-setup.exe
 
 jobs:
   build:
@@ -162,7 +165,6 @@ jobs:
         shell: bash
     env:
       TARGET: x86_64-pc-windows-msvc
-      SETUP: open-live-ingest-x86_64-pc-windows-msvc-setup.exe
       # Chocolatey's nsis package, used only when the image has no makensis.
       NSIS_VERSION: "3.13.0"
       # "true" or "false"; secrets cannot be read in `if:` directly.
@@ -1026,11 +1028,11 @@ jobs:
   # bundled Strom and checks that Go live is refused and quit ends the app, then warns
   # naming the secret and passes. Fork pull requests get no secrets and skip the job.
   #
-  # The Windows half runs from the installer once #36 (camera go/no-go on Windows 11)
-  # is a go; until then the step summary says so. Never on a tag ref: a release does
-  # not wait on a shared test instance. One run at a time per instance, shared with
-  # the e2e-audio-device workflow (`e2e-openlivedev`): a third queued run cancels the
-  # pending one, which is then re-run by hand.
+  # The Windows half, with the same test pattern, is `e2e-windows` (#145). Never on a
+  # tag ref: a release does not wait on a shared test instance. One run at a time per
+  # instance, shared with `e2e-windows` and the e2e-audio-device workflow
+  # (`e2e-openlivedev`): a third queued run cancels the pending one, which is then
+  # re-run by hand.
   e2e-macos:
     needs: macos-app
     if: >-
@@ -1092,10 +1094,6 @@ jobs:
           hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
           trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
           python3 -I .github/scripts/e2e-app.py "$mnt/$APP/Contents/MacOS/open-live-ingest-app"
-      - name: Windows
-        if: always()
-        run: |
-          echo "- Windows: not run. The Windows half runs from the installer once #36 (camera capture through Strom on Windows 11) is a go; #36 is not a go yet." >> "$GITHUB_STEP_SUMMARY"
       - name: App log
         if: always()
         run: |
@@ -1103,6 +1101,132 @@ jobs:
           if [[ -f "$log" ]]; then cat "$log"; else echo "no app log at $log"; fi
           strom_log="$(find "$HOME/Library/Application Support/open-live-ingest" -name strom.log 2>/dev/null | head -n 1)"
           if [[ -n "$strom_log" ]]; then echo "--- $strom_log (tail) ---"; tail -n 100 "$strom_log"; fi
+
+  # The Windows half of `e2e-macos` (#145, the open acceptance criteria of #130): the
+  # same .github/scripts/e2e-app.py run (E2E_PART openlivedev), with the test pattern,
+  # on the installer `windows-app` has just built and smoke tested. The installer is
+  # installed silently on a clean runner, as the smoke test does (the app and the CLI
+  # in %ProgramFiles%\Open Live Ingest, the Strom MSI's strom.exe in
+  # %ProgramFiles%\Strom\bin), and the installed open-live-ingest-app.exe is started
+  # with `--ipc-stdio`. Against `openlivedev`: Go live arms with no flow, activating
+  # a production holding the source starts the uplink within 5 s, the uplink's SRT
+  # stats over 60 s, deactivate stops the flow and keeps the source, Go live again
+  # reuses it and reactivating reconnects, quit while live. What it checks and how:
+  # the script's header.
+  #
+  # Camera capture on Windows is not part of it: that is #36. The test pattern goes
+  # through the same uplink flow a camera does.
+  #
+  # Everything else as `e2e-macos`: the same secret (OSC_ACCESS_TOKEN; without it a
+  # run by hand fails naming it, and a pull request run checks devices, the refused
+  # Go live and quit, then warns and passes), the same E2E_UPLINK_DROP_WARN_ONLY while
+  # #111 is open, the same `e2e-openlivedev` concurrency group (so it never runs at
+  # the same time as `e2e-macos` or e2e-audio-device), no fork pull requests and never
+  # on a tag ref. The script names the run's sources `...-win` and the macOS job's
+  # `...-mac`, so the two never share one. Instead of pf, Windows Firewall rules drop
+  # traffic to the Strom port (8080) from every address but loopback, with the
+  # firewall switched on, before the app can start Strom; the step fails if they do
+  # not take.
+  e2e-windows:
+    needs: windows-app
+    if: >-
+      github.ref_type != 'tag' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: windows-latest
+    # e2e-macos's 45 minutes, plus the silent install with the Strom MSI.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    concurrency:
+      group: e2e-openlivedev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SETUP }}
+      - name: Unit tests of the e2e checks, on Windows
+        shell: pwsh
+        run: |
+          python --version
+          python -I .github/scripts/test_e2e_app.py
+          exit $LASTEXITCODE
+      - name: Install, Go live, Stop and quit while live, against Open Live
+        shell: pwsh
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          OPEN_LIVE_INSTANCE: openlivedev
+          # A run by hand needs the secret; a pull request run without it warns and
+          # passes after the checks that need none.
+          E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+          # Everything but the late-listener check, as e2e-macos.
+          E2E_PART: openlivedev
+          # The SRT stats check (#112): the receiver comes up this long after Go
+          # live, and the uplink is sampled this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Fail([string]$Message) { Write-Host "::error title=e2e app::$Message"; exit 1 }
+
+          # The Strom the app starts has an unauthenticated API and listens on all
+          # interfaces: block its port (8080, the default [strom] url) from every
+          # remote address but loopback (127.0.0.0/8, ::1), and switch the firewall
+          # on, before the app can start it. As e2e-macos's pf rule.
+          $remote = @('0.0.0.0-126.255.255.255', '128.0.0.0-255.255.255.255', '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
+          foreach ($proto in 'TCP', 'UDP') {
+            New-NetFirewallRule -Name "oli-e2e-strom-$proto" -DisplayName "oli-e2e: Strom's port ($proto)" `
+              -Direction Inbound -Action Block -Protocol $proto -LocalPort 8080 -RemoteAddress $remote -Profile Any | Out-Null
+          }
+          Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True
+          $off = @(Get-NetFirewallProfile | Where-Object { "$($_.Enabled)" -ne 'True' })
+          if ($off.Count -gt 0) { Fail "Windows Firewall is not on for the $($off.Name -join ', ') profile(s)" }
+          $rules = @(Get-NetFirewallRule -Name 'oli-e2e-strom-*' |
+            Where-Object { "$($_.Enabled)" -eq 'True' -and "$($_.Action)" -eq 'Block' -and "$($_.Direction)" -eq 'Inbound' })
+          $ports = @($rules | Get-NetFirewallPortFilter | Where-Object { "$($_.LocalPort)" -eq '8080' })
+          if ($rules.Count -ne 2 -or $ports.Count -ne 2) { Fail "the Windows Firewall rules for Strom's port did not load" }
+          Write-Host "Windows Firewall: on, inbound 8080 (TCP, UDP) blocked from every address but loopback"
+
+          # A clean runner, as in windows-app's smoke test.
+          $dir = Join-Path $env:ProgramFiles 'Open Live Ingest'
+          $app = Join-Path $dir 'open-live-ingest-app.exe'
+          $strom = Join-Path $env:ProgramFiles 'Strom\bin\strom.exe'
+          if (Test-Path -LiteralPath $dir) { Fail "$dir exists before the install" }
+          Write-Host "--- silent install of $env:SETUP"
+          $p = Start-Process -FilePath (Join-Path $env:GITHUB_WORKSPACE $env:SETUP) -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            $msiLog = Join-Path $env:TEMP 'open-live-ingest-strom-msi.log'
+            if (Test-Path -LiteralPath $msiLog) { Get-Content -LiteralPath $msiLog -Tail 80 }
+            Fail "the silent install exited with $($p.ExitCode)"
+          }
+          foreach ($f in $app, $strom) {
+            if (-not (Test-Path -LiteralPath $f)) { Fail "$f is missing after the install" }
+          }
+          Write-Host "installed: $((& $app --version | Out-String).Trim())"
+          # What the MSI added to the machine PATH (GStreamer), which this step's PATH
+          # predates, as a new login after the install would see it.
+          $env:Path = $env:Path + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+
+          python -I .github/scripts/e2e-app.py $app
+          $code = $LASTEXITCODE
+          # GitHub's pwsh wrapper exits with the last native command's code otherwise.
+          exit $code
+      - name: App log
+        if: always()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:LOCALAPPDATA 'open-live-ingest\logs\app.log'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log } else { Write-Host "no app log at $log" }
+          $data = Join-Path $env:APPDATA 'open-live-ingest'
+          $stromLog = Get-ChildItem -LiteralPath $data -Recurse -Filter strom.log -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($stromLog) { Write-Host "--- $($stromLog.FullName) (tail) ---"; Get-Content -LiteralPath $stromLog.FullName -Tail 100 }
+          "- Windows: the test pattern only; camera capture through Strom on Windows 11 is #36." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
 
   # Adds the notarized DMG to the release `release` created: the DMG itself, a
   # SHA256SUMS that covers the release's tarballs, the Windows zip and installer, and the DMG

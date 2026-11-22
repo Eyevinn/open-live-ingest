@@ -3,16 +3,20 @@
 docs/specs/desktop-app.md section 14, #62 AC2).
 
 Drives the app executable a release artifact carries (the DMG's
-Contents/MacOS/open-live-ingest-app) with `--ipc-stdio`: the app core with no window
-and no webview, fed the same messages the page posts (`app/ui/app.js`), answering with
-the same replies and events (`app/src/stdio.rs`). The release workflow's `e2e-macos`
-job runs it on the DMG it has just built and checked:
+Contents/MacOS/open-live-ingest-app, or the open-live-ingest-app.exe the Windows
+installer puts in %ProgramFiles%\\Open Live Ingest) with `--ipc-stdio`: the app core
+with no window and no webview, fed the same messages the page posts (`app/ui/app.js`),
+answering with the same replies and events (`app/src/stdio.rs`). The release
+workflow's `e2e-macos` job runs it on the DMG it has just built and checked, and its
+`e2e-windows` job (#145) on the installer `windows-app` has just built and smoke
+tested, after a silent install:
 
     python3 -I .github/scripts/e2e-app.py "/Volumes/.../Open Live Ingest.app/Contents/MacOS/open-live-ingest-app"
+    python -I .github/scripts/e2e-app.py "C:\\Program Files\\Open Live Ingest\\open-live-ingest-app.exe"
 
 In order, each logged and written to the step summary:
   1. `state`, and `devices`: the app lists devices through the Strom the bundle
-     carries.
+     carries (on Windows, the one the installer's Strom MSI put in place).
   2. Where to send, as the page does it with a pasted token: `osc_paste_token` with
      OSC_ACCESS_TOKEN, then `choose_instance` with the instance named
      OPEN_LIVE_INSTANCE (default openlivedev) from the workspace the reply lists.
@@ -44,10 +48,12 @@ In order, each logged and written to the step summary:
      the process; the flow is gone from Strom and the source is kept, with the same id.
 
 Before step 2 the settings file the app reads is written with a gateway name unique
-to the run (the source prefix, so cleanup finds exactly this run's sources) and the
-SRT port range the instance does not publish, as the Advanced section would. The
-app's own settings file is used (HOME is not moved), because the pasted token goes to
-the login keychain, which lives under HOME.
+to the run and the platform (the source prefix, so cleanup finds exactly this run's
+sources, and the macOS and Windows jobs of one run never share one) and the SRT port
+range the instance does not publish, as the Advanced section would. The app's own
+settings file is used (HOME or APPDATA is not moved), because the pasted token goes
+to the login keychain (macOS) or the Credential Manager (Windows) of the user the
+runner runs as.
 
 Before step 2, with or without OSC_ACCESS_TOKEN, a `go_live` has to be refused (no
 Open Live address yet), and then the late-listener check runs with no secret (#112):
@@ -72,8 +78,8 @@ Open Live address yet), and then the late-listener check runs with no secret (#1
 E2E_PART picks the part of the run: `all` (the default, a run by hand), or, as the
 release workflow splits it, `late-listener` (the `e2e-macos-late-listener` job, no
 secret, fork pull requests too: the refused `go_live`, the late-listener check, then
-a `quit` with nothing live ends the app) and `openlivedev` (the `e2e-macos` job:
-everything but the late-listener check).
+a `quit` with nothing live ends the app) and `openlivedev` (the `e2e-macos` and
+`e2e-windows` jobs: everything but the late-listener check).
 
 The SRT stats check reads the uplink's `GET /api/flows/<flow id>/srt-stats` from the
 bundled Strom, as `src/strom.rs` does: the sending element's (`role` sink) first peer.
@@ -109,13 +115,15 @@ starts the bundled Strom with its own environment, and Strom would seed its own
 Open Source Cloud access from OSC_ACCESS_TOKEN while its API is unauthenticated. The
 app itself does not need the variable: the token reaches it over IPC
 (`osc_paste_token`), as a pasted token does from the page. Strom also listens on all
-interfaces; the workflow step loads a pf rule that drops traffic to its port (8080)
-on every interface but loopback before this script runs, as #83 does with iptables.
-Nothing GitHub documents promises that a hosted macOS runner cannot be reached from
-outside, so the rule is loaded rather than assumed unneeded; the step fails if pf
-does not take it.
+interfaces; the workflow step loads a pf rule (macOS) or Windows Firewall rules
+(Windows) that drop traffic to its port (8080) from anything but loopback before this
+script runs, as #83 does with iptables. Nothing GitHub documents promises that a
+hosted runner cannot be reached from outside, so the rule is loaded rather than
+assumed unneeded; the step fails if the firewall does not take it.
 
-Python standard library only. The token and the service token are masked as soon as
+Python standard library only. On Windows stdout and stderr are switched to UTF-8 (the
+source names carry an em dash, device names anything), since a pipe there defaults to
+the ANSI code page. The token and the service token are masked as soon as
 they are known. Every `url` value in the app's lines (the instance addresses the
 workspace lists, the address chosen), and its host without the scheme, is masked
 before the line is printed; loopback addresses (Strom's) are not. No response body
@@ -144,6 +152,8 @@ TEST_PATTERN_NAME = "Test pattern"
 PREFIX = "oli-app-e2e-"
 # `[strom] url` when the settings do not set it (src/config.rs).
 STROM_URL = "http://127.0.0.1:8080"
+# In the gateway name, so the macOS and Windows jobs of one run have sources of their own.
+PLATFORM_TAG = {"darwin": "mac", "win32": "win"}.get(sys.platform, sys.platform)
 # Never handed to the app, so never to the Strom it starts (#83).
 WITHHELD_ENV = ("OSC_ACCESS_TOKEN", "GH_TOKEN")
 # The uplink fails the run when it drops more than this share of what it sends (#112).
@@ -1215,7 +1225,7 @@ def run(exe, work):
     instance = os.environ.get("OPEN_LIVE_INSTANCE") or "openlivedev"
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", str(os.getpid()))
-    gateway_name = f"{PREFIX}{run_id}-{attempt}"
+    gateway_name = f"{PREFIX}{run_id}-{attempt}-{PLATFORM_TAG}"
     source_name = f"{gateway_name} — {TEST_PATTERN_NAME}"
     port_range = os.environ.get("E2E_PORT_RANGE") or "47300-47309"
     pat = os.environ.get("OSC_ACCESS_TOKEN") or ""
@@ -1364,6 +1374,10 @@ def run(exe, work):
 
 
 def main():
+    if sys.platform == "win32":
+        # A pipe on Windows is in the ANSI code page otherwise: see the header.
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     if len(sys.argv) != 2:
         print(f"usage: {sys.argv[0]} <path to open-live-ingest-app>", file=sys.stderr)
         return 2
