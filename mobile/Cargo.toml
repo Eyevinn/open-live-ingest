@@ -1,0 +1,31 @@
+[package]
+name = "open-live-ingest-mobile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The iPhone app's Rust core: the C ABI Swift calls (docs/specs/ios-app.md)"
+publish = false
+
+# A static library for the Xcode project to link, and an rlib for `cargo test` and
+# for tests/abi.rs, which calls the exported symbols the way Swift does.
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+# What it links on the phone, counted as the CI `ios` job counts it:
+#   cargo tree -p open-live-ingest-mobile --target aarch64-apple-ios -e normal,build
+# distinct crates (name and version), this one included. The job fails when the count
+# differs from the number below, so a new transitive dependency is a conscious change
+# (docs/specs/ios-app.md, sections 12 and 13): update it in the same commit.
+# ios-crate-count: 144
+
+[dependencies]
+# The gateway library without the `cli` feature: no clap, dialoguer or console.
+open-live-ingest = { path = "..", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+# The runtime the core owns, so `oli_core_send` never waits on the network.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

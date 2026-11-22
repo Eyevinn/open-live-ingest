@@ -1,10 +1,12 @@
-# Two packages, one version and one lockfile: this one (the library and the CLI) and
-# the desktop app in app/. A plain `cargo build`, `test` or `clippy` at the root builds
-# this package only, so nothing here needs the app's system webview libraries; the
-# app is built with `-p open-live-ingest-app` on macOS and Windows
-# (docs/specs/desktop-app.md, section 3).
+# Three packages, one version and one lockfile: this one (the library and the CLI),
+# the desktop app in app/ and the iPhone app's Rust core in mobile/. A plain
+# `cargo build`, `test` or `clippy` at the root builds this package only, so nothing
+# here needs the app's system webview libraries or an iOS target; the app is built
+# with `-p open-live-ingest-app` on macOS and Windows (docs/specs/desktop-app.md,
+# section 3), the phone's core with `-p open-live-ingest-mobile`
+# (docs/specs/ios-app.md, section 3).
 [workspace]
-members = [".", "app"]
+members = [".", "app", "mobile"]
 default-members = ["."]
 
 [workspace.package]
@@ -82,8 +84,9 @@ libc = "0.2"
 # its windows-targets and byteorder. Linux has no keychain here and needs nothing.
 # security-framework 3.7's own manifest marks it "looking-for-maintainer"; it is
 # still the crate `keyring`, rustls-native-certs and native-tls depend on, and the
-# few calls used here are easy to move should it be abandoned.
-[target.'cfg(target_os = "macos")'.dependencies]
+# few calls used here are easy to move should it be abandoned. The iOS Keychain is the
+# same API, so the iPhone app (mobile/) uses the same crate, with no new one.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 security-framework = { version = "3.7", default-features = false, features = ["OSX_10_14"] }
 
 [target.'cfg(windows)'.dependencies]

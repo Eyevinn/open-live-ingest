@@ -1,4 +1,5 @@
-//! Secrets in the OS keychain: the macOS Keychain and the Windows Credential Manager.
+//! Secrets in the OS keychain: the macOS and iOS Keychain and the Windows Credential
+//! Manager.
 //!
 //! Behind [`SecretStore`], so the code that keeps a credential signed in runs the same
 //! against [`MemoryKeychain`] in tests, and on Linux, where this gateway uses no
@@ -53,8 +54,9 @@ impl SecretStore for MemoryKeychain {
     }
 }
 
-/// The current user's keychain: the login keychain on macOS, the Credential Manager
-/// on Windows. Elsewhere every call fails with a message saying so.
+/// The current user's keychain: the login keychain on macOS, the app's Keychain on
+/// iOS, the Credential Manager on Windows. Elsewhere every call fails with a message
+/// saying so.
 #[derive(Debug, Clone)]
 pub struct OsKeychain {
     service: String,
@@ -76,36 +78,65 @@ impl OsKeychain {
 
     /// Whether this platform has a keychain this type can use.
     pub fn is_available() -> bool {
-        cfg!(any(target_os = "macos", windows))
+        cfg!(any(target_os = "macos", target_os = "ios", windows))
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod platform {
     use anyhow::{anyhow, Result};
     use security_framework::passwords::{
-        delete_generic_password, generic_password, set_generic_password, PasswordOptions,
+        delete_generic_password, generic_password, PasswordOptions,
     };
 
     /// `errSecItemNotFound`.
     const NOT_FOUND: i32 = -25300;
 
+    const KEYCHAIN: &str = if cfg!(target_os = "ios") {
+        "the iOS Keychain"
+    } else {
+        "the macOS Keychain"
+    };
+
     fn failed(what: &str, err: security_framework::base::Error) -> anyhow::Error {
-        anyhow!("{what} the macOS Keychain failed (OSStatus {})", err.code())
+        anyhow!("{what} {KEYCHAIN} failed (OSStatus {})", err.code())
     }
 
     pub fn get(service: &str, account: &str) -> Result<Option<String>> {
         match generic_password(PasswordOptions::new_generic_password(service, account)) {
             Ok(bytes) => String::from_utf8(bytes)
                 .map(Some)
-                .map_err(|_| anyhow!("the macOS Keychain entry {service}/{account} is not text")),
+                .map_err(|_| anyhow!("the {KEYCHAIN} entry {service}/{account} is not text")),
             Err(err) if err.code() == NOT_FOUND => Ok(None),
             Err(err) => Err(failed("reading from", err)),
         }
     }
 
+    #[cfg(target_os = "macos")]
     pub fn set(service: &str, account: &str, secret: &str) -> Result<()> {
-        set_generic_password(service, account, secret.as_bytes())
+        security_framework::passwords::set_generic_password(service, account, secret.as_bytes())
+            .map_err(|err| failed("writing to", err))
+    }
+
+    /// On the phone the entry is readable once the phone has been unlocked after a
+    /// restart, and only on this phone: never synced, never restored to another
+    /// (docs/specs/ios-app.md, section 7.1). An entry already there is removed and
+    /// written again, so the accessibility applies to it too; an update would keep
+    /// the old one's.
+    #[cfg(target_os = "ios")]
+    pub fn set(service: &str, account: &str, secret: &str) -> Result<()> {
+        use security_framework::access_control::{ProtectionMode, SecAccessControl};
+        use security_framework::passwords::set_generic_password_options;
+
+        delete(service, account)?;
+        let access = SecAccessControl::create_with_protection(
+            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
+            0,
+        )
+        .map_err(|err| failed("preparing an entry for", err))?;
+        let mut options = PasswordOptions::new_generic_password(service, account);
+        options.set_access_control(access);
+        set_generic_password_options(secret.as_bytes(), options)
             .map_err(|err| failed("writing to", err))
     }
 
@@ -217,7 +248,7 @@ mod platform {
     }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", windows)))]
 mod platform {
     use anyhow::{bail, Result};
 
@@ -309,7 +340,7 @@ mod tests {
         assert_eq!(store.get("osc").unwrap(), None);
     }
 
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", windows)))]
     #[test]
     fn elsewhere_the_os_keychain_says_it_is_unavailable() {
         assert!(!OsKeychain::is_available());

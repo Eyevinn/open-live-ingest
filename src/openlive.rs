@@ -380,6 +380,7 @@ impl OpenLiveClient {
         if settings.auth_mode != AuthMode::Osc {
             return Self::new(url, settings.auth_mode, settings.api_key.as_deref());
         }
+        let mut exchange_url = TOKEN_EXCHANGE_URL.to_string();
         let pat = match credential {
             OscCredential::Token(token) => {
                 let token = token.trim();
@@ -388,8 +389,10 @@ impl OpenLiveClient {
                 }
                 OscToken::Configured(token.to_string())
             }
-            OscCredential::Keychain(store) => {
-                OscToken::Keychain(Box::new(KeptCredential::new(store.clone())?))
+            OscCredential::Keychain(_) | OscCredential::KeychainAt(..) => {
+                let (kept, url) = credential.kept().expect("a kept credential")?;
+                exchange_url = url;
+                OscToken::Keychain(Box::new(kept))
             }
         };
         Ok(Self {
@@ -401,6 +404,7 @@ impl OpenLiveClient {
             auth: Auth::Osc {
                 pat,
                 cache: Mutex::new(None),
+                exchange: exchange_url,
             },
         })
     }
@@ -659,6 +663,8 @@ enum Auth {
     Osc {
         pat: OscToken,
         cache: Mutex<Option<CachedToken>>,
+        /// Where the personal access token is exchanged for service tokens.
+        exchange: String,
     },
 }
 
@@ -762,6 +768,7 @@ impl Auth {
             AuthMode::Osc => Auth::Osc {
                 pat: OscToken::resolve(key, keychain)?,
                 cache: Mutex::new(None),
+                exchange: TOKEN_EXCHANGE_URL.to_string(),
             },
         })
     }
@@ -769,12 +776,16 @@ impl Auth {
     async fn bearer(&self, http: &reqwest::Client) -> Result<Option<String>> {
         match self {
             Auth::Direct(key) => Ok(key.clone()),
-            Auth::Osc { pat, cache } => {
+            Auth::Osc {
+                pat,
+                cache,
+                exchange: url,
+            } => {
                 let mut guard = cache.lock().await;
                 if let Some(cached) = guard.as_ref().filter(|c| !is_expiring(c)) {
                     return Ok(Some(cached.token.clone()));
                 }
-                let fresh = exchange(http, pat).await?;
+                let fresh = exchange(http, url, pat).await?;
                 let token = fresh.token.clone();
                 *guard = Some(fresh);
                 Ok(Some(token))
@@ -793,9 +804,9 @@ fn is_expiring(cached: &CachedToken) -> bool {
     now() + REFRESH_BUFFER >= cached.expires_at
 }
 
-async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken> {
+async fn exchange(http: &reqwest::Client, url: &str, pat: &OscToken) -> Result<CachedToken> {
     let token = pat.read().await?;
-    let res = post_service_token(http, &token).await?;
+    let res = post_service_token_at(http, url, &token).await?;
     let status = res.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         // Refused before it expired, so revoked: the next try refreshes first.
@@ -823,10 +834,6 @@ pub(crate) async fn service_token_at(
 ) -> Result<String> {
     let res = post_service_token_at(http, url, pat).await?;
     Ok(decode_service_token(res).await?.token)
-}
-
-async fn post_service_token(http: &reqwest::Client, pat: &str) -> Result<reqwest::Response> {
-    post_service_token_at(http, TOKEN_EXCHANGE_URL, pat).await
 }
 
 async fn post_service_token_at(
@@ -936,6 +943,23 @@ mod tests {
         );
 
         assert!(OpenLiveClient::with_osc_credential(&settings, &"  ".into()).is_err());
+
+        // Against the Open Source Cloud an app's own tests point it at.
+        let endpoints = osc::Endpoints {
+            connect: "http://127.0.0.1:9".into(),
+            catalog: "http://127.0.0.1:9/mysubscriptions".into(),
+            token_exchange: "http://127.0.0.1:9/servicetoken".into(),
+        };
+        let at = OpenLiveClient::with_osc_credential(
+            &settings,
+            &OscCredential::KeychainAt(Arc::new(MemoryKeychain::new()), endpoints),
+        )
+        .unwrap();
+        assert!(
+            matches!(&at.auth, Auth::Osc { pat: OscToken::Keychain(_), exchange, .. } if exchange == "http://127.0.0.1:9/servicetoken"),
+            "the token is exchanged where the app says"
+        );
+        assert!(matches!(&kept.auth, Auth::Osc { exchange, .. } if exchange == TOKEN_EXCHANGE_URL));
 
         settings.url = Some("http://127.0.0.1:3000".into());
         settings.auth_mode = AuthMode::Direct;

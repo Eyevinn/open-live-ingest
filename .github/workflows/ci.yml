@@ -81,6 +81,60 @@ jobs:
           [[ "$got" == "open-live-ingest-app $version" ]] \
             || { echo "expected 'open-live-ingest-app $version'"; exit 1; }
 
+  # The iPhone app's Rust core (mobile/, docs/specs/ios-app.md, section 12): its C ABI
+  # and dispatcher linted for the phone and the simulator, its tests on the Mac, and
+  # what it links on the phone counted against the number recorded in
+  # mobile/Cargo.toml, so a new transitive dependency is a conscious change. The
+  # build job above never compiles it (default-members = ["."]); `cargo fmt --all`
+  # there covers it. The Swift half of this job comes with the Xcode project.
+  ios:
+    runs-on: macos-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios
+      - run: cargo clippy -p open-live-ingest-mobile --target aarch64-apple-ios --locked -- -D warnings
+      - run: cargo clippy -p open-live-ingest-mobile --target aarch64-apple-ios-sim --locked -- -D warnings
+      - run: cargo test -p open-live-ingest-mobile --locked
+
+      - name: The phone links the crates recorded in mobile/Cargo.toml
+        run: |
+          set -euo pipefail
+          want="$(sed -n 's/^# ios-crate-count: \([0-9][0-9]*\)$/\1/p' mobile/Cargo.toml)"
+          [[ -n "$want" ]] || { echo "mobile/Cargo.toml records no ios-crate-count"; exit 1; }
+          got="$(cargo tree -p open-live-ingest-mobile --target aarch64-apple-ios -e normal,build \
+            --prefix none --locked | awk '{print $1" "$2}' | sort -u | wc -l | tr -d ' ')"
+          echo "crates on the phone: $got (recorded: $want)"
+          [[ "$got" == "$want" ]] || {
+            echo "the phone's crate count changed; if that is on purpose, record $got in mobile/Cargo.toml"
+            exit 1
+          }
+
+  # The same core's tests on Linux: plain Rust, no iOS SDK (docs/specs/ios-app.md,
+  # section 3).
+  mobile-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: mobile
+      - run: cargo clippy -p open-live-ingest-mobile --all-targets --locked -- -D warnings
+      - run: cargo test -p open-live-ingest-mobile --locked
+
   # The session AC2 test (`start_events_and_stop_against_a_real_strom`, #[ignore]d so
   # `cargo test` above stays GStreamer-free) against a real Strom: the release binary
   # of the strom-types tag pinned in Cargo.toml, so a pin bump moves this job with it.

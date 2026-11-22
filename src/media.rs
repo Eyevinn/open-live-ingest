@@ -23,8 +23,9 @@ use crate::strom::{self as strom_api, StromClient};
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use strom_types::api::SrtCallerStats;
+pub use strom_types::api::SrtCallerStats;
 use strom_types::discovery::{DeviceCategory, DeviceResponse};
 use strom_types::FlowId;
 use tokio::sync::mpsc;
@@ -73,6 +74,15 @@ pub trait Media: Send + Sync {
 
     /// The SRT sender's cumulative counters, `None` before a peer exists.
     fn uplink(&self, input: &Input) -> impl Future<Output = Result<Option<SrtCallerStats>>> + Send;
+
+    /// Whether the media is held back for now, whatever the productions say: an
+    /// armed session then stops each uplink (its source kept, marked inactive) as
+    /// though no production holding it were live, and starts it again at the first
+    /// look after the hold ends. A phone in the background or in a call, whose camera
+    /// the OS has taken. Never on a computer.
+    fn held_back(&self) -> bool {
+        false
+    }
 }
 
 /// The inputs of a run once the devices are chosen: what `devices::inputs_for` turns
@@ -347,6 +357,7 @@ struct Reported {
 pub struct ExternalMedia {
     requests: mpsc::UnboundedSender<MediaRequest>,
     reported: Arc<Mutex<HashMap<String, Reported>>>,
+    held: Arc<AtomicBool>,
 }
 
 impl ExternalMedia {
@@ -357,6 +368,7 @@ impl ExternalMedia {
             Self {
                 requests,
                 reported: Arc::default(),
+                held: Arc::default(),
             },
             rx,
         )
@@ -370,6 +382,15 @@ impl ExternalMedia {
         if let Some(r) = self.reports().get_mut(input_id) {
             *r = Reported { running, uplink };
         }
+    }
+
+    /// Holds the media back, or lets it go again: the host cannot send for now (the
+    /// app in the background, a phone call). An armed session stops each uplink at
+    /// its next look at the productions, its source kept and marked inactive, and
+    /// starts it again at the first look after the hold ends if a production holding
+    /// the source is still live. See [`Media::held_back`].
+    pub fn hold(&self, held: bool) {
+        self.held.store(held, Ordering::SeqCst);
     }
 
     fn reports(&self) -> std::sync::MutexGuard<'_, HashMap<String, Reported>> {
@@ -492,5 +513,9 @@ impl Media for ExternalMedia {
 
     async fn uplink(&self, input: &Input) -> Result<Option<SrtCallerStats>> {
         Ok(self.reports().get(&input.id).and_then(|r| r.uplink.clone()))
+    }
+
+    fn held_back(&self) -> bool {
+        self.held.load(Ordering::SeqCst)
     }
 }
