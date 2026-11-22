@@ -279,7 +279,7 @@ the venue runs.
 Bump `version` in `Cargo.toml`, commit, then tag and push:
 
 ```bash
-git tag v0.5.0 && git push origin v0.5.0
+git tag v0.6.0 && git push origin v0.6.0
 ```
 
 The release workflow refuses a tag that does not match `Cargo.toml`, builds the five binaries
