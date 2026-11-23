@@ -7,8 +7,8 @@ import CoreVideo
 /// OL-64d; the end-to-end run OL-64h uses it).
 ///
 /// The picture: colour bars in the top two thirds with a white square sweeping across them, and
-/// a band of noise at the bottom that changes every frame, so the encoder has to spend its bits
-/// as it would on a camera's picture. The sound: a 1 kHz sine at -20 dBFS on every channel.
+/// a band of fine detail (noise) at the bottom that drifts every frame, so the encoder has to
+/// spend its bits as it would on a camera's picture. The sound: a 1 kHz sine at -20 dBFS on every channel.
 ///
 /// `pixelBuffer(frame:)` and `audioBuffer(startSample:frameCount:)` make any frame on demand (the
 /// tests encode faster than real time); `start` drives both at the frame rate on the host clock,
@@ -107,11 +107,12 @@ final class TestPatternSource {
         let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
         let cStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
 
-        // Where this frame's noise window starts: a fresh place every frame.
-        var random = SplitMix64(seed: UInt64(frame) &+ 1)
+        // Where this frame's noise window starts: drifting a few pixels a frame, as a camera's
+        // detail moves under a slow pan. (A fresh window every frame is pure noise to the encoder:
+        // the simulator's VideoToolbox then ran at 1.8 times the target rate.)
         let bandHeight = height - bandTop
-        let nx = Int(random.next() % UInt64(width)) & ~1
-        let ny = Int(random.next() % UInt64(bandHeight)) & ~1
+        let nx = (frame * 6) % width & ~1
+        let ny = (frame * 2) % bandHeight & ~1
 
         // The square: 1/6 of the height, sweeping left to right over two seconds.
         let side = (height / 6) & ~1

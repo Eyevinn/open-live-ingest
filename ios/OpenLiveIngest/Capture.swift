@@ -142,7 +142,7 @@ final class Capture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVC
     private func routeMicrophone() throws {
         let audioSession = AVAudioSession.sharedInstance()
         do {
-            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.allowBluetooth, .mixWithOthers])
+            try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.allowBluetoothHFP, .mixWithOthers])
             try audioSession.setPreferredSampleRate(48_000)
             try audioSession.setActive(true)
             if let microphoneUID,

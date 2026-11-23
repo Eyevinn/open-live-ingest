@@ -109,13 +109,15 @@ for pid in "${pids[@]}"; do
 done
 
 echo "== test-without-building"
+tests=0
 run_logged "$out/test.log" xcodebuild test-without-building \
   -project "$project" -scheme OpenLiveIngest \
   -destination "$destination" -derivedDataPath "$derived" \
   -parallel-testing-enabled NO \
-  -resultBundlePath "$out/OpenLiveIngest.xcresult"
+  -resultBundlePath "$out/OpenLiveIngest.xcresult" || tests=$?
 
-# The recordings: where the tests wrote them, or else the test host's temporary directory.
+# The recordings: where the tests wrote them, or else the test host's temporary directory. Checked
+# even when a test failed, so the report says what the stream looked like.
 container="$(xcrun simctl get_app_container "$udid" com.eyevinn.open-live-ingest.ios data 2>/dev/null || true)"
 echo "== checking the streams with $(ffprobe -version | head -n 1)"
 report="$out/stream-checks.md"
@@ -137,3 +139,4 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   { echo "## OL-64d stream checks"; echo; cat "$report"; } >>"$GITHUB_STEP_SUMMARY"
 fi
 [[ "$failed" == 0 ]] || { echo "the stream checks failed: see $report"; exit 1; }
+[[ "$tests" == 0 ]] || { echo "the tests failed ($tests): see $out/test.log"; exit "$tests"; }

@@ -138,10 +138,14 @@ final class MediaPipelineTests: XCTestCase {
             "no listener passphrase: run the tests with ios/run-tests.sh")
         let recording = try Self.recording.get()
         let receiver = try UDPReceiver(port: Self.deliveredUDPPort)
+        // SRTO_INPUTBW as the app sets it (the configured CBR rate), or the recording's own rate when
+        // the encoder overshot it, so the test carries the stream that was encoded.
+        let configured = Int64(VideoSettings.defaults.bitrateKbps + AudioSettings.defaults.bitrateKbps) * 1000
+        let measured = Int64(recording.stream.count) * 8 / Int64(Self.seconds)
+        print("transport stream: \(measured / 1000) kbps; configured \(configured / 1000) kbps")
         let sender = SRTSender(options: SRTSenderOptions(
             host: "127.0.0.1", port: Self.encodedPort, latencyMs: 200, passphrase: passphrase, pbkeylen: 16,
-            bitrateBitsPerSecond: Int64(VideoSettings.defaults.bitrateKbps + AudioSettings.defaults.bitrateKbps) * 1000,
-            connectTimeoutMs: 10_000))
+            bitrateBitsPerSecond: max(configured, measured), connectTimeoutMs: 10_000))
         defer { sender.stop() }
         try sender.connect()
 
