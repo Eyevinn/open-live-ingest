@@ -1301,7 +1301,8 @@ async fn look_at_productions<M: Media>(
                 productions: verdict.added_while_live.clone(),
             });
         }
-        match (verdict.send(), l.sending) {
+        // Held back (a phone in the background): stopped as though nothing were live.
+        match (verdict.send() && !media.held_back(), l.sending) {
             (true, false) => send_uplink(media, video, l, &verdict, events).await,
             (false, true) => arm_again(media, l, events).await,
             // A start that failed, for a production no longer live: armed again.

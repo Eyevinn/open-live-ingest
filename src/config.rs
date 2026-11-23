@@ -500,7 +500,8 @@ pub fn user_dir() -> PathBuf {
         std::env::var_os("APPDATA")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+        // On iOS, HOME is the app's sandbox, and Application Support in it is backed up.
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
     } else {
@@ -570,6 +571,10 @@ fn with_env_overrides(mut cfg: Config) -> Result<Config> {
 /// holds the Open Live credential and any SRT passphrase.
 pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     validate(cfg)?;
+    write(path, cfg)
+}
+
+fn write(path: &Path, cfg: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("creating the settings directory")?;
     }
@@ -589,6 +594,22 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     }
     std::fs::rename(&tmp, path).context("replacing the settings file")?;
     Ok(())
+}
+
+/// Writes settings that are not finished yet, as [`save`] does, refusing only what
+/// would be wrong whatever is chosen later: every problem but a missing Open Live
+/// address or credential. For a front end that keeps its choices one by one before
+/// anyone has said where to send: the phone's first launch, a camera picked before
+/// the instance, a sign-in forgotten.
+pub fn save_unfinished(path: &Path, cfg: &Config) -> Result<()> {
+    let unfinished = |setting: &str| matches!(setting, "open_live.url" | "open_live.api_key");
+    if let Some((_, err)) = check(cfg, crate::osc::saved_token().is_some())
+        .into_iter()
+        .find(|(setting, _)| !unfinished(setting))
+    {
+        return Err(err);
+    }
+    write(path, cfg)
 }
 
 /// Replaces the file's ACL with full control for the current user, SYSTEM and
@@ -923,7 +944,91 @@ fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
     if let Err(err) = crate::heartbeat::Target::from_config(&cfg.open_live) {
         found.push(("open_live.gateway_id", err));
     }
+    if cfg!(target_os = "ios") {
+        found.extend(check_phone(cfg));
+    }
     found
+}
+
+/// What the phone's encoder can do: H.264 in hardware at a constant bitrate. The
+/// other `[video]` choices are the desktop's, for Strom's encoders.
+const PHONE_CODEC: &str = "h264";
+const PHONE_ENCODER: &str = "hardware";
+const PHONE_RATE_CONTROL: &str = "cbr";
+
+/// What is wrong with settings for the iPhone app, on top of [`problems`]: the
+/// phone always sends H.264, encoded in hardware at a constant bitrate (VideoToolbox),
+/// so a `[video] codec`, `encoder_preference`, `quality_preset`, `tune` or
+/// `rate_control` other than that (the last three: other than the defaults, which
+/// it does not use) is refused rather than silently ignored, as a settings file
+/// copied from a desktop that asks for AV1 would be. [`problems`] includes these on
+/// iOS; this is them alone, on any OS.
+pub fn phone_problems(cfg: &Config) -> Vec<Problem> {
+    check_phone(cfg)
+        .into_iter()
+        .map(|(setting, err)| Problem::new(setting, format!("{err:#}")))
+        .collect()
+}
+
+fn check_phone(cfg: &Config) -> Vec<(&'static str, anyhow::Error)> {
+    let (video, defaults) = (&cfg.video, Video::default());
+    [
+        ("video.codec", &video.codec, PHONE_CODEC),
+        (
+            "video.encoder_preference",
+            &video.encoder_preference,
+            PHONE_ENCODER,
+        ),
+        (
+            "video.quality_preset",
+            &video.quality_preset,
+            defaults.quality_preset.as_str(),
+        ),
+        ("video.tune", &video.tune, defaults.tune.as_str()),
+        (
+            "video.rate_control",
+            &video.rate_control,
+            PHONE_RATE_CONTROL,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, value, wanted)| !value.trim().eq_ignore_ascii_case(wanted))
+    .map(|(key, value, wanted)| {
+        (
+            key,
+            anyhow!("the iPhone app always sends with {key} = {wanted:?}, got {value:?}"),
+        )
+    })
+    .collect()
+}
+
+/// Settings for a phone's first launch (docs/specs/ios-app.md, sections 7 and 11): a
+/// new random `gateway.id`, so two phones never share flows or sources; `gateway.name`
+/// `iPhone <first 4 hex of the id>`, so two phones never share the source prefix
+/// that cleanup sweeps by; and the phone's defaults: 1280x720 at 30 fps, H.264 in
+/// hardware at a constant 4000 kbps, a keyframe every 30 frames, the library's
+/// 200 ms SRT latency. Where to send and what to send are chosen later.
+pub fn phone_settings() -> Result<Config> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|err| anyhow!("the OS random source failed: {err}"))?;
+    Ok(phone_settings_with(
+        uuid::Builder::from_random_bytes(bytes).into_uuid(),
+    ))
+}
+
+fn phone_settings_with(id: uuid::Uuid) -> Config {
+    let id = id.hyphenated().to_string();
+    let mut cfg = Config::default();
+    cfg.gateway.name = format!("iPhone {}", id[..4].to_uppercase());
+    cfg.gateway.id = Some(id);
+    cfg.video.codec = PHONE_CODEC.to_string();
+    cfg.video.encoder_preference = PHONE_ENCODER.to_string();
+    cfg.video.rate_control = PHONE_RATE_CONTROL.to_string();
+    cfg.video.bitrate_kbps = 4000;
+    cfg.video.keyframe_interval = 30;
+    cfg.capture.video_resolution = Some("1280x720".to_string());
+    cfg.capture.video_framerate = Some("30/1".to_string());
+    cfg
 }
 
 /// Splits a `WxH` string.
@@ -966,6 +1071,120 @@ pub fn init_tracing(level: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The phone's first launch (docs/specs/ios-app.md, section 7.1): the id is a
+    /// random UUID, the name its first four hex digits, the video the phone's.
+    #[test]
+    fn a_phone_starts_with_an_id_of_its_own_and_a_name_from_it() {
+        let id = uuid::Uuid::parse_str("3f2a9c1e-0000-4000-8000-000000000000").unwrap();
+        let cfg = phone_settings_with(id);
+        assert_eq!(
+            cfg.gateway.id.as_deref(),
+            Some("3f2a9c1e-0000-4000-8000-000000000000")
+        );
+        assert_eq!(cfg.gateway.name, "iPhone 3F2A");
+        assert_eq!(cfg.video.codec, "h264");
+        assert_eq!(cfg.video.encoder_preference, "hardware");
+        assert_eq!(cfg.video.rate_control, "cbr");
+        assert_eq!(cfg.video.bitrate_kbps, 4000);
+        assert_eq!(cfg.video.keyframe_interval, 30);
+        assert_eq!(cfg.capture.video_resolution.as_deref(), Some("1280x720"));
+        assert_eq!(cfg.capture.video_framerate.as_deref(), Some("30/1"));
+        assert_eq!(cfg.uplink.latency_ms, 200);
+        assert_eq!(cfg.uplink.mode, UplinkMode::Caller);
+        assert!(phone_problems(&cfg).is_empty());
+
+        let (a, b) = (phone_settings().unwrap(), phone_settings().unwrap());
+        assert_ne!(a.gateway.id, b.gateway.id, "two phones, two ids");
+        let a_id = a.gateway.id.unwrap();
+        assert_eq!(uuid::Uuid::parse_str(&a_id).unwrap().get_version_num(), 4);
+        assert_eq!(
+            a.gateway.name,
+            format!("iPhone {}", a_id[..4].to_uppercase())
+        );
+    }
+
+    /// The phone sends H.264 in hardware at a constant bitrate: a desktop's file
+    /// asking for anything else is refused, one problem per key.
+    #[test]
+    fn a_phone_refuses_video_settings_it_cannot_send() {
+        let mut cfg = phone_settings_with(uuid::Uuid::nil());
+        cfg.video.codec = "AV1".into();
+        cfg.video.encoder_preference = "auto".into();
+        cfg.video.quality_preset = "slow".into();
+        cfg.video.tune = "film".into();
+        cfg.video.rate_control = "vbr".into();
+        let problems = phone_problems(&cfg);
+        let keys: Vec<_> = problems.iter().filter_map(|p| p.setting).collect();
+        assert_eq!(
+            keys,
+            [
+                "video.codec",
+                "video.encoder_preference",
+                "video.quality_preset",
+                "video.tune",
+                "video.rate_control"
+            ]
+        );
+        assert!(
+            problems[0].message.contains("\"h264\"") && problems[0].message.contains("AV1"),
+            "{}",
+            problems[0].message
+        );
+        // Case and spaces do not matter; the desktop's defaults for the other two do.
+        cfg.video = Video {
+            codec: " H264 ".into(),
+            encoder_preference: "Hardware".into(),
+            rate_control: "CBR".into(),
+            ..Video::default()
+        };
+        assert!(phone_problems(&cfg).is_empty());
+        // The desktop's own defaults ask for an encoder the phone does not choose.
+        assert_eq!(
+            phone_problems(&Config::default())
+                .iter()
+                .filter_map(|p| p.setting)
+                .collect::<Vec<_>>(),
+            ["video.encoder_preference"]
+        );
+        // Part of `problems` on iOS only.
+        assert_eq!(
+            problems_with(&cfg_with_codec("av1"), true)
+                .iter()
+                .any(|p| p.setting == Some("video.codec")),
+            cfg!(target_os = "ios")
+        );
+    }
+
+    fn cfg_with_codec(codec: &str) -> Config {
+        let mut cfg = phone_settings_with(uuid::Uuid::nil());
+        cfg.open_live.register = false;
+        cfg.uplink.host = Some("cloud.example.com".into());
+        cfg.video.codec = codec.into();
+        cfg
+    }
+
+    /// Settings with no Open Live chosen yet are written, and read back the same;
+    /// anything else wrong with them is still refused.
+    #[test]
+    fn unfinished_settings_are_saved_but_wrong_ones_are_not() {
+        let dir = std::env::temp_dir().join(format!("oli-unfinished-{}", std::process::id()));
+        let path = dir.join("gateway.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = phone_settings_with(uuid::Uuid::nil());
+        cfg.open_live.auth_mode = AuthMode::Osc;
+        assert!(validate_with(&cfg, false).is_err(), "no url, no credential");
+        save_unfinished(&path, &cfg).unwrap();
+        let back = load_or_default(&path).unwrap();
+        assert_eq!(back.gateway.name, cfg.gateway.name);
+        assert_eq!(back.video.encoder_preference, "hardware");
+
+        cfg.uplink.pbkeylen = Some(20);
+        let err = save_unfinished(&path, &cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("pbkeylen"), "{err:#}");
+        assert_eq!(load_or_default(&path).unwrap().uplink.pbkeylen, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn uplink(mode: UplinkMode) -> Uplink {
         Uplink {

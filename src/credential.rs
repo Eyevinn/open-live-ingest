@@ -131,6 +131,12 @@ pub enum OscCredential {
     /// What [`keep`] stored in this keychain: a sign-in, renewed from its refresh
     /// token as it is used, or a kept personal access token.
     Keychain(Arc<dyn SecretStore>),
+    /// [`Keychain`](Self::Keychain), against the Open Source Cloud at these
+    /// endpoints: its OAuth server renews the sign-in and its exchange turns the
+    /// access token into Open Live service tokens. An app whose own tests point
+    /// it at a fake Open Source Cloud goes live with the same endpoints;
+    /// [`Keychain`](Self::Keychain) is this with [`osc::Endpoints::production`].
+    KeychainAt(Arc<dyn SecretStore>, osc::Endpoints),
 }
 
 impl fmt::Debug for OscCredential {
@@ -138,6 +144,9 @@ impl fmt::Debug for OscCredential {
         match self {
             OscCredential::Token(_) => f.write_str("Token(<redacted>)"),
             OscCredential::Keychain(_) => f.write_str("Keychain"),
+            OscCredential::KeychainAt(_, endpoints) => {
+                write!(f, "KeychainAt({})", endpoints.connect)
+            }
         }
     }
 }
@@ -193,7 +202,34 @@ impl OscCredential {
                     .access_token()
                     .await
             }
+            OscCredential::KeychainAt(store, endpoints) => {
+                KeptCredential::with(
+                    store.clone(),
+                    &endpoints.connect,
+                    Arc::new(|| osc::now().as_secs()),
+                )?
+                .access_token()
+                .await
+            }
         }
+    }
+
+    /// The kept sign-in as the session renews it: from the keychain, against
+    /// Open Source Cloud itself or the endpoints given. None for a token in hand.
+    pub(crate) fn kept(&self) -> Option<Result<(KeptCredential, String)>> {
+        let (store, endpoints) = match self {
+            OscCredential::Token(_) => return None,
+            OscCredential::Keychain(store) => (store, osc::Endpoints::production()),
+            OscCredential::KeychainAt(store, endpoints) => (store, endpoints.clone()),
+        };
+        Some(
+            KeptCredential::with(
+                store.clone(),
+                &endpoints.connect,
+                Arc::new(|| osc::now().as_secs()),
+            )
+            .map(|kept| (kept, endpoints.token_exchange)),
+        )
     }
 }
 

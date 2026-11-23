@@ -1963,6 +1963,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "open-live-ingest-mobile"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "open-live-ingest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -256,7 +256,7 @@ async fn validate_as(settings: &Config, credential: Option<&OscCredential>) -> V
         // in check_open_live below.
         let in_hand = match credential {
             Some(OscCredential::Token(token)) => Some((token.trim().to_string(), "the app")),
-            Some(OscCredential::Keychain(_)) => None,
+            Some(OscCredential::Keychain(_) | OscCredential::KeychainAt(..)) => None,
             None if cfg.open_live.uses_keychain() => None,
             None => osc_credential(cfg).map(|(token, source, _)| (token, source)),
         };
@@ -296,7 +296,8 @@ async fn validate_as(settings: &Config, credential: Option<&OscCredential>) -> V
         }
     }
 
-    if !reported(&found, "strom.url") {
+    // The phone has no Strom: its own code does the media (docs/specs/ios-app.md).
+    if !cfg!(target_os = "ios") && !reported(&found, "strom.url") {
         match probe_strom(cfg).await {
             Reachability::Ok { .. } => {}
             Reachability::NeedsCredential => found.push(Problem::new(
@@ -494,6 +495,33 @@ pub fn osc_credential(settings: &Config) -> Option<(String, &'static str, bool)>
         return Some((token, osc::ENV_TOKEN, false));
     }
     osc::login_token().map(|token| (token, "the OSC CLI's saved login", true))
+}
+
+/// The sources in Open Live that carry the settings' source name prefix
+/// (`<gateway.name> — `, [`crate::devices::name_prefix`]) and are not tagged as this
+/// gateway's (`gatewayId`, set when the heartbeat is configured), by name. A stop
+/// and `down` sweep the sources of their prefix, so a gateway renamed onto a prefix
+/// that is in use would remove sources it did not register: a front end that lets
+/// the name be changed warns with these (docs/specs/ios-app.md, section 7.1).
+/// `credential` is the app's Open Source Cloud credential, as for [`validate_with`].
+pub async fn sources_named_like(
+    settings: &Config,
+    credential: Option<&OscCredential>,
+) -> Result<Vec<String>> {
+    let client = match credential {
+        Some(credential) => OpenLiveClient::with_osc_credential(&settings.open_live, credential)?,
+        None => OpenLiveClient::from_settings(&settings.open_live)?,
+    };
+    let prefix = crate::devices::name_prefix(&settings.gateway.name);
+    let ours = settings.open_live.gateway_id.as_deref();
+    Ok(client
+        .list_sources()
+        .await?
+        .into_iter()
+        .filter(|s| s.name.starts_with(&prefix))
+        .filter(|s| ours.is_none() || s.gateway_id.as_deref() != ours)
+        .map(|s| s.name)
+        .collect())
 }
 
 /// Confirms the address and credential work, returning what Open Live says about

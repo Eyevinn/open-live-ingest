@@ -1,7 +1,8 @@
 ## Project Overview
-A Cargo workspace of two packages sharing one version and one `Cargo.lock`. The root package
+A Cargo workspace of three packages sharing one version and one `Cargo.lock`. The root package
 `open-live-ingest` is a library and a thin CLI binary over it; `app/` (`open-live-ingest-app`) is
-the desktop app for macOS and Windows, a second front end over the same library (ADR-001). The
+the desktop app for macOS and Windows, a second front end over the same library (ADR-001); `mobile/`
+(`open-live-ingest-mobile`) is the iPhone app's Rust core, a third (ADR-002). The
 gateway drives a Strom instance on the same machine and registers sources with Open Live. It owns
 no media pipeline; Strom does the media. The iOS app (#133, ADR-002) links the same library with no
 Strom: its own Swift code does the media there, behind the `Media` seam (`src/media.rs`).
@@ -34,8 +35,14 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
   quit guard (`quit.rs`, with the macOS `applicationShouldTerminate:` and the Windows
   `WM_QUERYENDSESSION` subclass and single-instance mutex under `quit/`). `app/ui/` holds the
   three static page files, compiled in. No npm, no Node, no bundler.
+- `mobile/`: the iPhone app's Rust core (docs/specs/ios-app.md, section 8). `mobile/src/lib.rs` is
+  the C ABI Swift calls (four `extern "C"` functions, the crate's only `unsafe` code, declared in
+  the hand-written `mobile/include/oli.h`); `mobile/src/core.rs` the command dispatcher and view
+  model over the desktop app's JSON envelope, tested against fake servers in `testing.rs`;
+  `mobile/src/logs.rs` its `app.log`. Its media is Swift's, through `media::ExternalMedia`.
 - The terminal crates (`clap`, `dialoguer`, `console`) sit behind the root package's `cli` feature
-  (default on, required by the binary). The app depends on the library with default features off.
+  (default on, required by the binary). The app and `mobile/` depend on the library with default
+  features off.
 
 ## Language
 - All code, comments, commit messages, PR titles, PR descriptions, and documentation in English.
@@ -78,7 +85,8 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
 - No local state beyond the settings file, two pidfiles (the running `up`, and a Strom it
   started), the one keychain entry an app sign-in keeps the OSC credential in, the desktop app's
   `app.log` (with one rotated copy), and on Windows the app's WebView2 cache folder
-  (`%LOCALAPPDATA%\open-live-ingest\webview`). Flows are recognised by derived id, sources by the
+  (`%LOCALAPPDATA%\open-live-ingest\webview`). The iPhone app keeps the settings file, its one
+  Keychain entry and its own `app.log` with one rotated copy, and no pidfile. Flows are recognised by derived id, sources by the
   gateway's name prefix.
 - A Strom already listening is adopted and never stopped. Only a Strom the gateway started is
   stopped, on the way out.
@@ -87,6 +95,9 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
 - `cargo check`, `cargo clippy --all-targets -- -D warnings`, and `cargo test` run anywhere: no
   GStreamer, no device access. Keep it that way. `default-members = ["."]`, so at the root they
   build the root package only.
+- The iPhone app's core is built with `-p open-live-ingest-mobile`: its tests run on any OS, and
+  the CI `ios` job lints it for `aarch64-apple-ios` and `-sim` and checks the crate count recorded
+  in `mobile/Cargo.toml` (update it on purpose with a dependency change).
 - The app is built with `-p open-live-ingest-app`. On macOS and Windows that includes the window;
   elsewhere only its core builds (the window needs webkit2gtk there, and Linux is not a target).
   The CI `app` job runs its clippy and tests on macOS and Windows.

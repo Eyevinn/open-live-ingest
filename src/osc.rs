@@ -163,7 +163,11 @@ pub async fn browser_login_with(open: impl FnOnce(&str) -> Result<()>) -> Result
     sign_in(CONNECT_URL, SIGN_IN_TIMEOUT, open).await
 }
 
-pub(crate) async fn sign_in(
+/// [`browser_login_with`], against the OAuth server at `base` (production's is
+/// [`CONNECT_URL`]), waiting at most `wait` for the browser to come back. Returns
+/// once the code is exchanged, so a caller that shows the page itself (the iPhone
+/// app's authentication sheet) knows when to close it.
+pub async fn sign_in(
     base: &str,
     wait: Duration,
     open: impl FnOnce(&str) -> Result<()>,
