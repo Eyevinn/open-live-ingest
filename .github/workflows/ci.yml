@@ -174,7 +174,7 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
-          FFMPEG_VERSION: "8.0"
+          FFMPEG_VERSION: "9.0.2"
         run: |
           set -euo pipefail
           brew install ffmpeg
