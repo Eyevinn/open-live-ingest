@@ -34,10 +34,12 @@ not the app (the simulator shares the host's loopback), runs the test with
      `inputResolutions` (the cloud Strom's mixer has negotiated a picture for the input,
      as connect-order.py reads it) and the production's audio meters (`METER_DATA` for a
      `ch<n>` element above SILENCE_DB on the watch-only controller socket
-     `/ws/productions/<id>/controller?mode=watch`). No picture fails; meters that are
-     there but silent fail; no channel meter at all is a warning that names it (the
-     instance may run without metering). The peak-to-average bitrate of what was sent
-     is noted from the bytes counter (spec section 16).
+     `/ws/productions/<id>/controller?mode=watch`; Open Live gives watchers a meter ref
+     like operators, src/ws/controller.ts). No picture fails, and so does anything short
+     of sound: meters that are there but silent, no channel meter at all, a meter socket
+     that was refused, broke or closed, or one that got no frame. The report never says
+     "all checks passed" unless every measured phase heard sound. The peak-to-average
+     bitrate of what was sent is noted from the bytes counter (spec section 16).
   4. Deactivate: the app is back to waiting (Armed, or Waiting for production while the
      inactive production still holds the source), `Link: not sending` (AC2).
   5. Stop: the source is kept, `inactive`, with its id. Go live again: no input fails
@@ -46,7 +48,9 @@ not the app (the simulator shares the host's loopback), runs the test with
      background: the source has to be `inactive` within BACKGROUND_LIMIT seconds (the
      phone's own bound is 4 s, section 9; the time is noted). Back in the foreground,
      with the production still `active`, the app is Live again on a new SRT connection
-     (its counters started again), with the same source, and the cloud decodes again.
+     (its counters started again), with the same source, and the cloud decodes again:
+     only looks at Open Live that began after the app was Live and connected again count
+     (a `/measure/start` window), so a picture left from before the background does not.
   7. Stop, then this script deactivates and deletes the production and deletes the
      source, whatever happened before. Sources and productions carrying
      `oli-ios-e2e-` left by an earlier run that was killed are removed first.
@@ -95,6 +99,7 @@ MIXER_INDEX = 0
 PROJECT = "ios/OpenLiveIngest.xcodeproj"
 SCHEME = "OpenLiveIngest"
 TEST_ID = "OpenLiveIngestUITests/OpenLiveDevE2EUITests"
+TEST_BUNDLE = "OpenLiveIngestUITests"
 TEST_CASE = "OpenLiveDevE2EUITests"
 DROP_LIMIT = 0.01
 MIN_SECONDS = 60
@@ -328,6 +333,35 @@ def audio_verdict(meters, silence=SILENCE_DB):
     names = sorted({m[1] for m in channels})
     detail = f"{len(channels)} meter readings on {', '.join(names)}, loudest {loudest:.1f} dB"
     return ("sound" if loud else "silent"), detail
+
+
+def sound_check(verdict, detail, error=None, frames=None):
+    """The problem with the cloud side's sound for a measured phase, or None when it was
+    heard. Only `sound` passes: silent meters, no channel meter at all (`unreported`) and
+    a meter socket that failed (`error`) or got no frame (`frames` == 0) leave the sound
+    unverified, which fails AC1. `frames` None means there was no meter socket."""
+    if frames is None:
+        return "sound not verified: the meter socket was never opened (the production was not active)"
+    if error:
+        return f"sound not verified: the meter socket failed ({error}); {detail}"
+    if frames == 0:
+        return f"sound not verified: the meter socket got no frame; {detail}"
+    if verdict == "sound":
+        return None
+    if verdict == "silent":
+        return f"the cloud side shows no sound: {detail}"
+    return f"sound not verified: {detail} on the watch-only controller socket"
+
+
+def all_passed(code, checks, phases):
+    """Whether the run passed: the test and cleanup (`code` 0), every check the test
+    posted, and every measured phase, each of which must have heard sound. With no
+    measured phase at all nothing was verified, so it did not pass."""
+    if code != 0 or not phases:
+        return False
+    if any(not c.get("ok") for c in checks):
+        return False
+    return all(p.get("ok") and (p.get("audio") or ("unreported",))[0] == "sound" for p in phases.values())
 
 
 def decode_summary(polls, start, end):
@@ -634,11 +668,13 @@ class MeterWatch(threading.Thread):
                     except socket.timeout:
                         continue
                     if not chunk:
+                        self.error = "closed by Open Live"
                         break
                     buffer += chunk
                     continue
                 fin, opcode, payload, buffer = frame
                 if opcode == 0x8:
+                    self.error = "closed by Open Live"
                     break
                 if opcode == 0x9:
                     sock.sendall(ws_frame(0xA, payload))
@@ -706,12 +742,15 @@ class Session:
                 with self.lock:
                     self.sources, self.sources_at = found, time.monotonic()
                 if self.production_id:
+                    # A look counts from when it was asked, so a window opened while it was
+                    # on its way does not take an answer that may predate the window.
+                    asked = time.monotonic()
                     p = self.ol.production(self.production_id)
                     if p is not None:
                         res = decoding(p.get("inputResolutions"))
                         with self.lock:
                             self.production_status = p.get("status")
-                            self.polls.append((time.monotonic(), p.get("status"), res))
+                            self.polls.append((asked, p.get("status"), res))
             except Failed as err:
                 say(f"a look at Open Live failed (retried): {err}")
             self.stopping.wait(POLL_EVERY)
@@ -781,17 +820,16 @@ class Session:
         if not result["decode"]["resolution"]:
             problems.append("the cloud Strom never showed a picture for the input")
         watch = self.watch
-        if watch is not None:
-            meters = [m for m in watch.meters if start <= m[0] <= end]
-            verdict, detail = audio_verdict(meters)
-            if watch.error:
-                detail += f"; the meter socket: {watch.error}"
-            result["audio"] = (verdict, detail)
-            if verdict == "silent":
-                problems.append(f"the cloud side shows no sound: {detail}")
-            elif verdict == "unreported":
-                print(f"::warning title=e2e ios::sound not checked: the instance relayed no channel meter ({detail})",
-                      flush=True)
+        meters = [m for m in watch.meters if start <= m[0] <= end] if watch is not None else []
+        verdict, detail = audio_verdict(meters)
+        if watch is not None and watch.error:
+            detail += f"; the meter socket: {watch.error}"
+        problem = sound_check(verdict, detail, watch.error if watch is not None else None,
+                              watch.frames if watch is not None else None)
+        if problem:
+            verdict = "silent" if verdict == "silent" else "unverified"
+            problems.append(problem)
+        result["audio"] = (verdict, detail)
         result["problems"] = problems
         result["ok"] = not problems
         self.phases[phase] = result
@@ -818,6 +856,17 @@ class Session:
             return {"id": self.production_id, "status": self.production_status, "busy": self.busy,
                     "error": self.production_error,
                     "resolution": f"{last[2][0]}x{last[2][1]}" if last and last[2] else None}
+        if method == "GET" and path == "/picture":
+            # The cloud picture seen only by the looks that began after `/measure/start` of
+            # `phase` (never a look from before it, which may be stale).
+            phase = args.get("phase") or "measure"
+            with self.lock:
+                start = self.windows.get(phase)
+                polls = list(self.polls)
+            if start is None:
+                fail(f"no /measure/start for phase '{phase}'")
+            d = decode_summary(polls, start, time.monotonic())
+            return {"resolution": d["resolution"], "looks": d["looks"], "decoding": d["decoding"]}
         if method == "POST" and path == "/production/activate":
             if self.busy:
                 fail(f"the production is {self.busy}")
@@ -857,7 +906,7 @@ class Session:
             return {"ok": result["ok"], "problems": result["problems"],
                     "drop_share": gap.get("drop_share"), "packets_sent": gap.get("packets_sent"),
                     "resolution": result["decode"]["resolution"],
-                    "audio": (result.get("audio") or ("unreported", ""))[0]}
+                    "audio": result["audio"][0]}
         if method == "POST" and path == "/check":
             check = {"id": args.get("id", "?"), "ok": args.get("ok") == "1", "detail": args.get("detail", "")}
             with self.lock:
@@ -1001,7 +1050,7 @@ def run():
         code, output = run_test(udid, derived, out, None)
         if code != 0:
             fail(f"the end-to-end test bundle did not run (xcodebuild exit {code}); see xcodebuild-test.log")
-        if TEST_CASE not in output:
+        if f"Test Case '-[{TEST_BUNDLE}.{TEST_CASE}" not in output:
             fail(f"xcodebuild ran no {TEST_CASE}: the -only-testing name {TEST_ID} matches nothing")
         missing = (
             "missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud personal access "
@@ -1071,9 +1120,9 @@ def run():
 
     checks = session.checks if session else []
     phases = session.phases if session else {}
-    if any(not c["ok"] for c in checks) or any(not p["ok"] for p in phases.values()):
+    passed = all_passed(code, checks, phases)
+    if not passed:
         code = 1
-    passed = code == 0
     text = report(meta, checks, phases, cleanup)
     with open(os.path.join(out, "results.json"), "w", encoding="utf-8") as f:
         json.dump({"meta": meta, "checks": checks, "phases": phases, "cleanup": cleanup, "passed": passed},

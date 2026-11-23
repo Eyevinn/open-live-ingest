@@ -122,6 +122,31 @@ class Pure(unittest.TestCase):
         self.assertEqual(e2e.audio_verdict([(1, "main", -20.0)])[0], "unreported")
         self.assertEqual(e2e.audio_verdict([])[0], "unreported")
 
+    def test_anything_short_of_sound_fails_the_phase(self):
+        self.assertIsNone(e2e.sound_check("sound", "ch1 loud", None, 40))
+        # No channel meter arrived: sound is unverified, which fails AC1 (not a warning).
+        problem = e2e.sound_check(*e2e.audio_verdict([]), None, 40)
+        self.assertIn("sound not verified", problem)
+        self.assertIn("no channel meter arrived", problem)
+        self.assertIn("no sound", e2e.sound_check("silent", "loudest -90.0 dB", None, 40))
+        # The meter socket failed (a 401/403 on the upgrade, TLS, a drop): even sound seen
+        # before the failure does not pass.
+        for error in ("the meter socket was refused: 403", "SSLError", "closed by Open Live"):
+            self.assertIn(error, e2e.sound_check("sound", "ch1 loud", error, 40))
+        self.assertIn("no frame", e2e.sound_check("unreported", "no channel meter arrived", None, 0))
+        self.assertIn("never opened", e2e.sound_check("unreported", "no channel meter arrived", None, None))
+
+    def test_all_checks_passed_only_when_every_phase_heard_sound(self):
+        checks = [{"id": "AC2", "ok": True}]
+        heard = {"first": {"ok": True, "audio": ("sound", "ch1")}}
+        self.assertTrue(e2e.all_passed(0, checks, heard))
+        self.assertFalse(e2e.all_passed(1, checks, heard))
+        self.assertFalse(e2e.all_passed(0, [{"id": "AC3", "ok": False}], heard))
+        self.assertFalse(e2e.all_passed(0, checks, {}))
+        self.assertFalse(e2e.all_passed(0, checks, {"first": {"ok": True, "audio": ("unreported", "none")}}))
+        self.assertFalse(e2e.all_passed(0, checks, {"first": {"ok": True}}))
+        self.assertFalse(e2e.all_passed(0, checks, {"first": {"ok": False, "audio": ("sound", "ch1")}}))
+
     def test_websocket_frames_round_trip(self):
         for size in (0, 5, 200, 70000):
             payload = bytes(range(256)) * (size // 256) + bytes(range(size % 256))
@@ -189,6 +214,47 @@ class Control(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertTrue(any("second reading" in p for p in body["problems"]))
         self.assertTrue(any("picture" in p for p in body["problems"]))
+        # No meter socket was ever opened: sound is unverified and fails the phase.
+        self.assertTrue(any("sound not verified" in p for p in body["problems"]))
+        self.assertEqual(body["audio"], "unverified")
+
+    def test_unreported_sound_or_a_failed_meter_socket_fail_the_phase(self):
+        self.call("POST", "/measure/start?phase=first")
+        for t, sent in ((0, 100), (61, 23100)):
+            self.session.samples["first"].append(sample(self.session.windows["first"] + t * 0.0001, sent))
+        self.session.polls.append((self.session.windows["first"], "active", (1280, 720)))
+        watch = e2e.MeterWatch("https://open-live.example.com", "p1", {})
+        watch.frames = 12  # frames came, but no channel meter among them
+        self.session.watch = watch
+        self.session.seconds = 0.005
+        status, _, body = self.call("POST", "/measure/stop?phase=first")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["audio"], "unverified")
+        self.assertEqual([p for p in body["problems"] if "sound" in p],
+                         ["sound not verified: no channel meter arrived on the watch-only controller socket"])
+
+        watch.meters.append((self.session.windows["first"], "ch1", -20.0))
+        _, _, body = self.call("POST", "/measure/stop?phase=first")
+        self.assertTrue(body["ok"], body["problems"])
+        self.assertEqual(body["audio"], "sound")
+
+        watch.error = "the meter socket was refused: 403"
+        _, _, body = self.call("POST", "/measure/stop?phase=first")
+        self.assertFalse(body["ok"])
+        self.assertTrue(any("meter socket failed (the meter socket was refused: 403)" in p for p in body["problems"]))
+        self.assertFalse(e2e.all_passed(0, [], self.session.phases))
+
+    def test_the_foreground_picture_counts_only_looks_after_the_window(self):
+        self.session.polls.append((0.0, "active", (1280, 720)))  # from before the background
+        status, _, body = self.call("GET", "/picture?phase=foreground")
+        self.assertEqual(status, 500)
+        self.call("POST", "/measure/start?phase=foreground")
+        _, _, body = self.call("GET", "/picture?phase=foreground")
+        self.assertIsNone(body["resolution"])
+        self.session.polls.append((self.session.windows["foreground"], "active", (1920, 1080)))
+        _, _, body = self.call("GET", "/picture?phase=foreground")
+        self.assertEqual(body["resolution"], "1920x1080")
 
     def test_an_unknown_request_or_a_bad_activate_is_a_500_with_the_reason(self):
         status, _, body = self.call("GET", "/nope")

@@ -21,8 +21,12 @@ name: iPhone app end to end
 # step, naming the secret, before anything is built. A pull request run without it
 # builds the app and its tests, runs the end-to-end test once (it skips itself with no
 # control server, which proves the test bundle and its name), then warns naming the
-# secret ("missing capability") and passes; nothing is created on any instance. Fork
-# pull requests get no secrets and skip the job.
+# secret ("missing capability") and passes; nothing is created on any instance. Once the
+# secret is set, a pull request from this repository that touches these paths gets it, so
+# its run is the FULL live end to end against the instance (openlivedev): it creates and
+# activates a production there and holds the shared `e2e-openlivedev` group for up to
+# 90 min, as release.yml's e2e-macos does. Fork pull requests get no secrets and skip the
+# job.
 #
 # Never on a push or a tag: a release does not wait on a shared test instance. One run
 # at a time per instance, shared with e2e-macos, e2e-windows and connect-order

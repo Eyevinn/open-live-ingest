@@ -303,9 +303,14 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         app.activate()
         wait(state, "label == %@", "Live", within: 120)
         wait(link, "label BEGINSWITH %@", "Link: connected", within: 60)
+        // Only looks at Open Live that began from here on count for the cloud picture: the
+        // production stayed active in the background, so an earlier look may be stale.
+        try call("POST", "/measure/start", ["phase": "foreground"])
         let resumed = try poll(30) { () throws -> Bool? in try sources().first?.status == "active" ? true : nil }
         let after = poll(10) { () -> UInt64? in counters()?.sent }
-        let picture = try poll(90, every: 2) { () throws -> String? in try production()["resolution"] as? String }
+        let picture = try poll(90, every: 2) { () throws -> String? in
+            try call("GET", "/picture", ["phase": "foreground"])["resolution"] as? String
+        }
         let still = try sources()
         shot("9 live after the foreground")
         try verify(
