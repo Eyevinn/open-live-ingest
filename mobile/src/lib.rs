@@ -35,6 +35,13 @@ pub struct OliCore {
     sink: Sink,
 }
 
+// What `oli_core_send` relies on, proved by the compiler rather than said: a core is
+// used from any thread Swift calls on, through shared references only.
+const _: fn() = || {
+    fn shared_across_threads<T: Send + Sync>() {}
+    shared_across_threads::<OliCore>();
+};
+
 /// Swift's callback and its context pointer.
 #[derive(Clone, Copy)]
 struct Sink {
@@ -165,8 +172,9 @@ pub unsafe extern "C" fn oli_core_send(core: *mut OliCore, json: *const c_char) 
 }
 
 /// Stops what is live, waiting at most four seconds for its teardown (the source is
-/// kept, as at Stop), then frees the core. No delivery follows once it returns. A
-/// null core is ignored.
+/// kept, as at Stop), then frees the core. No delivery follows once it returns: it
+/// closes delivery and waits for one still under way to return (`core::Core::shutdown`).
+/// A null core is ignored.
 ///
 /// # Safety
 /// `core` is null or a pointer [`oli_core_new`] returned that has not been freed, and

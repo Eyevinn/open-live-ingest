@@ -30,7 +30,10 @@ OliCore *oli_core_new(const char *app_support_dir, const char *log_dir,
 void oli_core_send(OliCore *core, const char *json);
 
 /* Stops what is live, waits at most 4 s for its teardown, then frees the core.
-   Not to be called from within deliver. */
+   No delivery follows once it returns: it waits for a deliver call still under way
+   to return, so deliver must not wait on the thread that calls oli_core_free (hand
+   the message on with DispatchQueue.main.async, not sync). Not to be called from
+   within deliver. */
 void oli_core_free(OliCore *core);
 
 /* Reserved: nothing returns an owned string today. */

@@ -595,3 +595,49 @@ fn paste_token_choose_go_live_send_while_active_and_stop_keeping_the_source() {
         );
     }
 }
+
+#[test]
+fn nothing_is_delivered_once_shutdown_returns() {
+    let scratch = Scratch::new("closed");
+    let (mut core, mut swift) = core_over(&scratch, nowhere(), None);
+    send(&core, &mut swift, 1, "state", Value::Null);
+    let shared = core.shared.clone();
+    core.shutdown(SHUTDOWN_WITHIN);
+    // What was delivered before it returned is Swift's already.
+    while swift.rx.try_recv().is_ok() {}
+    // A task that outlived the runtime's shutdown, delivering late.
+    shared.emit("notice", json!({"message": "late"}));
+    shared.fatal();
+    shared.reply(&Reply::ok(2, Value::Null));
+    assert!(
+        swift.rx.try_recv().is_err(),
+        "a delivery followed the shutdown"
+    );
+}
+
+#[test]
+fn closing_the_gate_waits_for_a_delivery_under_way() {
+    let gate = Arc::new(Gate::default());
+    let (entered_tx, entered_rx) = channel();
+    let returned = Arc::new(AtomicBool::new(false));
+    let worker = {
+        let (gate, returned) = (gate.clone(), returned.clone());
+        std::thread::spawn(move || {
+            gate.pass(|| {
+                entered_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                returned.store(true, Ordering::SeqCst);
+            })
+        })
+    };
+    entered_rx.recv().unwrap();
+    gate.close(true);
+    assert!(
+        returned.load(Ordering::SeqCst),
+        "close returned while Swift's callback was still running"
+    );
+    let mut ran = false;
+    gate.pass(|| ran = true);
+    assert!(!ran, "a delivery passed a closed gate");
+    worker.join().unwrap();
+}

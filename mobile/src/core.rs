@@ -40,7 +40,8 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -350,6 +351,37 @@ impl Options {
 pub struct Core {
     shared: Arc<Shared>,
     runtime: Option<tokio::runtime::Runtime>,
+    gate: Arc<Gate>,
+}
+
+/// What every delivery to Swift passes through, so that none follows
+/// [`Core::shutdown`]: once it is closed, a delivery is dropped, and closing waits for
+/// the ones already under way to return.
+#[derive(Default)]
+struct Gate {
+    closed: AtomicBool,
+    /// Held shared by each delivery for the length of Swift's callback, and taken
+    /// exclusively by [`Gate::close`] to wait for those still running.
+    in_flight: RwLock<()>,
+}
+
+impl Gate {
+    /// Runs `deliver` unless the gate is closed.
+    fn pass(&self, deliver: impl FnOnce()) {
+        let _in_flight = self.in_flight.read().unwrap_or_else(|e| e.into_inner());
+        if !self.closed.load(Ordering::Acquire) {
+            deliver();
+        }
+    }
+
+    /// Closes the gate for good. With `wait`, returns only once no delivery is under
+    /// way any more; never wait from within a delivery, which would wait on itself.
+    fn close(&self, wait: bool) {
+        self.closed.store(true, Ordering::Release);
+        if wait {
+            drop(self.in_flight.write().unwrap_or_else(|e| e.into_inner()));
+        }
+    }
 }
 
 struct Shared {
@@ -439,7 +471,13 @@ impl Core {
             .enable_all()
             .build()
             .context("starting the core's runtime")?;
+        let gate = Arc::new(Gate::default());
+        let deliver: Deliver = {
+            let gate = gate.clone();
+            Arc::new(move |json: String| gate.pass(|| deliver(json)))
+        };
         Ok(Core {
+            gate,
             shared: Arc::new(Shared {
                 settings_file,
                 keychain,
@@ -668,9 +706,16 @@ impl Core {
     }
 
     /// Stops what is live and waits for its teardown, at most `within`, then stops the
-    /// runtime. What `oli_core_free` does before the core is freed. Called from a
-    /// thread of the core's own runtime (inside a delivery), it cannot wait: the
-    /// teardown is asked for and the runtime is left to end in the background.
+    /// runtime. What `oli_core_free` does before the core is freed. The teardown's own
+    /// events (`stopping`, `stopped`) are still delivered; once it is over, delivery
+    /// is closed ([`Gate`]), waiting for a delivery still under way to return, so
+    /// no delivery follows once this returns, even from a worker the runtime's
+    /// shutdown leaves running.
+    ///
+    /// Called from a thread of the core's own runtime (inside a delivery), it cannot
+    /// wait: the teardown is asked for, delivery is closed without waiting (only the
+    /// delivery it is called from is still under way), and the runtime is left to end
+    /// in the background.
     pub fn shutdown(&mut self, within: Duration) {
         let Some(runtime) = self.runtime.take() else {
             return;
@@ -683,6 +728,7 @@ impl Core {
             if let Some(mut handle) = handle {
                 handle.request_stop(Stop::Ending);
             }
+            self.gate.close(false);
             runtime.shutdown_background();
             return;
         }
@@ -695,6 +741,7 @@ impl Core {
                 tracing::warn!("the teardown did not finish within {within:?}; freed anyway");
             }
         }
+        self.gate.close(true);
         runtime.shutdown_timeout(Duration::from_millis(250));
     }
 }

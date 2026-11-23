@@ -123,17 +123,22 @@ mod platform {
     /// (docs/specs/ios-app.md, section 7.1). An entry already there is removed and
     /// written again, so the accessibility applies to it too; an update would keep
     /// the old one's.
+    ///
+    /// The access control is made before anything is removed, so failing to make it
+    /// leaves the old entry in place. The delete and the add are still two calls:
+    /// should the add fail after the delete, there is no entry at all (the person is
+    /// signed out and signs in again), never a half-written one.
     #[cfg(target_os = "ios")]
     pub fn set(service: &str, account: &str, secret: &str) -> Result<()> {
         use security_framework::access_control::{ProtectionMode, SecAccessControl};
         use security_framework::passwords::set_generic_password_options;
 
-        delete(service, account)?;
         let access = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
             0,
         )
         .map_err(|err| failed("preparing an entry for", err))?;
+        delete(service, account)?;
         let mut options = PasswordOptions::new_generic_password(service, account);
         options.set_access_control(access);
         set_generic_password_options(secret.as_bytes(), options)
