@@ -20,9 +20,9 @@ here="contrib/ios-sign-in-check"
 
 echo "== building the core for aarch64-apple-ios-sim (debug)"
 export IPHONEOS_DEPLOYMENT_TARGET=16.0
-cargo rustc -p open-live-ingest-mobile --target aarch64-apple-ios-sim --locked \
+cargo rustc -p open-live-ingest-mobile --target aarch64-apple-ios-sim --locked --color never \
   --crate-type staticlib -- --print native-static-libs 2>&1 | tee "$out/rustc.log"
-libs="$(sed -n 's/^note: native-static-libs: //p' "$out/rustc.log" | tail -n 1)"
+libs="$(sed -n 's/^.*native-static-libs: //p' "$out/rustc.log" | tail -n 1)"
 [[ -n "$libs" ]] || { echo "rustc printed no native-static-libs"; exit 1; }
 lib="target/aarch64-apple-ios-sim/debug/libopen_live_ingest_mobile.a"
 [[ -f "$lib" ]] || { echo "no $lib"; exit 1; }
