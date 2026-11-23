@@ -1,0 +1,477 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0C0000000000000000000101 /* OpenLiveIngestApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000201 /* OpenLiveIngestApp.swift */; };
+		0C0000000000000000000102 /* SRTSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000202 /* SRTSender.swift */; };
+		0C0000000000000000000103 /* ThirdPartyLicenses.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000203 /* ThirdPartyLicenses.swift */; };
+		0C0000000000000000000104 /* SRT.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000204 /* SRT.xcframework */; };
+		0C0000000000000000000105 /* SRTSenderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000205 /* SRTSenderTests.swift */; };
+		0C0000000000000000000106 /* LaunchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000206 /* LaunchTests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0C0000000000000000000301 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0C0000000000000000000901 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0C0000000000000000000701;
+			remoteInfo = OpenLiveIngest;
+		};
+		0C0000000000000000000302 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0C0000000000000000000901 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0C0000000000000000000701;
+			remoteInfo = OpenLiveIngest;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		0C0000000000000000000201 /* OpenLiveIngestApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenLiveIngestApp.swift; sourceTree = "<group>"; };
+		0C0000000000000000000202 /* SRTSender.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SRTSender.swift; sourceTree = "<group>"; };
+		0C0000000000000000000203 /* ThirdPartyLicenses.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThirdPartyLicenses.swift; sourceTree = "<group>"; };
+		0C0000000000000000000204 /* SRT.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = SRT.xcframework; sourceTree = "<group>"; };
+		0C0000000000000000000205 /* SRTSenderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SRTSenderTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000206 /* LaunchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000207 /* OpenLiveIngest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenLiveIngest.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0C0000000000000000000208 /* OpenLiveIngestTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenLiveIngestTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0C0000000000000000000209 /* OpenLiveIngestUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenLiveIngestUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		0C0000000000000000000401 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000104 /* SRT.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000402 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000403 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0C0000000000000000000501 = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000502 /* OpenLiveIngest */,
+				0C0000000000000000000503 /* OpenLiveIngestTests */,
+				0C0000000000000000000504 /* OpenLiveIngestUITests */,
+				0C0000000000000000000505 /* Vendor */,
+				0C0000000000000000000506 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000502 /* OpenLiveIngest */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000201 /* OpenLiveIngestApp.swift */,
+				0C0000000000000000000202 /* SRTSender.swift */,
+				0C0000000000000000000203 /* ThirdPartyLicenses.swift */,
+			);
+			path = OpenLiveIngest;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000503 /* OpenLiveIngestTests */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000205 /* SRTSenderTests.swift */,
+			);
+			path = OpenLiveIngestTests;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000504 /* OpenLiveIngestUITests */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000206 /* LaunchTests.swift */,
+			);
+			path = OpenLiveIngestUITests;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000505 /* Vendor */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000204 /* SRT.xcframework */,
+			);
+			path = Vendor;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000506 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000207 /* OpenLiveIngest.app */,
+				0C0000000000000000000208 /* OpenLiveIngestTests.xctest */,
+				0C0000000000000000000209 /* OpenLiveIngestUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0C0000000000000000000701 /* OpenLiveIngest */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0C0000000000000000000A02 /* Build configuration list for PBXNativeTarget "OpenLiveIngest" */;
+			buildPhases = (
+				0C0000000000000000000601 /* Sources */,
+				0C0000000000000000000401 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OpenLiveIngest;
+			productName = OpenLiveIngest;
+			productReference = 0C0000000000000000000207 /* OpenLiveIngest.app */;
+			productType = "com.apple.product-type.application";
+		};
+		0C0000000000000000000702 /* OpenLiveIngestTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0C0000000000000000000A03 /* Build configuration list for PBXNativeTarget "OpenLiveIngestTests" */;
+			buildPhases = (
+				0C0000000000000000000602 /* Sources */,
+				0C0000000000000000000402 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0C0000000000000000000801 /* PBXTargetDependency */,
+			);
+			name = OpenLiveIngestTests;
+			productName = OpenLiveIngestTests;
+			productReference = 0C0000000000000000000208 /* OpenLiveIngestTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		0C0000000000000000000703 /* OpenLiveIngestUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0C0000000000000000000A04 /* Build configuration list for PBXNativeTarget "OpenLiveIngestUITests" */;
+			buildPhases = (
+				0C0000000000000000000603 /* Sources */,
+				0C0000000000000000000403 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0C0000000000000000000802 /* PBXTargetDependency */,
+			);
+			name = OpenLiveIngestUITests;
+			productName = OpenLiveIngestUITests;
+			productReference = 0C0000000000000000000209 /* OpenLiveIngestUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		0C0000000000000000000901 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					0C0000000000000000000701 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					0C0000000000000000000702 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = 0C0000000000000000000701;
+					};
+					0C0000000000000000000703 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = 0C0000000000000000000701;
+					};
+				};
+			};
+			buildConfigurationList = 0C0000000000000000000A01 /* Build configuration list for PBXProject "OpenLiveIngest" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 0C0000000000000000000501;
+			productRefGroup = 0C0000000000000000000506 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				0C0000000000000000000701 /* OpenLiveIngest */,
+				0C0000000000000000000702 /* OpenLiveIngestTests */,
+				0C0000000000000000000703 /* OpenLiveIngestUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		0C0000000000000000000601 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000101 /* OpenLiveIngestApp.swift in Sources */,
+				0C0000000000000000000102 /* SRTSender.swift in Sources */,
+				0C0000000000000000000103 /* ThirdPartyLicenses.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000602 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000105 /* SRTSenderTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000603 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000106 /* LaunchTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0C0000000000000000000801 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0C0000000000000000000701 /* OpenLiveIngest */;
+			targetProxy = 0C0000000000000000000301 /* PBXContainerItemProxy */;
+		};
+		0C0000000000000000000802 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0C0000000000000000000701 /* OpenLiveIngest */;
+			targetProxy = 0C0000000000000000000302 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0C0000000000000000000B01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B02 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		0C0000000000000000000B03 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Live Ingest";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Open Live Ingest sends the camera's picture to your production.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Live Ingest sends the microphone's sound to your production.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.0.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B04 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Live Ingest";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Open Live Ingest sends the camera's picture to your production.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Live Ingest sends the microphone's sound to your production.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.0.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+			};
+			name = Release;
+		};
+		0C0000000000000000000B05 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenLiveIngest.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/OpenLiveIngest";
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B06 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenLiveIngest.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/OpenLiveIngest";
+			};
+			name = Release;
+		};
+		0C0000000000000000000B07 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = OpenLiveIngest;
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B08 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = OpenLiveIngest;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0C0000000000000000000A01 /* Build configuration list for PBXProject "OpenLiveIngest" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B01 /* Debug */,
+				0C0000000000000000000B02 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0C0000000000000000000A02 /* Build configuration list for PBXNativeTarget "OpenLiveIngest" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B03 /* Debug */,
+				0C0000000000000000000B04 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0C0000000000000000000A03 /* Build configuration list for PBXNativeTarget "OpenLiveIngestTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B05 /* Debug */,
+				0C0000000000000000000B06 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0C0000000000000000000A04 /* Build configuration list for PBXNativeTarget "OpenLiveIngestUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B07 /* Debug */,
+				0C0000000000000000000B08 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 0C0000000000000000000901 /* Project object */;
+}

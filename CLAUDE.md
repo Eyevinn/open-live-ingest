@@ -98,6 +98,11 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
 - The iPhone app's core is built with `-p open-live-ingest-mobile`: its tests run on any OS, and
   the CI `ios` job lints it for `aarch64-apple-ios` and `-sim` and checks the crate count recorded
   in `mobile/Cargo.toml` (update it on purpose with a dependency change).
+- The iPhone app's Xcode project is `ios/` (no Swift package, no project generator). Its SRT and
+  crypto are `ios/Vendor/SRT.xcframework`, built by `ios/Vendor/build-libsrt.sh` from the pinned,
+  digest-checked libsrt and mbedTLS tarballs and never committed; bump a pin on purpose, with
+  `ThirdPartyLicenses.swift`. `ios/run-tests.sh` builds it for a device and runs its tests on a
+  simulator (macOS only), as the CI `ios` job does.
 - The app is built with `-p open-live-ingest-app`. On macOS and Windows that includes the window;
   elsewhere only its core builds (the window needs webkit2gtk there, and Linux is not a target).
   The CI `app` job runs its clippy and tests on macOS and Windows.
