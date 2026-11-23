@@ -45,6 +45,14 @@ pub enum Event {
     Registering { input: String },
     /// An input's source was created in Open Live.
     Registered { input: String, source_id: String },
+    /// An input took over the source Open Live already held under its name, left by
+    /// an earlier run or kept at the last Stop (`run::Sources::Keep`): same id, same
+    /// port, so a production slot holding it stays valid.
+    SourceAdopted {
+        input: String,
+        source_id: String,
+        port: u16,
+    },
     /// Open Live registered an input's source but warns that its address may not
     /// work against the cloud Strom (`connect.warning`, such as
     /// `srt-listener-unsupported`).

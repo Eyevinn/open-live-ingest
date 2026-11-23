@@ -887,6 +887,12 @@ async fn assign_ports_from_open_live(
         let mut warning = None;
         let (source_id, address) = match plan_port(existing, ports) {
             PortPlan::Keep { source_id, port } => {
+                info!(input = %input.name, source_id = %source_id, port, "adopted the source Open Live already holds, same id and port");
+                events.emit(Event::SourceAdopted {
+                    input: input.name.clone(),
+                    source_id: source_id.clone(),
+                    port,
+                });
                 if let Some(stored) = existing {
                     note_connect_warning(&input.name, stored, &mut warning, false, events);
                 }
@@ -2967,6 +2973,85 @@ mod tests {
             PortPlan::Reassign {
                 source_id: "src-1".to_string()
             }
+        );
+    }
+
+    /// #115: Go live after a Stop that kept the source (`Sources::Keep`) adopts it by
+    /// name. The `SourceAdopted` event, and the log line beside it, name its id and
+    /// port, so a run shows the id reused instead of leaving it to be inferred from a
+    /// missing `Registered`. Nothing is created or patched: the fake Open Live answers
+    /// the source list and nothing else.
+    #[tokio::test]
+    async fn a_kept_source_is_adopted_with_its_id_and_port_in_the_event() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = serde_json::json!([{
+                "id": "src-kept",
+                "name": "Venue — Cam",
+                "address": "srt://:47103?mode=listener&passphrase=***",
+                "streamType": "srt",
+                "status": "inactive",
+            }])
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+            request
+        });
+        let client = OpenLiveClient::new(
+            &format!("http://{addr}"),
+            crate::config::AuthMode::Direct,
+            None,
+        )
+        .unwrap();
+        let mut inputs = vec![Input {
+            id: "dev-cam".to_string(),
+            name: "Venue — Cam".to_string(),
+            source: flow::Source::Test {
+                resolution: "1280x720".to_string(),
+                framerate: "25/1".to_string(),
+            },
+            endpoint: crate::config::Uplink::default().endpoint("cloud.example.com", 0),
+        }];
+        let range: BTreeSet<u16> = (47100..=47109).collect();
+        let mut ids = HashMap::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let events = {
+            let seen = seen.clone();
+            Events::new(move |e| seen.lock().unwrap().push(e))
+        };
+        assign_ports_from_open_live(&client, &mut inputs, &range, None, &mut ids, &events)
+            .await
+            .unwrap();
+        assert!(
+            served.await.unwrap().starts_with("GET /api/v1/sources "),
+            "only the source list is read"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Event::SourceAdopted {
+                input: "Venue — Cam".to_string(),
+                source_id: "src-kept".to_string(),
+                port: 47103,
+            }]
+        );
+        assert_eq!(inputs[0].endpoint.port, 47103);
+        assert_eq!(
+            ids.get("dev-cam"),
+            Some(&Registered {
+                input: "Venue — Cam".to_string(),
+                source_id: "src-kept".to_string(),
+                warning: None,
+            })
         );
     }
 
