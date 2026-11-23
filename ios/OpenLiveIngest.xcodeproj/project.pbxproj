@@ -13,6 +13,14 @@
 		0C0000000000000000000104 /* SRT.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000204 /* SRT.xcframework */; };
 		0C0000000000000000000105 /* SRTSenderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000205 /* SRTSenderTests.swift */; };
 		0C0000000000000000000106 /* LaunchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000206 /* LaunchTests.swift */; };
+		0C0000000000000000000110 /* TSMuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000210 /* TSMuxer.swift */; };
+		0C0000000000000000000111 /* MediaSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000211 /* MediaSettings.swift */; };
+		0C0000000000000000000112 /* Encoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000212 /* Encoder.swift */; };
+		0C0000000000000000000113 /* TestPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000213 /* TestPattern.swift */; };
+		0C0000000000000000000114 /* Capture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000214 /* Capture.swift */; };
+		0C0000000000000000000115 /* MediaPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000215 /* MediaPipeline.swift */; };
+		0C0000000000000000000116 /* TSMuxerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000216 /* TSMuxerTests.swift */; };
+		0C0000000000000000000117 /* MediaPipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000217 /* MediaPipelineTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -42,6 +50,14 @@
 		0C0000000000000000000207 /* OpenLiveIngest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenLiveIngest.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		0C0000000000000000000208 /* OpenLiveIngestTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenLiveIngestTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		0C0000000000000000000209 /* OpenLiveIngestUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenLiveIngestUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0C0000000000000000000210 /* TSMuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSMuxer.swift; sourceTree = "<group>"; };
+		0C0000000000000000000211 /* MediaSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaSettings.swift; sourceTree = "<group>"; };
+		0C0000000000000000000212 /* Encoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Encoder.swift; sourceTree = "<group>"; };
+		0C0000000000000000000213 /* TestPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestPattern.swift; sourceTree = "<group>"; };
+		0C0000000000000000000214 /* Capture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Capture.swift; sourceTree = "<group>"; };
+		0C0000000000000000000215 /* MediaPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPipeline.swift; sourceTree = "<group>"; };
+		0C0000000000000000000216 /* TSMuxerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSMuxerTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000217 /* MediaPipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPipelineTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -87,6 +103,12 @@
 				0C0000000000000000000201 /* OpenLiveIngestApp.swift */,
 				0C0000000000000000000202 /* SRTSender.swift */,
 				0C0000000000000000000203 /* ThirdPartyLicenses.swift */,
+				0C0000000000000000000210 /* TSMuxer.swift */,
+				0C0000000000000000000211 /* MediaSettings.swift */,
+				0C0000000000000000000212 /* Encoder.swift */,
+				0C0000000000000000000213 /* TestPattern.swift */,
+				0C0000000000000000000214 /* Capture.swift */,
+				0C0000000000000000000215 /* MediaPipeline.swift */,
 			);
 			path = OpenLiveIngest;
 			sourceTree = "<group>";
@@ -95,6 +117,8 @@
 			isa = PBXGroup;
 			children = (
 				0C0000000000000000000205 /* SRTSenderTests.swift */,
+				0C0000000000000000000216 /* TSMuxerTests.swift */,
+				0C0000000000000000000217 /* MediaPipelineTests.swift */,
 			);
 			path = OpenLiveIngestTests;
 			sourceTree = "<group>";
@@ -229,6 +253,12 @@
 				0C0000000000000000000101 /* OpenLiveIngestApp.swift in Sources */,
 				0C0000000000000000000102 /* SRTSender.swift in Sources */,
 				0C0000000000000000000103 /* ThirdPartyLicenses.swift in Sources */,
+				0C0000000000000000000110 /* TSMuxer.swift in Sources */,
+				0C0000000000000000000111 /* MediaSettings.swift in Sources */,
+				0C0000000000000000000112 /* Encoder.swift in Sources */,
+				0C0000000000000000000113 /* TestPattern.swift in Sources */,
+				0C0000000000000000000114 /* Capture.swift in Sources */,
+				0C0000000000000000000115 /* MediaPipeline.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -237,6 +267,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				0C0000000000000000000105 /* SRTSenderTests.swift in Sources */,
+				0C0000000000000000000116 /* TSMuxerTests.swift in Sources */,
+				0C0000000000000000000117 /* MediaPipelineTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -144,8 +144,8 @@ final class SRTSenderTests: XCTestCase {
     }
 }
 
-/// A UDP socket on 127.0.0.1 collecting what the delivery listener forwards.
-private final class UDPReceiver {
+/// A UDP socket on 127.0.0.1 collecting what a listener forwards (SRTSenderTests, MediaPipelineTests).
+final class UDPReceiver {
     private let fd: Int32
 
     init(port: UInt16) throws {

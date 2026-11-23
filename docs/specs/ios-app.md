@@ -495,6 +495,8 @@ sequenceDiagram
   `src/flow.rs`): H.264 as stream type 0x1B (Annex B, SPS/PPS before every IDR), AAC-LC as stream
   type 0x0F (ADTS), PCR on the video PID at least every 40 ms, PAT/PMT at least every 100 ms. The
   PID numbers are the muxer's choice; `builtin.mpegtssrt_input` reads the program from the PMT.
+  `TSMuxer.swift` (OL-64d) uses program 1, PMT PID 0x1000, video PID 0x0100 (also the PCR PID)
+  and audio PID 0x0101.
   OL-64d checks the stream with `ffprobe`, and OL-64h checks that the cloud Strom decodes it.
 - **No Strom pipeline change and no EFP path.** Contribution stays MPEG-TS over SRT
   (`DESIGN.md` §9); the EFP sequence-validation rule for ingest designs does not apply.
