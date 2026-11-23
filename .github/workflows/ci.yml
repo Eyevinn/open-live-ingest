@@ -89,7 +89,8 @@ jobs:
   # there covers it. Then the Swift half: SRT.xcframework (libsrt and mbedTLS from
   # pinned, digest-checked source, ios/Vendor/build-libsrt.sh, cached by that script,
   # which carries the pins), and the Xcode project ios/ built for a device and tested
-  # on an iOS Simulator (ios/run-tests.sh). No secret.
+  # on an iOS Simulator (ios/run-tests.sh), with the encoded test pattern checked by
+  # ffprobe (OL-64d). No secret.
   ios:
     runs-on: macos-latest
     timeout-minutes: 60
@@ -166,6 +167,23 @@ jobs:
           echo "Homebrew srt $got (recorded: $SRT_TOOLS_VERSION)"
           [[ "$got" == "$SRT_TOOLS_VERSION" ]] \
             || echo "::warning::Homebrew srt is $got, the job records $SRT_TOOLS_VERSION; update SRT_TOOLS_VERSION on purpose"
+      # ffprobe for the stream checks of ios/run-tests.sh (OL-64d): the 10 s test-pattern
+      # recording and the same stream received over SRT. CI only, like srt above; the version
+      # below is the one recorded for this job, a different one is reported, not fatal.
+      - name: Install ffprobe (Homebrew ffmpeg)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          FFMPEG_VERSION: "9.0.2"
+        run: |
+          set -euo pipefail
+          brew install ffmpeg
+          got="$(brew list --versions ffmpeg | awk '{print $2}')"
+          got="${got%%_*}"
+          echo "Homebrew ffmpeg $got (recorded: $FFMPEG_VERSION)"
+          ffprobe -version | head -n 1
+          [[ "$got" == "$FFMPEG_VERSION" ]] \
+            || echo "::warning::Homebrew ffmpeg is $got, the job records $FFMPEG_VERSION; update FFMPEG_VERSION on purpose"
       - run: ios/run-tests.sh "$RUNNER_TEMP/ios-tests"
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -174,6 +192,15 @@ jobs:
           path: |
             ${{ runner.temp }}/ios-tests/*.log
             ${{ runner.temp }}/ios-tests/OpenLiveIngest.xcresult
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-stream-checks
+          path: |
+            ${{ runner.temp }}/ios-tests/stream-checks.md
+            ${{ runner.temp }}/ios-tests/recordings
+          if-no-files-found: ignore
           retention-days: 14
 
   # The sign-in check of docs/specs/ios-app.md, sections 6 and 14 Q4 (#138): the core in a

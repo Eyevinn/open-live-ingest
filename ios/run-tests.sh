@@ -1,15 +1,19 @@
 #!/bin/bash
 # The iOS app's tests on an iOS Simulator, as the CI job `ios` runs them on macos-latest
 # (docs/specs/ios-app.md, section 12). macOS with Xcode, after ios/Vendor/build-libsrt.sh, with
-# Homebrew's srt (`srt-live-transmit`) on the PATH. From the repo root:
+# Homebrew's srt (`srt-live-transmit`) and ffmpeg (`ffprobe`) on the PATH. From the repo root:
 #
 #   ios/run-tests.sh <result-dir>
 #
 # 1. builds the app for a device, unsigned, which links SRT.xcframework's device slice;
 # 2. builds the app and its tests for the newest iPhone simulator (build-for-testing);
-# 3. starts the srt-live-transmit listeners SRTSenderTests.swift calls on 127.0.0.1;
-# 4. runs the unit and UI tests (test-without-building).
-# The .xcresult and the logs go to <result-dir>.
+# 3. starts the srt-live-transmit listeners SRTSenderTests.swift and MediaPipelineTests.swift call
+#    on 127.0.0.1;
+# 4. runs the unit and UI tests (test-without-building);
+# 5. checks the 10 s test-pattern recording and the same stream received over SRT, which
+#    MediaPipelineTests.swift writes, with ffprobe and ios/check-stream.py (section 11's stream
+#    shape, and the peak-to-average bitrate of section 16).
+# The .xcresult, the logs, the recordings and the report (stream-checks.md) go to <result-dir>.
 set -euo pipefail
 
 out="${1:?usage: ios/run-tests.sh <result-dir>}"
@@ -19,6 +23,7 @@ project="ios/OpenLiveIngest.xcodeproj"
 [[ -d "$project" ]] || { echo "run from the repository root"; exit 1; }
 [[ -d ios/Vendor/SRT.xcframework ]] || { echo "no ios/Vendor/SRT.xcframework: run ios/Vendor/build-libsrt.sh first"; exit 1; }
 command -v srt-live-transmit >/dev/null || { echo "srt-live-transmit not found (brew install srt)"; exit 1; }
+command -v ffprobe >/dev/null || { echo "ffprobe not found (brew install ffmpeg)"; exit 1; }
 derived="$out/DerivedData"
 
 # run_logged <log> <command...>: the command's output to the terminal and <log>, its status kept.
@@ -68,10 +73,13 @@ run_logged "$out/build-for-testing.log" xcodebuild build-for-testing -quiet \
 echo "== waiting for the simulator to finish booting"
 xcrun simctl bootstatus "$udid" -b
 
-# The listeners of SRTSenderTests.swift, on its ports, with a passphrase made for this run and
+# The listeners of SRTSenderTests.swift and MediaPipelineTests.swift, on their ports, with a passphrase made for this run and
 # handed to the tests (xcodebuild passes TEST_RUNNER_<name> to them as <name>).
 pass="$(openssl rand -hex 16)"
 export TEST_RUNNER_OLI_SRT_TEST_PASSPHRASE="$pass"
+recordings="$out/recordings"
+mkdir -p "$recordings"
+export TEST_RUNNER_OLI_RECORDING_DIR="$recordings"
 pids=()
 listen() {
   local name="$1" port="$2" target="$3"
@@ -94,14 +102,41 @@ listen delivery 4201 "udp://127.0.0.1:4301"
 listen passphrase 4202 "file://con"
 listen stats 4203 "file://con"
 listen reconnect 4204 "file://con"
+listen encoded 4205 "udp://127.0.0.1:4305"
 sleep 2
 for pid in "${pids[@]}"; do
   kill -0 "$pid" 2>/dev/null || { echo "a listener exited at start"; exit 1; }
 done
 
 echo "== test-without-building"
+tests=0
 run_logged "$out/test.log" xcodebuild test-without-building \
   -project "$project" -scheme OpenLiveIngest \
   -destination "$destination" -derivedDataPath "$derived" \
   -parallel-testing-enabled NO \
-  -resultBundlePath "$out/OpenLiveIngest.xcresult"
+  -resultBundlePath "$out/OpenLiveIngest.xcresult" || tests=$?
+
+# The recordings: where the tests wrote them, or else the test host's temporary directory. Checked
+# even when a test failed, so the report says what the stream looked like.
+container="$(xcrun simctl get_app_container "$udid" com.eyevinn.open-live-ingest.ios data 2>/dev/null || true)"
+echo "== checking the streams with $(ffprobe -version | head -n 1)"
+report="$out/stream-checks.md"
+: >"$report"
+failed=0
+for name in test-pattern.ts received-over-srt.ts; do
+  file="$recordings/$name"
+  if [[ ! -s "$file" && -n "$container" && -s "$container/tmp/$name" ]]; then
+    cp "$container/tmp/$name" "$file"
+  fi
+  if [[ ! -s "$file" ]]; then
+    echo "no $name from the tests"
+    failed=1
+    continue
+  fi
+  GITHUB_STEP_SUMMARY="$report" python3 ios/check-stream.py "$file" || failed=1
+done
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  { echo "## OL-64d stream checks"; echo; cat "$report"; } >>"$GITHUB_STEP_SUMMARY"
+fi
+[[ "$failed" == 0 ]] || { echo "the stream checks failed: see $report"; exit 1; }
+[[ "$tests" == 0 ]] || { echo "the tests failed ($tests): see $out/test.log"; exit "$tests"; }
