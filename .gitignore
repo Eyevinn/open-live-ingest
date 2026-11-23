@@ -7,3 +7,7 @@ gateway-*.toml
 # The iOS app: ios/Vendor/build-libsrt.sh's output and Xcode's per-user state.
 /ios/Vendor/SRT.xcframework/
 xcuserdata/
+
+# Python bytecode caches (the e2e CI scripts)
+__pycache__/
+*.pyc
