@@ -109,8 +109,9 @@ packaging/windows/    open-live-ingest.nsi
 - **Stop keeps the Open Live sources (#115).** A production slot references a source by id, so
   Stop (and quitting while live, §8) removes the flows but leaves each input's source in Open Live,
   marked inactive (`run::Sources::Keep`, `Event::SourceRetained`). The next Go live adopts it by
-  name with the same id and port (`plan_port`'s `Keep`, `reconcile_sources`), so the slot keeps
-  working without picking the source in Studio again. Sources carrying the prefix that are not
+  name with the same id and port (`plan_port`'s `Keep`, which emits `Event::SourceAdopted` and a
+  log line naming the id and port, and `reconcile_sources`), so the slot keeps working without
+  picking the source in Studio again. Sources carrying the prefix that are not
   this session's inputs (a renamed label, an input not ticked now) are still swept at Stop, and
   `open-live-ingest down` removes them all. The CLI `up` keeps removing its sources (`DESIGN.md`
   §6).

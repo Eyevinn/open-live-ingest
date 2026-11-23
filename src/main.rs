@@ -357,6 +357,7 @@ fn render(event: &Event) -> Option<String> {
         // A failure is printed once, as `Error:` when `up` returns it.
         Event::Registering { .. }
         | Event::Registered { .. }
+        | Event::SourceAdopted { .. }
         | Event::ConnectWarning { .. }
         | Event::InputFailed { .. }
         | Event::Warning { .. }
@@ -741,6 +742,11 @@ mod tests {
             Event::Registered {
                 input: "x".to_string(),
                 source_id: "s".to_string(),
+            },
+            Event::SourceAdopted {
+                input: "x".to_string(),
+                source_id: "s".to_string(),
+                port: 47110,
             },
             Event::Stats { inputs: Vec::new() },
             Event::Stopped,
