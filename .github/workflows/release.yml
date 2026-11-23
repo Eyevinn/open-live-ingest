@@ -6,7 +6,10 @@ name: Release
 # the macOS DMG was notarized, `release-macos` then adds the DMG to that release,
 # rewrites SHA256SUMS to cover it and attests it; otherwise it is skipped and the
 # release is the archives only. The manual trigger builds the same artifacts and
-# SHA256SUMS without publishing anything, to try the workflow out. A pull request
+# SHA256SUMS without publishing anything, to try the workflow out. `ios-app` builds the
+# iPhone app on every run: unsigned without the Apple distribution secrets (a notice
+# says the TestFlight upload is skipped), signed with them, and uploaded to TestFlight
+# for internal testers only on a tag ref with the App Store Connect key. A pull request
 # that changes this workflow, the macOS app or Strom MSI script, the desktop app (app/) or the
 # packaging (packaging/) runs it too, so the change is proven before it merges; like
 # a manual run from a branch, it publishes nothing (`release` and `release-macos` run
@@ -1227,6 +1230,335 @@ jobs:
           if ($stromLog) { Write-Host "--- $($stromLog.FullName) (tail) ---"; Get-Content -LiteralPath $stromLog.FullName -Tail 100 }
           "- Windows: the test pattern only; camera capture through Strom on Windows 11 is #36." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           exit 0
+
+  # The iPhone app (docs/specs/ios-app.md, section 12): ios/OpenLiveIngest.xcodeproj
+  # built with SRT.xcframework (ios/Vendor/build-libsrt.sh, cached under the same key
+  # as ci.yml's `ios` job) and the Rust core (mobile/, built by the project's "Build the
+  # Rust core" phase, ios/build-core.sh). Its own job, on macos-latest; it needs `build`
+  # so that on a tag ref the tag has been checked against Cargo.toml first, and reads
+  # none of its artifacts.
+  #
+  # One version (section 3): MARKETING_VERSION, so CFBundleShortVersionString, is the
+  # workspace version from Cargo.toml, read as ios/run-tests.sh reads it (the project
+  # itself says 0.0.0); CURRENT_PROJECT_VERSION, so CFBundleVersion, is
+  # github.run_number, which only grows, as App Store Connect requires of a build
+  # number. "Check the built apps" fails unless both, the bundle id and the
+  # export-compliance answer (ITSAppUsesNonExemptEncryption false: TLS and SRT's AES,
+  # standard algorithms) are what every app this job builds carries.
+  #
+  # The identity depends on the repository secrets (section 14 Q11), guarded like
+  # macos-app's HAS_DEVELOPER_ID:
+  #   - always: an unsigned iOS Simulator .app (CODE_SIGNING_ALLOWED=NO), uploaded as
+  #     the artifact `ios-app-simulator`.
+  #   - APPLE_DISTRIBUTION_P12, APPLE_DISTRIBUTION_P12_PASSWORD and
+  #     APPLE_IOS_PROVISIONING_PROFILE not all set (pull requests, and every run until
+  #     section 14 Q11 is done): the device archive is built with signing disabled and
+  #     uploaded as the artifact `ios-app-device-archive-unsigned`, and a notice says
+  #     the TestFlight upload is skipped.
+  #   - all three set: the Apple Distribution certificate goes into a temporary
+  #     keychain and the App Store profile into the user's profile directories, both
+  #     removed by the last step on every outcome; the archive is signed with them
+  #     (manual signing) and exported with method app-store-connect. On a tag ref with
+  #     the App Store Connect API key (APP_STORE_CONNECT_KEY_ID, _ISSUER_ID, _KEY_P8)
+  #     too, the export's destination is `upload`: the build goes to App Store Connect,
+  #     for internal TestFlight testers only (testFlightInternalTestingOnly, section 14
+  #     Q12). On any other run the destination is `export`, which proves the signing
+  #     and uploads nothing, and a notice says why.
+  # Whether the APPLE_NOTARY_* key has the App Manager role is not checked here: it is
+  # part of #133's closing check, next to the TestFlight upload (section 14 Q11, #143).
+  # Nothing here is a release asset: the artifact names do not start with "$BIN-", so
+  # `checksums`, `release` and `release-macos` never pick them up. Secrets are read
+  # only through step env, never echoed.
+  ios-app:
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROJECT: ios/OpenLiveIngest.xcodeproj
+      SCHEME: OpenLiveIngest
+      BUNDLE_ID: com.eyevinn.open-live-ingest.ios
+      BUILD_NUMBER: ${{ github.run_number }}
+      # "true" or "false"; secrets cannot be read in `if:` directly.
+      HAS_DISTRIBUTION: ${{ secrets.APPLE_DISTRIBUTION_P12 != '' && secrets.APPLE_DISTRIBUTION_P12_PASSWORD != '' && secrets.APPLE_IOS_PROVISIONING_PROFILE != '' }}
+      HAS_ASC_KEY: ${{ secrets.APP_STORE_CONNECT_KEY_ID != '' && secrets.APP_STORE_CONNECT_ISSUER_ID != '' && secrets.APP_STORE_CONNECT_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-app
+
+      - name: The version and the build number
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          [[ -n "$version" ]] || { echo "no workspace version in Cargo.toml"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "CFBundleShortVersionString $version (Cargo.toml), CFBundleVersion $BUILD_NUMBER (run number)"
+          xcodebuild -version
+          cmake --version | head -n 1
+
+      - uses: actions/cache@v4
+        id: libsrt
+        with:
+          path: ios/Vendor/SRT.xcframework
+          key: libsrt-${{ runner.os }}-${{ hashFiles('ios/Vendor/build-libsrt.sh') }}
+      - name: Build SRT.xcframework (libsrt and mbedTLS from pinned source)
+        if: steps.libsrt.outputs.cache-hit != 'true'
+        run: ios/Vendor/build-libsrt.sh
+
+      - name: Build the simulator app, unsigned
+        run: |
+          set -euo pipefail
+          xcodebuild build -quiet \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS Simulator" -derivedDataPath "$RUNNER_TEMP/ios-sim" \
+            CODE_SIGNING_ALLOWED=NO MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          app="$RUNNER_TEMP/ios-sim/Build/Products/Release-iphonesimulator/$SCHEME.app"
+          [[ -d "$app" ]] || { echo "no $app"; exit 1; }
+          echo "SIM_APP=$app" >> "$GITHUB_ENV"
+
+      - name: Archive for a device, unsigned
+        if: env.HAS_DISTRIBUTION != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$SCHEME-unsigned.xcarchive"
+          xcodebuild archive -quiet \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS" -derivedDataPath "$RUNNER_TEMP/ios-device" \
+            -archivePath "$archive" \
+            CODE_SIGNING_ALLOWED=NO MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Say the TestFlight upload is skipped
+        if: env.HAS_DISTRIBUTION != 'true'
+        run: echo "::notice title=TestFlight upload skipped::APPLE_DISTRIBUTION_P12, APPLE_DISTRIBUTION_P12_PASSWORD and APPLE_IOS_PROVISIONING_PROFILE are not all set, so the iOS app is built unsigned (a simulator .app and a device archive, as workflow artifacts) and nothing is uploaded to App Store Connect."
+
+      # A keychain of its own with a random password, first in the search list so
+      # codesign finds the identity, and the profile under its UUID where Xcode looks
+      # for it. KEYCHAIN and PROFILE_FILES are exported before anything that can fail,
+      # so the cleanup step removes them whatever happens next.
+      - name: Import the Apple Distribution certificate and the provisioning profile
+        if: env.HAS_DISTRIBUTION == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_P12_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.APPLE_IOS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/distribution.keychain-db"
+          kc_pw="$(openssl rand -hex 32)"
+          echo "::add-mask::$kc_pw"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$kc_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pw" "$keychain"
+          p12="$RUNNER_TEMP/distribution.p12"
+          trap 'rm -f "$p12"' EXIT
+          base64 --decode <<<"$P12_BASE64" > "$p12"
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$keychain" >/dev/null
+          existing=()
+          while IFS= read -r k; do existing+=("$k"); done < <(security list-keychains -d user | tr -d '" ')
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+
+          profile="$RUNNER_TEMP/ios-app.mobileprovision"
+          base64 --decode <<<"$PROFILE_BASE64" > "$profile"
+          security cms -D -i "$profile" > "$RUNNER_TEMP/ios-app-profile.plist"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$RUNNER_TEMP/ios-app-profile.plist"; }
+          uuid="$(pb UUID)"
+          team="$(pb TeamIdentifier:0)"
+          app_id="$(pb Entitlements:application-identifier)"
+          [[ "$app_id" == "$team.$BUNDLE_ID" ]] \
+            || { echo "the profile is for $app_id, not $team.$BUNDLE_ID"; exit 1; }
+          if pb ProvisionedDevices >/dev/null 2>&1; then
+            echo "the profile lists devices: it is not an App Store profile"; exit 1
+          fi
+          files=()
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            files+=("$dir/$uuid.mobileprovision")
+          done
+          printf 'PROFILE_FILES=%s\n' "$(IFS=:; echo "${files[*]}")" >> "$GITHUB_ENV"
+          for f in "${files[@]}"; do mkdir -p "$(dirname "$f")"; cp "$profile" "$f"; done
+          rm -f "$profile"
+
+          identities="$(security find-identity -v -p codesigning "$keychain")"
+          hash="$(grep -E "\"(Apple|iPhone) Distribution: .*\\($team\\)\"" <<<"$identities" | awk 'NR == 1 { print $2 }')"
+          [[ -n "$hash" ]] || { echo "the certificate holds no valid Apple Distribution identity for team $team"; exit 1; }
+          {
+            echo "IOS_SIGN_IDENTITY=$hash"
+            echo "IOS_TEAM_ID=$team"
+            echo "IOS_PROFILE_UUID=$uuid"
+          } >> "$GITHUB_ENV"
+          echo "Signing with Apple Distribution identity $hash, team $team, profile $uuid ($(pb Name))"
+
+      - name: Archive for a device, signed
+        if: env.HAS_DISTRIBUTION == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$SCHEME.xcarchive"
+          xcodebuild archive -quiet \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS" -derivedDataPath "$RUNNER_TEMP/ios-device" \
+            -archivePath "$archive" \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            CODE_SIGN_IDENTITY="$IOS_SIGN_IDENTITY" PROVISIONING_PROFILE_SPECIFIER="$IOS_PROFILE_UUID" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      # What App Store Connect and the phone read: the version is the workspace's, the
+      # build number this run's, the bundle id and the export-compliance answer the
+      # spec's; the simulator app is built for the simulator and the archive for a
+      # device.
+      - name: Check the built apps
+        run: |
+          set -euo pipefail
+          check() {
+            local app="$1" platform="$2" plist="$1/Info.plist" exe got
+            pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
+            echo "== $app"
+            got="$(pb CFBundleShortVersionString)"
+            [[ "$got" == "$VERSION" ]] || { echo "CFBundleShortVersionString is $got, not $VERSION"; exit 1; }
+            got="$(pb CFBundleVersion)"
+            [[ "$got" == "$BUILD_NUMBER" ]] || { echo "CFBundleVersion is $got, not $BUILD_NUMBER"; exit 1; }
+            got="$(pb CFBundleIdentifier)"
+            [[ "$got" == "$BUNDLE_ID" ]] || { echo "CFBundleIdentifier is $got, not $BUNDLE_ID"; exit 1; }
+            got="$(pb ITSAppUsesNonExemptEncryption)"
+            [[ "$got" == false ]] || { echo "ITSAppUsesNonExemptEncryption is $got, not false"; exit 1; }
+            exe="$app/$(pb CFBundleExecutable)"
+            lipo -archs "$exe" | grep -qw arm64 || { echo "$exe is not arm64"; exit 1; }
+            got="$(xcrun vtool -show-build "$exe")"
+            grep -Eq "^[[:space:]]*platform[[:space:]]+$platform\$" <<<"$got" \
+              || { echo "$exe is not built for $platform:"; echo "$got"; exit 1; }
+            echo "OK: $BUNDLE_ID $VERSION ($BUILD_NUMBER), arm64 for $platform, ITSAppUsesNonExemptEncryption false"
+          }
+          check "$SIM_APP" IOSSIMULATOR
+          check "$ARCHIVE/Products/Applications/$SCHEME.app" IOS
+          got="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleShortVersionString' "$ARCHIVE/Info.plist")"
+          [[ "$got" == "$VERSION" ]] || { echo "the archive's version is $got, not $VERSION"; exit 1; }
+          if [[ "$HAS_DISTRIBUTION" == true ]]; then
+            codesign --verify --strict --verbose=2 "$ARCHIVE/Products/Applications/$SCHEME.app"
+          fi
+          {
+            echo "## iOS app"
+            echo
+            echo "- \`$BUNDLE_ID\` $VERSION ($BUILD_NUMBER), ITSAppUsesNonExemptEncryption false"
+            if [[ "$HAS_DISTRIBUTION" == true ]]; then
+              echo "- device archive signed with Apple Distribution (team $IOS_TEAM_ID)"
+            else
+              echo "- simulator .app and device archive unsigned; TestFlight upload skipped (no distribution secrets)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ditto keeps the bundles' symlinks and modes, which upload-artifact would not.
+      - name: Zip the simulator app and the unsigned archive
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "$SIM_APP" "$RUNNER_TEMP/$SCHEME-simulator.app.zip"
+          if [[ "$HAS_DISTRIBUTION" != true ]]; then
+            ditto -c -k --keepParent "$ARCHIVE" "$RUNNER_TEMP/$SCHEME-unsigned.xcarchive.zip"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-app-simulator
+          path: ${{ runner.temp }}/${{ env.SCHEME }}-simulator.app.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_DISTRIBUTION != 'true'
+        with:
+          name: ios-app-device-archive-unsigned
+          path: ${{ runner.temp }}/${{ env.SCHEME }}-unsigned.xcarchive.zip
+          if-no-files-found: error
+
+      # The .p8 is written to a private directory and removed when the step ends; the
+      # cleanup step removes it too if the runner is cut short.
+      - name: Export the archive (TestFlight upload on a tag)
+        if: env.HAS_DISTRIBUTION == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/app-store-connect"
+          mkdir -p "$dir"
+          chmod 700 "$dir"
+          trap 'rm -rf "$dir"' EXIT
+          auth=()
+          if [[ "$IS_TAG" == true && "$HAS_ASC_KEY" == true ]]; then
+            destination="upload"
+            key="$dir/AuthKey_$ASC_KEY_ID.p8"
+            # The base64 of the .p8, like APPLE_NOTARY_KEY_P8; the PEM text itself works too.
+            if [[ "$ASC_KEY_P8" == -----BEGIN* ]]; then
+              printf '%s\n' "$ASC_KEY_P8" > "$key"
+            else
+              base64 --decode <<<"$ASC_KEY_P8" > "$key"
+            fi
+            auth=(-authenticationKeyPath "$key" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          else
+            destination="export"
+            if [[ "$IS_TAG" != true ]]; then
+              why="the TestFlight upload runs on a tag ref only"
+            else
+              why="APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID and APP_STORE_CONNECT_KEY_P8 are not all set"
+            fi
+            echo "::notice title=TestFlight upload skipped::$why; the signed archive is exported for App Store Connect without uploading it."
+          fi
+          cat > "$dir/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>$destination</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>$IOS_TEAM_ID</string>
+            <key>signingCertificate</key><string>$IOS_SIGN_IDENTITY</string>
+            <key>provisioningProfiles</key>
+            <dict><key>$BUNDLE_ID</key><string>$IOS_PROFILE_UUID</string></dict>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>testFlightInternalTestingOnly</key><true/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$dir/ExportOptions.plist"
+          xcodebuild -exportArchive -archivePath "$ARCHIVE" \
+            -exportOptionsPlist "$dir/ExportOptions.plist" -exportPath "$dir/export" \
+            ${auth[@]+"${auth[@]}"}
+          if [[ "$destination" == upload ]]; then
+            echo "Uploaded $BUNDLE_ID $VERSION ($BUILD_NUMBER) to App Store Connect, internal TestFlight testers only"
+          else
+            ls -l "$dir/export"
+          fi
+
+      - name: Remove the temporary keychain and the profile
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/app-store-connect" "$RUNNER_TEMP/distribution.p12" \
+            "$RUNNER_TEMP/ios-app.mobileprovision" "$RUNNER_TEMP/ios-app-profile.plist"
+          if [[ -n "${PROFILE_FILES:-}" ]]; then
+            IFS=: read -r -a files <<<"$PROFILE_FILES"
+            rm -f "${files[@]}"
+            echo "Removed the provisioning profile"
+          fi
+          if [[ -n "${KEYCHAIN:-}" && -e "$KEYCHAIN" ]]; then
+            security delete-keychain "$KEYCHAIN"
+            echo "Deleted the temporary keychain"
+          else
+            echo "No temporary keychain to delete"
+          fi
 
   # Adds the notarized DMG to the release `release` created: the DMG itself, a
   # SHA256SUMS that covers the release's tarballs, the Windows zip and installer, and the DMG
