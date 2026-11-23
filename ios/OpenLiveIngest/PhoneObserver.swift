@@ -52,8 +52,16 @@ final class PhoneObserver {
         }
         on(UIApplication.didEnterBackgroundNotification) { [phone] _ in phone.enteredBackground() }
         on(UIApplication.willEnterForegroundNotification) { [phone] _ in phone.enteredForeground() }
-        // Any capture session's: Capture's own is private to it.
-        on(AVCaptureSession.wasInterruptedNotification) { [phone] _ in phone.interruptionBegan(.capture) }
+        on(UIApplication.didBecomeActiveNotification) { [phone] _ in phone.becameActive() }
+        // Any capture session's: Capture's own is private to it. The background's own interruption
+        // is not one: `foreground:false` holds the uplink, and the session it belongs to is
+        // released before it could post its end.
+        on(AVCaptureSession.wasInterruptedNotification) { [phone] note in
+            let raw = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
+            let reason = raw.flatMap(AVCaptureSession.InterruptionReason.init(rawValue:))
+            guard reason != .videoDeviceNotAvailableInBackground else { return }
+            phone.interruptionBegan(.capture)
+        }
         on(AVCaptureSession.interruptionEndedNotification) { [phone] _ in phone.interruptionEnded(.capture) }
         on(AVAudioSession.interruptionNotification) { [phone] note in
             guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,

@@ -170,17 +170,78 @@ final class PhoneTests: XCTestCase {
         phone.interruptionEnded(.audio)
         XCTAssertEqual(sent.count, 3)
 
-        // Interrupted in the background: one task, and resumed only when both are over.
+        // Interrupted in the background: one task.
         phone.enteredBackground()
         phone.interruptionBegan(.capture)
         XCTAssertEqual(Array(sent.suffix(2)), [report(false, false, .wifi), report(false, true, .wifi)])
         XCTAssertEqual(system.begun.count, 2)
-        phone.enteredForeground()
-        XCTAssertEqual(sent.last, report(true, true, .wifi))
-        XCTAssertTrue(phone.held)
+        // A late end changes nothing while in the background.
         phone.interruptionEnded(.capture)
+        XCTAssertEqual(sent.last, report(false, false, .wifi))
+        XCTAssertTrue(phone.held)
+        phone.enteredForeground()
         XCTAssertEqual(sent.last, report(true, false, .wifi))
         XCTAssertFalse(phone.held)
+    }
+
+    /// On a device, the background interrupts the capture session too, and the core stopping the
+    /// uplink releases that session: no `interruptionEnded` ever comes. The foreground ends it.
+    func testTheForegroundEndsAnInterruptionWhoseEndNeverCame() {
+        let phone = makePhone()
+        phone.pathChanged(.wifi)
+        phone.liveChanged(true)
+
+        phone.enteredBackground()
+        phone.interruptionBegan(.capture)
+        phone.interruptionBegan(.audio)
+        XCTAssertEqual(Array(sent.suffix(2)), [report(false, false, .wifi), report(false, true, .wifi)])
+        // The core stopped the uplink; its capture session is gone.
+        phone.uplinkHeld()
+        XCTAssertTrue(system.open.isEmpty)
+
+        phone.enteredForeground()
+        XCTAssertEqual(sent.last, report(true, false, .wifi))
+        XCTAssertFalse(phone.held)
+        // Becoming active right after has nothing left to end.
+        phone.becameActive()
+        XCTAssertEqual(sent.count, 4)
+        XCTAssertTrue(system.open.isEmpty)
+        XCTAssertEqual(system.begun.count, 1)
+    }
+
+    /// A call (or Siri) while in the foreground: the camera and the audio are interrupted, the core
+    /// stops the uplink and its capture session with it, so neither end may come. The app becoming
+    /// active again after the call ends them; the next interruption holds the uplink again.
+    func testBecomingActiveAgainEndsTheInterruptionsOfACall() {
+        let phone = makePhone()
+        phone.pathChanged(.cellular)
+        phone.liveChanged(true)
+
+        phone.interruptionBegan(.capture)
+        phone.interruptionBegan(.audio)
+        XCTAssertEqual(sent, [report(true, false, .cellular), report(true, true, .cellular)])
+        XCTAssertEqual(system.open.count, 1)
+        // The media stopped: the input is armed again.
+        phone.uplinkHeld()
+        XCTAssertTrue(system.open.isEmpty)
+        XCTAssertTrue(phone.held)
+
+        phone.becameActive()
+        XCTAssertEqual(sent.last, report(true, false, .cellular))
+        XCTAssertEqual(sent.count, 3)
+        XCTAssertFalse(phone.held)
+        XCTAssertTrue(system.open.isEmpty)
+        XCTAssertTrue(system.idleTimerDisabled)
+
+        // Becoming active with nothing interrupted sends nothing.
+        phone.becameActive()
+        XCTAssertEqual(sent.count, 3)
+
+        // The camera still taken: the new uplink's session is interrupted again, and held again.
+        phone.interruptionBegan(.capture)
+        XCTAssertEqual(sent.last, report(true, true, .cellular))
+        XCTAssertEqual(system.begun.count, 2)
+        XCTAssertTrue(phone.held)
     }
 
     func testAChangeOfTheSatisfiedInterfaceReconnects() {

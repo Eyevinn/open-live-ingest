@@ -22,7 +22,9 @@ protocol PhoneSystem: AnyObject {
 ///   bounded at 4 s, ended when the core has stopped the uplink (`uplinkHeld`) or at the deadline;
 ///   the core stops the uplink, PATCHes the source `inactive` and stays armed;
 /// - foreground, interruption ended: `phone {foreground:true, interrupted:false}`; the core's next
-///   look at the productions starts the uplink again;
+///   look at the productions starts the uplink again. Coming back to the foreground, or becoming
+///   active again, ends every interruption still recorded: the held uplink's capture session is
+///   released, so it never posts its end, and an audio `.began` is not promised an `.ended`;
 /// - network path: `phone {network}`; a change of the satisfied interface (Wi-Fi to cellular, say)
 ///   reconnects the SRT caller at once, capture and encoders running on (libsrt 1.5 has no
 ///   connection migration); no network tears nothing down;
@@ -99,15 +101,31 @@ final class Phone {
         changed(wasHeld: wasHeld)
     }
 
-    /// `UIApplication.willEnterForegroundNotification`.
+    /// `UIApplication.willEnterForegroundNotification`. Ends the interruptions still recorded too
+    /// (see `becameActive`).
     func enteredForeground() {
         guard !foreground else { return }
         let wasHeld = held
         foreground = true
+        interruptions.removeAll()
         changed(wasHeld: wasHeld)
     }
 
-    /// `AVCaptureSession.wasInterruptedNotification`, or `AVAudioSession.interruptionNotification`
+    /// `UIApplication.didBecomeActiveNotification`: a call, Siri or another app is no longer over
+    /// this one, so whatever interrupted it is over. The end may never come otherwise: the core
+    /// stopping the uplink releases its `AVCaptureSession`, which then posts no
+    /// `interruptionEndedNotification`, and iOS does not promise an audio `.ended` for every
+    /// `.began`. If the camera or the audio is still taken, the next uplink's session is
+    /// interrupted again and the hold comes back.
+    func becameActive() {
+        guard foreground, interrupted else { return }
+        let wasHeld = held
+        interruptions.removeAll()
+        changed(wasHeld: wasHeld)
+    }
+
+    /// `AVCaptureSession.wasInterruptedNotification` (not for `videoDeviceNotAvailableInBackground`:
+    /// `foreground:false` already holds the uplink then), or `AVAudioSession.interruptionNotification`
     /// with `.began`.
     func interruptionBegan(_ source: Interruption) {
         let wasHeld = held
@@ -146,6 +164,10 @@ final class Phone {
 
     /// The core stopped the uplink after a hold (the input is armed again, or the session
     /// stopped): the background task is done.
+    ///
+    /// Held while armed but not sending, the core has nothing to stop and sends no `input` event,
+    /// so this is not called: the task then stays open until the 4 s deadline (or iOS's
+    /// expiration) ends it. Bounded, and the app does nothing in it.
     func uplinkHeld() {
         endTask()
     }
