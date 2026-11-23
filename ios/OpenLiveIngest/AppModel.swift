@@ -11,7 +11,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var signingIn = false
     // Steps 2 and 3
     @Published private(set) var view: ViewModel?
-    @Published private(set) var live = false
+    @Published private(set) var live = false {
+        didSet { phone?.liveChanged(live) }
+    }
     @Published private(set) var row: InputRow?
     @Published private(set) var status: StatusRow?
     @Published private(set) var network: NetworkKind?
@@ -34,16 +36,29 @@ final class AppModel: ObservableObject {
     private let channel: CoreChannel?
     private let core: RustCore?
     private var media: MediaController!
+    /// The phone's lifecycle (section 9): background, interruptions, network, heat.
+    private(set) var phone: Phone!
+    /// The app's notifications into `phone`; none in the tests.
+    private var observer: PhoneObserver?
     private let sheet = SignInSheet()
 
     /// Over `channel`, with `media` making the inputs' media (a `MediaSession` unless a test says
-    /// otherwise).
-    init(channel: CoreChannel?, core: RustCore? = nil, logFile: URL? = nil, media: MediaController.Factory? = nil) {
+    /// otherwise) and `system` the idle timer and background tasks (none unless the app or a test
+    /// says otherwise).
+    init(
+        channel: CoreChannel?, core: RustCore? = nil, logFile: URL? = nil, media: MediaController.Factory? = nil,
+        system: PhoneSystem? = nil
+    ) {
         self.channel = channel
         self.core = core
         self.logFile = logFile
         self.media = MediaController(
             report: { [weak channel] report in channel?.send(.mediaReport(report)) }, factory: media)
+        phone = Phone(
+            system: system ?? NoPhoneSystem(),
+            send: { [weak channel] report in channel?.send(.phone(report)) },
+            reconnect: { [weak self] in self?.media.reconnectAll() },
+            notice: { [weak self] notice in self?.showHot(notice) })
         channel?.onEvent = { [weak self] event in self?.handle(event) }
         if channel == nil {
             fatal = "The app could not start. Restart the phone, or Share logs."
@@ -75,7 +90,12 @@ final class AppModel: ObservableObject {
         exclude.isExcludedFromBackup = true
         try? settings.setResourceValues(exclude)
         let core = RustCore(supportDirectory: support, logDirectory: logs)
-        let model = AppModel(channel: core?.channel, core: core, logFile: logs.appendingPathComponent("app.log"))
+        let model = AppModel(
+            channel: core?.channel, core: core, logFile: logs.appendingPathComponent("app.log"),
+            system: UIKitPhoneSystem())
+        let observer = PhoneObserver(phone: model.phone)
+        observer.start()
+        model.observer = observer
         model.refresh()
         return model
     }
@@ -161,6 +181,7 @@ final class AppModel: ObservableObject {
         bitrateKbps = nil
         notices = []
         stopping = nil
+        if phone.hot { notices = [Phone.hotNotice] }
         live = true
         channel.send(.goLive) { [weak self] reply in
             guard let self else { return }
@@ -180,9 +201,10 @@ final class AppModel: ObservableObject {
         notices.removeAll { $0.id == notice.id }
     }
 
-    /// The network the phone is on, for the status line.
-    func phone(network: NetworkKind) {
-        channel?.send(.phone(PhoneReport(foreground: true, interrupted: false, network: network)))
+    /// The thermal notice (section 9), or none once the phone has cooled down.
+    private func showHot(_ notice: Notice?) {
+        notices.removeAll { $0.kind == Phone.hotKind }
+        if let notice { notices.append(notice) }
     }
 
     private func request(_ command: CoreCommand, then: @escaping (CoreChannel.Reply) -> Void) {
@@ -245,6 +267,8 @@ final class AppModel: ObservableObject {
             sheet.finish()
         case .input(let row):
             self.row = row
+            // Armed again (or failed) after a hold: the core's part of the background is done.
+            if row.state == "armed" || row.state == "failed" { phone.uplinkHeld() }
         case .summary:
             break
         case .stats(let stats):

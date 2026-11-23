@@ -39,6 +39,11 @@
 		0C0000000000000000000127 /* AppInfoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000227 /* AppInfoTests.swift */; };
 		0C0000000000000000000128 /* StatusTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000228 /* StatusTextTests.swift */; };
 		0C0000000000000000000129 /* ScreensUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000229 /* ScreensUITests.swift */; };
+		0C000000000000000000012B /* Phone.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022B /* Phone.swift */; };
+		0C000000000000000000012C /* PhoneObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022C /* PhoneObserver.swift */; };
+		0C000000000000000000012D /* PhoneTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022D /* PhoneTests.swift */; };
+		0C000000000000000000012E /* FakeControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022E /* FakeControl.swift */; };
+		0C000000000000000000012F /* FakeControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022E /* FakeControl.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -94,6 +99,10 @@
 		0C0000000000000000000227 /* AppInfoTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInfoTests.swift; sourceTree = "<group>"; };
 		0C0000000000000000000228 /* StatusTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusTextTests.swift; sourceTree = "<group>"; };
 		0C0000000000000000000229 /* ScreensUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreensUITests.swift; sourceTree = "<group>"; };
+		0C000000000000000000022B /* Phone.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Phone.swift; sourceTree = "<group>"; };
+		0C000000000000000000022C /* PhoneObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneObserver.swift; sourceTree = "<group>"; };
+		0C000000000000000000022D /* PhoneTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneTests.swift; sourceTree = "<group>"; };
+		0C000000000000000000022E /* FakeControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FakeControl.swift; sourceTree = "<group>"; };
 		0C000000000000000000022A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -159,6 +168,8 @@
 				0C0000000000000000000222 /* Devices.swift */,
 				0C0000000000000000000223 /* StatusText.swift */,
 				0C0000000000000000000224 /* SignInSheet.swift */,
+				0C000000000000000000022B /* Phone.swift */,
+				0C000000000000000000022C /* PhoneObserver.swift */,
 				0C000000000000000000022A /* Info.plist */,
 			);
 			path = OpenLiveIngest;
@@ -174,6 +185,7 @@
 				0C0000000000000000000226 /* MediaControllerTests.swift */,
 				0C0000000000000000000227 /* AppInfoTests.swift */,
 				0C0000000000000000000228 /* StatusTextTests.swift */,
+				0C000000000000000000022D /* PhoneTests.swift */,
 			);
 			path = OpenLiveIngestTests;
 			sourceTree = "<group>";
@@ -183,6 +195,7 @@
 			children = (
 				0C0000000000000000000206 /* LaunchTests.swift */,
 				0C0000000000000000000229 /* ScreensUITests.swift */,
+				0C000000000000000000022E /* FakeControl.swift */,
 			);
 			path = OpenLiveIngestUITests;
 			sourceTree = "<group>";
@@ -352,6 +365,8 @@
 				0C0000000000000000000122 /* Devices.swift in Sources */,
 				0C0000000000000000000123 /* StatusText.swift in Sources */,
 				0C0000000000000000000124 /* SignInSheet.swift in Sources */,
+				0C000000000000000000012B /* Phone.swift in Sources */,
+				0C000000000000000000012C /* PhoneObserver.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -366,6 +381,8 @@
 				0C0000000000000000000126 /* MediaControllerTests.swift in Sources */,
 				0C0000000000000000000127 /* AppInfoTests.swift in Sources */,
 				0C0000000000000000000128 /* StatusTextTests.swift in Sources */,
+				0C000000000000000000012D /* PhoneTests.swift in Sources */,
+				0C000000000000000000012F /* FakeControl.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -375,6 +392,7 @@
 			files = (
 				0C0000000000000000000106 /* LaunchTests.swift in Sources */,
 				0C0000000000000000000129 /* ScreensUITests.swift in Sources */,
+				0C000000000000000000012E /* FakeControl.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
