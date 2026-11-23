@@ -223,6 +223,10 @@ final class AppModel: ObservableObject {
 
     private func apply(_ value: JSONValue) {
         guard let model = try? value.decode(ViewModel.self) else { return }
+        apply(model)
+    }
+
+    private func apply(_ model: ViewModel) {
         view = model
         if let place = model.whereToSend { whereToSend = place }
         if let network = model.network { self.network = network }
