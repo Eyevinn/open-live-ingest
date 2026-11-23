@@ -529,8 +529,9 @@ sequenceDiagram
   `APP_STORE_CONNECT_ISSUER_ID`, `APP_STORE_CONNECT_KEY_P8`) it builds an unsigned simulator
   `.app` and a device archive with signing disabled, uploads them as workflow artifacts, and
   skips the upload with a notice. The existing `APPLE_NOTARY_*` key is reused if its role is App
-  Manager or higher (OL-64g checks with a dry `-exportArchive` run; the role is not readable
-  otherwise).
+  Manager or higher. The role is not readable by an agent, so whoever supplies the §14 Q11
+  certificate confirms it (Q11's API-key item), and it is recorded in #133's closing check next to
+  the TestFlight upload (re-scoped from OL-64g on #143).
 - **Internal TestFlight testers only.** External testers trigger Beta App Review, an
   outward-facing step for a human (§14 Q12).
 

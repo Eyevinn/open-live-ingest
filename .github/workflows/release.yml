@@ -1264,6 +1264,8 @@ jobs:
   #     for internal TestFlight testers only (testFlightInternalTestingOnly, section 14
   #     Q12). On any other run the destination is `export`, which proves the signing
   #     and uploads nothing, and a notice says why.
+  # Whether the APPLE_NOTARY_* key has the App Manager role is not checked here: it is
+  # part of #133's closing check, next to the TestFlight upload (section 14 Q11, #143).
   # Nothing here is a release asset: the artifact names do not start with "$BIN-", so
   # `checksums`, `release` and `release-macos` never pick them up. Secrets are read
   # only through step env, never echoed.
