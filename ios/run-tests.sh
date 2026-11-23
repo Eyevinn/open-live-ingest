@@ -58,11 +58,15 @@ print("iOS %d.%d, %s" % (best[0] + (best[2],)), file=sys.stderr)
 print(best[1])
 ')"
 destination="platform=iOS Simulator,id=$udid"
+xcrun simctl boot "$udid" 2>/dev/null || true
 
 echo "== build-for-testing"
 run_logged "$out/build-for-testing.log" xcodebuild build-for-testing -quiet \
   -project "$project" -scheme OpenLiveIngest -configuration Debug \
   -destination "$destination" -derivedDataPath "$derived"
+
+echo "== waiting for the simulator to finish booting"
+xcrun simctl bootstatus "$udid" -b
 
 # The listeners of SRTSenderTests.swift, on its ports, with a passphrase made for this run and
 # handed to the tests (xcodebuild passes TEST_RUNNER_<name> to them as <name>).
@@ -71,7 +75,7 @@ export TEST_RUNNER_OLI_SRT_TEST_PASSPHRASE="$pass"
 pids=()
 listen() {
   local name="$1" port="$2" target="$3"
-  srt-live-transmit -v "srt://:$port?mode=listener&passphrase=$pass&pbkeylen=16" "$target" \
+  srt-live-transmit "srt://:$port?mode=listener&passphrase=$pass&pbkeylen=16" "$target" \
     >/dev/null 2>"$out/srt-$name.log" &
   pids+=("$!")
 }

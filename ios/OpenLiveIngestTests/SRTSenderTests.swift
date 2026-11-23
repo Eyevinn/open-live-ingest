@@ -23,7 +23,9 @@ final class SRTSenderTests: XCTestCase {
     private func options(port: UInt16, passphrase: String? = nil) -> SRTSenderOptions {
         SRTSenderOptions(
             host: "127.0.0.1", port: port, latencyMs: 200, passphrase: passphrase ?? self.passphrase, pbkeylen: 16,
-            bitrateBitsPerSecond: 4_128_000)
+            bitrateBitsPerSecond: 4_128_000,
+            // Generous: a CI runner is busy while the simulator settles.
+            connectTimeoutMs: 10_000)
     }
 
     /// `count` payload-sized chunks, each with its own byte pattern.

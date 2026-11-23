@@ -16,6 +16,8 @@ struct SRTSenderOptions: Equatable {
     /// second) with `SRTO_MAXBW` 0 and `SRTO_OHEADBW` 25 %. Zero leaves the input rate to libsrt's
     /// estimate.
     var bitrateBitsPerSecond: Int64
+    /// `SRTO_CONNTIMEO`, set only when present; libsrt's default (3 s for a caller) otherwise.
+    var connectTimeoutMs: Int32?
 }
 
 extension SRTSenderOptions: CustomStringConvertible, CustomDebugStringConvertible {
@@ -283,6 +285,9 @@ final class SRTSender {
         }
         if let pbkeylen = options.pbkeylen {
             try set(sock, SRTO_PBKEYLEN, "SRTO_PBKEYLEN", pbkeylen)
+        }
+        if let connectTimeoutMs = options.connectTimeoutMs {
+            try set(sock, SRTO_CONNTIMEO, "SRTO_CONNTIMEO", connectTimeoutMs)
         }
     }
 
