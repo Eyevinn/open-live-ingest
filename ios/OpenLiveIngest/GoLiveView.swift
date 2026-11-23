@@ -46,6 +46,7 @@ struct GoLiveView: View {
                         Text(StatusText.productionLine(model.status?.productions))
                             .accessibilityIdentifier("productionLine")
                         Text(StatusText.linkLine(model.status?.link))
+                            .accessibilityValue(StatusText.linkCounters(model.status?.link))
                             .accessibilityIdentifier("linkLine")
                         Text(StatusText.networkLine(model.network, bitrateKbps: model.bitrateKbps))
                             .accessibilityIdentifier("networkLine")

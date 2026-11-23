@@ -52,6 +52,18 @@ enum StatusText {
         return text
     }
 
+    /// The link line's accessibility value: the connection's counters, `120000 packets sent,
+    /// 3 dropped, 158000000 bytes sent`; empty while there are none. The agent-run end to end
+    /// (OL-64h) reads them twice to take the dropped share over an interval.
+    static func linkCounters(_ link: LinkStatus?) -> String {
+        guard let link, let sent = link.packetsSent, let dropped = link.packetsSentDropped else { return "" }
+        var text = "\(sent) packets sent, \(dropped) dropped"
+        if let bytes = link.bytesSent {
+            text += ", \(bytes) bytes sent"
+        }
+        return text
+    }
+
     /// `Network: Wi-Fi, 4.1 Mbit/s`.
     static func networkLine(_ network: NetworkKind?, bitrateKbps: Int?) -> String {
         var text = "Network: " + (network?.label ?? "unknown")

@@ -1,0 +1,160 @@
+name: iPhone app end to end
+
+# The agent-run end to end of the iPhone app (OL-64h, #144; docs/specs/ios-app.md
+# sections 15 and 16): the app and its UI tests built for the newest iPhone simulator on
+# macos-latest (Debug, as the CI `ios` job builds them), then the XCUITest
+# ios/OpenLiveIngestUITests/OpenLiveDevE2EUITests.swift drives the app with the test
+# pattern against an Open Live instance (default `openlivedev`), with
+# .github/scripts/e2e-ios.py as its host half: PAT sign-in and instance pick, Go live
+# arms and sends nothing (AC2), activating a production through the Open Live API
+# starts the uplink and the SRT sender's counters are read over 60 s, under 1 % dropped,
+# with the cloud Strom decoding picture and sound (AC1 on the simulator), deactivating
+# stops it (AC2), Stop keeps the source and Go live again reuses its id with no 409
+# (AC3), background while live pauses and marks the source inactive and the foreground
+# resumes, the peak-to-average bitrate is noted, and the test production and source are
+# removed. What it checks and how: the script's header. The results go on #133 from the
+# `comment.md` the run uploads.
+#
+# Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
+# token for the workspace that owns the instance (the same secret as release.yml's
+# e2e-macos job and connect-order.yml). A run by hand without it fails at its first
+# step, naming the secret, before anything is built. A pull request run without it
+# builds the app and its tests, runs the end-to-end test once (it skips itself with no
+# control server, which proves the test bundle and its name), then warns naming the
+# secret ("missing capability") and passes; nothing is created on any instance. Once the
+# secret is set, a pull request from this repository that touches these paths gets it, so
+# its run is the FULL live end to end against the instance (openlivedev): it creates and
+# activates a production there and holds the shared `e2e-openlivedev` group for up to
+# 90 min, as release.yml's e2e-macos does. Fork pull requests get no secrets and skip the
+# job.
+#
+# Never on a push or a tag: a release does not wait on a shared test instance. One run
+# at a time per instance, shared with e2e-macos, e2e-windows and connect-order
+# (`e2e-openlivedev`).
+on:
+  workflow_dispatch:
+    inputs:
+      instance:
+        description: "Open Live instance name in the token's workspace"
+        required: false
+        default: openlivedev
+        type: string
+      seconds:
+        description: "Seconds between the two SRT stats readings (at least 60)"
+        required: false
+        default: "60"
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/e2e-ios.yml
+      - .github/scripts/e2e-ios.py
+      - .github/scripts/test_e2e_ios.py
+      - ios/OpenLiveIngestUITests/OpenLiveDevE2EUITests.swift
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  e2e-ios:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: macos-latest
+    timeout-minutes: 90
+    concurrency:
+      group: e2e-openlivedev
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: The secret is set
+        env:
+          HAS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN != '' }}
+          BY_HAND: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [[ "$HAS_TOKEN" == "true" ]]; then
+            echo "OSC_ACCESS_TOKEN is set"
+          elif [[ "$BY_HAND" == "true" ]]; then
+            echo "::error title=e2e ios::missing capability: the repository secret OSC_ACCESS_TOKEN (an Open Source Cloud personal access token for the workspace that owns the Open Live instance) is not set; nothing was built or run"
+            exit 1
+          else
+            echo "OSC_ACCESS_TOKEN is not set: the app and the test are built and the live part is skipped"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Unit tests of the end-to-end checks
+        run: python3 -I .github/scripts/test_e2e_ios.py
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-ios
+
+      # cmake comes from the runner image.
+      - name: Tools
+        run: |
+          xcodebuild -version
+          cmake --version | head -n 1
+      - uses: actions/cache@v4
+        id: libsrt
+        with:
+          path: ios/Vendor/SRT.xcframework
+          key: libsrt-${{ runner.os }}-${{ hashFiles('ios/Vendor/build-libsrt.sh') }}
+      - name: Build SRT.xcframework (libsrt and mbedTLS from pinned source)
+        if: steps.libsrt.outputs.cache-hit != 'true'
+        run: ios/Vendor/build-libsrt.sh
+
+      - name: Pick and boot a simulator
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/e2e-ios"
+          mkdir -p "$out"
+          udid="$(python3 -I .github/scripts/e2e-ios.py simulator 2>"$out/simulator.txt")"
+          cat "$out/simulator.txt"
+          xcrun simctl boot "$udid" 2>/dev/null || true
+          {
+            echo "IOS_UDID=$udid"
+            echo "IOS_SIMULATOR=$(cat "$out/simulator.txt")"
+            echo "E2E_OUT=$out"
+            echo "E2E_DERIVED=$out/DerivedData"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the app and its tests for the simulator (build-for-testing)
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          [[ -n "$version" ]] || { echo "no workspace version in Cargo.toml"; exit 1; }
+          xcodebuild build-for-testing -quiet \
+            -project ios/OpenLiveIngest.xcodeproj -scheme OpenLiveIngest -configuration Debug \
+            -destination "platform=iOS Simulator,id=$IOS_UDID" -derivedDataPath "$E2E_DERIVED" \
+            MARKETING_VERSION="$version" 2>&1 | tee "$E2E_OUT/build-for-testing.log"
+          xcrun simctl bootstatus "$IOS_UDID" -b
+
+      - name: The end to end against Open Live
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          OPEN_LIVE_INSTANCE: ${{ inputs.instance || 'openlivedev' }}
+          E2E_SRT_INTERVAL: ${{ inputs.seconds || '60' }}
+          # A run by hand needs the secret; a pull request run without it warns and passes
+          # after the test bundle has run.
+          E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+        run: python3 -I .github/scripts/e2e-ios.py run
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-ios
+          path: |
+            ${{ runner.temp }}/e2e-ios/*.md
+            ${{ runner.temp }}/e2e-ios/*.json
+            ${{ runner.temp }}/e2e-ios/*.log
+            ${{ runner.temp }}/e2e-ios/*.txt
+            ${{ runner.temp }}/e2e-ios/e2e.xcresult
+          if-no-files-found: ignore

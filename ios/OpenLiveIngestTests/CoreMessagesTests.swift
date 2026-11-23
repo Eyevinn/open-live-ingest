@@ -201,7 +201,8 @@ final class CoreMessagesTests: XCTestCase {
                 #"""
                 {"event": "status", "data": {"network": "cellular", "inputs": [{"input": "V — Cam",
                  "productions": [{"name": "Morning Show", "state": "active", "slots": ["video_in_1"]}],
-                 "link": {"state": "connected", "dropped_pct": 0.2, "rtt_ms": 31.0}}]}}
+                 "link": {"state": "connected", "dropped_pct": 0.2, "rtt_ms": 31.0,
+                          "packets_sent": 1000, "packets_sent_dropped": 2, "bytes_sent": 1316000}}]}}
                 """#),
             .status(
                 Status(
@@ -209,7 +210,9 @@ final class CoreMessagesTests: XCTestCase {
                         StatusRow(
                             input: "V — Cam",
                             productions: [Holder(name: "Morning Show", state: "active", slots: ["video_in_1"])],
-                            link: LinkStatus(state: "connected", droppedPct: 0.2, rttMs: 31))
+                            link: LinkStatus(
+                                state: "connected", droppedPct: 0.2, rttMs: 31, packetsSent: 1000,
+                                packetsSentDropped: 2, bytesSent: 1_316_000))
                     ], network: .cellular)))
         XCTAssertEqual(
             try event(
