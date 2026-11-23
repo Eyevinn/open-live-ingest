@@ -4,3 +4,6 @@ gateway-*.toml
 *.log
 .DS_Store
 /.dev/
+# The iOS app: ios/Vendor/build-libsrt.sh's output and Xcode's per-user state.
+/ios/Vendor/SRT.xcframework/
+xcuserdata/

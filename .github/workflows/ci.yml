@@ -86,9 +86,13 @@ jobs:
   # what it links on the phone counted against the number recorded in
   # mobile/Cargo.toml, so a new transitive dependency is a conscious change. The
   # build job above never compiles it (default-members = ["."]); `cargo fmt --all`
-  # there covers it. The Swift half of this job comes with the Xcode project.
+  # there covers it. Then the Swift half: SRT.xcframework (libsrt and mbedTLS from
+  # pinned, digest-checked source, ios/Vendor/build-libsrt.sh, cached by that script,
+  # which carries the pins), and the Xcode project ios/ built for a device and tested
+  # on an iOS Simulator (ios/run-tests.sh). No secret.
   ios:
     runs-on: macos-latest
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -118,6 +122,58 @@ jobs:
             echo "the phone's crate count changed; if that is on purpose, record $got in mobile/Cargo.toml"
             exit 1
           }
+
+      # cmake comes from the runner image.
+      - name: Tools
+        run: |
+          xcodebuild -version
+          cmake --version | head -n 1
+      - uses: actions/cache@v4
+        id: libsrt
+        with:
+          path: ios/Vendor/SRT.xcframework
+          key: libsrt-${{ runner.os }}-${{ hashFiles('ios/Vendor/build-libsrt.sh') }}
+      - name: Build SRT.xcframework (libsrt and mbedTLS from pinned source)
+        if: steps.libsrt.outputs.cache-hit != 'true'
+        run: ios/Vendor/build-libsrt.sh
+      - name: build-libsrt.sh refuses a tarball that does not match its pinned digest
+        run: |
+          set -euo pipefail
+          bad="$RUNNER_TEMP/build-libsrt-bad-digest.sh"
+          sed 's/^SRT_SHA256=.*/SRT_SHA256=0000000000000000000000000000000000000000000000000000000000000000/' \
+            ios/Vendor/build-libsrt.sh > "$bad"
+          log="$RUNNER_TEMP/build-libsrt-bad-digest.log"
+          if bash "$bad" "$RUNNER_TEMP/bad-digest-out" >"$log" 2>&1; then
+            cat "$log"; echo "build-libsrt.sh accepted a wrong digest"; exit 1
+          fi
+          cat "$log"
+          grep -q "does not match the pinned" "$log" || { echo "it failed, but not on the digest"; exit 1; }
+          [[ ! -e "$RUNNER_TEMP/bad-digest-out/SRT.xcframework" ]] || { echo "it wrote an xcframework"; exit 1; }
+
+      # srt-live-transmit for the sender tests' listeners on 127.0.0.1. CI only: it never
+      # ships and sees no secret. The version below is the one recorded for this job; a
+      # different one from Homebrew is reported, not fatal.
+      - name: Install srt-live-transmit (Homebrew srt)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          SRT_TOOLS_VERSION: "1.5.7"
+        run: |
+          set -euo pipefail
+          brew install srt
+          got="$(brew list --versions srt | awk '{print $2}')"
+          echo "Homebrew srt $got (recorded: $SRT_TOOLS_VERSION)"
+          [[ "$got" == "$SRT_TOOLS_VERSION" ]] \
+            || echo "::warning::Homebrew srt is $got, the job records $SRT_TOOLS_VERSION; update SRT_TOOLS_VERSION on purpose"
+      - run: ios/run-tests.sh "$RUNNER_TEMP/ios-tests"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: ios-tests
+          path: |
+            ${{ runner.temp }}/ios-tests/*.log
+            ${{ runner.temp }}/ios-tests/OpenLiveIngest.xcresult
+          retention-days: 14
 
   # The sign-in check of docs/specs/ios-app.md, sections 6 and 14 Q4 (#138): the core in a
   # throwaway Swift harness on an iOS Simulator, signing in through
