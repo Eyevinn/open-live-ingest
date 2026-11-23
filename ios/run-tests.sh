@@ -1,14 +1,19 @@
 #!/bin/bash
 # The iOS app's tests on an iOS Simulator, as the CI job `ios` runs them on macos-latest
 # (docs/specs/ios-app.md, section 12). macOS with Xcode, after ios/Vendor/build-libsrt.sh, with
-# Homebrew's srt (`srt-live-transmit`) and ffmpeg (`ffprobe`) on the PATH. From the repo root:
+# Homebrew's srt (`srt-live-transmit`) and ffmpeg (`ffprobe`) on the PATH, and Rust with the
+# aarch64-apple-ios and aarch64-apple-ios-sim targets (the app's "Build the Rust core" phase runs
+# ios/build-core.sh). From the repo root:
 #
 #   ios/run-tests.sh <result-dir>
 #
-# 1. builds the app for a device, unsigned, which links SRT.xcframework's device slice;
-# 2. builds the app and its tests for the newest iPhone simulator (build-for-testing);
+# 1. builds the app for a device, unsigned, which links SRT.xcframework's device slice and the
+#    release core;
+# 2. builds the app and its tests for the newest iPhone simulator (build-for-testing), with the
+#    debug core; both builds take the workspace version (Cargo.toml) as CFBundleShortVersionString;
 # 3. starts the srt-live-transmit listeners SRTSenderTests.swift and MediaPipelineTests.swift call
-#    on 127.0.0.1;
+#    on 127.0.0.1, and for the UI tests (ScreensUITests.swift) the fake Open Source Cloud and Open
+#    Live (mobile/examples/fake_servers.rs) and a listener standing in for the cloud Strom;
 # 4. runs the unit and UI tests (test-without-building);
 # 5. checks the 10 s test-pattern recording and the same stream received over SRT, which
 #    MediaPipelineTests.swift writes, with ffprobe and ios/check-stream.py (section 11's stream
@@ -25,6 +30,11 @@ project="ios/OpenLiveIngest.xcodeproj"
 command -v srt-live-transmit >/dev/null || { echo "srt-live-transmit not found (brew install srt)"; exit 1; }
 command -v ffprobe >/dev/null || { echo "ffprobe not found (brew install ffmpeg)"; exit 1; }
 derived="$out/DerivedData"
+command -v cargo >/dev/null || { echo "cargo not found (install Rust with rustup)"; exit 1; }
+# One version for the phone, the desktop app and the CLI (docs/specs/ios-app.md, section 3).
+version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+[[ -n "$version" ]] || { echo "no workspace version in Cargo.toml"; exit 1; }
+echo "workspace version $version"
 
 # run_logged <log> <command...>: the command's output to the terminal and <log>, its status kept.
 run_logged() {
@@ -42,7 +52,7 @@ echo "== building for a device, unsigned (the device slice)"
 run_logged "$out/build-device.log" xcodebuild build -quiet \
   -project "$project" -scheme OpenLiveIngest -configuration Release \
   -destination "generic/platform=iOS" -derivedDataPath "$derived" \
-  CODE_SIGNING_ALLOWED=NO
+  CODE_SIGNING_ALLOWED=NO MARKETING_VERSION="$version"
 
 echo "== picking a simulator"
 udid="$(xcrun simctl list devices available --json | python3 -c '
@@ -68,7 +78,7 @@ xcrun simctl boot "$udid" 2>/dev/null || true
 echo "== build-for-testing"
 run_logged "$out/build-for-testing.log" xcodebuild build-for-testing -quiet \
   -project "$project" -scheme OpenLiveIngest -configuration Debug \
-  -destination "$destination" -derivedDataPath "$derived"
+  -destination "$destination" -derivedDataPath "$derived" MARKETING_VERSION="$version"
 
 echo "== waiting for the simulator to finish booting"
 xcrun simctl bootstatus "$udid" -b
@@ -89,6 +99,10 @@ listen() {
 }
 cleanup() {
   for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  if [[ -f "$out/fake-servers.log" ]]; then
+    echo "== fake-servers.log (tail)"
+    tail -n 20 "$out/fake-servers.log"
+  fi
   for log in "$out"/srt-*.log; do
     [[ -f "$log" ]] || continue
     echo "== $(basename "$log") (tail)"
@@ -103,10 +117,32 @@ listen passphrase 4202 "file://con"
 listen stats 4203 "file://con"
 listen reconnect 4204 "file://con"
 listen encoded 4205 "udp://127.0.0.1:4305"
+# The UI tests' cloud Strom: the fake Open Live publishes 127.0.0.1 and these ports, and the
+# first source registered gets the first one. No passphrase, as the UI test sets none.
+srt-live-transmit "srt://:47250?mode=listener" "file://con" >/dev/null 2>"$out/srt-uplink.log" &
+pids+=("$!")
 sleep 2
 for pid in "${pids[@]}"; do
   kill -0 "$pid" 2>/dev/null || { echo "a listener exited at start"; exit 1; }
 done
+
+echo "== starting the fake Open Source Cloud and Open Live (mobile/examples/fake_servers.rs)"
+run_logged "$out/fake-servers-build.log" cargo build -p open-live-ingest-mobile --features fake-servers \
+  --example fake_servers --locked
+urls="$out/fake-servers.json"
+rm -f "$urls"
+target/debug/examples/fake_servers "$urls" >"$out/fake-servers.log" 2>&1 &
+pids+=("$!")
+for _ in $(seq 1 30); do
+  [[ -s "$urls" ]] && break
+  sleep 1
+done
+[[ -s "$urls" ]] || { echo "the fake servers did not start"; exit 1; }
+fake() { python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$urls" "$1"; }
+export TEST_RUNNER_OLI_FAKE_OSC_URL="$(fake osc)"
+export TEST_RUNNER_OLI_FAKE_CONTROL_URL="$(fake control)"
+curl -fsS -m 5 "$TEST_RUNNER_OLI_FAKE_CONTROL_URL/health" >/dev/null || { echo "the fake servers do not answer"; exit 1; }
+echo "fake Open Source Cloud at $TEST_RUNNER_OLI_FAKE_OSC_URL, control at $TEST_RUNNER_OLI_FAKE_CONTROL_URL"
 
 echo "== test-without-building"
 tests=0

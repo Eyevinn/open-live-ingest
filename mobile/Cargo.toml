@@ -29,3 +29,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 # The runtime the core owns, so `oli_core_send` never waits on the network.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[features]
+# Builds the test fakes (src/testing.rs) into the library for examples/fake_servers.rs,
+# the host process the iOS UI tests run against (ios/run-tests.sh). No dependency of its
+# own, so the phone's crate count above is unchanged; the app never enables it.
+fake-servers = []
+
+[[example]]
+name = "fake_servers"
+required-features = ["fake-servers"]

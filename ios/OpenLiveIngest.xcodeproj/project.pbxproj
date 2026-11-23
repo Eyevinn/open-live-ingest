@@ -21,6 +21,24 @@
 		0C0000000000000000000115 /* MediaPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000215 /* MediaPipeline.swift */; };
 		0C0000000000000000000116 /* TSMuxerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000216 /* TSMuxerTests.swift */; };
 		0C0000000000000000000117 /* MediaPipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000217 /* MediaPipelineTests.swift */; };
+		0C0000000000000000000118 /* Core.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000218 /* Core.swift */; };
+		0C0000000000000000000119 /* Messages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000219 /* Messages.swift */; };
+		0C000000000000000000011A /* AppLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021A /* AppLog.swift */; };
+		0C000000000000000000011B /* MediaController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021B /* MediaController.swift */; };
+		0C000000000000000000011C /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021C /* AppModel.swift */; };
+		0C000000000000000000011D /* WhereToSendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021D /* WhereToSendView.swift */; };
+		0C000000000000000000011E /* WhatToSendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021E /* WhatToSendView.swift */; };
+		0C000000000000000000011F /* GoLiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021F /* GoLiveView.swift */; };
+		0C0000000000000000000120 /* AdvancedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000220 /* AdvancedView.swift */; };
+		0C0000000000000000000121 /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000221 /* CameraPreview.swift */; };
+		0C0000000000000000000122 /* Devices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000222 /* Devices.swift */; };
+		0C0000000000000000000123 /* StatusText.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000223 /* StatusText.swift */; };
+		0C0000000000000000000124 /* SignInSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000224 /* SignInSheet.swift */; };
+		0C0000000000000000000125 /* CoreMessagesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000225 /* CoreMessagesTests.swift */; };
+		0C0000000000000000000126 /* MediaControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000226 /* MediaControllerTests.swift */; };
+		0C0000000000000000000127 /* AppInfoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000227 /* AppInfoTests.swift */; };
+		0C0000000000000000000128 /* StatusTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000228 /* StatusTextTests.swift */; };
+		0C0000000000000000000129 /* ScreensUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000229 /* ScreensUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -58,6 +76,25 @@
 		0C0000000000000000000215 /* MediaPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPipeline.swift; sourceTree = "<group>"; };
 		0C0000000000000000000216 /* TSMuxerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSMuxerTests.swift; sourceTree = "<group>"; };
 		0C0000000000000000000217 /* MediaPipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPipelineTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000218 /* Core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core.swift; sourceTree = "<group>"; };
+		0C0000000000000000000219 /* Messages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Messages.swift; sourceTree = "<group>"; };
+		0C000000000000000000021A /* AppLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLog.swift; sourceTree = "<group>"; };
+		0C000000000000000000021B /* MediaController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaController.swift; sourceTree = "<group>"; };
+		0C000000000000000000021C /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		0C000000000000000000021D /* WhereToSendView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhereToSendView.swift; sourceTree = "<group>"; };
+		0C000000000000000000021E /* WhatToSendView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhatToSendView.swift; sourceTree = "<group>"; };
+		0C000000000000000000021F /* GoLiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoLiveView.swift; sourceTree = "<group>"; };
+		0C0000000000000000000220 /* AdvancedView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdvancedView.swift; sourceTree = "<group>"; };
+		0C0000000000000000000221 /* CameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreview.swift; sourceTree = "<group>"; };
+		0C0000000000000000000222 /* Devices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Devices.swift; sourceTree = "<group>"; };
+		0C0000000000000000000223 /* StatusText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusText.swift; sourceTree = "<group>"; };
+		0C0000000000000000000224 /* SignInSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInSheet.swift; sourceTree = "<group>"; };
+		0C0000000000000000000225 /* CoreMessagesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreMessagesTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000226 /* MediaControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaControllerTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000227 /* AppInfoTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInfoTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000228 /* StatusTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusTextTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000229 /* ScreensUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreensUITests.swift; sourceTree = "<group>"; };
+		0C000000000000000000022A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -109,6 +146,20 @@
 				0C0000000000000000000213 /* TestPattern.swift */,
 				0C0000000000000000000214 /* Capture.swift */,
 				0C0000000000000000000215 /* MediaPipeline.swift */,
+				0C0000000000000000000218 /* Core.swift */,
+				0C0000000000000000000219 /* Messages.swift */,
+				0C000000000000000000021A /* AppLog.swift */,
+				0C000000000000000000021B /* MediaController.swift */,
+				0C000000000000000000021C /* AppModel.swift */,
+				0C000000000000000000021D /* WhereToSendView.swift */,
+				0C000000000000000000021E /* WhatToSendView.swift */,
+				0C000000000000000000021F /* GoLiveView.swift */,
+				0C0000000000000000000220 /* AdvancedView.swift */,
+				0C0000000000000000000221 /* CameraPreview.swift */,
+				0C0000000000000000000222 /* Devices.swift */,
+				0C0000000000000000000223 /* StatusText.swift */,
+				0C0000000000000000000224 /* SignInSheet.swift */,
+				0C000000000000000000022A /* Info.plist */,
 			);
 			path = OpenLiveIngest;
 			sourceTree = "<group>";
@@ -119,6 +170,10 @@
 				0C0000000000000000000205 /* SRTSenderTests.swift */,
 				0C0000000000000000000216 /* TSMuxerTests.swift */,
 				0C0000000000000000000217 /* MediaPipelineTests.swift */,
+				0C0000000000000000000225 /* CoreMessagesTests.swift */,
+				0C0000000000000000000226 /* MediaControllerTests.swift */,
+				0C0000000000000000000227 /* AppInfoTests.swift */,
+				0C0000000000000000000228 /* StatusTextTests.swift */,
 			);
 			path = OpenLiveIngestTests;
 			sourceTree = "<group>";
@@ -127,6 +182,7 @@
 			isa = PBXGroup;
 			children = (
 				0C0000000000000000000206 /* LaunchTests.swift */,
+				0C0000000000000000000229 /* ScreensUITests.swift */,
 			);
 			path = OpenLiveIngestUITests;
 			sourceTree = "<group>";
@@ -156,6 +212,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 0C0000000000000000000A02 /* Build configuration list for PBXNativeTarget "OpenLiveIngest" */;
 			buildPhases = (
+				0C0000000000000000000604 /* Build the Rust core */,
 				0C0000000000000000000601 /* Sources */,
 				0C0000000000000000000401 /* Frameworks */,
 			);
@@ -245,6 +302,29 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		0C0000000000000000000604 /* Build the Rust core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build the Rust core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "exec \"$SRCROOT/build-core.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		0C0000000000000000000601 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -259,6 +339,19 @@
 				0C0000000000000000000113 /* TestPattern.swift in Sources */,
 				0C0000000000000000000114 /* Capture.swift in Sources */,
 				0C0000000000000000000115 /* MediaPipeline.swift in Sources */,
+				0C0000000000000000000118 /* Core.swift in Sources */,
+				0C0000000000000000000119 /* Messages.swift in Sources */,
+				0C000000000000000000011A /* AppLog.swift in Sources */,
+				0C000000000000000000011B /* MediaController.swift in Sources */,
+				0C000000000000000000011C /* AppModel.swift in Sources */,
+				0C000000000000000000011D /* WhereToSendView.swift in Sources */,
+				0C000000000000000000011E /* WhatToSendView.swift in Sources */,
+				0C000000000000000000011F /* GoLiveView.swift in Sources */,
+				0C0000000000000000000120 /* AdvancedView.swift in Sources */,
+				0C0000000000000000000121 /* CameraPreview.swift in Sources */,
+				0C0000000000000000000122 /* Devices.swift in Sources */,
+				0C0000000000000000000123 /* StatusText.swift in Sources */,
+				0C0000000000000000000124 /* SignInSheet.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -269,6 +362,10 @@
 				0C0000000000000000000105 /* SRTSenderTests.swift in Sources */,
 				0C0000000000000000000116 /* TSMuxerTests.swift in Sources */,
 				0C0000000000000000000117 /* MediaPipelineTests.swift in Sources */,
+				0C0000000000000000000125 /* CoreMessagesTests.swift in Sources */,
+				0C0000000000000000000126 /* MediaControllerTests.swift in Sources */,
+				0C0000000000000000000127 /* AppInfoTests.swift in Sources */,
+				0C0000000000000000000128 /* StatusTextTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -277,6 +374,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				0C0000000000000000000106 /* LaunchTests.swift in Sources */,
+				0C0000000000000000000129 /* ScreensUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -340,11 +438,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/include",
 				);
+				INFOPLIST_FILE = OpenLiveIngest/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Open Live Ingest";
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
@@ -358,15 +459,27 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.0.0;
+				OLI_RUST_LIB = "$(SRCROOT)/../target/$(OLI_RUST_TRIPLE)/$(OLI_RUST_PROFILE)/libopen_live_ingest_mobile.a";
+				OLI_RUST_PROFILE = debug;
+				OLI_RUST_TRIPLE = "aarch64-apple-ios-sim";
+				"OLI_RUST_TRIPLE[sdk=iphoneos*]" = "aarch64-apple-ios";
+				"OLI_RUST_TRIPLE[sdk=iphonesimulator*]" = "aarch64-apple-ios-sim";
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lc++",
+					"$(OLI_RUST_LIB)",
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+					"-liconv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_INCLUDE_PATHS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
 				);
 			};
 			name = Debug;
@@ -375,11 +488,14 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/include",
 				);
+				INFOPLIST_FILE = OpenLiveIngest/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "Open Live Ingest";
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
@@ -393,15 +509,27 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 0.0.0;
+				OLI_RUST_LIB = "$(SRCROOT)/../target/$(OLI_RUST_TRIPLE)/$(OLI_RUST_PROFILE)/libopen_live_ingest_mobile.a";
+				OLI_RUST_PROFILE = release;
+				OLI_RUST_TRIPLE = "aarch64-apple-ios-sim";
+				"OLI_RUST_TRIPLE[sdk=iphoneos*]" = "aarch64-apple-ios";
+				"OLI_RUST_TRIPLE[sdk=iphonesimulator*]" = "aarch64-apple-ios-sim";
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lc++",
+					"$(OLI_RUST_LIB)",
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+					"-liconv",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_INCLUDE_PATHS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
 				);
 			};
 			name = Release;
@@ -418,6 +546,7 @@
 				SWIFT_INCLUDE_PATHS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
 				);
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenLiveIngest.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/OpenLiveIngest";
 			};
@@ -435,6 +564,7 @@
 				SWIFT_INCLUDE_PATHS = (
 					"$(inherited)",
 					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
 				);
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenLiveIngest.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/OpenLiveIngest";
 			};

@@ -40,6 +40,13 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
   the hand-written `mobile/include/oli.h`); `mobile/src/core.rs` the command dispatcher and view
   model over the desktop app's JSON envelope, tested against fake servers in `testing.rs`;
   `mobile/src/logs.rs` its `app.log`. Its media is Swift's, through `media::ExternalMedia`.
+  `mobile/examples/fake_servers.rs` (feature `fake-servers`) runs those fakes as the host process
+  the iOS UI tests use.
+- `ios/`: the iPhone app's Xcode project (SwiftUI, no Swift package). `Core.swift` wraps the C ABI
+  with Codable messages (`Messages.swift`); `MediaController.swift` carries out the core's `media`
+  events with the capture, encoder, muxer and SRT classes; `AppModel.swift` and the `*View.swift`
+  files are the three steps. The "Build the Rust core" phase runs `ios/build-core.sh`;
+  `ios/run-tests.sh` runs the unit and UI tests on a simulator as CI does.
 - The terminal crates (`clap`, `dialoguer`, `console`) sit behind the root package's `cli` feature
   (default on, required by the binary). The app and `mobile/` depend on the library with default
   features off.

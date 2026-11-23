@@ -17,8 +17,12 @@
 
 pub mod core;
 pub mod logs;
-#[cfg(test)]
-mod testing;
+/// The fake Open Source Cloud and Open Live the tests run against. Also built with the
+/// `fake-servers` feature, for `examples/fake_servers.rs`, which the iOS UI tests use
+/// as a host process; never part of the app.
+#[cfg(any(test, feature = "fake-servers"))]
+#[doc(hidden)]
+pub mod testing;
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};

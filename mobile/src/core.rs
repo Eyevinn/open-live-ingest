@@ -32,12 +32,13 @@ use open_live_ingest::flow::{Input, Source};
 use open_live_ingest::gateway::{self, InputState};
 use open_live_ingest::keychain::{OsKeychain, SecretStore};
 use open_live_ingest::media::{ExternalMedia, MediaRequest, SrtCallerStats};
+use open_live_ingest::openlive::{OpenLiveClient, Production};
 use open_live_ingest::osc;
 use open_live_ingest::run::{Sources, Stop};
 use open_live_ingest::session::{self, Inputs, Session, SessionHandle};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +63,11 @@ pub const SHUTDOWN_WITHIN: Duration = Duration::from_secs(4);
 
 /// How long a lookup of the workspace and its instances may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How often, while live, the productions holding the source are looked up for the
+/// status lines: the desktop's `status::POLL` (desktop spec, section 5.1), apart from
+/// the session's own, slower tick.
+pub const STATUS_POLL: Duration = Duration::from_secs(4);
 
 const NOT_UNDERSTOOD: &str = "The app did not understand that request. Restart the app.";
 const STOP_FIRST: &str = "Press Stop before changing what or where to send.";
@@ -708,6 +714,7 @@ impl Core {
         let (media, requests) = ExternalMedia::new();
         media.hold(lock(&shared.phone).held());
         let capture = Capture::of(&settings);
+        let productions = productions_client(&settings, credential.as_ref(), &shared.keychain);
         let (handle, events) = {
             // The session's tasks go on the core's runtime.
             let _runtime = self.runtime().enter();
@@ -715,7 +722,7 @@ impl Core {
                 media.clone(),
                 settings,
                 Inputs::default(),
-                credential,
+                credential.clone(),
                 Sources::Keep,
             )
         };
@@ -729,6 +736,9 @@ impl Core {
         tracing::info!("going live");
         let task = forward(shared.clone(), session, events, requests, capture);
         self.spawn(task);
+        if let Some(client) = productions {
+            self.spawn(watch_productions(shared.clone(), session, client));
+        }
         Reply::ok(id, Value::Null)
     }
 
@@ -928,6 +938,60 @@ async fn forward(
     // Requests sent as the session ended (the stop of its teardown).
     while let Ok(request) = requests.try_recv() {
         shared.emit("media", media_event(&request, &capture));
+    }
+}
+
+/// The Open Live the session registers with, to list its productions for the status
+/// lines: with the session's own credential, or the settings' key when self-hosted.
+/// None when no client can be made; the lines then say the productions are unknown.
+fn productions_client(
+    settings: &Config,
+    credential: Option<&OscCredential>,
+    keychain: &Arc<dyn SecretStore>,
+) -> Option<OpenLiveClient> {
+    let client = match credential {
+        Some(credential) => OpenLiveClient::with_osc_credential(&settings.open_live, credential),
+        None => OpenLiveClient::from_settings_with(&settings.open_live, keychain.clone()),
+    };
+    client
+        .map_err(|err| tracing::warn!("no production lookup for the status lines: {err:#}"))
+        .ok()
+}
+
+/// Looks up Open Live's productions every [`STATUS_POLL`] while session `session`
+/// lasts, once a source is registered, and sends the status lines after each look. A
+/// failed look shows the productions as unknown and never touches the feed.
+async fn watch_productions(shared: Arc<Shared>, session: u64, client: OpenLiveClient) {
+    let current = |live: &Live| live.session == session && live.phase != Phase::Idle;
+    let mut tick = tokio::time::interval(STATUS_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tick.tick().await;
+        {
+            let live = lock(&shared.live);
+            if !current(&live) {
+                break;
+            }
+            if live.board.sources.is_empty() {
+                continue;
+            }
+        }
+        let listing = client.list_productions().await;
+        let status = {
+            let mut live = lock(&shared.live);
+            if !current(&live) {
+                break;
+            }
+            live.board.listing = match listing {
+                Ok(list) => Some(list),
+                Err(err) => {
+                    tracing::debug!("could not list the productions; shown as unknown: {err:#}");
+                    None
+                }
+            };
+            live.board.status(lock(&shared.phone).network)
+        };
+        shared.emit("status", status);
     }
 }
 
@@ -1504,8 +1568,10 @@ struct Link {
 struct Board {
     /// Per input id, what Swift last reported.
     links: HashMap<String, Link>,
-    /// Per input name, the live productions holding its source; absent while armed.
-    productions: BTreeMap<String, Vec<String>>,
+    /// Per input name, its Open Live source id, once registered or adopted.
+    sources: HashMap<String, String>,
+    /// Open Live's productions at the last look; None before one, or when it failed.
+    listing: Option<Vec<Production>>,
     /// Every input by name, in the order they were heard of.
     inputs: Vec<String>,
     stopping: Option<(usize, usize)>,
@@ -1557,6 +1623,10 @@ impl Board {
                 self.input(input);
                 out.push(row(input, "registering", None));
             }
+            E::Registered { input, source_id } | E::SourceAdopted { input, source_id, .. } => {
+                self.input(input);
+                self.sources.insert(input.clone(), source_id.clone());
+            }
             E::InputFailed { input, reason } => {
                 self.input(input);
                 out.push(row(input, "failed", Some(reason)));
@@ -1564,13 +1634,10 @@ impl Board {
             E::Input { input, state } => {
                 self.input(input);
                 let (state, message) = match state {
-                    InputState::Armed => {
-                        self.productions.remove(input);
-                        (
-                            "armed",
-                            Some("Ready. Nothing is sent until a production that holds this source is activated in Studio."),
-                        )
-                    }
+                    InputState::Armed => (
+                        "armed",
+                        Some("Ready. Nothing is sent until a production that holds this source is activated in Studio."),
+                    ),
                     InputState::Starting | InputState::Waiting | InputState::Unreachable => {
                         ("connecting", None)
                     }
@@ -1578,12 +1645,6 @@ impl Board {
                     InputState::Failed { reason } => ("failed", Some(reason.as_str())),
                 };
                 out.push(row(input, state, message));
-            }
-            E::ProductionLive { input, productions } => {
-                self.productions.insert(input.clone(), productions.clone());
-            }
-            E::NoProductionLive { input } => {
-                self.productions.remove(input);
             }
             E::SlotAddedWhileLive { input, productions } if !productions.is_empty() => {
                 out.push((
@@ -1607,7 +1668,13 @@ impl Board {
                     })).collect::<Vec<Value>>()
                 }),
             )),
-            E::Stats { inputs } => out.push((
+            E::Stats { inputs } => {
+                for s in inputs {
+                    if let Some(id) = &s.source_id {
+                        self.sources.insert(s.input.clone(), id.clone());
+                    }
+                }
+                out.push((
                 "stats",
                 json!({
                     "inputs": inputs.iter().map(|s| json!({
@@ -1617,7 +1684,8 @@ impl Board {
                         "dropped": s.uplink.map(|u| u.dropped),
                     })).collect::<Vec<Value>>()
                 }),
-            )),
+            ));
+            }
             E::Warning { message } => out.push((
                 "notice",
                 json!({"kind": "warning", "message": message}),
@@ -1670,7 +1738,26 @@ impl Board {
         out
     }
 
-    /// The status lines (desktop spec, section 5.1): per input, the live productions
+    /// The productions holding `input`'s source, as the Production line shows them
+    /// (desktop spec, section 5.1): `[{name, state, slots}]` in Open Live's order, empty
+    /// when none holds it, null when not known (no look yet, a failed one, or the
+    /// source not registered yet).
+    fn holders(&self, input: &str) -> Value {
+        let (Some(list), Some(source)) = (&self.listing, self.sources.get(input)) else {
+            return Value::Null;
+        };
+        Value::Array(
+            list.iter()
+                .filter_map(|p| {
+                    let slots: Vec<&str> = p.slots_of(source).collect();
+                    (!slots.is_empty())
+                        .then(|| json!({"name": p.name, "state": p.state.as_str(), "slots": slots}))
+                })
+                .collect(),
+        )
+    }
+
+    /// The status lines (desktop spec, section 5.1): per input, the productions
     /// holding its source and the link as Swift reports it; and the network.
     fn status(&self, network: Network) -> Value {
         let inputs: Vec<Value> = self
@@ -1697,7 +1784,7 @@ impl Board {
                 };
                 json!({
                     "input": name,
-                    "productions": self.productions.get(name),
+                    "productions": self.holders(name),
                     "link": {"state": state, "dropped_pct": dropped_pct, "rtt_ms": rtt_ms},
                 })
             })
