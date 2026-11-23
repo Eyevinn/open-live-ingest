@@ -46,7 +46,11 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
   with Codable messages (`Messages.swift`); `MediaController.swift` carries out the core's `media`
   events with the capture, encoder, muxer and SRT classes; `AppModel.swift` and the `*View.swift`
   files are the three steps. The "Build the Rust core" phase runs `ios/build-core.sh`;
-  `ios/run-tests.sh` runs the unit and UI tests on a simulator as CI does.
+  `ios/run-tests.sh` runs the unit and UI tests on a simulator as CI does. The agent-run end to
+  end against a real Open Live (OL-64h) is the `e2e-ios` workflow: the XCUITest
+  `OpenLiveDevE2EUITests.swift` drives the app, `.github/scripts/e2e-ios.py` is its host half
+  (Open Live API, the token on the simulator's pasteboard, the report); without its control server
+  the test skips itself.
 - The terminal crates (`clap`, `dialoguer`, `console`) sit behind the root package's `cli` feature
   (default on, required by the binary). The app and `mobile/` depend on the library with default
   features off.

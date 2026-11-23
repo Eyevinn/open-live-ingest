@@ -415,11 +415,19 @@ struct LinkStatus: Decodable, Equatable {
     var state: String
     var droppedPct: Double?
     var rttMs: Double?
+    /// The SRT connection's cumulative counters while connected (they start again from zero
+    /// on a reconnect).
+    var packetsSent: UInt64? = nil
+    var packetsSentDropped: UInt64? = nil
+    var bytesSent: UInt64? = nil
 
     enum CodingKeys: String, CodingKey {
         case state
         case droppedPct = "dropped_pct"
         case rttMs = "rtt_ms"
+        case packetsSent = "packets_sent"
+        case packetsSentDropped = "packets_sent_dropped"
+        case bytesSent = "bytes_sent"
     }
 }
 

@@ -539,6 +539,16 @@ fn paste_token_choose_go_live_send_while_active_and_stop_keeping_the_source() {
         "{status}"
     );
     assert_eq!(status["data"]["inputs"][0]["input"], name);
+    // The link carries the connection's counters as Swift reported them, not only the share.
+    let link = swift.event("status", within, |d| {
+        d["inputs"][0]["link"]["state"] == "connected"
+            && d["inputs"][0]["link"]["packets_sent"].as_u64().is_some()
+    });
+    let link = &link["data"]["inputs"][0]["link"];
+    let sent = link["packets_sent"].as_u64().unwrap();
+    assert_eq!(link["packets_sent_dropped"], 0, "{link}");
+    assert_eq!(link["bytes_sent"].as_u64().unwrap() / 1316, sent, "{link}");
+    assert_eq!(link["dropped_pct"], 0.0, "{link}");
 
     // To the background: the uplink stops, the source is marked inactive, armed.
     core.send(r#"{"id": 7, "cmd": "phone", "args": {"foreground": false, "interrupted": false, "network": "wifi"}}"#);

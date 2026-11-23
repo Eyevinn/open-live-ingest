@@ -47,6 +47,18 @@ final class StatusTextTests: XCTestCase {
         XCTAssertEqual(
             StatusText.linkLine(LinkStatus(state: "connected", droppedPct: 0.2, rttMs: 31.4)),
             "Link: connected, 0.2 % dropped, RTT 31 ms")
+        XCTAssertEqual(StatusText.linkCounters(nil), "")
+        XCTAssertEqual(StatusText.linkCounters(LinkStatus(state: "connecting", droppedPct: nil, rttMs: nil)), "")
+        XCTAssertEqual(
+            StatusText.linkCounters(
+                LinkStatus(
+                    state: "connected", droppedPct: 0.0025, rttMs: 31, packetsSent: 120_000, packetsSentDropped: 3,
+                    bytesSent: 158_000_000)),
+            "120000 packets sent, 3 dropped, 158000000 bytes sent")
+        XCTAssertEqual(
+            StatusText.linkCounters(
+                LinkStatus(state: "connected", droppedPct: 0, rttMs: nil, packetsSent: 10, packetsSentDropped: 0)),
+            "10 packets sent, 0 dropped")
         XCTAssertEqual(StatusText.networkLine(.wifi, bitrateKbps: 4100), "Network: Wi-Fi, 4.1 Mbit/s")
         XCTAssertEqual(StatusText.networkLine(.cellular, bitrateKbps: nil), "Network: Cellular")
         XCTAssertEqual(StatusText.networkLine(nil, bitrateKbps: 0), "Network: unknown")

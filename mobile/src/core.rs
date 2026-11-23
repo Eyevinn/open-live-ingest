@@ -1765,7 +1765,7 @@ impl Board {
             .iter()
             .map(|name| {
                 let link = self.links.values().find(|l| &l.name == name);
-                let (state, dropped_pct, rtt_ms) = match link {
+                let (state, dropped_pct, rtt_ms, counters) = match link {
                     Some(Link {
                         running: true,
                         stats: Some(s),
@@ -1777,15 +1777,24 @@ impl Board {
                             }
                             _ => None,
                         };
-                        ("connected", dropped, s.rtt_ms)
+                        ("connected", dropped, s.rtt_ms, Some(s))
                     }
-                    Some(Link { running: true, .. }) => ("connecting", None, None),
-                    _ => ("not_sending", None, None),
+                    Some(Link { running: true, .. }) => ("connecting", None, None, None),
+                    _ => ("not_sending", None, None, None),
                 };
+                // The connection's cumulative counters as well as the share, so that a
+                // reader can take the share over an interval (OL-64h reads them twice).
                 json!({
                     "input": name,
                     "productions": self.holders(name),
-                    "link": {"state": state, "dropped_pct": dropped_pct, "rtt_ms": rtt_ms},
+                    "link": {
+                        "state": state,
+                        "dropped_pct": dropped_pct,
+                        "rtt_ms": rtt_ms,
+                        "packets_sent": counters.and_then(|s| s.packets_sent),
+                        "packets_sent_dropped": counters.and_then(|s| s.packets_sent_dropped),
+                        "bytes_sent": counters.and_then(|s| s.bytes_sent),
+                    },
                 })
             })
             .collect();
