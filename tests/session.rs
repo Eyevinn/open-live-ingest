@@ -1127,6 +1127,111 @@ async fn an_armed_session_through_external_media_hands_start_and_stop_to_the_hos
     no_strom.assert_untouched();
 }
 
+/// OL-64f: a phone going to the background (`ExternalMedia::hold`) while it sends.
+/// The session looks at the productions at once rather than at its next poll: the
+/// host is asked to stop, the source is marked inactive and the input is armed,
+/// all within the 4 s iOS gives the app (docs/specs/ios-app.md, section 9). Let go
+/// with the production still active, the host is asked to start again at once.
+#[tokio::test]
+async fn a_hold_stops_the_uplink_and_marks_the_source_inactive_within_four_seconds() {
+    no_terminal_and_a_scratch_user_dir();
+    let no_strom = NoStrom::new();
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(open_live_state.clone());
+    let name = "Session test — iPhone";
+
+    let (media, mut requests) = ExternalMedia::new();
+    let host = media.clone();
+    let (handle, mut events) = Session::start_armed_with(
+        media,
+        phone_settings(&no_strom.url(), &open_live, "gw-session-external-hold"),
+        Inputs::default(),
+        None,
+        Sources::Keep,
+    );
+    until_event(
+        &mut events,
+        "the summary",
+        |e| matches!(e, Event::Summary { .. }),
+        Duration::from_secs(30),
+    )
+    .await;
+    let (source, _) = source_named(&open_live_state, name).expect("no source registered");
+    open_live_state.lock().unwrap().productions =
+        vec![production("prod-1", "Morning Show", "active", &[&source])];
+    let MediaRequest::Start { input, .. } =
+        next_request(&mut requests, "a start", Duration::from_secs(5)).await
+    else {
+        panic!("not a start");
+    };
+    host.report(&input.id, true, None);
+    until_event(
+        &mut events,
+        "ProductionLive",
+        |e| matches!(e, Event::ProductionLive { input, .. } if input == name),
+        Duration::from_secs(5),
+    )
+    .await;
+    // As a tick marks it once delivering.
+    let patched_before = {
+        let mut ol = open_live_state.lock().unwrap();
+        ol.sources[0]["status"] = json!("active");
+        ol.patched.len()
+    };
+
+    // To the background: everything within 4 s, not at the next poll or tick.
+    let held_at = std::time::Instant::now();
+    host.hold(true);
+    let stop_request = next_request(&mut requests, "the hold's stop", Duration::from_secs(4)).await;
+    assert!(
+        matches!(&stop_request, MediaRequest::Stop { input_id } if *input_id == input.id),
+        "{stop_request:?}"
+    );
+    loop {
+        {
+            let ol = open_live_state.lock().unwrap();
+            if ol.sources[0]["status"] == "inactive" {
+                assert!(
+                    ol.patched[patched_before..].iter().any(|s| s == "inactive"),
+                    "not PATCHed: {:?}",
+                    ol.patched
+                );
+                break;
+            }
+        }
+        assert!(
+            held_at.elapsed() < Duration::from_secs(4),
+            "the source stayed active for 4 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    until_event(
+        &mut events,
+        "Armed",
+        |e| matches!(e, Event::Input { input, state: InputState::Armed } if input == name),
+        Duration::from_secs(4).saturating_sub(held_at.elapsed()),
+    )
+    .await;
+    assert_eq!(
+        open_live_state.lock().unwrap().deleted,
+        0,
+        "the source was deleted"
+    );
+
+    // Back, the production still active: started again at once, the same session.
+    host.hold(false);
+    let again = next_request(&mut requests, "a start again", Duration::from_secs(4)).await;
+    assert!(
+        matches!(&again, MediaRequest::Start { input: i, .. } if i.id == input.id),
+        "{again:?}"
+    );
+    host.report(&input.id, true, None);
+
+    let rest = stop(handle, &mut events).await;
+    assert_torn_down(&rest, name);
+    no_strom.assert_untouched();
+}
+
 /// OL-64a: the stall restart (#111, #127) through `ExternalMedia`. The host reports
 /// an uplink whose sender drops all it sends, the counters moving; two stalled
 /// intervals after the first sample, the session asks the host to restart it.
