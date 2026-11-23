@@ -8,6 +8,9 @@ protocol MediaRunning: AnyObject {
     /// Opens the source and starts calling.
     func run() throws
     func stop()
+    /// Closes the SRT socket and calls again on the current network path, capture and encoders
+    /// running on (docs/specs/ios-app.md, section 9). The counters restart from zero.
+    func reconnect()
     /// Whether the SRT caller is connected, calling, or stopped, with its counters.
     var uplink: (state: SRTSender.State, stats: SRTSenderStats?) { get }
 }
@@ -23,6 +26,10 @@ extension MediaSession: MediaRunning {
 
     var uplink: (state: SRTSender.State, stats: SRTSenderStats?) {
         (sender.state, sender.stats())
+    }
+
+    func reconnect() {
+        sender.reconnect()
     }
 }
 
@@ -72,6 +79,15 @@ final class MediaController {
             }
             end(input)
             begin(start)
+        }
+    }
+
+    /// Every running input's SRT caller calls again on the new network path (section 9): only the
+    /// socket, not capture or the encoders, and the session is not restarted.
+    func reconnectAll() {
+        for input in inputs {
+            AppLog.info("media reconnect \(input): the network path changed")
+            running[input]?.media.reconnect()
         }
     }
 

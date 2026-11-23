@@ -1190,6 +1190,7 @@ async fn run_until_stopped<M: Media>(
         tokio::select! {
             () = &mut next_look, if gated.is_some() => {
                 let client = gated.expect("guarded");
+                let sending = live.iter().filter(|l| l.sending).count();
                 let soon = look_at_productions(
                     media,
                     client,
@@ -1199,6 +1200,11 @@ async fn run_until_stopped<M: Media>(
                     events,
                 )
                 .await;
+                // Held back (a phone going to the background): the stopped sources are
+                // marked inactive now, not at the next tick, as iOS gives the app 4 s.
+                if media.held_back() && live.iter().filter(|l| l.sending).count() < sending {
+                    update_sources(client, live, source_gateway_id, events).await;
+                }
                 if let Some(reporter) = reporter {
                     reporter.publish(live);
                 }
@@ -1226,19 +1232,33 @@ async fn run_until_stopped<M: Media>(
                     reporter.publish(live);
                 }
                 if let Some(client) = open_live {
-                    if let Err(err) = reconcile_sources(client, live, source_gateway_id, events).await {
-                        // Never fatal: the feeds are already flowing. Retried next tick.
-                        warn!(err = %format_args!("{err:#}"), "could not update the Open Live sources, retrying next tick");
-                        events.emit(Event::Warning {
-                            message: format!("could not update the Open Live sources ({err:#}); the feeds are unaffected, retrying next tick"),
-                        });
-                    }
+                    update_sources(client, live, source_gateway_id, events).await;
                 }
                 tell_changes(live, events);
                 events.emit(stats_of(live));
             }
+            // The hold changed: look at the productions now.
+            () = media.hold_changed(), if gated.is_some() => {
+                next_look.as_mut().reset(tokio::time::Instant::now());
+            }
             stop = &mut stop => return Ok(stop),
         }
+    }
+}
+
+/// [`reconcile_sources`], warning rather than failing: never fatal, the feeds are
+/// already flowing. Retried at the next tick.
+async fn update_sources(
+    client: &OpenLiveClient,
+    live: &mut [Live],
+    gateway_id: Option<&str>,
+    events: &Events,
+) {
+    if let Err(err) = reconcile_sources(client, live, gateway_id, events).await {
+        warn!(err = %format_args!("{err:#}"), "could not update the Open Live sources, retrying next tick");
+        events.emit(Event::Warning {
+            message: format!("could not update the Open Live sources ({err:#}); the feeds are unaffected, retrying next tick"),
+        });
     }
 }
 

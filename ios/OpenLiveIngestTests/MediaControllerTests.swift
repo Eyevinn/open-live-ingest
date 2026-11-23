@@ -7,6 +7,7 @@ final class FakeMedia: MediaRunning {
     let start: MediaStart
     var ran = false
     var stopped = false
+    var reconnects = 0
     var state: SRTSender.State = .connecting
     var stats: SRTSenderStats?
     private var change: (() -> Void)?
@@ -18,6 +19,7 @@ final class FakeMedia: MediaRunning {
     func observe(_ change: (() -> Void)?) { self.change = change }
     func run() throws { ran = true }
     func stop() { stopped = true }
+    func reconnect() { reconnects += 1 }
     var uplink: (state: SRTSender.State, stats: SRTSenderStats?) { (state, stats) }
 
     func set(_ state: SRTSender.State, stats: SRTSenderStats? = nil) {

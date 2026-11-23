@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 pub use strom_types::api::SrtCallerStats;
 use strom_types::discovery::{DeviceCategory, DeviceResponse};
 use strom_types::FlowId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::warn;
 
 /// What the session asks of whatever does the media. Not object-safe on purpose:
@@ -82,6 +82,15 @@ pub trait Media: Send + Sync {
     /// the OS has taken. Never on a computer.
     fn held_back(&self) -> bool {
         false
+    }
+
+    /// Resolves when the hold may have changed ([`Media::held_back`]): an armed
+    /// session then looks at the productions at once rather than at its next poll,
+    /// and marks a source whose uplink the hold stopped inactive at once, so a phone
+    /// going to the background is done within the 4 s iOS gives it. Never resolves
+    /// on a computer.
+    fn hold_changed(&self) -> impl Future<Output = ()> + Send {
+        std::future::pending()
     }
 }
 
@@ -358,6 +367,8 @@ pub struct ExternalMedia {
     requests: mpsc::UnboundedSender<MediaRequest>,
     reported: Arc<Mutex<HashMap<String, Reported>>>,
     held: Arc<AtomicBool>,
+    /// Told on each change of `held`, for [`Media::hold_changed`].
+    hold_changed: Arc<Notify>,
 }
 
 impl ExternalMedia {
@@ -369,6 +380,7 @@ impl ExternalMedia {
                 requests,
                 reported: Arc::default(),
                 held: Arc::default(),
+                hold_changed: Arc::default(),
             },
             rx,
         )
@@ -389,8 +401,12 @@ impl ExternalMedia {
     /// its next look at the productions, its source kept and marked inactive, and
     /// starts it again at the first look after the hold ends if a production holding
     /// the source is still live. See [`Media::held_back`].
+    /// A change wakes the session at once ([`Media::hold_changed`]); the same value
+    /// again changes nothing.
     pub fn hold(&self, held: bool) {
-        self.held.store(held, Ordering::SeqCst);
+        if self.held.swap(held, Ordering::SeqCst) != held {
+            self.hold_changed.notify_one();
+        }
     }
 
     fn reports(&self) -> std::sync::MutexGuard<'_, HashMap<String, Reported>> {
@@ -517,5 +533,9 @@ impl Media for ExternalMedia {
 
     fn held_back(&self) -> bool {
         self.held.load(Ordering::SeqCst)
+    }
+
+    async fn hold_changed(&self) {
+        self.hold_changed.notified().await;
     }
 }

@@ -1,4 +1,3 @@
-import Network
 import SwiftUI
 
 /// The app's entry point (docs/specs/ios-app.md, section 5): one navigation stack over the
@@ -24,7 +23,6 @@ struct OpenLiveIngestApp: App {
 struct ContentView: View {
     @ObservedObject var model: AppModel
     @State private var path: [Step] = []
-    @State private var monitor = NetworkMonitor()
 
     enum Step: Hashable {
         case what, go
@@ -44,9 +42,6 @@ struct ContentView: View {
             if let fatal = model.fatal {
                 FatalView(message: fatal, logFile: model.logFile)
             }
-        }
-        .onAppear {
-            monitor.start { network in model.phone(network: network) }
         }
     }
 }
@@ -72,36 +67,5 @@ struct FatalView: View {
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.regularMaterial)
-    }
-}
-
-/// The network the phone is on, from `NWPathMonitor`, for the status line (section 5, step 3).
-/// What the uplink does on a change of path is OL-64f's (section 9).
-final class NetworkMonitor {
-    private var monitor: NWPathMonitor?
-    private let queue = DispatchQueue(label: "com.eyevinn.open-live-ingest.network")
-    /// The last kind reported; touched on `queue` only.
-    private var last: NetworkKind?
-
-    func start(_ changed: @escaping (NetworkKind) -> Void) {
-        guard monitor == nil else { return }
-        let monitor = NWPathMonitor()
-        monitor.pathUpdateHandler = { [weak self] path in
-            guard let self else { return }
-            let kind = NetworkMonitor.kind(of: path)
-            guard kind != self.last else { return }
-            self.last = kind
-            DispatchQueue.main.async { changed(kind) }
-        }
-        monitor.start(queue: queue)
-        self.monitor = monitor
-    }
-
-    static func kind(of path: NWPath) -> NetworkKind {
-        guard path.status == .satisfied else { return .noNetwork }
-        if path.usesInterfaceType(.wifi) { return .wifi }
-        if path.usesInterfaceType(.cellular) { return .cellular }
-        if path.usesInterfaceType(.wiredEthernet) { return .wired }
-        return .other
     }
 }

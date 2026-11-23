@@ -11,6 +11,7 @@
 #    release core;
 # 2. builds the app and its tests for the newest iPhone simulator (build-for-testing), with the
 #    debug core; both builds take the workspace version (Cargo.toml) as CFBundleShortVersionString;
+#    the device build's Info.plist is checked for an empty UIBackgroundModes (section 9);
 # 3. starts the srt-live-transmit listeners SRTSenderTests.swift and MediaPipelineTests.swift call
 #    on 127.0.0.1, and for the UI tests (ScreensUITests.swift) the fake Open Source Cloud and Open
 #    Live (mobile/examples/fake_servers.rs) and a listener standing in for the cloud Strom;
@@ -53,6 +54,17 @@ run_logged "$out/build-device.log" xcodebuild build -quiet \
   -project "$project" -scheme OpenLiveIngest -configuration Release \
   -destination "generic/platform=iOS" -derivedDataPath "$derived" \
   CODE_SIGNING_ALLOWED=NO MARKETING_VERSION="$version"
+
+# No background modes (docs/specs/ios-app.md, section 9): the built app's Info.plist has
+# UIBackgroundModes empty or not at all. AppInfoTests.swift checks the simulator build's too.
+plist="$derived/Build/Products/Release-iphoneos/OpenLiveIngest.app/Info.plist"
+[[ -f "$plist" ]] || { echo "no Info.plist in the device build at $plist"; exit 1; }
+python3 -c '
+import plistlib, sys
+modes = plistlib.load(open(sys.argv[1], "rb")).get("UIBackgroundModes", [])
+sys.exit("UIBackgroundModes is not empty in the built app: %r" % (modes,) if modes else 0)
+' "$plist"
+echo "UIBackgroundModes: none, in the built app's Info.plist"
 
 echo "== picking a simulator"
 udid="$(xcrun simctl list devices available --json | python3 -c '

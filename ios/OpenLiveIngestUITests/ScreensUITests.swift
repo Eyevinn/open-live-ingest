@@ -50,11 +50,73 @@ final class ScreensUITests: XCTestCase {
 
     func testPasteTokenPickInstanceGoLiveAndStopKeepingTheSource() throws {
         continueAfterFailure = false
-        let osc = try environment("OLI_FAKE_OSC_URL")
         let control = try FakeControl(base: try environment("OLI_FAKE_CONTROL_URL"))
-        _ = try control.call("POST", "/reset")
-
         let app = XCUIApplication()
+        let sourceID = try goLiveUntilActive(app, control)
+
+        // Stop: the source is kept, marked inactive, for the next Go live.
+        let go = app.buttons["goLive"]
+        XCTAssertEqual(go.label, "Stop")
+        go.tap()
+        wait(go, "label == %@", "Go live", within: 60)
+        shot("6 stopped")
+        let after = try control.call("GET", "/state")
+        let kept = try XCTUnwrap(after["sources"] as? [[String: Any]])
+        XCTAssertEqual(kept.count, 1, "\(after)")
+        XCTAssertEqual(kept.first?["id"] as? String, sourceID, "not the same source")
+        XCTAssertEqual(kept.first?["status"] as? String, "inactive", "\(after)")
+        XCTAssertEqual(after["deleted"] as? Int, 0, "the source was deleted: \(after)")
+    }
+
+    /// OL-64f (docs/specs/ios-app.md, section 9): live, the app goes to the background (the
+    /// screen locked, another app); within 4 s the fake Open Live has the source `inactive`, and
+    /// the session stays armed with no background mode. Back in the foreground with the fake
+    /// production still active, the uplink starts again and the state line says Live, with the
+    /// same source and no new session.
+    func testBackgroundWhileLiveMarksTheSourceInactiveAndTheForegroundResumes() throws {
+        continueAfterFailure = false
+        let control = try FakeControl(base: try environment("OLI_FAKE_CONTROL_URL"))
+        let app = XCUIApplication()
+        let sourceID = try goLiveUntilActive(app, control)
+        let created = try control.call("GET", "/state")["created"] as? Int
+
+        let backgrounded = Date()
+        XCUIDevice.shared.press(.home)
+        var status: String?
+        repeat {
+            let state = try control.call("GET", "/state")
+            status = ((state["sources"] as? [[String: Any]])?.first)?["status"] as? String
+            if status == "inactive" { break }
+            Thread.sleep(forTimeInterval: 0.1)
+        } while Date().timeIntervalSince(backgrounded) < 4
+        let took = Date().timeIntervalSince(backgrounded)
+        XCTAssertEqual(status, "inactive", "the source still read \(status ?? "nothing") 4 s after the app went to the background")
+        XCTAssertLessThan(took, 4)
+
+        app.activate()
+        let state = app.staticTexts["stateLine"]
+        wait(state, "label == %@", "Live", within: 60)
+        wait(app.staticTexts["linkLine"], "label BEGINSWITH %@", "Link: connected", within: 60)
+        shot("7 live again after the background")
+        let go = app.buttons["goLive"]
+        XCTAssertEqual(go.label, "Stop", "the session ended")
+        let after = try control.call("GET", "/state")
+        let sources = try XCTUnwrap(after["sources"] as? [[String: Any]])
+        XCTAssertEqual(sources.count, 1, "\(after)")
+        XCTAssertEqual(sources.first?["id"] as? String, sourceID, "not the same source")
+        XCTAssertEqual(after["created"] as? Int, created, "a new source was registered: \(after)")
+        XCTAssertEqual(after["deleted"] as? Int, 0, "\(after)")
+
+        go.tap()
+        wait(go, "label == %@", "Go live", within: 60)
+    }
+
+    /// From a fresh launch to Live: paste the token, pick the instance, the test pattern, Go live
+    /// (Armed), the fake production active, Live, and the source marked active on the fake Open
+    /// Live. The source's id.
+    private func goLiveUntilActive(_ app: XCUIApplication, _ control: FakeControl) throws -> String {
+        let osc = try environment("OLI_FAKE_OSC_URL")
+        _ = try control.call("POST", "/reset")
         app.launchArguments = ["-OLITestOSCURL", osc, "-OLIReset"]
         app.launch()
 
@@ -113,83 +175,6 @@ final class ScreensUITests: XCTestCase {
             Thread.sleep(forTimeInterval: 1)
         } while Date() < deadline
         XCTAssertEqual(((live["sources"] as? [[String: Any]])?.first)?["status"] as? String, "active", "\(live)")
-
-        // Stop: the source is kept, marked inactive, for the next Go live.
-        XCTAssertEqual(go.label, "Stop")
-        go.tap()
-        wait(go, "label == %@", "Go live", within: 60)
-        shot("6 stopped")
-        let after = try control.call("GET", "/state")
-        let kept = try XCTUnwrap(after["sources"] as? [[String: Any]])
-        XCTAssertEqual(kept.count, 1, "\(after)")
-        XCTAssertEqual(kept.first?["id"] as? String, sources.first?["id"] as? String, "not the same source")
-        XCTAssertEqual(kept.first?["status"] as? String, "inactive", "\(after)")
-        XCTAssertEqual(after["deleted"] as? Int, 0, "the source was deleted: \(after)")
-    }
-}
-
-/// The fakes' control address, over plain HTTP/1.1 on a socket of its own (App Transport Security
-/// covers URLSession, not this), one request per connection as the fakes serve them. IPv4 only:
-/// the fakes listen on 127.0.0.1.
-struct FakeControl {
-    let host: String
-    let port: UInt16
-
-    struct Failed: Error, CustomStringConvertible {
-        let description: String
-    }
-
-    init(base: String) throws {
-        guard let url = URL(string: base), let host = url.host, let port = url.port, let port16 = UInt16(exactly: port)
-        else { throw Failed(description: "not an http://host:port address: \(base)") }
-        self.host = host
-        self.port = port16
-    }
-
-    /// `method path`, the JSON object it answers with.
-    func call(_ method: String, _ path: String) throws -> [String: Any] {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw Failed(description: "no socket: errno \(errno)") }
-        defer { close(fd) }
-        var timeout = timeval(tv_sec: 10, tv_usec: 0)
-        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = port.bigEndian
-        address.sin_addr.s_addr = inet_addr(host)
-        let connected = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard connected == 0 else { throw Failed(description: "\(method) \(path): cannot connect, errno \(errno)") }
-
-        let request = Array(
-            "\(method) \(path) HTTP/1.1\r\nHost: \(host):\(port)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
-        var offset = 0
-        while offset < request.count {
-            let n = request[offset...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-            guard n > 0 else { throw Failed(description: "\(method) \(path): write failed, errno \(errno)") }
-            offset += n
-        }
-        var received: [UInt8] = []
-        var buffer = [UInt8](repeating: 0, count: 65_536)
-        while true {
-            let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
-            if n <= 0 { break }
-            received.append(contentsOf: buffer[0..<n])
-        }
-
-        let text = String(decoding: received, as: UTF8.self)
-        guard text.hasPrefix("HTTP/1.1 200"), let split = text.range(of: "\r\n\r\n") else {
-            throw Failed(description: "\(method) \(path): \(text)")
-        }
-        let body = Data(text[split.upperBound...].utf8)
-        guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            throw Failed(description: "\(method) \(path): not a JSON object: \(text)")
-        }
-        return object
+        return try XCTUnwrap(sources.first?["id"] as? String)
     }
 }
