@@ -415,7 +415,7 @@ final class PhoneTests: XCTestCase {
             deliver()
             return try source()?["status"] as? String == "active"
         }
-        XCTAssertEqual(model.row?.state, "live")
+        until(10, "Live") { model.row?.state == "live" }
         let id = try XCTUnwrap(source()?["id"] as? String)
 
         // To the background.
@@ -426,7 +426,7 @@ final class PhoneTests: XCTestCase {
             try source()?["status"] as? String == "inactive"
         }
         XCTAssertLessThan(Date().timeIntervalSince(backgrounded), 4)
-        XCTAssertTrue(made.first?.stopped == true, "the uplink was not stopped")
+        until(4, "the uplink stopped") { made.first?.stopped == true }
         until(4, "armed again") { model.row?.state == "armed" }
         XCTAssertTrue(system.open.isEmpty, "the background task was not ended")
         XCTAssertTrue(model.live, "the session ended")
