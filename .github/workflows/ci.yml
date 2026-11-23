@@ -162,6 +162,7 @@ jobs:
           set -euo pipefail
           brew install srt
           got="$(brew list --versions srt | awk '{print $2}')"
+          got="${got%%_*}"  # without Homebrew's bottle revision (1.5.7_1)
           echo "Homebrew srt $got (recorded: $SRT_TOOLS_VERSION)"
           [[ "$got" == "$SRT_TOOLS_VERSION" ]] \
             || echo "::warning::Homebrew srt is $got, the job records $SRT_TOOLS_VERSION; update SRT_TOOLS_VERSION on purpose"
