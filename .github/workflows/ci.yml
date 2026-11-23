@@ -184,6 +184,8 @@ jobs:
           ffprobe -version | head -n 1
           [[ "$got" == "$FFMPEG_VERSION" ]] \
             || echo "::warning::Homebrew ffmpeg is $got, the job records $FFMPEG_VERSION; update FFMPEG_VERSION on purpose"
+      # The unit and UI tests; the UI tests (OL-64e) against the fake Open Source Cloud and Open
+      # Live of mobile/examples/fake_servers.rs, which the script starts on the runner.
       - run: ios/run-tests.sh "$RUNNER_TEMP/ios-tests"
       - uses: actions/upload-artifact@v4
         if: failure()
@@ -243,6 +245,8 @@ jobs:
         with:
           key: mobile
       - run: cargo clippy -p open-live-ingest-mobile --all-targets --locked -- -D warnings
+      # The fakes as the host process the iOS UI tests run against (examples/fake_servers.rs).
+      - run: cargo clippy -p open-live-ingest-mobile --features fake-servers --all-targets --locked -- -D warnings
       - run: cargo test -p open-live-ingest-mobile --locked
 
   # The session AC2 test (`start_events_and_stop_against_a_real_strom`, #[ignore]d so

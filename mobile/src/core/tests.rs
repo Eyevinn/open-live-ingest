@@ -529,6 +529,16 @@ fn paste_token_choose_go_live_send_while_active_and_stop_keeping_the_source() {
         .unwrap()
         .patched
         .contains(&"active".to_string()));
+    // The status lines name the production holding the source, its state and the slot.
+    let status = swift.event("status", within, |d| {
+        d["inputs"][0]["productions"][0]["state"] == "active"
+    });
+    assert_eq!(
+        status["data"]["inputs"][0]["productions"],
+        json!([{"name": "Morning Show", "state": "active", "slots": ["video_in_1"]}]),
+        "{status}"
+    );
+    assert_eq!(status["data"]["inputs"][0]["input"], name);
 
     // To the background: the uplink stops, the source is marked inactive, armed.
     core.send(r#"{"id": 7, "cmd": "phone", "args": {"foreground": false, "interrupted": false, "network": "wifi"}}"#);

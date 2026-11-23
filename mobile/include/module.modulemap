@@ -1,0 +1,6 @@
+// The Rust core's C ABI as a Clang module, so Swift says `import OliCore`
+// (ios/OpenLiveIngest/Core.swift). The Xcode project puts this folder on SWIFT_INCLUDE_PATHS.
+module OliCore {
+    header "oli.h"
+    export *
+}

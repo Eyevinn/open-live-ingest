@@ -332,6 +332,16 @@ pub struct OpenLiveState {
 /// A fake Open Live that wants `Bearer <bearer>`: server info publishing a cloud
 /// host and [`PUBLISHED_PORTS`], sources, and productions.
 pub fn fake_open_live(bearer: &'static str, state: Arc<Mutex<OpenLiveState>>) -> String {
+    fake_open_live_at(bearer, state, "cloud.example.com")
+}
+
+/// [`fake_open_live`], publishing `strom_host` as the cloud Strom: `127.0.0.1` when an
+/// SRT listener on [`PUBLISHED_PORTS`] stands in for it (the iOS UI tests).
+pub fn fake_open_live_at(
+    bearer: &'static str,
+    state: Arc<Mutex<OpenLiveState>>,
+    strom_host: &'static str,
+) -> String {
     serve(Arc::new(move |req| {
         if req.header("authorization") != Some(&format!("Bearer {bearer}")) {
             return (401, json!({"error": "unauthorized"}));
@@ -346,7 +356,7 @@ pub fn fake_open_live(bearer: &'static str, state: Arc<Mutex<OpenLiveState>>) ->
         ) {
             ("GET", "/api/v1/server-info", _) => (
                 200,
-                json!({"stromHost": "cloud.example.com", "srtPorts": PUBLISHED_PORTS,
+                json!({"stromHost": strom_host, "srtPorts": PUBLISHED_PORTS,
                        "srtPortState": "reserved"}),
             ),
             ("GET", "/api/v1/sources", _) => (200, Value::Array(s.sources.clone())),
