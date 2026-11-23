@@ -119,6 +119,32 @@ jobs:
             exit 1
           }
 
+  # The sign-in check of docs/specs/ios-app.md, sections 6 and 14 Q4 (#138): the core in a
+  # throwaway Swift harness on an iOS Simulator, signing in through
+  # ASWebAuthenticationSession against a fake Open Source Cloud on the runner. No secret.
+  ios-sign-in:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - run: rustup target add aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-sign-in
+      - run: contrib/ios-sign-in-check/run.sh "$RUNNER_TEMP/sign-in-check"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-sign-in-check
+          path: ${{ runner.temp }}/sign-in-check
+          retention-days: 14
+
   # The same core's tests on Linux: plain Rust, no iOS SDK (docs/specs/ios-app.md,
   # section 3).
   mobile-linux:

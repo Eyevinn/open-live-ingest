@@ -334,17 +334,44 @@ impl Options {
     /// The phone's: the settings at
     /// `<app_support_dir>/open-live-ingest/gateway.toml` (`config::user_dir()` on iOS),
     /// the iOS Keychain, and Open Source Cloud itself.
+    ///
+    /// A debug build only also reads `OLI_TEST_OSC_URL`: when set, Open Source Cloud
+    /// is the fake at that address instead ([`test_osc`]). A release build has no
+    /// such switch.
     pub fn new(app_support_dir: &Path) -> Self {
+        #[cfg(debug_assertions)]
+        let endpoints = test_osc().unwrap_or_else(osc::Endpoints::production);
+        #[cfg(not(debug_assertions))]
+        let endpoints = osc::Endpoints::production();
         Options {
             settings_file: app_support_dir
                 .join("open-live-ingest")
                 .join("gateway.toml"),
             keychain: Arc::new(OsKeychain::default()),
-            endpoints: osc::Endpoints::production(),
+            endpoints,
             sign_in_wait: osc::SIGN_IN_TIMEOUT,
             browser: None,
         }
     }
+}
+
+/// The fake Open Source Cloud a debug build is pointed at with `OLI_TEST_OSC_URL`
+/// (the simulator sign-in check, `contrib/ios-sign-in-check/`): `/api/connect` at
+/// that address, the catalog at `/mysubscriptions`, the token exchange at
+/// `/servicetoken`, as the fakes of `testing.rs` lay them out.
+#[cfg(debug_assertions)]
+fn test_osc() -> Option<osc::Endpoints> {
+    let base = std::env::var("OLI_TEST_OSC_URL").ok()?;
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    tracing::warn!("debug build: signing in at the fake Open Source Cloud of OLI_TEST_OSC_URL");
+    Some(osc::Endpoints {
+        connect: base.to_string(),
+        catalog: format!("{base}/mysubscriptions"),
+        token_exchange: format!("{base}/servicetoken"),
+    })
 }
 
 /// The core Swift drives through the C ABI: one per app.
