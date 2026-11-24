@@ -125,6 +125,12 @@ pub enum Failure {
     /// through one: `connect.reason` `srt-relay-not-configured`, a 422 with that
     /// `code`, or one with `srt-relay-unknown` and no relays at all.
     RelayNotConfigured,
+    /// The settings say to send only through an SRT relay (`uplink.mode = "relay"`),
+    /// and Open Live has none (it is older than relays, or reports none): the
+    /// relay choice before registering (`run::choose_relay`). Unlike
+    /// [`Failure::RelayNotConfigured`], Go live again fails the same way until the
+    /// mode is changed.
+    RelayModeWithoutRelay,
     /// Open Live has no SRT relay named `relay` (the one picked under Advanced, or
     /// `default`); it has `relays`: `connect.reason` `srt-relay-unknown`, or a 422
     /// with that `code` and its `relays`. `relay` is `None` when the refusal does
@@ -249,6 +255,10 @@ impl Failure {
             Failure::RelayNotConfigured => Message::new(
                 "Open Live has no SRT relay to send through any more. Press Go live again to send to it directly.",
                 Some(Retry),
+            ),
+            Failure::RelayModeWithoutRelay => Message::new(
+                "The settings file says to send only through an SRT relay (uplink.mode = \"relay\"), but Open Live has none. Set uplink.mode to \"caller\" in the settings file, then press Go live.",
+                Some(ShowFile),
             ),
             Failure::RelayUnknown { relay, relays } => {
                 let which = match relay {
@@ -607,10 +617,15 @@ fn relay_failure(text: &str) -> Option<Failure> {
     if has("(srt-relay-public-unknown)") {
         return Some(Failure::RelayPublicUnknown);
     }
-    if has("(srt-relay-not-configured)")
-        || has("Open Live reports no SRT relay")
-        || has("Open Live is older than SRT relays")
+    // `uplink.mode is "relay", but Open Live is older than SRT relays` or `... but
+    // Open Live reports no SRT relay`: only in relay mode, so pressing Go live
+    // again would fail the same way. (The unreachable case is above: it can pass.)
+    if has("uplink.mode is \"relay\"")
+        && (has("Open Live reports no SRT relay") || has("Open Live is older than SRT relays"))
     {
+        return Some(Failure::RelayModeWithoutRelay);
+    }
+    if has("(srt-relay-not-configured)") || has("Open Live reports no SRT relay") {
         return Some(Failure::RelayNotConfigured);
     }
     // `has no SRT relay named "x"; it has a, b: set uplink.relay ...` (the choice)
@@ -936,12 +951,39 @@ mod tests {
             ),
             Failure::RelayUnreachable.message()
         );
+    }
+
+    /// `uplink.mode = "relay"` and Open Live has no relay: Go live again fails the
+    /// same way, so the message says to change the mode, not to press Go live.
+    #[test]
+    fn relay_mode_without_a_relay_says_to_change_the_mode() {
+        let expected = "The settings file says to send only through an SRT relay (uplink.mode = \"relay\"), but Open Live has none. Set uplink.mode to \"caller\" in the settings file, then press Go live.";
+        for text in [
+            // `run::choose_relay`
+            "uplink.mode is \"relay\", but Open Live is older than SRT relays; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+            "uplink.mode is \"relay\", but Open Live reports no SRT relay; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+            // `api.rs` and `setup.rs`
+            "uplink.mode is \"relay\", but Open Live reports no SRT relay; set uplink.mode = \"caller\"",
+        ] {
+            assert_message(for_error(text, &ctx()), expected, Some(Action::ShowFile));
+            assert!(!for_error(text, &ctx()).message.contains("Go live again"));
+        }
+        // Not in relay mode: the same "reports no SRT relay" words (the 422's advice,
+        // `connect.reason`) still say Go live again sends directly.
         assert_eq!(
             for_error(
-                "uplink.mode is \"relay\", but Open Live is older than SRT relays; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+                "Open Live reports no SRT relay, so it cannot give an address for relay \"default\" (srt-relay-not-configured)",
                 &ctx(),
             ),
             Failure::RelayNotConfigured.message()
+        );
+        // Relay mode and Strom unreachable can pass on a retry: unchanged.
+        assert_eq!(
+            for_error(
+                "uplink.mode is \"relay\", but Open Live cannot reach its Strom to ask about SRT relays; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+                &ctx(),
+            ),
+            Failure::RelayUnreachable.message()
         );
     }
 
