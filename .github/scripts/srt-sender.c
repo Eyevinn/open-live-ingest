@@ -4,12 +4,23 @@
  * runs it, against the Homebrew libsrt of a macOS runner.
  *
  *     ffmpeg ... -f mpegts pipe:1 | srt-sender <host> <port> [latency_ms] [inputbw_bytes]
+ *                                               [streamid] [passphrase]
  *
  * Reads MPEG-TS from stdin in 1316-byte payloads (7 TS packets) and sends each as one
  * SRT message, with the socket options the phone's sender is specified with (spec
  * section 11): SRTO_TRANSTYPE live, SRTO_LATENCY (= SRTO_PEERLATENCY) `latency_ms`
  * (default 200), SRTO_PAYLOADSIZE 1316, SRTO_MAXBW 0 with SRTO_INPUTBW `inputbw_bytes`
- * (bytes per second, the CBR rate) and SRTO_OHEADBW 25 %, no passphrase.
+ * (bytes per second, the CBR rate) and SRTO_OHEADBW 25 %.
+ *
+ * Through Open Live's SRT relay (`srt+relay://` sources), `host` and `port` are the
+ * relay's public address from the source's `connect` (host, port), `streamid` is
+ * `connect.streamid` (set as SRTO_STREAMID, which the relay pairs on) and
+ * `passphrase` is the one the source was registered with (SRTO_PASSPHRASE, 10 to 79
+ * bytes, with SRTO_PBKEYLEN 16). Both are optional and may be empty: with neither,
+ * the sender dials a plain listener unencrypted, as before. Neither is ever printed.
+ * The passphrase is on the command line, so it is visible to other processes of the
+ * same machine; the measurement generates a new one for every run on a throwaway
+ * runner.
  *
  * Caller mode, dialling until a listener answers: while it is not connected the input is
  * read and discarded, so the encoder upstream stays real time and nothing is sent in a
@@ -115,7 +126,16 @@ static int set_i64(SRTSOCKET s, SRT_SOCKOPT opt, int64_t value, const char *name
     return 0;
 }
 
-static SRTSOCKET dial(const struct sockaddr *addr, socklen_t len, int latency, int64_t inputbw) {
+static int set_str(SRTSOCKET s, SRT_SOCKOPT opt, const char *value, const char *name) {
+    if (srt_setsockflag(s, opt, value, (int)strlen(value)) == SRT_ERROR) {
+        fprintf(stderr, "srt-sender: %s: %s\n", name, srt_getlasterror_str());
+        return -1;
+    }
+    return 0;
+}
+
+static SRTSOCKET dial(const struct sockaddr *addr, socklen_t len, int latency, int64_t inputbw,
+                      const char *streamid, const char *passphrase) {
     SRTSOCKET s = srt_create_socket();
     if (s == SRT_INVALID_SOCK) {
         fprintf(stderr, "srt-sender: create: %s\n", srt_getlasterror_str());
@@ -128,7 +148,10 @@ static SRTSOCKET dial(const struct sockaddr *addr, socklen_t len, int latency, i
         || set_i64(s, SRTO_MAXBW, 0, "SRTO_MAXBW")
         || set_i64(s, SRTO_INPUTBW, inputbw, "SRTO_INPUTBW")
         || set_int(s, SRTO_OHEADBW, 25, "SRTO_OHEADBW")
-        || set_int(s, SRTO_CONNTIMEO, 2000, "SRTO_CONNTIMEO")) {
+        || set_int(s, SRTO_CONNTIMEO, 2000, "SRTO_CONNTIMEO")
+        || (*streamid && set_str(s, SRTO_STREAMID, streamid, "SRTO_STREAMID"))
+        || (*passphrase && (set_str(s, SRTO_PASSPHRASE, passphrase, "SRTO_PASSPHRASE")
+                            || set_int(s, SRTO_PBKEYLEN, 16, "SRTO_PBKEYLEN")))) {
         srt_close(s);
         return SRT_INVALID_SOCK;
     }
@@ -140,16 +163,29 @@ static SRTSOCKET dial(const struct sockaddr *addr, socklen_t len, int latency, i
 }
 
 int main(int argc, char **argv) {
-    if (argc < 3 || argc > 5) {
-        fprintf(stderr, "usage: %s <host> <port> [latency_ms] [inputbw_bytes_per_s]\n", argv[0]);
+    if (argc < 3 || argc > 7) {
+        fprintf(stderr,
+                "usage: %s <host> <port> [latency_ms] [inputbw_bytes_per_s] [streamid] [passphrase]\n",
+                argv[0]);
         return 2;
     }
     const char *host = argv[1];
     const char *port = argv[2];
     int latency = argc > 3 ? atoi(argv[3]) : 200;
     int64_t inputbw = argc > 4 ? strtoll(argv[4], NULL, 10) : (4000000 + 128000) / 8;
+    const char *streamid = argc > 5 ? argv[5] : "";
+    const char *passphrase = argc > 6 ? argv[6] : "";
     if (latency <= 0 || inputbw <= 0) {
         fprintf(stderr, "srt-sender: latency and inputbw must be positive\n");
+        return 2;
+    }
+    if (strlen(streamid) > 512) {
+        fprintf(stderr, "srt-sender: the streamid is longer than SRT's 512 bytes\n");
+        return 2;
+    }
+    size_t plen = strlen(passphrase);
+    if (plen != 0 && (plen < 10 || plen > 79)) {
+        fprintf(stderr, "srt-sender: the passphrase must be 10 to 79 bytes\n");
         return 2;
     }
 
@@ -177,10 +213,11 @@ int main(int argc, char **argv) {
     }
 
     emit("\"event\":\"dialling\",\"latency_ms\":%d,\"payload_size\":%d,\"inputbw\":%" PRId64
-         ",\"oheadbw\":25", latency, PAYLOAD, inputbw);
+         ",\"oheadbw\":25,\"streamid\":%s,\"encrypted\":%s", latency, PAYLOAD, inputbw,
+         *streamid ? "true" : "false", *passphrase ? "true" : "false");
     int connects = 0;
     while (!input_ended) {
-        SRTSOCKET s = dial(res->ai_addr, res->ai_addrlen, latency, inputbw);
+        SRTSOCKET s = dial(res->ai_addr, res->ai_addrlen, latency, inputbw, streamid, passphrase);
         if (s == SRT_INVALID_SOCK) {
             sleep(1);
             continue;

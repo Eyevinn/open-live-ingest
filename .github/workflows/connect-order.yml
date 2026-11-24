@@ -2,12 +2,19 @@ name: Connect order
 
 # The connect-order measurement of OL-64-0 (#136; docs/specs/ios-app.md section 14 Q13
 # and Q8): an SRT caller with the phone defaults of spec section 11, from a macOS
-# runner into an SRT listener source on an Open Live instance (default `openlivedev`),
-# 60 s with the production active first (run A) and 60 s with the caller dialling
-# first (run B), the sender's SRT stats read twice a minute apart, and whether the
-# cloud input decodes. What it does and how: .github/scripts/connect-order.py; the
-# sender: .github/scripts/srt-sender.c. The results go on #133 by hand, from the
-# `comment.md` the run uploads.
+# runner through Open Live's SRT relay into a source on an Open Live instance (default
+# `openlivedev`), 60 s with the production active first (run A) and 60 s with the
+# caller dialling first (run B, also #159's AC2), the sender's SRT stats read twice a
+# minute apart, and whether the cloud input decodes. What it does and how:
+# .github/scripts/connect-order.py; the sender: .github/scripts/srt-sender.c. The
+# results go on #133 and #159 by hand, from the `comment.md` the run uploads.
+#
+# SRT goes through the relay only: each run registers an `srt+relay://auto` source
+# with a generated passphrase and the sender dials the relay's public address from
+# the source's `connect` with its stream id. openlivedev publishes no SRT ports on
+# purpose, so no `srtPorts` and no `srt://:<port>?mode=listener` source are used. An
+# instance whose server-info `srt` block reports no relay fails the run with a
+# message that says so, before anything is created.
 #
 # A measurement, not a check: run by hand only, never on a push, a pull request or a
 # tag, and nothing in the release path depends on it.
