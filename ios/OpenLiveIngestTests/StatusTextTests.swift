@@ -63,4 +63,23 @@ final class StatusTextTests: XCTestCase {
         XCTAssertEqual(StatusText.networkLine(.cellular, bitrateKbps: nil), "Network: Cellular")
         XCTAssertEqual(StatusText.networkLine(nil, bitrateKbps: 0), "Network: unknown")
     }
+
+    /// Through Open Live's SRT relay (#161): the relay and its dial-in address, the passphrase masked.
+    func testTheUplinkLine() {
+        let dialIn = "srt://relay.example.com:6000?streamid=phonerelayid0000000001"
+        XCTAssertNil(StatusText.uplinkLine(nil), "no relay: no line, as before relays")
+        XCTAssertEqual(
+            StatusText.uplinkLine(RelayRoute(name: "default", dialIn: dialIn, encrypted: true)),
+            "Uplink: via relay default to \(dialIn)&passphrase=***")
+        XCTAssertEqual(
+            StatusText.uplinkLine(RelayRoute(name: "eu", dialIn: dialIn, encrypted: false)),
+            "Uplink: via relay eu to \(dialIn)")
+        XCTAssertEqual(StatusText.uplinkLine(RelayRoute(name: "eu", dialIn: nil, encrypted: true)), "Uplink: via relay eu")
+        XCTAssertEqual(
+            StatusText.uplinkLine(RelayRoute(name: "default", dialIn: dialIn + "&passphrase=s3cret-s3cret", encrypted: true)),
+            "Uplink: via relay default to \(dialIn)&passphrase=***")
+        XCTAssertEqual(
+            StatusText.masked("srt://r:1?passphrase=s3cret&streamid=x"), "srt://r:1?passphrase=***&streamid=x")
+        XCTAssertEqual(StatusText.masked("srt://r:1"), "srt://r:1")
+    }
 }

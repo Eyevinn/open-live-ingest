@@ -1,8 +1,8 @@
 import SwiftUI
 
 /// Step 3, "Go live / Stop" (docs/specs/ios-app.md, section 5): one button; the state line; the
-/// status lines (the production holding the source and its slot, the link, the network and the
-/// bitrate); a banner for session-wide notices; and Advanced, collapsed.
+/// status lines (the production holding the source and its slot, the link, through an SRT relay
+/// the relay and its dial-in address, the network and the bitrate); a banner for session-wide notices; and Advanced, collapsed.
 struct GoLiveView: View {
     @ObservedObject var model: AppModel
     @State private var showAdvanced = false
@@ -48,6 +48,10 @@ struct GoLiveView: View {
                         Text(StatusText.linkLine(model.status?.link))
                             .accessibilityValue(StatusText.linkCounters(model.status?.link))
                             .accessibilityIdentifier("linkLine")
+                        if let uplink = StatusText.uplinkLine(model.relay) {
+                            Text(uplink)
+                                .accessibilityIdentifier("uplinkLine")
+                        }
                         Text(StatusText.networkLine(model.network, bitrateKbps: model.bitrateKbps))
                             .accessibilityIdentifier("networkLine")
                     }

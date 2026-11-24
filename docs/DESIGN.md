@@ -173,8 +173,8 @@ itself, so a source recreated mid-run keeps the address the venue dials. Registe
 the id (`auto` keeps it), and a source registered in caller mode by an older gateway is moved with a
 PATCH, keeping its source id. The relay's port is public, so the stream id is no secret: a relay
 link always carries a passphrase, generated and kept in the settings file when the operator set
-none. A phone cannot dial a stream id yet (#161), so its media says so (`Media::dials_relay`) and it
-stays on a port.
+none. The phone goes through the relay too: its own SRT sender sets the stream id on the socket
+before it calls (`Media::dials_relay` is whether a media can).
 
 ## 6. The front ends own what they start
 
