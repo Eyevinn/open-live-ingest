@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Unit tests of the pure parts of connect-order.py (OL-64-0, #136): the listener port,
-the instance lookup, the two stats readings and the interval between them, the
+"""Unit tests of the pure parts of connect-order.py (OL-64-0, #136): the server-info
+`srt` block, the relay choice, the generated passphrase, the relay source address, the
+dial-in from `connect` and the refusals, the instance lookup, the two stats readings and the interval between them, the
 receiving side's summary, the stall verdict and the report. No network:
 
     python3 -I .github/scripts/test_connect_order.py
@@ -25,15 +26,104 @@ def stats(t, sent, dropped, connects=1, rtt=6.0, rate=4.3, nbytes=None, acks=0):
     }
 
 
-class Pure(unittest.TestCase):
-    def test_listener_port_reads_hostless_listener_addresses_only(self):
-        self.assertEqual(co.listener_port("srt://:47100?mode=listener"), 47100)
-        self.assertEqual(co.listener_port("srt://:47100"), 47100)
-        self.assertIsNone(co.listener_port("srt://:0?mode=listener"))
-        self.assertIsNone(co.listener_port("srt://host.example.com:47100?mode=caller"))
-        self.assertIsNone(co.listener_port("srt://:47100x"))
-        self.assertIsNone(co.listener_port(None))
+# The server-info shape of open-live main (src/routes/status.ts) on an instance that
+# takes SRT through the relay only.
+SERVER_INFO = {
+    "stromHost": "strom.example.com",
+    "srtPorts": None,
+    "srtPortState": "disabled",
+    "srt": {
+        "state": "ok",
+        "modes": {"listener": True, "caller": True, "rendezvous": True},
+        "relays": [{"name": "default", "public": "relay.example.com:9000"}],
+        "inboundReachable": None,
+        "ports": None,
+    },
+}
 
+# A created relay source (open-live src/routes/sources.ts toApi, src/lib/srt-connect.ts).
+MADE = {
+    "id": "src-1",
+    "address": "srt+relay://AbCdEfGhIjKlMnOpQrStUv?latency=200&passphrase=***&pbkeylen=16",
+    "connect": {
+        "uri": "srt://relay.example.com:9000?streamid=AbCdEfGhIjKlMnOpQrStUv",
+        "host": "relay.example.com", "port": 9000, "mode": "caller", "source": "srt-relay",
+        "streamid": "AbCdEfGhIjKlMnOpQrStUv", "relay": "default",
+    },
+}
+
+
+class Relay(unittest.TestCase):
+    def test_the_srt_block_is_read(self):
+        srt = co.srt_info(SERVER_INFO)
+        self.assertEqual(srt["state"], "ok")
+        self.assertEqual(srt["relays"], [{"name": "default", "public": "relay.example.com:9000"}])
+        self.assertTrue(srt["modes"]["caller"])
+
+    def test_no_srt_block_is_an_older_open_live(self):
+        self.assertIsNone(co.srt_info({"stromHost": "h", "srtPorts": [47100]}))
+        with self.assertRaisesRegex(co.Failed, "too old"):
+            co.pick_relay(None)
+
+    def test_no_relay_fails_and_says_so(self):
+        srt = co.srt_info({"srt": {"state": "ok", "relays": []}})
+        with self.assertRaisesRegex(co.Failed, r"no SRT relay \(srt.state 'ok', relays \[\]\)"):
+            co.pick_relay(srt)
+
+    def test_malformed_relays_are_skipped(self):
+        srt = co.srt_info({"srt": {"state": "ok", "relays": [{"public": "x:1"}, "y", {"name": "", "public": "z:2"}]}})
+        self.assertEqual(srt["relays"], [])
+
+    def test_the_default_relay_is_picked_else_the_first(self):
+        self.assertEqual(co.pick_relay(co.srt_info(SERVER_INFO)), "default")
+        two = {"srt": {"state": "ok", "relays": [{"name": "eu-north", "public": "a:1"}, {"name": "us", "public": "b:2"}]}}
+        self.assertEqual(co.pick_relay(co.srt_info(two)), "eu-north")
+
+    def test_a_generated_passphrase_meets_the_length_rules_and_is_random(self):
+        a, b = co.generate_passphrase(), co.generate_passphrase()
+        self.assertNotEqual(a, b)
+        for p in (a, b):
+            self.assertTrue(10 <= len(p.encode()) <= 79)
+            self.assertTrue(p.isalnum() and p.isascii())
+        with self.assertRaises(ValueError):
+            co.generate_passphrase(9)
+        with self.assertRaises(ValueError):
+            co.generate_passphrase(80)
+
+    def test_the_relay_address_asks_for_an_id(self):
+        self.assertEqual(
+            co.relay_address("default", "p" * 32),
+            "srt+relay://auto?latency=200&passphrase=" + "p" * 32 + "&pbkeylen=16",
+        )
+        self.assertTrue(co.relay_address("eu-north", "p" * 32).startswith("srt+relay://auto@eu-north?latency=200&"))
+
+    def test_the_caller_dials_connect(self):
+        dial = co.relay_dial(MADE)
+        self.assertEqual(dial["host"], "relay.example.com")
+        self.assertEqual(dial["port"], 9000)
+        self.assertEqual(dial["streamid"], "AbCdEfGhIjKlMnOpQrStUv")
+        self.assertEqual(dial["relay"], "default")
+        self.assertTrue(dial["uri"].startswith("srt://relay.example.com:9000?streamid="))
+
+    def test_a_null_uri_reports_the_reason(self):
+        made = {"id": "src-1", "connect": {"uri": None, "host": None, "port": None, "mode": "caller",
+                                           "source": "srt-relay", "streamid": "x" * 22, "relay": "default",
+                                           "reason": "srt-relay-unreachable"}}
+        with self.assertRaisesRegex(co.Failed, "connect.reason srt-relay-unreachable"):
+            co.relay_dial(made)
+        with self.assertRaisesRegex(co.Failed, "no `connect`"):
+            co.relay_dial({"id": "src-1"})
+
+    def test_a_422_names_the_code_and_the_relays(self):
+        body = {"error": "...", "statusCode": 422, "code": "srt-relay-unknown", "relays": ["eu-north", "us"]}
+        self.assertEqual(co.refusal(422, body), "POST /api/v1/sources failed with HTTP 422: code srt-relay-unknown, relays [eu-north, us]")
+        body = {"error": "...", "statusCode": 422, "code": "srt-relay-not-configured", "relays": []}
+        self.assertIn("code srt-relay-not-configured, relays []", co.refusal(422, body))
+        self.assertEqual(co.refusal(400, {"error": "bad"}), "POST /api/v1/sources failed with HTTP 400")
+        self.assertEqual(co.refusal(422, None), "POST /api/v1/sources failed with HTTP 422")
+
+
+class Pure(unittest.TestCase):
     def test_the_instance_is_found_by_name(self):
         instances = [{"name": "other", "url": "https://a.example.com"}, {"name": "openlivedev", "url": "https://b.example.com"}]
         self.assertEqual(co.find_instance(instances, "openlivedev"), "https://b.example.com")
@@ -115,6 +205,16 @@ class Report(unittest.TestCase):
             "decode": {"reported": True, "resolution": None if stalled else "1280x720", "polls": 30, "polls_reporting": 28},
             "stalled": stalled, "reasons": ["x"] if stalled else [], "over_drop_limit": over or stalled,
         }
+
+    def test_the_comment_names_the_relay_path_and_first_decoded_at(self):
+        meta = {"instance": "openlivedev", "seconds": 60, "sha": "abc123", "cleanup": "done", "relay": "default"}
+        r = self.result("A", False)
+        r["decode"].update({"first_seen_after_active_s": 2.0, "first_seen_after_connect_s": 1.0})
+        text = co.comment([r], meta)
+        self.assertIn("through Open Live's SRT relay `default`", text)
+        self.assertIn("`srt+relay://auto`", text)
+        self.assertIn("first decoded at 1280x720", text)
+        self.assertNotIn("relay.example.com", text)
 
     def test_the_comment_cites_the_gate_only_when_caller_first_stalls(self):
         meta = {"instance": "openlivedev", "seconds": 60, "sha": "abc123", "cleanup": "done"}
