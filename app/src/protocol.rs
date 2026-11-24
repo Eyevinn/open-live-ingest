@@ -163,4 +163,81 @@ mod tests {
             "inline style is refused by the CSP"
         );
     }
+
+    /// The text of the handler the page registers for `event`, from the start of
+    /// its line (the element it is on) up to the `});` that closes it.
+    fn handler(js: &str, event: &str) -> String {
+        let at = js
+            .find(&format!("addEventListener(\"{event}\""))
+            .unwrap_or_else(|| panic!("app.js handles {event}"));
+        let start = js[..at].rfind('\n').map_or(0, |n| n + 1);
+        let end = start + js[start..].find("\n  });").expect("the handler ends");
+        js[start..end].to_string()
+    }
+
+    /// The body of `function name`, up to the `}` that closes it at the left margin.
+    fn function(js: &str, name: &str) -> String {
+        let start = js
+            .find(&format!("function {name}("))
+            .unwrap_or_else(|| panic!("app.js has {name}"));
+        let end = start + js[start..].find("\n}\n").expect("the function ends");
+        js[start..end].to_string()
+    }
+
+    /// Every element the script looks up by a literal id is in the page.
+    #[test]
+    fn every_id_the_script_uses_is_in_the_page() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let html = std::str::from_utf8(INDEX_HTML).unwrap();
+        let used: Vec<&str> = js
+            .match_indices("byId(\"")
+            .map(|(at, open)| {
+                let rest = &js[at + open.len()..];
+                &rest[..rest.find('"').unwrap()]
+            })
+            .collect();
+        assert!(used.contains(&"go-passphrase"), "{used:?}");
+        for id in used {
+            assert!(
+                html.contains(&format!("id=\"{id}\"")),
+                "no #{id} in index.html"
+            );
+        }
+    }
+
+    /// The library says `passphrase` before `uplink` (OL-66): each has its own line,
+    /// so the relay line does not overwrite the passphrase one. Go live clears both.
+    #[test]
+    fn the_relay_and_passphrase_lines_do_not_overwrite_each_other() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let uplink = handler(js, "oli:uplink");
+        let passphrase = handler(js, "oli:passphrase");
+        assert!(uplink.contains("byId(\"go-uplink\")"), "{uplink}");
+        assert!(!uplink.contains("go-passphrase"), "{uplink}");
+        assert!(
+            passphrase.contains("byId(\"go-passphrase\")"),
+            "{passphrase}"
+        );
+        assert!(!passphrase.contains("go-uplink"), "{passphrase}");
+        let go_live = function(js, "goLive");
+        assert!(
+            go_live.contains("\"go-uplink\", \"go-passphrase\""),
+            "{go_live}"
+        );
+    }
+
+    /// Advanced asks Open Live for the relays again whenever it opens, by its own
+    /// summary or by the Advanced action of a failure (an unknown relay): the list
+    /// from when the window opened may be gone.
+    #[test]
+    fn opening_advanced_reloads_the_relays() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let toggle = handler(js, "toggle");
+        assert!(toggle.contains("byId(\"advanced\")"), "{toggle}");
+        assert!(toggle.contains("loadRelays()"), "{toggle}");
+        // Already open: setting `open` fires no toggle, so the action asks itself.
+        let open = function(js, "openAdvanced");
+        assert!(open.contains("loadRelays()"), "{open}");
+        assert!(js.contains("advanced: { label: \"Advanced\", run: () => openAdvanced() }"));
+    }
 }
