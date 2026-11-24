@@ -7,18 +7,33 @@ docs/specs/ios-app.md section 14 Q13 and Q8). Run by the `connect-order` workflo
 
 Does a caller that dials before the production holding its source is active stall the
 way Eyevinn/strom#1277 does, and what do drops, RTT and send rate look like at the
-phone defaults (spec section 11)? Two runs, each with its own SRT listener source:
+phone defaults (spec section 11)? Two runs, each with its own SRT source through
+Open Live's SRT relay:
 
   A, production first: the production is activated, and once Open Live says it is
      `active` the caller connects.
   B, caller first: the caller dials, CO_CALLER_LEAD seconds (default 30, never under
-     10) go by with nothing listening, then the production is activated.
+     10) go by with the cloud Strom not yet calling the relay (nothing to pair the
+     caller with), then the production is activated. This is also #159's AC2, the
+     late connect through the relay.
 
 The sender is ffmpeg (test pattern and a tone: 1280x720 at 30 fps, H.264 High, CBR
 4000 kbps, a keyframe every 30 frames, no B-frames, AAC-LC 48 kHz stereo 128 kbps,
 MPEG-TS) piped into srt-sender (.github/scripts/srt-sender.c, libsrt with the phone's
 socket options: caller, latency 200, payload size 1316, SRTO_INPUTBW at the CBR rate,
 SRTO_OHEADBW 25 %), which prints libsrt's sender stats once a second.
+
+The SRT path is the relay, and only the relay: openlivedev publishes no SRT ports on
+purpose (it takes SRT through one public relay port, paired by stream id), so a
+`srt://:<port>?mode=listener` source is refused there. Each run's source is registered
+as `srt+relay://auto?latency=200&passphrase=<generated>&pbkeylen=16` (`auto@<relay>`
+when Open Live reports relays but none called `default`); Open Live generates the
+stream id and answers with `connect` (`uri`, `host`, `port`, `streamid`, `relay`), and
+srt-sender dials `connect.host`:`connect.port` in caller mode with SRTO_STREAMID set to
+`connect.streamid` and the same passphrase. The cloud Strom dials the relay from the
+inside with the same stream id once the production is active, and the relay pairs the
+two. The passphrase is generated per run (32 letters and digits from the OS random
+source, inside Open Live's 10 to 80 bytes and libsrt's 10 to 79).
 
 In each run the sender stats are read twice, CO_SECONDS apart (default 60, never
 under 60): 1 s after the connect and CO_SECONDS later. Each reading gives bytes and
@@ -38,8 +53,10 @@ per-second stats are kept for the reader to judge.
 Open Live calls (spec section 6): the OSC catalog (`mysubscriptions`, the
 eyevinn-open-live `apiUrl`) and a service token from OSC_ACCESS_TOKEN, the instance
 named OPEN_LIVE_INSTANCE (default openlivedev) from the instance list,
-`GET /api/v1/server-info` (stromHost, srtPorts), `POST /api/v1/sources` with
-`srt://:0?mode=listener` (Open Live picks the port from the ones it holds),
+`GET /api/v1/server-info` (stromHost and the `srt` block: `state`, `modes`,
+`relays[]` of `{name, public}`; no relay there is a failure that names it),
+`POST /api/v1/sources` with the relay address above (a null `connect.uri` is reported
+with its `connect.reason`, a 422 with its `code` and `relays`),
 `POST /api/v1/productions` and `/sources` (the source on video_in_0),
 `POST .../activate` and `.../deactivate`, `GET /api/v1/productions/<id>`, and
 `DELETE` of both at the end. Whatever happens, the exit path deactivates and deletes
@@ -51,14 +68,17 @@ the per-second stats included), `report.md` (also appended to the step summary) 
 `comment.md` (a draft of the comment for #133). Exits 1 when a run could not be
 completed; a stall or drops above 1 % are results, not failures.
 
-Python standard library only. The OSC token, the service token, the instance address
-and the cloud Strom's host are masked in the log as soon as they are known; no
-response body is printed. The pure parts are unit tested:
+Python standard library only. The OSC token, the service token, the instance address,
+the cloud Strom's host, the relay's public address, the stream id and the passphrase
+are masked in the log as soon as they are known, and none of the last three is
+written to the results; no response body is printed. The pure parts are unit tested:
 `python3 -I .github/scripts/test_connect_order.py`.
 """
 
 import json
 import os
+import secrets
+import string
 import subprocess
 import sys
 import threading
@@ -73,6 +93,14 @@ PREFIX = "oli-connect-order-"
 MIXER_INPUT = "video_in_0"
 MIXER_INDEX = 0
 LATENCY_MS = 200
+DEFAULT_RELAY = "default"
+# A generated passphrase: letters and digits (no escaping in a URI), inside Open
+# Live's 10 to 80 bytes (src/lib/url-validation.ts) and libsrt's 10 to 79.
+PASSPHRASE_ALPHABET = string.ascii_letters + string.digits
+PASSPHRASE_LEN = 32
+PASSPHRASE_MIN = 10
+PASSPHRASE_MAX = 79
+PBKEYLEN = 16
 VIDEO_KBPS = 4000
 AUDIO_KBPS = 128
 # What SRTO_INPUTBW is set to: the CBR rate, in bytes per second (spec section 11).
@@ -125,7 +153,8 @@ def mask_url(url):
 
 def http(method, url, headers=None, body=None, timeout=30):
     """(status, parsed JSON or None). Never raises for an HTTP status, never prints a
-    body."""
+    body. The body of an error status is parsed too, for the callers that read a
+    refusal's fields (a 422's `code` and `relays`)."""
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method, headers=headers or {})
     if data is not None:
@@ -135,7 +164,11 @@ def http(method, url, headers=None, body=None, timeout=30):
             raw = response.read()
             status = response.status
     except urllib.error.HTTPError as err:
-        return err.code, None
+        try:
+            raw = err.read()
+            return err.code, json.loads(raw) if raw else None
+        except (OSError, ValueError):
+            return err.code, None
     except (urllib.error.URLError, TimeoutError, OSError) as err:
         return 0, {"_transport_error": type(err).__name__}
     try:
@@ -147,23 +180,86 @@ def http(method, url, headers=None, body=None, timeout=30):
 # --- pure parts (unit tested) ----------------------------------------------------------
 
 
-def listener_port(address):
-    """The port of a hostless listener address, as src/openlive.rs reads it:
-    `srt://:47100?mode=listener` gives 47100; anything else, or port 0, None."""
-    rest = str(address or "").strip()
-    if not rest.startswith("srt://:"):
+def srt_info(info):
+    """The `srt` block of server-info (open-live src/routes/status.ts), normalised:
+    `state`, `modes`, `relays` (a list of `{name, public}`). None when the block is
+    absent, which is an Open Live older than relays."""
+    srt = info.get("srt") if isinstance(info, dict) else None
+    if not isinstance(srt, dict):
         return None
-    rest = rest[len("srt://:"):]
-    digits = ""
-    for c in rest:
-        if not c.isdigit():
-            break
-        digits += c
-    after = rest[len(digits):]
-    if not digits or not (after == "" or after.startswith("?")):
-        return None
-    port = int(digits)
-    return port if 0 < port < 65536 else None
+    relays = []
+    for item in srt.get("relays") if isinstance(srt.get("relays"), list) else []:
+        if isinstance(item, dict) and isinstance(item.get("name"), str) and item["name"]:
+            relays.append({"name": item["name"], "public": str(item.get("public") or "")})
+    modes = srt.get("modes") if isinstance(srt.get("modes"), dict) else None
+    return {"state": srt.get("state"), "modes": modes, "relays": relays}
+
+
+def pick_relay(srt):
+    """The relay to register through: `default` when Open Live reports it, else the
+    first it reports (it lists `default` first). Fails when there is none."""
+    if srt is None:
+        fail(
+            "Open Live's server-info has no `srt` block, so it is too old to send through an SRT relay; "
+            "the measurement needs the relay (the instance publishes no SRT ports)"
+        )
+    names = [r["name"] for r in srt["relays"]]
+    if not names:
+        fail(
+            f"Open Live reports no SRT relay (srt.state '{srt.get('state')}', relays []); the measurement "
+            "sends through the relay only, as the instance publishes no SRT ports, so nothing was measured"
+        )
+    return DEFAULT_RELAY if DEFAULT_RELAY in names else names[0]
+
+
+def generate_passphrase(length=PASSPHRASE_LEN):
+    """A fresh SRT passphrase from the OS random source: letters and digits."""
+    if not PASSPHRASE_MIN <= length <= PASSPHRASE_MAX:
+        raise ValueError(f"an SRT passphrase is {PASSPHRASE_MIN} to {PASSPHRASE_MAX} bytes")
+    return "".join(secrets.choice(PASSPHRASE_ALPHABET) for _ in range(length))
+
+
+def relay_address(relay, passphrase, latency=LATENCY_MS):
+    """The source address that asks Open Live for a relay stream id: the default relay
+    is written without `@`, as Open Live writes it (src/lib/srt-relay.ts)."""
+    at = "" if relay == DEFAULT_RELAY else f"@{relay}"
+    return f"srt+relay://auto{at}?latency={latency}&passphrase={passphrase}&pbkeylen={PBKEYLEN}"
+
+
+REASONS = {
+    "srt-relay-not-configured": "Open Live's Strom reports no SRT relay",
+    "srt-relay-unknown": "Open Live's Strom has no SRT relay of that name",
+    "srt-relay-unreachable": "Open Live could not ask its Strom about the relay; try again shortly",
+    "srt-relay-public-unknown": "Open Live's Strom reports the relay without a usable public address",
+}
+
+
+def relay_dial(made):
+    """Where the caller dials, from the created source's `connect` (open-live
+    src/lib/srt-connect.ts): `uri`, `host`, `port`, `streamid`, `relay`. Fails with
+    `connect.reason` when `uri` is null."""
+    connect = (made or {}).get("connect") if isinstance(made, dict) else None
+    if not isinstance(connect, dict):
+        fail("Open Live returned no `connect` for the relay source, so there is no address to dial")
+    relay = connect.get("relay") or DEFAULT_RELAY
+    if not connect.get("uri"):
+        reason = connect.get("reason")
+        text = REASONS.get(reason, "Open Live gave no reason")
+        fail(f"Open Live gave no dial-in address for relay '{relay}': connect.reason {reason or 'absent'} ({text})")
+    host, port, streamid = connect.get("host"), connect.get("port"), connect.get("streamid")
+    if not host or not isinstance(port, int) or not 0 < port < 65536 or not streamid:
+        fail("Open Live's `connect` for the relay source lacks host, port or streamid")
+    return {"uri": str(connect["uri"]), "host": str(host), "port": port, "streamid": str(streamid), "relay": relay}
+
+
+def refusal(status, body):
+    """The words for a refused source POST: a relay 422 (open-live
+    src/services/srt-address-write.ts) names its `code` and `relays`."""
+    text = f"POST /api/v1/sources failed with HTTP {status}"
+    if status == 422 and isinstance(body, dict) and body.get("code"):
+        relays = body.get("relays") if isinstance(body.get("relays"), list) else []
+        text += f": code {body['code']}, relays [{', '.join(str(r) for r in relays)}]"
+    return text
 
 
 def find_instance(instances, name):
@@ -320,7 +416,11 @@ def report(results, meta):
         f"## Connect-order measurement (OL-64-0) against `{meta['instance']}`",
         "",
         f"Run: {meta.get('run_url', 'local')}. Sender: ffmpeg {meta.get('ffmpeg', '?')} into srt-sender "
-        f"(libsrt {meta.get('libsrt', '?')}) on {meta.get('runner', '?')}. Phone defaults (spec §11): "
+        f"(libsrt {meta.get('libsrt', '?')}) on {meta.get('runner', '?')}. SRT path: through Open Live's SRT "
+        f"relay `{meta.get('relay', '?')}`: each run's source is `srt+relay://auto` with a generated passphrase "
+        f"(pbkeylen {PBKEYLEN}), the caller dials the relay's public address from `connect.uri` with "
+        f"SRTO_STREAMID set to `connect.streamid`, and the cloud Strom calls the same relay; no SRT port is "
+        f"used. Phone defaults (spec §11): "
         f"1280x720 30 fps, H.264 High CBR {VIDEO_KBPS} kbps, keyframe every 30 frames, no B-frames, "
         f"AAC-LC 48 kHz stereo {AUDIO_KBPS} kbps, MPEG-TS; SRT caller, latency {LATENCY_MS} ms, payload 1316, "
         f"SRTO_INPUTBW {INPUT_BW} B/s, SRTO_OHEADBW 25 %. Readings {meta['seconds']} s apart.",
@@ -348,9 +448,10 @@ def report(results, meta):
         )
         if d.get("reported"):
             out.append(
-                f"- Receiving side (`inputResolutions[{MIXER_INDEX}]`): first decoded "
+                f"- Receiving side (`inputResolutions[{MIXER_INDEX}]`, the mixer's negotiated resolution): "
+                f"first decoded at {d.get('resolution') or 'n/a'}, "
                 f"{num(d.get('first_seen_after_active_s'))} s after `active` / "
-                f"{num(d.get('first_seen_after_connect_s'))} s after the connect, at {d.get('resolution') or 'n/a'}; "
+                f"{num(d.get('first_seen_after_connect_s'))} s after the connect; "
                 f"decoding in {pct(d.get('decoding_share_after_connect'))} of the looks after the connect; "
                 f"longest gap after the first frame {num(d.get('longest_gap_after_first_s'))} s "
                 f"({d.get('polls_reporting')} of {d.get('polls')} looks carried the field)."
@@ -471,26 +572,36 @@ class OpenLive:
         if not host:
             fail("Open Live reported no stromHost in server-info")
         mask(host)
-        return {"stromHost": host, "srtPorts": info.get("srtPorts"), "srtPortState": info.get("srtPortState")}
+        srt = srt_info(info)
+        for relay in (srt or {}).get("relays", []):
+            mask(relay["public"])
+            mask(relay["public"].rsplit(":", 1)[0])
+        return {"stromHost": host, "srt": srt}
 
-    def create_source(self, name):
+    def create_source(self, name, relay):
+        """Registers a relay source; (source id, where the caller dials, passphrase)."""
+        passphrase = generate_passphrase()
+        mask(passphrase)
         body = {
             "name": name,
-            "address": "srt://:0?mode=listener",
+            "address": relay_address(relay, passphrase),
             "streamType": "srt",
             "status": "active",
             "latency": LATENCY_MS,
             "liveCamera": True,
         }
-        made = self.call("POST", "/api/v1/sources", body)
-        source_id = (made or {}).get("_id") or (made or {}).get("id")
+        status, made = http("POST", f"{self.url}/api/v1/sources", self.bearer(), body)
+        if status not in (200, 201):
+            fail(refusal(status, made))
+        source_id = (made or {}).get("id") or (made or {}).get("_id")
         if not source_id:
             fail("Open Live created a source but returned no id")
         self.sources_made.append(source_id)
-        port = listener_port((made or {}).get("address"))
-        if port is None:
-            fail("Open Live gave the source no listener port")
-        return source_id, port
+        connect = (made or {}).get("connect") if isinstance(made, dict) else None
+        for key in ("streamid", "uri", "host"):
+            if isinstance(connect, dict) and connect.get(key):
+                mask(str(connect[key]))
+        return source_id, relay_dial(made), passphrase
 
     def create_production(self, name, source_id):
         made = self.call("POST", "/api/v1/productions", {"name": name})
@@ -594,7 +705,7 @@ def ffmpeg_args(ffmpeg):
 
 
 class Sender:
-    def __init__(self, host, port, work, run):
+    def __init__(self, dial, passphrase, work, run):
         self.lines = []
         self.lock = threading.Lock()
         self.connected = threading.Event()
@@ -604,7 +715,7 @@ class Sender:
         sender = os.environ.get("CO_SENDER", os.path.join(work, "srt-sender"))
         self.encoder = subprocess.Popen(ffmpeg_args(ffmpeg), stdout=subprocess.PIPE, stderr=self.ffmpeg_log, stdin=subprocess.DEVNULL, env=child_env())
         self.sender = subprocess.Popen(
-            [sender, host, str(port), str(LATENCY_MS), str(INPUT_BW)],
+            [sender, dial["host"], str(dial["port"]), str(LATENCY_MS), str(INPUT_BW), dial["streamid"], passphrase],
             stdin=self.encoder.stdout, stdout=subprocess.PIPE, stderr=self.sender_log, text=True, env=child_env(),
         )
         self.encoder.stdout.close()
@@ -690,10 +801,11 @@ def wait_for(predicate, timeout, what, alive=lambda: None):
     fail(f"{what} within {timeout} s")
 
 
-def measure(ol, cloud, run, name, seconds, lead, work):
+def measure(ol, relay, run, name, seconds, lead, work):
     result = {"run": run, "order": RUNS[run]}
-    source_id, port = ol.create_source(f"{name}-{run} — Test pattern")
-    say(f"run {run}: source {source_id} listens on SRT port {port}")
+    source_id, dial, passphrase = ol.create_source(f"{name}-{run} — Test pattern", relay)
+    result["relay"] = dial["relay"]
+    say(f"run {run}: source {source_id} goes through SRT relay '{dial['relay']}'; the caller dials it with the stream id")
     production_id = ol.create_production(f"{name}-{run} — production", source_id)
     sender = None
     poller = None
@@ -704,10 +816,10 @@ def measure(ol, cloud, run, name, seconds, lead, work):
             ol.activate(production_id)
             active = time.time() * 1000
             say(f"run A: production active after {(active - asked) / 1000:.1f} s; the caller dials now")
-            sender = Sender(cloud, port, work, run)
+            sender = Sender(dial, passphrase, work, run)
             connected = wait_for(sender.first_connect, CONNECT_TIMEOUT, "the caller did not connect", sender.check_alive)
         else:
-            sender = Sender(cloud, port, work, run)
+            sender = Sender(dial, passphrase, work, run)
             say(f"run B: the caller dials; the production is activated in {lead} s")
             time.sleep(lead)
             sender.check_alive()
@@ -820,13 +932,19 @@ def main():
         ol.resolve(instance)
         say(f"instance '{instance}' found")
         info = ol.server_info()
-        say(f"server-info: srtPortState {info['srtPortState']}, {len(info['srtPorts'] or [])} SRT ports")
+        srt = info["srt"]
+        if srt is not None:
+            names = ", ".join(r["name"] for r in srt["relays"]) or "none"
+            say(f"server-info: srt.state {srt.get('state')}, relays: {names}")
+        relay = pick_relay(srt)
+        meta["relay"] = relay
+        say(f"sending through SRT relay '{relay}'")
         left = ol.sweep()
         if left:
             say(f"removed {left} production(s)/source(s) left by an earlier run")
         for run in runs:
             try:
-                results.append(measure(ol, info["stromHost"], run, name, seconds, lead, work))
+                results.append(measure(ol, relay, run, name, seconds, lead, work))
             except Failed as err:
                 say(f"run {run} failed: {err}")
                 results.append({"run": run, "order": RUNS[run], "error": str(err)})
