@@ -127,7 +127,9 @@ jobs:
 
       - name: Run late / first / nosync
         run: |
-          set -uo pipefail
+          # No errexit (the default shell runs `bash -e`): a run that FAILs exits 1,
+          # and the next runs must still go.
+          set +e -uo pipefail
           out="$RUNNER_TEMP/late-connect"
           mkdir -p "$out"
           bin="target/debug/examples/late_connect"
@@ -164,6 +166,8 @@ jobs:
 
       - name: Results
         if: always()
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/late-connect"
@@ -174,7 +178,7 @@ jobs:
           {
             echo "## Late connect (Strom receiver), #111 / strom#1277"
             echo
-            echo "Strom ${STROM_TAG:-unknown} (strom-types pin) on both ends, sender :$SENDER_STROM_PORT, receiver :$RECEIVER_STROM_PORT, window 60 s, commit \`$GITHUB_SHA\`."
+            echo "Strom ${STROM_TAG:-unknown} (strom-types pin) on both ends, sender :$SENDER_STROM_PORT, receiver :$RECEIVER_STROM_PORT, window 60 s, commit \`$HEAD_SHA\`."
             echo
             echo "| run | arguments | expected | result |"
             echo "|---|---|---|---|"
