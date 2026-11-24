@@ -77,6 +77,24 @@
 //! | `--listener-delay 0`, `sync: true` | PASS: 0 dropped |
 //! | `--listener-delay 35 --receiver-sync false` | PASS: 0 dropped |
 //!
+//! `--restart-on-late-connect` tries the ingest-side workaround that #111's
+//! 2026-11-24 triage proposed for `up` (not shipped): it looks for the uplink's peer
+//! every `CONNECT_POLL` (1 s), and when the first peer appears more than
+//! `LATE_CONNECT_AFTER` (5 s) after the flow started, it stops and starts the flow
+//! once, so the caller connects again into the receiver that is now running. The
+//! window and its counters then start at that second connect. Measured with the
+//! Strom receiver (PR #170, late-connect run 45480983729, Strom 0.8.2 on both ends),
+//! and expected until a Strom release fixes strom#1277:
+//!
+//! | run | expected |
+//! |---|---|
+//! | `--listener-delay 35 --restart-on-late-connect`, `sync: true` | FAIL: the restart connects about 1 s after the receiver came up and stalls it the same way (0 dropped at +10 s, about 28 % at +20 s, 52 % at +30 s), until the caller reconnects on its own between +30 and +40 s (31-41 s after the receiver came up) |
+//!
+//! So the stall depends on how long the receiver has been running when the caller
+//! connects, not on how long the caller has been dialling, and an immediate restart
+//! does not avoid it. That is why `up` has no such restart; #127's stall restart
+//! covers the later window.
+//!
 //! With the default `srt-live-transmit` receiver both the late run and the control
 //! pass (0 dropped, #120 and the Mac run on #111). With a Strom carrying the
 //! strom#1277 fix, the first row must PASS: that is the after-fix half of AC1, run
@@ -89,7 +107,8 @@
 //! `srt-live-transmit`), `--receiver-strom <url>` (default `--strom`, or
 //! `OLI_RECEIVER_STROM_URL`), `--receiver-sync <true|false>` (default true),
 //! `--out <file>` (default a file in the temp dir; `srt-live-transmit` only),
-//! `--keep` to leave the flows in Strom afterwards. `OLI_STROM_API_KEY` is sent when
+//! `--keep` to leave the flows in Strom afterwards, `--restart-on-late-connect` (see
+//! above). `OLI_STROM_API_KEY` is sent when
 //! set, to the receiving Strom too unless `OLI_RECEIVER_STROM_API_KEY` is set.
 
 use anyhow::{bail, Context, Result};
@@ -114,6 +133,11 @@ const RECEIVER_LATENCY_MS: u64 = 125;
 const MAX_DROP_RATIO: f64 = 0.01;
 /// How long to wait for the uplink to report a peer once the listener is up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// `--restart-on-late-connect`: how often the peer is looked for while dialling.
+const CONNECT_POLL: Duration = Duration::from_secs(1);
+/// `--restart-on-late-connect`: a first peer later than this after the flow started
+/// counts as a late connect and restarts the flow once.
+const LATE_CONNECT_AFTER: Duration = Duration::from_secs(5);
 /// Time between two samples of the uplink's counters.
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 /// How far a Strom receiver sink's PTS may fall behind the wall time between its first
@@ -149,6 +173,7 @@ struct Options {
     receiver: ReceiverKind,
     receiver_strom: Option<String>,
     receiver_sync: bool,
+    restart_on_late_connect: bool,
 }
 
 impl Options {
@@ -169,6 +194,7 @@ fn options() -> Result<Options> {
         receiver: ReceiverKind::SrtLiveTransmit,
         receiver_strom: std::env::var("OLI_RECEIVER_STROM_URL").ok(),
         receiver_sync: true,
+        restart_on_late_connect: false,
     };
     // --receiver-strom and --receiver-sync given without --receiver strom.
     let mut strom_receiver_option = false;
@@ -188,6 +214,7 @@ fn options() -> Result<Options> {
             "--window" => o.window = Duration::from_secs(value()?.parse().context("--window")?),
             "--out" => o.out = value()?.into(),
             "--keep" => o.keep = true,
+            "--restart-on-late-connect" => o.restart_on_late_connect = true,
             "--receiver" => {
                 o.receiver = match value()?.as_str() {
                     "srt-live-transmit" => ReceiverKind::SrtLiveTransmit,
@@ -310,7 +337,40 @@ async fn main() -> Result<ExitCode> {
             );
         }
 
-        let first = wait_for_peer(&strom, &id).await?;
+        // With the proposed workaround, the peer is looked for every CONNECT_POLL, and
+        // a late first peer restarts the flow once.
+        let poll = if o.restart_on_late_connect {
+            CONNECT_POLL
+        } else {
+            Duration::from_millis(250)
+        };
+        let mut first = wait_for_peer(&strom, &id, poll).await?;
+        if o.restart_on_late_connect {
+            let dialled = started.elapsed();
+            if dialled > LATE_CONNECT_AFTER {
+                sample("late peer", &first);
+                println!(
+                    "late connect: first peer {:.1} s after the flow started (over {} s), restarting the uplink once",
+                    dialled.as_secs_f64(),
+                    LATE_CONNECT_AFTER.as_secs()
+                );
+                strom.stop_flow(&id).await?;
+                if !strom.start_flow(&id).await? {
+                    bail!("Strom did not start the flow again after the late connect");
+                }
+                let restarted = Instant::now();
+                first = wait_for_peer(&strom, &id, poll).await?;
+                println!(
+                    "late connect: connected again {:.1} s after the restart",
+                    restarted.elapsed().as_secs_f64()
+                );
+            } else {
+                println!(
+                    "first peer {:.1} s after the flow started, in time: no restart",
+                    dialled.as_secs_f64()
+                );
+            }
+        }
         let connected = Instant::now();
         sample("connected", &first);
         let mut samples = vec![("connected".to_string(), totals(&first))];
@@ -691,7 +751,7 @@ async fn last_pts(client: &StromClient, rx_id: &FlowId, sink: &str) -> Result<Op
     Ok(Some(pts.trim().to_string()))
 }
 
-async fn wait_for_peer(strom: &StromClient, id: &FlowId) -> Result<SrtCallerStats> {
+async fn wait_for_peer(strom: &StromClient, id: &FlowId, poll: Duration) -> Result<SrtCallerStats> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         // The caller entry appears before its counters do.
@@ -706,7 +766,7 @@ async fn wait_for_peer(strom: &StromClient, id: &FlowId) -> Result<SrtCallerStat
                 CONNECT_TIMEOUT.as_secs()
             );
         }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        tokio::time::sleep(poll).await;
     }
 }
 
