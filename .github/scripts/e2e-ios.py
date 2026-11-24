@@ -17,9 +17,11 @@ not the app (the simulator shares the host's loopback), runs the test with
      field. The token never reaches the test: this script puts OSC_ACCESS_TOKEN on the
      simulator's pasteboard (`xcrun simctl pbcopy`, the token on stdin) just before the
      paste and empties the pasteboard right after. Then the instance named
-     OPEN_LIVE_INSTANCE (default openlivedev) is picked, and the test pattern, with a
-     label unique to the run (`oli-ios-e2e-<run id>-<attempt>`), so the source is
-     `<venue> — <label>`.
+     OPEN_LIVE_INSTANCE (default openlivedev) is picked: the test taps it in the app's
+     list when the workspace has two or more instances; when it is the workspace's only
+     one the app picks it itself and the test finds `Sending to <instance>` already
+     showing. Then the test pattern, with a label unique to the run
+     (`oli-ios-e2e-<run id>-<attempt>`), so the source is `<venue> — <label>`.
   2. Go live with no production: the app says Armed, the source is registered in Open
      Live, and nothing is sent for ARMED_HOLD seconds: the link line says
      `Link: not sending`, it carries no SRT counters and the source is not `active` (AC2).
@@ -1159,6 +1161,42 @@ def env_int(name, default, floor):
     return value
 
 
+def empty_pasteboard(session):
+    """Empties the simulator's pasteboard at cleanup, so the PAT is not left on it. A pbcopy
+    that fails is tried once more, after `simctl bootstatus -b` has waited for the simulator
+    (which xcodebuild may have left mid-shutdown or not yet booted). Returns None, or the
+    problem with the reason; that reason is a Failed from `Session.pasteboard`, which never
+    names the text or what pbcopy said."""
+    try:
+        session.pasteboard("")
+        return None
+    except Failed as err:
+        say(f"emptying the simulator's pasteboard failed ({err}); waiting for the simulator and trying once more")
+    try:
+        subprocess.run(["xcrun", "simctl", "bootstatus", session.udid, "-b"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=WARM_PASTEBOARD)
+    except (subprocess.TimeoutExpired, OSError) as err:
+        say(f"simctl bootstatus did not finish ({type(err).__name__})")
+    try:
+        session.pasteboard("")
+        return None
+    except Failed as err:
+        return f"the simulator's pasteboard could not be emptied ({err})"
+
+
+def cleanup_text(touched, unremoved, other):
+    """The report's cleanup line: what could not be removed from Open Live (`unremoved`,
+    names), then any other problem (`other`, whole phrases), or what was done when nothing
+    went wrong. `touched` is whether the run reached Open Live at all."""
+    parts = []
+    if unremoved:
+        parts.append(f"could not remove {', '.join(unremoved)}")
+    parts.extend(other)
+    if parts:
+        return "; ".join(parts)
+    return "the test production and source were deactivated and deleted" if touched else "nothing was created"
+
+
 def simulator():
     listing = json.loads(subprocess.run(["xcrun", "simctl", "list", "devices", "available", "--json"],
                                         capture_output=True, text=True, check=True).stdout)
@@ -1219,7 +1257,6 @@ def run():
     session = None
     server = None
     code = 1
-    cleanup = "nothing was created"
     try:
         ol.resolve(instance)
         say(f"instance '{instance}' found")
@@ -1248,32 +1285,29 @@ def run():
         print(f"::error title=e2e ios::{err}", flush=True)
         code = 1
     finally:
-        problems = []
+        unremoved, other = [], []
         if session is not None:
             session.stopping.set()
             session.stop_meters()
-            try:
-                session.pasteboard("")
-            except Failed:
-                problems.append("the simulator's pasteboard could not be emptied")
+            problem = empty_pasteboard(session)
+            if problem:
+                other.append(problem)
         if server is not None:
             server.shutdown()
         if ol.url:
             try:
                 if session is not None and session.production_id:
                     if not ol.remove_production(session.production_id):
-                        problems.append(f"production {session.production_id}")
+                        unremoved.append(f"production {session.production_id}")
                 for s in ours(ol.sources(), label):
                     if not ol.remove_source(s["id"]):
-                        problems.append(f"source {s['id']}")
+                        unremoved.append(f"source {s['id']}")
                 if any(ours(ol.sources(), label)):
-                    problems.append("a source of the run is still listed")
-                cleanup = ("the test production and source were deactivated and deleted"
-                           if not problems else f"could not remove {', '.join(problems)}")
+                    other.append("a source of the run is still listed")
             except Failed as err:
-                cleanup = f"could not finish: {err}"
-                problems.append(cleanup)
-        if problems:
+                other.append(f"could not finish: {err}")
+        cleanup = cleanup_text(bool(ol.url), unremoved, other)
+        if unremoved or other:
             print(f"::error title=e2e ios::cleanup: {cleanup}", flush=True)
             code = 1
 

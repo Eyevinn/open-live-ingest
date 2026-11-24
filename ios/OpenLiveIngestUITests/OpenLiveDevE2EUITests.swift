@@ -212,16 +212,37 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let enabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: use)
         XCTAssertEqual(XCTWaiter().wait(for: [enabled], timeout: 10), .completed, "nothing was pasted into the token field")
         use.tap()
+        // With two or more instances in the workspace the app lists them; with one it picks it
+        // itself (mobile/src/core.rs `signed_in`) and shows the summary straight away.
         let pick = app.buttons["instance \(instance)"]
-        let listed = pick.waitForExistence(timeout: 90)
-        if !listed, app.staticTexts["problem"].exists {
-            try verify(false, "PAT sign-in", "the app says: \(app.staticTexts["problem"].label)")
+        let summary = app.staticTexts["whereSummary"]
+        let problem = app.staticTexts["problem"]
+        enum SignedIn { case listed, picked, problem }
+        let signedIn = poll(90) { () -> SignedIn? in
+            if pick.exists { return .listed }
+            if summary.exists, summary.label.hasPrefix("Sending to \(instance)") { return .picked }
+            if problem.exists { return .problem }
+            return nil
         }
-        try verify(listed, "PAT sign-in", "the token was taken and the workspace's instances listed, '\(instance)' among them")
-        shot("1 instances")
-        pick.tap()
-        wait(app.staticTexts["whereSummary"], "label BEGINSWITH %@", "Sending to \(instance)", within: 30)
-        try verify(true, "instance pick", app.staticTexts["whereSummary"].label)
+        switch signedIn {
+        case .listed?:
+            try verify(true, "PAT sign-in", "the token was taken and the workspace's instances listed, '\(instance)' among them")
+            shot("1 instances")
+            pick.tap()
+        case .picked?:
+            try verify(
+                true, "PAT sign-in",
+                "the token was taken; '\(instance)' is the workspace's only Open Live instance and was picked by the app")
+            shot("1 instances")
+        case .problem?:
+            try verify(false, "PAT sign-in", "the app says: \(problem.label)")
+        case nil:
+            try verify(
+                false, "PAT sign-in",
+                "neither the instance list with '\(instance)' nor 'Sending to \(instance)' showed within 90 s")
+        }
+        wait(summary, "label BEGINSWITH %@", "Sending to \(instance)", within: 30)
+        try verify(true, "instance pick", summary.label)
         app.buttons["toWhat"].tap()
 
         // What to send: the test pattern (no camera on a simulator), the run's label.

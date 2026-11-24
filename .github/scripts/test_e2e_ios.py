@@ -436,6 +436,46 @@ class Control(unittest.TestCase):
         self.assertEqual([(c["input"], c["timeout"]) for c in calls], [(b"", e2e.WARM_PASTEBOARD)])
         self.assertGreater(e2e.WARM_PASTEBOARD, e2e.PASTEBOARD_TIMEOUT)
 
+    def test_cleanup_names_why_the_pasteboard_could_not_be_emptied_and_never_the_token(self):
+        calls = []
+
+        def broken(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[2] == "pbcopy":
+                raise subprocess.CalledProcessError(4, cmd, output=b"secret-token", stderr=b"secret-token")
+
+        with unittest.mock.patch.object(e2e.subprocess, "run", side_effect=broken):
+            problem = e2e.empty_pasteboard(self.session)
+        # Tried once more, after waiting for the simulator; the clear is never dropped.
+        self.assertEqual(calls, [["xcrun", "simctl", "pbcopy", "UDID"],
+                                 ["xcrun", "simctl", "bootstatus", "UDID", "-b"],
+                                 ["xcrun", "simctl", "pbcopy", "UDID"]])
+        self.assertEqual(
+            problem,
+            "the simulator's pasteboard could not be emptied "
+            "(the simulator's pasteboard did not take the text (simctl pbcopy exit 4))")
+        text = e2e.cleanup_text(True, [], [problem])
+        self.assertIn("(simctl pbcopy exit 4)", text)
+        self.assertNotIn("secret-token", text)
+        self.assertNotIn("could not remove", text)
+
+        tries = iter([subprocess.TimeoutExpired("pbcopy", 60), None, None])
+
+        def once(cmd, **kwargs):
+            outcome = next(tries)
+            if outcome:
+                raise outcome
+
+        with unittest.mock.patch.object(e2e.subprocess, "run", side_effect=once):
+            self.assertIsNone(e2e.empty_pasteboard(self.session))
+
+    def test_the_cleanup_line(self):
+        self.assertEqual(e2e.cleanup_text(False, [], []), "nothing was created")
+        self.assertEqual(e2e.cleanup_text(True, [], []), "the test production and source were deactivated and deleted")
+        self.assertEqual(
+            e2e.cleanup_text(True, ["production p1", "source s1"], ["the simulator's pasteboard could not be emptied (x)"]),
+            "could not remove production p1, source s1; the simulator's pasteboard could not be emptied (x)")
+
 
 class Report(unittest.TestCase):
     def test_the_report_and_the_comment(self):
