@@ -501,9 +501,11 @@ function renderNotices() {
 
 async function goLive() {
   clearGoProblem();
-  const uplink = byId("go-uplink");
-  uplink.textContent = "";
-  uplink.hidden = true;
+  for (const id of ["go-uplink", "go-passphrase"]) {
+    const line = byId(id);
+    line.textContent = "";
+    line.hidden = true;
+  }
   rows.clear();
   notices.clear();
   renderRows();
@@ -537,6 +539,8 @@ function wireGoLive() {
     byId("go-strom").textContent = words[event.detail.state] || "";
   });
   // Through Open Live's SRT relay (OL-66): which one, and the passphrase made for it.
+  // Each has its own line: the library says `passphrase` before `uplink`, so one
+  // shared line would lose the passphrase text when the relay line is written.
   document.addEventListener("oli:uplink", (event) => {
     const uplink = byId("go-uplink");
     uplink.textContent =
@@ -548,10 +552,9 @@ function wireGoLive() {
   });
   document.addEventListener("oli:passphrase", (event) => {
     if (event.detail.kept) {
-      const uplink = byId("go-uplink");
-      const line = "A passphrase for the relay was made and saved in the settings.";
-      uplink.textContent = uplink.textContent ? uplink.textContent + " " + line : line;
-      uplink.hidden = false;
+      const line = byId("go-passphrase");
+      line.textContent = "A passphrase for the relay was made and saved in the settings.";
+      line.hidden = false;
     }
   });
   document.addEventListener("oli:input", (event) => {
@@ -628,10 +631,18 @@ function wireGoLive() {
 
 // Go live picks the relay by itself. The picker is offered only when Open Live
 // reports more than one, or no longer has the one saved; the core decides.
-function openAdvanced() {
+// Opening it asks Open Live again (the toggle handler in wireAdvanced): the relays
+// may have changed since the window opened, and a Go live that names an unknown
+// relay offers this button. A stale list would keep the picker hidden, or offer
+// the names that are gone. Already open: no toggle event, so ask here.
+async function openAdvanced() {
   const advanced = byId("advanced");
+  const wasOpen = advanced.open;
   advanced.open = true;
   advanced.scrollIntoView();
+  if (wasOpen) {
+    await loadRelays();
+  }
 }
 
 async function loadRelays() {
@@ -659,6 +670,11 @@ async function loadRelays() {
 }
 
 function wireAdvanced() {
+  byId("advanced").addEventListener("toggle", (event) => {
+    if (event.target.open) {
+      loadRelays();
+    }
+  });
   byId("relay-select").addEventListener("change", (event) => {
     if (live) {
       return;
