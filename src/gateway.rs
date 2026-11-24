@@ -35,6 +35,21 @@ pub enum Event {
         /// The whole uplink, from the configured video bitrate.
         total_mbps: f64,
     },
+    /// `up` knows where to send and is about to bring its inputs up, through Open
+    /// Live's SRT relay: every input dials `relay`, at `public` (its `host:port`,
+    /// when Open Live reports it), with a stream id of its own.
+    BringingUpViaRelay {
+        inputs: usize,
+        relay: String,
+        public: Option<String>,
+        /// The whole uplink, from the configured video bitrate.
+        total_mbps: f64,
+    },
+    /// The settings had no SRT passphrase for links through the relay, whose port is
+    /// public, so one was generated. Kept in the settings file `kept_in` for the next
+    /// runs; `None` when it could not be, and is used for this run only. The
+    /// passphrase itself is never in an event.
+    PassphraseGenerated { kept_in: Option<PathBuf> },
     /// An Open Live source of this gateway, left by an earlier run, held a port one of
     /// the inputs needs and was removed.
     LeftoverSourceRemoved { name: String, port: u16 },
@@ -132,10 +147,12 @@ pub struct SummaryRow {
     pub name: String,
     pub port: u16,
     /// The address registered with Open Live, passphrase masked: where Open Live's
-    /// Strom receives (in caller mode its listener, such as `srt://:47110?mode=listener`).
+    /// Strom receives (in caller mode its listener, such as `srt://:47110?mode=listener`;
+    /// through a relay `srt+relay://<stream id>[@<relay>]?latency=<ms>...`).
     pub address: String,
     /// Where the gateway's Strom sends the uplink, passphrase masked (in caller mode
-    /// `srt://<cloud host>:<port>?mode=caller&latency=<ms>`).
+    /// `srt://<cloud host>:<port>?mode=caller&latency=<ms>`; through a relay the
+    /// dial-in address, `srt://<relay>?streamid=<id>&mode=caller&latency=<ms>`).
     pub uplink: String,
 }
 

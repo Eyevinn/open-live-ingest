@@ -145,7 +145,29 @@ from the environment variables above, or for Open Source Cloud from `OSC_ACCESS_
 saved login. Given interactively, the same flags become the defaults the prompts show. `setup
 --help` lists them all.
 
-In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live reserves ports
+The uplink has three modes (`uplink.mode`):
+
+| Mode | Who dials | Used when |
+|---|---|---|
+| `caller` (default) | this machine | always, unless set otherwise: through Open Live's SRT relay when Open Live reports one, otherwise to a port on the cloud Strom |
+| `relay` | this machine and the cloud Strom, both to the relay | set it to insist on the relay; an Open Live without one is then an error, not a port |
+| `listener` | the cloud Strom dials this machine | set it when the venue has a public address and inbound UDP; it never uses the relay |
+
+Through a relay, Strom and the gateway both dial the relay's one public port and the relay pairs
+them by stream id; nothing listens on the cloud Strom, and no port is leased. The gateway registers
+each input as `srt+relay://auto@<relay>?latency=<ms>&passphrase=...` and dials the address Open Live
+answers with (`connect.uri`, `srt://<relay host>:<port>?streamid=<id>`). `uplink.relay` picks a
+relay by the name Open Live reports (`GET /api/v1/server-info`, `srt.relays`); without it the
+gateway uses `default`, and a name Open Live does not have stops `up` with the names it does have.
+The relay's port is public, so a relay link always has a passphrase: with none in the settings one
+is generated and saved as `uplink.passphrase`, and used from then on. A stop and a new `up` keep the
+source's id and stream id, so a production slot holding it stays valid; a source an older gateway
+registered in caller mode is moved to the relay with its id unchanged. An Open Live without relays
+(v0.8.0 and before) sees exactly what it always did. `up` and `status` (and `status --json`, as
+`uplink.relay` and each source's `relay` and `dial_in`) show the relay and the dial-in address,
+passphrase masked.
+
+Without a relay, in `caller` mode the SRT ports belong to the cloud Strom. Open Live reserves ports
 from that Strom's port pool and publishes them on `GET /api/v1/server-info` together with the Strom
 host, and the gateway registers each input with port 0 and Open Live assigns it a free one, so
 several gateways can feed one Open Live; `uplink.port_range` is only a fallback for an

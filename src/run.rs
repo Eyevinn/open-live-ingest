@@ -142,9 +142,38 @@ fn source_gateway_id(cfg: &Config) -> Result<Option<String>> {
 
 /// Where feeds are sent, and which ports the links use.
 struct Cloud {
+    /// The cloud Strom, or through a relay the relay's public host when Open Live
+    /// reports it (empty when not).
     host: String,
+    /// Empty through a relay: it needs no port of the cloud Strom.
     ports: BTreeSet<u16>,
     port_source: PortSource,
+    /// Set when the links go through Open Live's SRT relay.
+    relay: Option<CloudRelay>,
+}
+
+/// The SRT relay the links go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloudRelay {
+    name: String,
+    /// Its public `host:port`, as Open Live reports it, when it does.
+    public: Option<String>,
+}
+
+impl CloudRelay {
+    /// The host in [`CloudRelay::public`], for the links until Open Live has given
+    /// each its dial-in address.
+    fn host(&self) -> String {
+        let public = self.public.as_deref().unwrap_or_default();
+        let public = public.strip_prefix("srt://").unwrap_or(public);
+        match public.rsplit_once(':') {
+            Some((host, port)) if port.parse::<u16>().is_ok() => host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string(),
+            _ => String::new(),
+        }
+    }
 }
 
 /// Who chose the port range.
@@ -154,6 +183,8 @@ enum PortSource {
     OpenLive,
     /// `uplink.port_range` in the settings.
     Settings,
+    /// None: the links go through Open Live's SRT relay.
+    Relay,
 }
 
 impl fmt::Display for PortSource {
@@ -161,18 +192,22 @@ impl fmt::Display for PortSource {
         f.write_str(match self {
             PortSource::OpenLive => "Open Live",
             PortSource::Settings => "the settings",
+            PortSource::Relay => "Open Live's SRT relay",
         })
     }
 }
 
-/// Resolves the cloud host, configured or asked of Open Live, and the port range.
-/// Open Live is asked whenever it can be and something is needed from it: the host,
-/// or in caller mode its Strom's ports. A configured host together with a configured
-/// range still starts when Open Live is down, as it always has; the sources are
-/// registered once it is back.
+/// Resolves the cloud host, configured or asked of Open Live, and the port range,
+/// or the SRT relay the links go through instead ([`choose_relay`]). Open Live is
+/// asked whenever it can be and something is needed from it: the host, or in caller
+/// and relay mode its relays and its Strom's ports. A configured host together with
+/// a configured range still starts when Open Live is down, as it always has; the
+/// sources are registered once it is back. `dials_relay` is whether the media can
+/// send through a relay at all.
 async fn resolve_cloud(
     cfg: &Config,
     open_live: Option<&OpenLiveClient>,
+    dials_relay: bool,
     events: &Events,
 ) -> Result<Cloud> {
     let configured_host = cfg
@@ -182,11 +217,15 @@ async fn resolve_cloud(
         .map(str::trim)
         .filter(|h| !h.is_empty());
     let local = cfg.uplink.local_ports()?;
-    let needs_open_live = configured_host.is_none() || cfg.uplink.mode == UplinkMode::Caller;
+    let needs_open_live = configured_host.is_none() || cfg.uplink.mode != UplinkMode::Listener;
     let info: Option<ServerInfo> = match open_live {
         Some(client) if needs_open_live => match client.server_info().await {
             Ok(info) => info,
-            Err(err) if configured_host.is_some() && local.is_some() => {
+            Err(err)
+                if configured_host.is_some()
+                    && local.is_some()
+                    && cfg.uplink.mode != UplinkMode::Relay =>
+            {
                 warn!(err = %format_args!("{err:#}"), "could not ask Open Live for its server info; using uplink.host and uplink.port_range from the settings");
                 events.emit(Event::Warning {
                     message: format!("could not ask Open Live for its server info ({err:#}); using uplink.host and uplink.port_range from the settings"),
@@ -197,6 +236,21 @@ async fn resolve_cloud(
         },
         _ => None,
     };
+
+    if let Some(relay) = choose_relay(
+        cfg.uplink.mode,
+        cfg.uplink.relay_name(),
+        open_live.is_some(),
+        dials_relay,
+        info.as_ref(),
+    )? {
+        return Ok(Cloud {
+            host: relay.host(),
+            ports: BTreeSet::new(),
+            port_source: PortSource::Relay,
+            relay: Some(relay),
+        });
+    }
 
     let host = match configured_host {
         Some(host) => host.to_string(),
@@ -220,7 +274,66 @@ async fn resolve_cloud(
         host,
         ports,
         port_source,
+        relay: None,
     })
+}
+
+/// Whether the links go through Open Live's SRT relay, and which. Pure, so the
+/// choice is tested without a server.
+///
+/// - `listener`: never.
+/// - `caller` (the default, and what every settings file before relays says):
+///   through the relay when Open Live reports at least one, the media can send
+///   through one, and the sources are registered (only Open Live can give the
+///   address); otherwise to a port on the cloud Strom, exactly as before relays.
+/// - `relay`: always, and an error when that cannot be.
+///
+/// The relay is `name` (`uplink.relay`, or `default`). One Open Live does not report
+/// is an error naming those it does, never a quiet switch to another mode.
+fn choose_relay(
+    mode: UplinkMode,
+    name: &str,
+    registering: bool,
+    dials_relay: bool,
+    info: Option<&ServerInfo>,
+) -> Result<Option<CloudRelay>> {
+    let relays = info.map(ServerInfo::relays).unwrap_or_default();
+    match mode {
+        UplinkMode::Listener => return Ok(None),
+        UplinkMode::Caller if !(registering && dials_relay && !relays.is_empty()) => {
+            return Ok(None)
+        }
+        UplinkMode::Caller => {}
+        UplinkMode::Relay => {
+            if !registering {
+                bail!("uplink.mode is \"relay\", whose address only Open Live can give, and registration is off");
+            }
+            if !dials_relay {
+                bail!("uplink.mode is \"relay\", and this device cannot send through an SRT relay yet; set uplink.mode = \"caller\"");
+            }
+            if relays.is_empty() {
+                let why = match info.and_then(|i| i.srt.as_ref()) {
+                    None => "Open Live is older than SRT relays",
+                    Some(srt) if srt.state.as_deref() == Some("unreachable") => {
+                        "Open Live cannot reach its Strom to ask about SRT relays"
+                    }
+                    Some(_) => "Open Live reports no SRT relay",
+                };
+                bail!("uplink.mode is \"relay\", but {why}; set uplink.mode = \"caller\" to send to a port on its Strom instead");
+            }
+        }
+    }
+    let Some(relay) = relays.iter().find(|r| r.name == name) else {
+        let names: Vec<&str> = relays.iter().map(|r| r.name.as_str()).collect();
+        bail!(
+            "Open Live has no SRT relay named {name:?}; it has {}: set uplink.relay to one of them",
+            names.join(", ")
+        );
+    };
+    Ok(Some(CloudRelay {
+        name: relay.name.clone(),
+        public: Some(relay.public.trim().to_string()).filter(|p| !p.is_empty()),
+    }))
 }
 
 /// Which range the links use. In caller mode the ports are the cloud Strom's, and
@@ -240,7 +353,8 @@ fn choose_ports(
         UplinkMode::Listener => local.map(|range| (range, PortSource::Settings)).context(
             "uplink.mode is \"listener\", so uplink.port_range must name this machine's SRT ports",
         ),
-        UplinkMode::Caller => match (published, local) {
+        // A relay link never gets here: `choose_relay` answers for it or refuses.
+        UplinkMode::Caller | UplinkMode::Relay => match (published, local) {
             (Some(published), Some(local)) => {
                 if local != published {
                     warn!(
@@ -477,6 +591,8 @@ fn snapshot_of(live: &[Live], host: &str, strom_version: Option<&str>) -> heartb
                 flow_state: l.state.flow_state(),
                 source_id: l.source_id.clone(),
                 uplink: l.uplink.as_ref().map(heartbeat::Uplink::from_srt),
+                relay: l.input.endpoint.relay_name().map(str::to_string),
+                dial_in: l.input.endpoint.dial_in().map(str::to_string),
             })
             .collect(),
     }
@@ -503,6 +619,41 @@ fn stats_of(live: &[Live]) -> Event {
                 }),
             })
             .collect(),
+    }
+}
+
+/// The passphrase for links through the relay when the settings have none. The
+/// relay's port is public, so without one anyone who learns a stream id could send
+/// or pull it. One is generated and kept in the settings file the settings came from
+/// ([`config::keep_passphrase`]), so the next run, and Open Live's source, use the
+/// same one. Should it not be kept, it still protects this run, and the next one
+/// generates another and writes it to the source when it registers.
+fn relay_passphrase(cfg: &Config, events: &Events) -> Result<String> {
+    let generated = config::generate_passphrase()?;
+    let Some(file) = &cfg.file else {
+        warn!("generated an SRT passphrase for the relay for this run only: these settings were not loaded from a file to keep it in");
+        events.emit(Event::PassphraseGenerated { kept_in: None });
+        return Ok(generated);
+    };
+    match config::keep_passphrase(file, &generated) {
+        Ok(kept) => {
+            info!(settings = %file.display(), "generated an SRT passphrase for the relay and kept it in the settings");
+            events.emit(Event::PassphraseGenerated {
+                kept_in: Some(file.clone()),
+            });
+            Ok(kept)
+        }
+        Err(err) => {
+            warn!(err = %format_args!("{err:#}"), "could not keep the generated SRT passphrase in the settings; it is used for this run only");
+            events.emit(Event::Warning {
+                message: format!(
+                    "could not keep the generated SRT passphrase in {} ({err:#}); it is used for this run only, and the next run generates another",
+                    file.display()
+                ),
+            });
+            events.emit(Event::PassphraseGenerated { kept_in: None });
+            Ok(generated)
+        }
     }
 }
 
@@ -578,12 +729,20 @@ pub async fn up<M: Media>(
     } = media.resolve_inputs(&cfg, inputs, events).await?;
 
     // Without somewhere to send there is no point starting: the feeds would go nowhere.
-    let cloud = resolve_cloud(&cfg, open_live.as_ref(), events).await?;
+    let cloud = resolve_cloud(&cfg, open_live.as_ref(), media.dials_relay(), events).await?;
+    let mut uplink = cfg.uplink.clone();
+    if let Some(relay) = &cloud.relay {
+        uplink.mode = UplinkMode::Relay;
+        uplink.relay = Some(relay.name.clone());
+        if uplink.passphrase.as_deref().is_none_or(str::is_empty) {
+            uplink.passphrase = Some(relay_passphrase(&cfg, events)?);
+        }
+    }
     let mut inputs = devices::inputs_for(
         &chosen,
         test_pattern,
         &cfg.gateway.name,
-        &cfg.uplink,
+        &uplink,
         &cfg.capture,
         &cloud.host,
         &cloud.ports,
@@ -595,12 +754,21 @@ pub async fn up<M: Media>(
 
     // Each input costs an encoder and its share of the uplink, which is easy to
     // overlook when one command starts all of them.
-    events.emit(Event::BringingUp {
-        inputs: inputs.len(),
-        host: cloud.host.clone(),
-        ports: format_ports(&cloud.ports),
-        port_source: cloud.port_source.to_string(),
-        total_mbps: inputs.len() as f64 * cfg.video.bitrate_kbps as f64 / 1000.0,
+    let total_mbps = inputs.len() as f64 * cfg.video.bitrate_kbps as f64 / 1000.0;
+    events.emit(match &cloud.relay {
+        Some(relay) => Event::BringingUpViaRelay {
+            inputs: inputs.len(),
+            relay: relay.name.clone(),
+            public: relay.public.clone(),
+            total_mbps,
+        },
+        None => Event::BringingUp {
+            inputs: inputs.len(),
+            host: cloud.host.clone(),
+            ports: format_ports(&cloud.ports),
+            port_source: cloud.port_source.to_string(),
+            total_mbps,
+        },
     });
 
     // From here on sources may be registered with Open Live before any flow runs.
@@ -723,6 +891,13 @@ async fn start_inputs<M: Media>(
     registered: &mut HashMap<String, Registered>,
     events: &Events,
 ) -> Result<Vec<Live>> {
+    // Through a relay, Open Live gives each source its stream id and the address to
+    // dial: register first, then build the flows to that address.
+    if let (Some(client), PortSource::Relay) = (open_live, cloud.port_source) {
+        inputs =
+            register_through_relay(client, inputs, source_gateway_id, registered, events).await?;
+    }
+
     // When the range is Open Live's, so is the port inside it: register first and
     // take the port Open Live wrote into the source, then build the flows to it.
     if let (Some(client), PortSource::OpenLive) = (open_live, cloud.port_source) {
@@ -971,6 +1146,104 @@ async fn assign_ports_from_open_live(
         input.endpoint.port = port;
     }
     Ok(())
+}
+
+/// Registers each input's source through the relay and takes the address to dial
+/// from Open Live's answer (`connect.uri`). No port is leased. A source Open Live
+/// already holds under the input's name is adopted with a PATCH, keeping its id: a
+/// source of an earlier relay run keeps its stream id too (`auto` keeps it), and one
+/// left in caller mode by an older gateway is moved to the relay. Every source is
+/// written, so it carries this run's passphrase. An input Open Live gives no address
+/// for is reported with `connect.reason` and left out; the others carry on. Returns
+/// the inputs ready to send. Records each source in `ids` as soon as it exists.
+async fn register_through_relay(
+    client: &OpenLiveClient,
+    inputs: Vec<Input>,
+    gateway_id: Option<&str>,
+    ids: &mut HashMap<String, Registered>,
+    events: &Events,
+) -> Result<Vec<Input>> {
+    let sources = client
+        .list_sources()
+        .await
+        .context("listing Open Live's sources to register them through the SRT relay")?;
+    let mut ready = Vec::with_capacity(inputs.len());
+    for mut input in inputs {
+        let existing = sources.iter().find(|s| s.name == input.name);
+        events.emit(Event::Registering {
+            input: input.name.clone(),
+        });
+        let payload = SourcePayload::new(
+            &input.name,
+            &input.endpoint.cloud_uri(),
+            false,
+            input.endpoint.latency_ms,
+            gateway_id,
+        );
+        let written = match existing {
+            Some(stored) => client.patch_source(&stored.id, &payload).await,
+            None => client.create_source(&payload).await,
+        }
+        .map_err(|err| relay_refusal(err, &input.name))?;
+        let mut warning = None;
+        note_connect_warning(&input.name, &written, &mut warning, true, events);
+        ids.insert(
+            input.id.clone(),
+            Registered {
+                input: input.name.clone(),
+                source_id: written.id.clone(),
+                warning,
+            },
+        );
+        let dial_in = written.relay_dial_in();
+        match existing {
+            Some(_) => {
+                info!(input = %input.name, source_id = %written.id, "adopted the source Open Live already holds, same id, through the SRT relay");
+                events.emit(Event::SourceAdopted {
+                    input: input.name.clone(),
+                    source_id: written.id.clone(),
+                    port: dial_in.as_ref().map(|d| d.port).unwrap_or(0),
+                });
+            }
+            None => {
+                info!(input = %input.name, source_id = %written.id, "registered the source with Open Live, through the SRT relay");
+                events.emit(Event::Registered {
+                    input: input.name.clone(),
+                    source_id: written.id.clone(),
+                });
+            }
+        }
+        match dial_in {
+            Ok(d) => {
+                input
+                    .endpoint
+                    .dial_relay(&d.stream_id, &d.uri, &d.host, d.port);
+                ready.push(input);
+            }
+            Err(reason) => {
+                warn!(input = %input.name, reason = %reason, "Open Live registered the source but gave no address to send it through the relay");
+                events.emit(Event::InputFailed {
+                    input: input.name.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    Ok(ready)
+}
+
+/// A failed relay registration, worded for the operator: Open Live's refusal and,
+/// for a relay it does not have (422 with `code`), the relays it does.
+fn relay_refusal(err: anyhow::Error, input: &str) -> anyhow::Error {
+    let refused = err.downcast_ref::<Refused>();
+    if let Some((reason, advice)) = refused.and_then(|r| Some((r.explain(), r.relay_advice()?))) {
+        return anyhow::anyhow!(
+            "Open Live would not register {input:?} through the SRT relay: {reason}. {advice}"
+        );
+    }
+    err.context(format!(
+        "registering {input:?} with Open Live through the SRT relay"
+    ))
 }
 
 /// What registering an input with Open Live left behind.
@@ -2149,11 +2422,17 @@ pub struct ProcessReport {
     pub pid: Option<u32>,
 }
 
+/// Where the uplink goes. Through a relay `host` is the relay's public `host:port`
+/// (empty when Open Live does not report it) and `relay` its name, with no ports.
 #[derive(Debug, Serialize)]
 pub struct UplinkReport {
     pub host: String,
-    pub ports: String,
-    pub port_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ports: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2193,6 +2472,35 @@ pub struct SourceReport {
     /// Open Live's `connect.warning`, such as `srt-listener-unsupported`. `null` when
     /// it reports none, or is older than the field.
     pub warning: Option<String>,
+    /// Through a relay only: the relay's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// Through a relay only: the address the uplink dials
+    /// (`srt://<relay>?streamid=<id>`), never with a passphrase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dial_in: Option<String>,
+    /// Through a relay only, when Open Live gives no `dial_in`: why, in words.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dial_in_error: Option<String>,
+}
+
+impl SourceReport {
+    fn of(s: &Source) -> Self {
+        let relay = s.relay().map(str::to_string);
+        let (dial_in, dial_in_error) = match (&relay, s.relay_dial_in()) {
+            (None, _) => (None, None),
+            (Some(_), Ok(d)) => (Some(d.uri), None),
+            (Some(_), Err(why)) => (None, Some(why)),
+        };
+        SourceReport {
+            id: s.id.clone(),
+            status: s.status.clone(),
+            warning: s.connect_warning().map(str::to_string),
+            relay,
+            dial_in,
+            dial_in_error,
+        }
+    }
 }
 
 /// Reports what is running, from Strom and Open Live directly. Neither being
@@ -2212,12 +2520,24 @@ pub async fn status(cfg: &Config) -> Result<StatusReport> {
     let open_live = open_live_client(cfg, None)?;
     // Warnings while working out the uplink are the log's, not the report's.
     let (uplink, uplink_error) =
-        match resolve_cloud(cfg, open_live.as_ref(), &Events::discard()).await {
+        match resolve_cloud(cfg, open_live.as_ref(), true, &Events::discard()).await {
+            Ok(Cloud {
+                relay: Some(relay), ..
+            }) => (
+                Some(UplinkReport {
+                    host: relay.public.unwrap_or_default(),
+                    ports: None,
+                    port_source: None,
+                    relay: Some(relay.name),
+                }),
+                None,
+            ),
             Ok(cloud) => (
                 Some(UplinkReport {
                     host: cloud.host,
-                    ports: format_ports(&cloud.ports),
-                    port_source: cloud.port_source.to_string(),
+                    ports: Some(format_ports(&cloud.ports)),
+                    port_source: Some(cloud.port_source.to_string()),
+                    relay: None,
                 }),
                 None,
             ),
@@ -2306,11 +2626,7 @@ pub async fn status(cfg: &Config) -> Result<StatusReport> {
             source: sources
                 .iter()
                 .find(|s| s.name == name)
-                .map(|s| SourceReport {
-                    id: s.id.clone(),
-                    status: s.status.clone(),
-                    warning: s.connect_warning().map(str::to_string),
-                }),
+                .map(SourceReport::of),
         });
     }
     Ok(StatusReport {
@@ -2331,12 +2647,25 @@ pub fn render_status(r: &StatusReport) -> String {
         None => out += "No gateway process running.\n",
     }
     match (&r.uplink, &r.uplink_error) {
-        (Some(u), _) => {
-            out += &format!(
-                "Uplink to {}, SRT ports {} from {}.\n\n",
-                u.host, u.ports, u.port_source
-            )
-        }
+        (Some(u), _) => match (&u.relay, &u.ports, &u.port_source) {
+            (Some(relay), _, _) if u.host.is_empty() => {
+                out += &format!("Uplink through Open Live's SRT relay {relay:?}.\n\n")
+            }
+            (Some(relay), _, _) => {
+                out += &format!(
+                    "Uplink through Open Live's SRT relay {relay:?} at {}.\n\n",
+                    u.host
+                )
+            }
+            (None, ports, source) => {
+                out += &format!(
+                    "Uplink to {}, SRT ports {} from {}.\n\n",
+                    u.host,
+                    ports.as_deref().unwrap_or_default(),
+                    source.as_deref().unwrap_or_default()
+                )
+            }
+        },
         (None, Some(err)) => out += &format!("Uplink not resolved: {err}.\n\n"),
         (None, None) => {}
     }
@@ -2367,10 +2696,21 @@ pub fn render_status(r: &StatusReport) -> String {
         };
         // Last column, so a warning lengthens the line without moving any column.
         let source = match &input.source {
-            Some(s) => match &s.warning {
-                Some(warning) => format!("{} (warning: {warning})", s.status),
-                None => s.status.clone(),
-            },
+            Some(s) => {
+                let mut text = match &s.warning {
+                    Some(warning) => format!("{} (warning: {warning})", s.status),
+                    None => s.status.clone(),
+                };
+                if let Some(relay) = &s.relay {
+                    text += &format!(", via relay {relay:?}");
+                    match (&s.dial_in, &s.dial_in_error) {
+                        (Some(dial_in), _) => text += &format!(" to {dial_in}"),
+                        (None, Some(why)) => text += &format!(": {why}"),
+                        (None, None) => {}
+                    }
+                }
+                text
+            }
             None => "not registered".to_string(),
         };
         out += &format!(
@@ -2688,8 +3028,9 @@ mod tests {
             },
             uplink: Some(UplinkReport {
                 host: "cloud.example.com".to_string(),
-                ports: "47110-47129".to_string(),
-                port_source: PortSource::OpenLive.to_string(),
+                ports: Some("47110-47129".to_string()),
+                port_source: Some(PortSource::OpenLive.to_string()),
+                relay: None,
             }),
             uplink_error: None,
             strom: EndpointReport {
@@ -2718,6 +3059,9 @@ mod tests {
                         id: "s1".to_string(),
                         status: "active".to_string(),
                         warning: None,
+                        relay: None,
+                        dial_in: None,
+                        dial_in_error: None,
                     }),
                 },
                 InputReport {
@@ -2838,6 +3182,7 @@ mod tests {
         let mut warned = stored("srt://:47103?mode=listener");
         warned.connect = Some(crate::openlive::Connect {
             warning: Some("srt-listener-unsupported".to_string()),
+            ..Default::default()
         });
         let clear = stored("srt://:47103?mode=listener");
         let mut last = None;
@@ -3146,6 +3491,97 @@ mod tests {
     }
 
     /// Listener ports are this machine's own; nothing Open Live publishes applies.
+    fn info_with_relays(relays: &[&str]) -> ServerInfo {
+        ServerInfo {
+            strom_host: Some("strom.example.com".into()),
+            srt: Some(crate::openlive::SrtInfo {
+                state: Some("ok".into()),
+                relays: relays
+                    .iter()
+                    .map(|name| crate::openlive::Relay {
+                        name: name.to_string(),
+                        public: format!("{name}.relay.example.com:6000"),
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            ..ServerInfo::default()
+        }
+    }
+
+    /// `caller` goes through the relay when Open Live reports one, the media can
+    /// dial one and the sources are registered; otherwise it stays on a port, as
+    /// before relays (an Open Live without `srt`, AC5). `listener` never does.
+    #[test]
+    fn caller_uses_the_relay_when_open_live_reports_one() {
+        let with = info_with_relays(&["default", "eu"]);
+        let relay = choose_relay(UplinkMode::Caller, "default", true, true, Some(&with))
+            .unwrap()
+            .unwrap();
+        assert_eq!(relay.name, "default");
+        assert_eq!(
+            relay.public.as_deref(),
+            Some("default.relay.example.com:6000")
+        );
+        assert_eq!(relay.host(), "default.relay.example.com");
+        let eu = choose_relay(UplinkMode::Caller, "eu", true, true, Some(&with))
+            .unwrap()
+            .unwrap();
+        assert_eq!(eu.name, "eu");
+
+        let v0_8_0 = ServerInfo {
+            strom_host: Some("strom.example.com".into()),
+            srt_ports: Some([47110].into_iter().collect()),
+            ..ServerInfo::default()
+        };
+        for (info, registering, dials) in [
+            (Some(&v0_8_0), true, true),
+            (Some(&info_with_relays(&[])), true, true),
+            (None, true, true),
+            (Some(&with), false, true),
+            (Some(&with), true, false),
+        ] {
+            assert_eq!(
+                choose_relay(UplinkMode::Caller, "default", registering, dials, info).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            choose_relay(UplinkMode::Listener, "default", true, true, Some(&with)).unwrap(),
+            None
+        );
+    }
+
+    /// No quiet switch: a relay Open Live does not report, or relay mode where there
+    /// is none, is an error that says what to set.
+    #[test]
+    fn a_missing_relay_is_an_error_naming_the_ones_there_are() {
+        let with = info_with_relays(&["default", "eu"]);
+        let err = choose_relay(UplinkMode::Caller, "us", true, true, Some(&with)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"Open Live has no SRT relay named "us"; it has default, eu: set uplink.relay to one of them"#
+        );
+        let err = choose_relay(UplinkMode::Relay, "default", true, true, None).unwrap_err();
+        assert!(err.to_string().contains("older than SRT relays"), "{err}");
+        let err = choose_relay(
+            UplinkMode::Relay,
+            "default",
+            true,
+            true,
+            Some(&info_with_relays(&[])),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reports no SRT relay"), "{err}");
+        assert!(choose_relay(UplinkMode::Relay, "default", false, true, Some(&with)).is_err());
+        assert!(choose_relay(UplinkMode::Relay, "default", true, false, Some(&with)).is_err());
+        assert!(
+            choose_relay(UplinkMode::Relay, "eu", true, true, Some(&with))
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn in_listener_mode_only_the_settings_count() {
         assert_eq!(

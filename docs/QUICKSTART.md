@@ -16,7 +16,9 @@ You need, from whoever runs the production:
 | A name for this gateway | `Venue A` | prefixes every source name in Open Live |
 
 Both machines need to be able to reach the internet outbound. Nothing inbound is required in the
-default caller mode.
+default caller mode, which sends through Open Live's SRT relay when Open Live has one and to a port
+on its Strom when it does not. `--uplink-mode relay` insists on the relay; `--uplink-mode listener`
+has the cloud dial this machine instead (README, "Setup", has the three modes).
 
 ## 1. Install
 
@@ -113,6 +115,8 @@ Failure: exit code 1 and an `Error:` line. The message names the fix.
 | `up will start` names a different Strom than `which strom` | a `strom` in the same directory as `open-live-ingest` is used before `PATH`; to use another one, set `binary` under `[strom]` in `gateway.toml` to its full path |
 | `Strom at ... wants a credential` | an existing Strom runs with `STROM_API_KEY`; `export OLI_STROM_API_KEY='<that key>'` and rerun |
 | `Open Live publishes no SRT port range` | pass `--port-range 47110-47129` |
+| `no SRT relay named` | pass `--relay <name>` with one of the names the message lists |
+| `uplink.mode is "relay", but Open Live` | that Open Live has no relay: pass `--uplink-mode caller` |
 | `listener mode needs` | you chose `--uplink-mode listener`; pass `--public-host` and `--port-range` |
 
 Then validate the file on its own:

@@ -235,6 +235,8 @@ async fn validate_as(settings: &Config, credential: Option<&OscCredential>) -> V
     // called missing once Open Live has answered without one.
     let mut published = None;
     let mut ports_known = true;
+    // The SRT relays Open Live reports, once it has answered.
+    let mut relays: Option<Vec<String>> = None;
     if !cfg.open_live.register {
         if cfg
             .uplink
@@ -275,7 +277,14 @@ async fn validate_as(settings: &Config, credential: Option<&OscCredential>) -> V
             ports_known = false;
         } else {
             match check_open_live_as(cfg, credential).await {
-                Ok(info) => published = info.and_then(|i| i.srt_ports),
+                Ok(info) => {
+                    relays = Some(
+                        info.as_ref()
+                            .map(|i| i.relays().iter().map(|r| r.name.clone()).collect())
+                            .unwrap_or_default(),
+                    );
+                    published = info.and_then(|i| i.srt_ports);
+                }
                 Err(err) => {
                     ports_known = false;
                     found.push(Problem::new(
@@ -323,9 +332,39 @@ async fn validate_as(settings: &Config, credential: Option<&OscCredential>) -> V
         }
     }
 
+    // Through a relay no port is needed; in caller mode the gateway goes through
+    // one whenever Open Live reports any (run::choose_relay, on a computer; the phone
+    // cannot dial a relay yet), and in relay mode it must.
+    let relay = cfg.uplink.relay_name();
+    let through_relay = !cfg!(target_os = "ios")
+        && relays
+            .as_ref()
+            .is_some_and(|r| r.iter().any(|name| name == relay));
+    if let Some(reported) = relays.as_ref().filter(|_| !through_relay) {
+        let wants_relay = match cfg.uplink.mode {
+            UplinkMode::Relay => true,
+            UplinkMode::Caller => !reported.is_empty() && !cfg!(target_os = "ios"),
+            UplinkMode::Listener => false,
+        };
+        if wants_relay {
+            found.push(Problem::new(
+                if reported.is_empty() { "uplink.mode" } else { "uplink.relay" },
+                if reported.is_empty() {
+                    "uplink.mode is \"relay\", but Open Live reports no SRT relay; set uplink.mode = \"caller\"".to_string()
+                } else {
+                    format!(
+                        "Open Live has no SRT relay named {relay:?}; it has {}: set uplink.relay to one of them",
+                        reported.join(", ")
+                    )
+                },
+            ));
+        }
+    }
+
     // In listener mode the range is this machine's own, and config::problems already
     // insists on it.
     if cfg.uplink.mode == UplinkMode::Caller
+        && !through_relay
         && ports_known
         && published.is_none()
         && matches!(cfg.uplink.local_ports(), Ok(None))

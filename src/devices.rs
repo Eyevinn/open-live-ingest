@@ -1,7 +1,7 @@
 //! From the devices Strom can see to the inputs the gateway streams: filtering,
 //! selection, naming, and port allocation.
 
-use crate::config::{format_ports, Capture, InputSettings, Uplink};
+use crate::config::{format_ports, Capture, InputSettings, Uplink, UplinkMode};
 use crate::flow::{self, Input, Source};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
@@ -329,7 +329,12 @@ pub fn inputs_for(
     ports: &BTreeSet<u16>,
 ) -> Result<Vec<Input>> {
     let mut taken = BTreeSet::new();
+    let relay = uplink.mode == UplinkMode::Relay;
     let mut next_port = || {
+        // Through a relay there is no port to take: Open Live gives the address.
+        if relay {
+            return Ok(0);
+        }
         let port = ports
             .iter()
             .copied()

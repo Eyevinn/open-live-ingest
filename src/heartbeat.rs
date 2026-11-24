@@ -146,6 +146,13 @@ pub struct InputStatus {
     pub source_id: Option<String>,
     /// Absent until something receives the feed.
     pub uplink: Option<Uplink>,
+    /// Through an SRT relay only: its name. Left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// Through an SRT relay only: the address the uplink dials
+    /// (`srt://<relay>?streamid=<id>`), never with a passphrase. Left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dial_in: Option<String>,
 }
 
 /// Strom's flow state vocabulary, which is what Open Live stores. Strom also has
@@ -722,6 +729,8 @@ mod tests {
                         rtt_ms: 18.0,
                         dropped: 0,
                     }),
+                    relay: None,
+                    dial_in: None,
                 },
                 InputStatus {
                     input_id: "dev-2".into(),
@@ -729,6 +738,8 @@ mod tests {
                     flow_state: FlowState::Idle,
                     source_id: None,
                     uplink: None,
+                    relay: None,
+                    dial_in: None,
                 },
             ],
         }
@@ -758,6 +769,21 @@ mod tests {
         assert_eq!(v["inputs"][1]["flowState"], "idle");
         assert_eq!(v["inputs"][1]["sourceId"], serde_json::Value::Null);
         assert_eq!(v["inputs"][1]["uplink"], serde_json::Value::Null);
+        // Not through a relay: the relay fields are left out, as before relays.
+        assert!(v["inputs"][0].get("relay").is_none());
+        assert!(v["inputs"][0].get("dialIn").is_none());
+
+        // Through a relay: its name and the address dialled, which has no passphrase.
+        let mut relayed = sample();
+        relayed.inputs[0].relay = Some("default".into());
+        relayed.inputs[0].dial_in = Some("srt://relay.example.com:6000?streamid=abc".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&frame(&mut seq, "HEARTBEAT", &relayed).unwrap()).unwrap();
+        assert_eq!(v["inputs"][0]["relay"], "default");
+        assert_eq!(
+            v["inputs"][0]["dialIn"],
+            "srt://relay.example.com:6000?streamid=abc"
+        );
 
         let text = frame(
             &mut seq,
@@ -769,7 +795,7 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["type"], "GATEWAY_OFFLINE");
-        assert_eq!(v["seq"], 2, "the sequence keeps counting across frames");
+        assert_eq!(v["seq"], 3, "the sequence keeps counting across frames");
         assert_eq!(v["reason"], "operator-stop");
     }
 

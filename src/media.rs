@@ -75,6 +75,13 @@ pub trait Media: Send + Sync {
     /// The SRT sender's cumulative counters, `None` before a peer exists.
     fn uplink(&self, input: &Input) -> impl Future<Output = Result<Option<SrtCallerStats>>> + Send;
 
+    /// Whether it can send through an SRT relay: dial its address with a stream id
+    /// (`input.endpoint.venue_uri()` does that). Only then does `caller` mode go
+    /// through a relay Open Live reports. Yes on a computer, where Strom dials.
+    fn dials_relay(&self) -> bool {
+        true
+    }
+
     /// Whether the media is held back for now, whatever the productions say: an
     /// armed session then stops each uplink (its source kept, marked inactive) as
     /// though no production holding it were live, and starts it again at the first
@@ -529,6 +536,12 @@ impl Media for ExternalMedia {
 
     async fn uplink(&self, input: &Input) -> Result<Option<SrtCallerStats>> {
         Ok(self.reports().get(&input.id).and_then(|r| r.uplink.clone()))
+    }
+
+    /// Not yet: the phone's SRT sender takes a host and a port, and no stream id
+    /// (#161), so its links stay on a port of the cloud Strom.
+    fn dials_relay(&self) -> bool {
+        false
     }
 
     fn held_back(&self) -> bool {
