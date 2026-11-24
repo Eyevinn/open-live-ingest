@@ -361,6 +361,15 @@ class App:
             timeout,
         )["data"]
 
+    def event_since(self, name, since, timeout, where=lambda data: True):
+        """A `name` event the app said since line `since`, or the next one within
+        `timeout`. An event the app says while it handles a command comes before that
+        command's reply, so `ok()` has already read it into `seen` (#145)."""
+        for m in self.seen[since:]:
+            if m.get("event") == name and where(m.get("data") or {}):
+                return m.get("data")
+        return self.event(name, timeout, where)
+
     def ended(self, timeout):
         """Waits for the process to end, reading what it still says. Its exit code."""
         deadline = time.monotonic() + timeout
@@ -1176,8 +1185,9 @@ def late_listener_check(app, strom, gateway_name, source_name, work):
         app.wait_row(source_name, ("waiting_for_production",), again_from, f"{step}: production inactive again")
 
         # Stop: the source stays with its id (#115).
+        mark = len(app.seen)
         app.ok("stop")
-        stopped_cleanly(app.event("stopped", 120), f"{step}: Stop")
+        stopped_cleanly(app.event_since("stopped", mark, 120), f"{step}: Stop")
         kept = local.ours(gateway_name)
         if [s.get("id") for s in kept] != [source.get("id")]:
             fail(f"{step}: Stop: expected source {source.get('id')} kept as the only one of '{gateway_name}' in the stand-in Open Live, found {[s.get('id') for s in kept]}")
@@ -1319,8 +1329,9 @@ def run(exe, work):
         production_id, flow = late_receiver_check(app, open_live, strom, source, source_name, live_at, gateway_name)
 
         # 4. Stop: the flow goes, the source stays (#115).
+        mark = len(app.seen)
         app.ok("stop")
-        data = app.event("stopped", 120)
+        data = app.event_since("stopped", mark, 120)
         stopped_cleanly(data, "Stop")
         kept = [s.get("id") for s in open_live.ours(gateway_name)]
         if kept != [source.get("id")]:
@@ -1342,8 +1353,10 @@ def run(exe, work):
         flow = reactivated_check(app, open_live, strom, production_id, source_name, since)
 
         # 6. Quit while live.
+        # The app asks while it handles `quit`, so the question comes before the reply.
+        mark = len(app.seen)
         app.ok("quit", {"confirmed": False})
-        asked = app.event("quit_requested", 30)
+        asked = app.event_since("quit_requested", mark, 30)
         if not asked.get("inputs_live"):
             fail(f"Quit while live: the question counts {asked.get('inputs_live')} live inputs")
         passed(f"Quit while live: the app asks first (\"You are live with {asked['inputs_live']} input(s)\")")

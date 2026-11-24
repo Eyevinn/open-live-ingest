@@ -437,6 +437,51 @@ class Rows(unittest.TestCase):
         self.assertIn("Go live: the row of 'gw — Test pattern' is 'connecting', not armed or waiting_for_production", str(caught.exception))
 
 
+class EventsSaidBeforeTheReply(unittest.TestCase):
+    """`quit_requested` comes before the reply to `quit`: `ok()` reads it into `seen`
+    while it waits for the reply, and the wait for the event must still find it (#145)."""
+
+    def quit_app(self, before_reply):
+        app = FakeApp(before_reply + [{"id": 1, "ok": None}])
+        app.send = lambda cmd, args=None: 1
+        return app
+
+    def test_an_event_read_while_waiting_for_the_reply_is_found(self):
+        app = self.quit_app([{"event": "quit_requested", "data": {"inputs_live": 1}}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mark = len(app.seen)
+            app.ok("quit", {"confirmed": False})
+            asked = app.event_since("quit_requested", mark, 0.2)
+        self.assertEqual(asked, {"inputs_live": 1})
+
+    def test_waiting_only_for_a_new_event_misses_it(self):
+        app = self.quit_app([{"event": "quit_requested", "data": {"inputs_live": 1}}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(e2e.Failed):
+            app.ok("quit", {"confirmed": False})
+            app.event("quit_requested", 0.2)
+
+    def test_an_event_from_before_the_mark_does_not_count(self):
+        app = FakeApp([{"event": "stopped", "data": {"error": None}}, {"id": 1, "ok": None}])
+        app.send = lambda cmd, args=None: 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(e2e.Failed):
+            app.drain()
+            mark = len(app.seen)
+            app.ok("stop")
+            app.event_since("stopped", mark, 0.2)
+
+    def test_an_event_after_the_reply_is_still_waited_for(self):
+        app = FakeApp([{"id": 1, "ok": None}, {"event": "stopped", "data": {"left_behind": []}}])
+        app.send = lambda cmd, args=None: 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mark = len(app.seen)
+            app.ok("stop")
+            self.assertEqual(app.event_since("stopped", mark, 0.2), {"left_behind": []})
+
+
 class FakeOpenLive:
     """Open Live's activate, with no network: `while_activating` runs once, as for a
     production that is still activating at the first look."""
