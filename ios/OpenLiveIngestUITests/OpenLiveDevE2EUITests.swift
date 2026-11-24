@@ -15,6 +15,11 @@ import XCTest
 ///
 /// Each check that passes is posted to the control server for the report; a failure stops the
 /// test, and the run fails on the test's result.
+///
+/// openlivedev takes SRT through its relay only (#159, #161), so unless the run says otherwise
+/// (`relay` in `/config`) the uplink has to go through Open Live's SRT relay: the Go live screen's
+/// uplink line (`uplinkLine`, StatusText.uplinkLine) is handed to the control server, which
+/// holds its relay, stream id and dial-in address against what Open Live reports for the source.
 final class OpenLiveDevE2EUITests: XCTestCase {
     private var control: FakeControl!
     private var app: XCUIApplication!
@@ -88,6 +93,17 @@ final class OpenLiveDevE2EUITests: XCTestCase {
     }
 
     private func production() throws -> [String: Any] { try call("GET", "/production") }
+
+    /// The uplink line, `Uplink: via relay <name> to srt://<relay>?streamid=<id>&passphrase=***`,
+    /// judged by the control server against the source as Open Live has it (its relay, stream id
+    /// and dial-in address), and against the stream id of the first connect after that.
+    private func relayCheck(_ phase: String, _ id: String) throws {
+        let line = app.staticTexts["uplinkLine"]
+        _ = line.waitForExistence(timeout: 30)
+        let shown = line.exists ? line.label : ""
+        let verdict = try call("POST", "/uplink", ["phase": phase, "line": shown])
+        try verify(verdict["ok"] as? Bool == true, id, verdict["detail"] as? String ?? "no verdict from the control server")
+    }
 
     /// The SRT sender's counters on the link line (its accessibility value): packets sent,
     /// dropped and bytes sent, or nil while it carries none.
@@ -165,6 +181,7 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let armedHold = config["armed_hold"] as? Int ?? 10
         let backgroundLimit = config["background_limit"] as? Double ?? 10
         let phoneBound = config["phone_background_bound"] as? Double ?? 4
+        let relay = config["relay"] as? Bool ?? true
 
         app = XCUIApplication()
         app.launchArguments = ["-OLIReset"]
@@ -224,7 +241,11 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let start = Date()
         var sentAnything = false
         while Date().timeIntervalSince(start) < TimeInterval(armedHold) {
-            if counters() != nil || !link.label.hasPrefix("Link: not sending") || state.label != "Armed" { sentAnything = true }
+            if counters() != nil || !link.label.hasPrefix("Link: not sending") || state.label != "Armed"
+                || app.staticTexts["uplinkLine"].exists
+            {
+                sentAnything = true
+            }
             if try sources().contains(where: { $0.status == "active" }) { sentAnything = true }
             Thread.sleep(forTimeInterval: 1)
         }
@@ -232,7 +253,8 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let armedSources = try sources()
         try verify(
             !sentAnything && armedSources.count == 1, "AC2: Go live before activation arms and sends nothing",
-            "Armed for \(armedHold) s, link '\(link.label)', no SRT counters, source \(source.id) registered and not active")
+            "Armed for \(armedHold) s, link '\(link.label)', no SRT counters, no uplink line, source \(source.id) "
+                + "registered and not active")
 
         // 3. The production holding the source goes active: the uplink starts; AC1's numbers.
         try activate(source.id)
@@ -243,6 +265,9 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         try verify(
             active == true, "AC2: activation starts the uplink",
             "Live, '\(link.label)', \(app.staticTexts["productionLine"].label), source active in Open Live")
+        if relay {
+            try relayCheck("first connect", "relay: the uplink goes through Open Live's SRT relay with the source's stream id")
+        }
         let first = try measure("first connect", seconds: seconds)
         shot("5 measured")
         let share = (first["drop_share"] as? Double).map { String(format: "%.3f %%", $0 * 100) } ?? "n/a"
@@ -319,6 +344,9 @@ final class OpenLiveDevE2EUITests: XCTestCase {
             "foreground resumes the uplink",
             "Live, source \(source.id) active again, a new SRT connection (\(after.map { String($0) } ?? "?") packets "
                 + "after resuming, \(before) before the background), cloud picture \(picture ?? "none")")
+        if relay {
+            try relayCheck("foreground", "relay: the foreground reconnect keeps the relay and the stream id")
+        }
 
         // 7. Stop; the control server removes the production and the source after the test.
         go.tap()

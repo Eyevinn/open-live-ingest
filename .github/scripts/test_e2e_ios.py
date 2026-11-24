@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Unit tests of the pure parts of e2e-ios.py (OL-64h, #144): the simulator pick, the
-run's sources and stale names, the SRT counters over the window, the peak-to-average
+run's sources and stale names, the relay uplink line against Open Live's source, the SRT counters over the window, the peak-to-average
 bitrate, the cloud side's picture and sound, the WebSocket frames, the control server's
 answers and the report. No network beyond loopback, no simulator:
 
@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import unittest
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -19,6 +20,18 @@ e2e = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(e2e)
 
 LABEL = "oli-ios-e2e-100-1"
+
+
+STREAM_ID = "AbCdEfGhIjKlMnOpQrStUv"
+DIAL_IN = f"srt://relay.example.com:6000?streamid={STREAM_ID}"
+UPLINK = f"Uplink: via relay default to {DIAL_IN}&passphrase=***"
+# An Open Live source through the relay, as src/openlive.rs's tests have it.
+RELAYED = {
+    "_id": "s1", "name": f"iPhone-ab12 — {LABEL}", "status": "active",
+    "address": f"srt+relay://{STREAM_ID}?latency=200&passphrase=s3cret-s3cret&pbkeylen=16",
+    "connect": {"uri": DIAL_IN, "host": "relay.example.com", "port": 6000, "mode": "caller",
+                "source": "srt-relay", "streamid": STREAM_ID, "relay": "default"},
+}
 
 
 def sample(t, sent, dropped=0, nbytes=None):
@@ -56,7 +69,8 @@ class Pure(unittest.TestCase):
             {"id": "s4", "name": "iPhone-ab12 — oli-ios-e2e-100-12", "status": "active"},
         ]
         self.assertEqual(e2e.ours(sources, LABEL),
-                         [{"id": "s1", "name": f"iPhone-ab12 — {LABEL}", "status": "inactive", "port": 47101}])
+                         [{"id": "s1", "name": f"iPhone-ab12 — {LABEL}", "status": "inactive", "port": 47101,
+                           "relay_address": False, "relay": None, "streamid": None, "dial_in": None}])
         self.assertFalse(e2e.stale(f"iPhone-ab12 — {LABEL}", LABEL))
         self.assertFalse(e2e.stale(f"{LABEL} — production", LABEL))
         self.assertTrue(e2e.stale("iPhone-ab12 — oli-ios-e2e-99-1", LABEL))
@@ -64,6 +78,66 @@ class Pure(unittest.TestCase):
         self.assertTrue(e2e.stale("iPhone-ab12 — oli-ios-e2e-100-12", LABEL))
         self.assertFalse(e2e.stale("Venue — Camera 1", LABEL))
         self.assertFalse(e2e.stale("oli-app-e2e-1-1-mac — Test pattern", LABEL))
+
+    def test_a_relay_source_keeps_its_connect_block_and_never_its_address(self):
+        found = e2e.ours([RELAYED], LABEL)
+        self.assertEqual(found, [{"id": "s1", "name": f"iPhone-ab12 — {LABEL}", "status": "active", "port": None,
+                                  "relay_address": True, "relay": "default", "streamid": STREAM_ID,
+                                  "dial_in": DIAL_IN}])
+        self.assertNotIn("s3cret", json.dumps(found))
+
+    def test_the_uplink_line_is_parsed(self):
+        self.assertEqual(e2e.uplink_route(UPLINK), {
+            "relay": "default", "dial_in": DIAL_IN, "streamid": STREAM_ID, "encrypted": True})
+        self.assertEqual(e2e.uplink_route("Uplink: via relay eu-north"),
+                         {"relay": "eu-north", "dial_in": None, "streamid": None, "encrypted": False})
+        self.assertEqual(e2e.uplink_route("Uplink: via relay default to srt://relay.example.com:6000")["streamid"], None)
+        for line in ("", None, "Link: connected", "Uplink: to srt://relay.example.com:6000?streamid=x"):
+            self.assertIsNone(e2e.uplink_route(line))
+        self.assertEqual(e2e.short_id(STREAM_ID), "`AbCd…` (22 chars)")
+        self.assertEqual(e2e.short_id(None), "none")
+
+    def test_the_relay_verdict_holds_the_line_against_open_live(self):
+        sources = e2e.ours([RELAYED], LABEL)
+        ok, detail, sid = e2e.relay_verdict(UPLINK, sources)
+        self.assertTrue(ok, detail)
+        self.assertEqual(sid, STREAM_ID)
+        self.assertIn("'Uplink: via relay default', stream id `AbCd…` (22 chars), encrypted", detail)
+        # The report shows no host and not the whole stream id.
+        self.assertNotIn("relay.example.com", detail)
+        self.assertNotIn(STREAM_ID, detail)
+        # A reconnect with the same stream id passes; another one fails.
+        ok, detail, _ = e2e.relay_verdict(UPLINK, sources, first=STREAM_ID)
+        self.assertTrue(ok, detail)
+        self.assertIn("the same stream id as at the first connect", detail)
+        ok, detail, _ = e2e.relay_verdict(UPLINK, sources, first="ZyXwVuTsRqPoNmLkJiHgFe")
+        self.assertFalse(ok)
+        self.assertIn("the stream id changed since the first connect (`ZyXw…` (22 chars))", detail)
+
+    def test_anything_short_of_the_relay_fails(self):
+        sources = e2e.ours([RELAYED], LABEL)
+        ok, detail, sid = e2e.relay_verdict("", sources)
+        self.assertEqual((ok, sid), (False, None))
+        self.assertIn("no relay uplink line (it says: 'nothing')", detail)
+        ok, detail, _ = e2e.relay_verdict("Uplink: via relay default", sources)
+        self.assertFalse(ok)
+        self.assertIn("carries no stream id", detail)
+        ok, detail, _ = e2e.relay_verdict(UPLINK.replace(STREAM_ID, "ZyXwVuTsRqPoNmLkJiHgFe"), sources)
+        self.assertFalse(ok)
+        self.assertIn("Open Live's stream id for the source is `AbCd…` (22 chars) (connect.streamid)", detail)
+        self.assertIn("differs from Open Live's connect.uri", detail)
+        ok, detail, _ = e2e.relay_verdict(UPLINK.replace("relay default", "relay eu"), sources)
+        self.assertFalse(ok)
+        self.assertIn("Open Live reports relay 'default'", detail)
+        # A listener source (no relay in Open Live) or no source at all.
+        listener = e2e.ours([{"_id": "s1", "name": f"iPhone — {LABEL}", "address": "srt://:47101"}], LABEL)
+        ok, detail, _ = e2e.relay_verdict(UPLINK, listener)
+        self.assertFalse(ok)
+        self.assertIn("not an srt+relay:// one", detail)
+        self.assertIn("Open Live reports relay 'None'", detail)
+        ok, detail, _ = e2e.relay_verdict(UPLINK, [])
+        self.assertFalse(ok)
+        self.assertIn("Open Live lists 0 sources of the run, not one", detail)
 
     def test_the_drop_share_is_taken_between_the_two_readings(self):
         samples = [{"t": 0, "sent": None, "dropped": None, "bytes": None}, sample(1, 0), sample(2, 1000, 5)]
@@ -244,6 +318,31 @@ class Control(unittest.TestCase):
         self.assertFalse(body["ok"])
         self.assertTrue(any("meter socket failed (the meter socket was refused: 403)" in p for p in body["problems"]))
         self.assertFalse(e2e.all_passed(0, [], self.session.phases))
+
+    def test_config_says_whether_the_relay_is_required(self):
+        _, _, body = self.call("GET", "/config")
+        self.assertIs(body["relay"], True)
+
+    def test_the_uplink_line_is_judged_and_its_stream_id_kept(self):
+        line = urllib.parse.quote(UPLINK, safe="")
+        status, _, body = self.call("POST", f"/uplink?phase=first&line={line}")
+        self.assertEqual(status, 200)
+        self.assertFalse(body["ok"], "no source of the run seen yet")
+        self.assertIsNone(self.session.first_streamid)
+        self.session.sources = e2e.ours([RELAYED], LABEL)
+        _, _, body = self.call("POST", f"/uplink?phase=first&line={line}")
+        self.assertTrue(body["ok"], body["detail"])
+        self.assertEqual(self.session.first_streamid, STREAM_ID)
+        other = urllib.parse.quote(UPLINK.replace(STREAM_ID, "ZyXwVuTsRqPoNmLkJiHgFe"), safe="")
+        self.session.sources[0]["streamid"] = "ZyXwVuTsRqPoNmLkJiHgFe"
+        self.session.sources[0]["dial_in"] = DIAL_IN.replace(STREAM_ID, "ZyXwVuTsRqPoNmLkJiHgFe")
+        _, _, body = self.call("POST", f"/uplink?phase=foreground&line={other}")
+        self.assertFalse(body["ok"])
+        self.assertIn("changed since the first connect", body["detail"])
+        self.assertEqual(self.session.first_streamid, STREAM_ID)
+        _, _, body = self.call("POST", "/uplink?phase=foreground")
+        self.assertFalse(body["ok"])
+        self.assertIn("no relay uplink line", body["detail"])
 
     def test_the_foreground_picture_counts_only_looks_after_the_window(self):
         self.session.polls.append((0.0, "active", (1280, 720)))  # from before the background

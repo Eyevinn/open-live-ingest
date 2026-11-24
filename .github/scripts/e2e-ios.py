@@ -40,6 +40,14 @@ not the app (the simulator shares the host's loopback), runs the test with
      that was refused, broke or closed, or one that got no frame. The report never says
      "all checks passed" unless every measured phase heard sound. The peak-to-average
      bitrate of what was sent is noted from the bytes counter (spec section 16).
+     Before the measurement, the uplink has to go through Open Live's SRT relay (the
+     only way into openlivedev, #159/#161): the Go live screen's uplink line
+     (`uplinkLine`, StatusText.uplinkLine: `Uplink: via relay <name> to
+     srt://<relay>?streamid=<id>&passphrase=***`) has to name a relay and carry a stream
+     id, and both, with the dial-in address, have to be what Open Live reports for the
+     source (`connect.relay`, `connect.streamid`, `connect.uri`), whose address is an
+     `srt+relay://` one. Armed, there is no uplink line at all. E2E_RELAY=0 drops this
+     for an instance without a relay (the default is to require it).
   4. Deactivate: the app is back to waiting (Armed, or Waiting for production while the
      inactive production still holds the source), `Link: not sending` (AC2).
   5. Stop: the source is kept, `inactive`, with its id. Go live again: no input fails
@@ -51,6 +59,8 @@ not the app (the simulator shares the host's loopback), runs the test with
      (its counters started again), with the same source, and the cloud decodes again:
      only looks at Open Live that began after the app was Live and connected again count
      (a `/measure/start` window), so a picture left from before the background does not.
+     The uplink goes through the same relay with the same stream id as at the first
+     connect (the app keeps it for every reconnect).
   7. Stop, then this script deactivates and deletes the production and deletes the
      source, whatever happened before. Sources and productions carrying
      `oli-ios-e2e-` left by an earlier run that was killed are removed first.
@@ -69,7 +79,9 @@ request run).
 Needs IOS_UDID (a booted or bootable simulator, from `simulator`) and E2E_DERIVED (the
 DerivedData folder `xcodebuild build-for-testing` wrote). Python standard library only.
 OSC_ACCESS_TOKEN, the service token, the instance address and the cloud Strom's host
-are masked in the log as soon as they are known; no response body is printed; xcodebuild
+are masked in the log as soon as they are known, and so are the relay's dial-in address
+and the source's stream id (a report shows only its first characters); a source's address,
+which may carry the SRT passphrase, is never kept; no response body is printed; xcodebuild
 is started with OSC_ACCESS_TOKEN, GH_TOKEN and GITHUB_TOKEN removed from its
 environment. The pure parts are unit tested: `python3 -I .github/scripts/test_e2e_ios.py`.
 """
@@ -210,17 +222,85 @@ def listener_port(address):
 
 
 def ours(sources, label):
-    """The sources of this run: named `<venue> — <label>`."""
+    """The sources of this run: named `<venue> — <label>`. Through a relay, whether the
+    address is an `srt+relay://` one and what Open Live's `connect` block says (the
+    relay, the stream id, the dial-in address); never the address itself, which may
+    carry the SRT passphrase."""
     out = []
     for s in sources if isinstance(sources, list) else []:
         if isinstance(s, dict) and str(s.get("name", "")).endswith(f" — {label}"):
+            connect = s.get("connect") if isinstance(s.get("connect"), dict) else {}
             out.append({
                 "id": s.get("_id") or s.get("id"),
                 "name": s.get("name"),
                 "status": s.get("status"),
                 "port": listener_port(s.get("address")),
+                "relay_address": str(s.get("address") or "").startswith("srt+relay://"),
+                "relay": connect.get("relay"),
+                "streamid": connect.get("streamid"),
+                "dial_in": connect.get("uri"),
             })
     return out
+
+
+def uplink_route(line):
+    """The app's uplink line (StatusText.uplinkLine), `Uplink: via relay <name> to
+    srt://<relay>?streamid=<id>&passphrase=***`: a dict with the relay's name, the
+    dial-in address without the masked passphrase, the stream id in it (or None) and
+    whether the line says the link is encrypted. None when the line names no relay."""
+    m = re.fullmatch(r"Uplink: via relay (\S+)(?: to (\S+))?", str(line or "").strip())
+    if not m:
+        return None
+    route = {"relay": m[1], "dial_in": None, "streamid": None, "encrypted": False}
+    if m[2]:
+        base, _, rest = m[2].partition("?")
+        params = [p for p in rest.split("&") if p]
+        secret = [p for p in params if p.split("=", 1)[0] == "passphrase"]
+        route["encrypted"] = bool(secret)
+        kept = [p for p in params if p not in secret]
+        route["dial_in"] = base + ("?" + "&".join(kept) if kept else "")
+        route["streamid"] = next((p[len("streamid="):] for p in kept if p.startswith("streamid=")), None) or None
+    return route
+
+
+def short_id(value):
+    """The first characters of a stream id and its length, for a report."""
+    value = str(value or "")
+    return f"`{value[:4]}…` ({len(value)} chars)" if value else "none"
+
+
+def relay_verdict(line, sources, first=None):
+    """Whether the uplink goes through Open Live's SRT relay as Open Live has the source:
+    `line` is the app's uplink line, `sources` the run's sources (`ours`), `first` the
+    stream id seen at the first connect (a reconnect has to keep it). (ok, detail,
+    stream id); the detail names no host and only the start of the stream id."""
+    route = uplink_route(line)
+    if route is None:
+        return False, f"the app shows no relay uplink line (it says: '{line or 'nothing'}')", None
+    sid = route["streamid"]
+    problems = []
+    if not sid:
+        problems.append("the uplink line's dial-in address carries no stream id")
+    if len(sources) != 1:
+        problems.append(f"Open Live lists {len(sources)} sources of the run, not one")
+    source = sources[0] if sources else {}
+    if not source.get("relay_address"):
+        problems.append("the source's address in Open Live is not an srt+relay:// one")
+    if source.get("relay") != route["relay"]:
+        problems.append(f"Open Live reports relay '{source.get('relay')}' for the source (connect.relay)")
+    if sid and source.get("streamid") != sid:
+        problems.append(f"Open Live's stream id for the source is {short_id(source.get('streamid'))} (connect.streamid)")
+    if route["dial_in"] != source.get("dial_in"):
+        problems.append("the dial-in address differs from Open Live's connect.uri")
+    if first and sid != first:
+        problems.append(f"the stream id changed since the first connect ({short_id(first)})")
+    detail = (f"'Uplink: via relay {route['relay']}', stream id {short_id(sid)}"
+              f"{', encrypted' if route['encrypted'] else ''}")
+    if problems:
+        return False, detail + "; " + "; ".join(problems), sid
+    detail += (", the relay, stream id and dial-in address Open Live reports for the srt+relay:// source"
+               + (", the same stream id as at the first connect" if first else ""))
+    return True, detail, sid
 
 
 def stale(name, label):
@@ -731,6 +811,8 @@ class Session:
         self.samples = {}
         self.windows = {}
         self.watch = None
+        self.relay = os.environ.get("E2E_RELAY", "1").strip() != "0"
+        self.first_streamid = None
         self.lock = threading.Lock()
         self.stopping = threading.Event()
         self.poller = threading.Thread(target=self.poll, daemon=True)
@@ -739,6 +821,10 @@ class Session:
         while not self.stopping.is_set():
             try:
                 found = ours(self.ol.sources(), self.label)
+                for s in found:
+                    if s.get("dial_in"):
+                        mask_url(s["dial_in"])
+                    mask(s.get("streamid"))
                 with self.lock:
                     self.sources, self.sources_at = found, time.monotonic()
                 if self.production_id:
@@ -839,7 +925,7 @@ class Session:
         if method == "GET" and path == "/config":
             return {"instance": self.instance, "label": self.label, "seconds": self.seconds,
                     "armed_hold": ARMED_HOLD, "background_limit": BACKGROUND_LIMIT,
-                    "phone_background_bound": PHONE_BACKGROUND_BOUND}
+                    "phone_background_bound": PHONE_BACKGROUND_BOUND, "relay": self.relay}
         if method == "POST" and path == "/pasteboard/token":
             self.pasteboard(self.pat)
             return {"ok": True}
@@ -907,6 +993,17 @@ class Session:
                     "drop_share": gap.get("drop_share"), "packets_sent": gap.get("packets_sent"),
                     "resolution": result["decode"]["resolution"],
                     "audio": result["audio"][0]}
+        if method == "POST" and path == "/uplink":
+            # The app's uplink line against Open Live's source; the first stream id that
+            # passes is the one every later reconnect has to keep.
+            with self.lock:
+                found = list(self.sources)
+                first = self.first_streamid
+            ok, detail, sid = relay_verdict(args.get("line", ""), found, first)
+            if ok and first is None:
+                with self.lock:
+                    self.first_streamid = sid
+            return {"ok": ok, "detail": detail}
         if method == "POST" and path == "/check":
             check = {"id": args.get("id", "?"), "ok": args.get("ok") == "1", "detail": args.get("detail", "")}
             with self.lock:
