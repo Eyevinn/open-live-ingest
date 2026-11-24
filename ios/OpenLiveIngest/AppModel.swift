@@ -16,6 +16,8 @@ final class AppModel: ObservableObject {
     }
     @Published private(set) var row: InputRow?
     @Published private(set) var status: StatusRow?
+    /// The SRT relay the uplink goes through while it runs; nil without one.
+    @Published private(set) var relay: RelayRoute?
     @Published private(set) var network: NetworkKind?
     @Published private(set) var bitrateKbps: Int?
     @Published private(set) var stopping: StoppingProgress?
@@ -178,6 +180,7 @@ final class AppModel: ObservableObject {
         }
         row = nil
         status = nil
+        relay = nil
         bitrateKbps = nil
         notices = []
         stopping = nil
@@ -282,14 +285,17 @@ final class AppModel: ObservableObject {
             stopping = progress
         case .stopped(let stopped):
             media.stopAll()
+            relay = nil
             live = false
             stopping = nil
             if let error = stopped.error { goProblem = error.message }
             refresh()
         case .media(let command):
             media.handle(command)
+            relay = media.relay
         case .fatal(let message):
             media.stopAll()
+            relay = nil
             fatal = message
         case .unknown:
             break

@@ -6,6 +6,10 @@ import SRT
 struct SRTSenderOptions: Equatable {
     var host: String
     var port: UInt16
+    /// `SRTO_STREAMID`, set only when present and not empty: through Open Live's SRT relay, what
+    /// pairs this caller with the cloud Strom there. Up to 512 bytes (libsrt's `MAX_SID_LENGTH`).
+    /// Every call of a sender, a reconnect too, sets the same one.
+    var streamId: String?
     /// `SRTO_LATENCY`, which libsrt also applies as `SRTO_PEERLATENCY`.
     var latencyMs: Int32 = 200
     /// `SRTO_PASSPHRASE`, set only when present (10 to 79 characters).
@@ -22,7 +26,9 @@ struct SRTSenderOptions: Equatable {
 
 extension SRTSenderOptions: CustomStringConvertible, CustomDebugStringConvertible {
     var description: String {
-        var uri = "srt://\(host):\(port)?mode=caller&latency=\(latencyMs)"
+        var uri = "srt://\(host):\(port)?"
+        if let streamId, !streamId.isEmpty { uri += "streamid=\(streamId)&" }
+        uri += "mode=caller&latency=\(latencyMs)"
         if passphrase != nil { uri += "&passphrase=***" }
         if let pbkeylen { uri += "&pbkeylen=\(pbkeylen)" }
         return uri
@@ -81,7 +87,7 @@ enum SRTSenderError: Error, Equatable {
 }
 
 /// MPEG-TS over SRT in caller mode to `host:port`, with libsrt (docs/specs/ios-app.md, sections 9
-/// and 11; ADR-002 section 3).
+/// and 11; ADR-002 section 3); through Open Live's SRT relay, to the relay with the stream id.
 ///
 /// `connect()` makes one call. `start()` keeps calling until connected: after a failed call (which
 /// takes up to libsrt's connect timeout) it tries again every 2 s, and it starts again the same way
@@ -278,6 +284,12 @@ final class SRTSender {
             try set(sock, SRTO_INPUTBW, "SRTO_INPUTBW", options.bitrateBitsPerSecond / 8)
         }
         try set(sock, SRTO_OHEADBW, "SRTO_OHEADBW", Self.overheadPercent)
+        // A string option, its bytes without a terminator, and "pre": only before the call.
+        if let streamId = options.streamId, !streamId.isEmpty {
+            let bytes = Array(streamId.utf8)
+            let rc = bytes.withUnsafeBytes { srt_setsockflag(sock, SRTO_STREAMID, $0.baseAddress, Int32($0.count)) }
+            if rc == SRT_ERROR { throw SRTSenderError.option(name: "SRTO_STREAMID", message: Self.lastError()) }
+        }
         if let passphrase = options.passphrase {
             let bytes = Array(passphrase.utf8)
             let rc = bytes.withUnsafeBytes { srt_setsockflag(sock, SRTO_PASSPHRASE, $0.baseAddress, Int32($0.count)) }

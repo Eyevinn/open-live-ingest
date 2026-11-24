@@ -65,6 +65,17 @@ final class MediaController {
     /// The inputs whose media runs.
     var inputs: [String] { Array(running.keys) }
 
+    /// The SRT relay `input`'s uplink goes through, from its `media` start; nil when it does not run
+    /// or sends to a port of the cloud Strom.
+    func relayRoute(of input: String) -> RelayRoute? {
+        running[input]?.start.uplink.relayRoute
+    }
+
+    /// The relay of the first running input that goes through one: the phone sends one input.
+    var relay: RelayRoute? {
+        inputs.sorted().lazy.compactMap { self.relayRoute(of: $0) }.first
+    }
+
     func handle(_ command: MediaCommand) {
         AppLog.info(command.description)
         switch command {
@@ -83,7 +94,8 @@ final class MediaController {
     }
 
     /// Every running input's SRT caller calls again on the new network path (section 9): only the
-    /// socket, not capture or the encoders, and the session is not restarted.
+    /// socket, not capture or the encoders, and the session is not restarted. The sender keeps its
+    /// options, so a call through a relay carries the same stream id.
     func reconnectAll() {
         for input in inputs {
             AppLog.info("media reconnect \(input): the network path changed")

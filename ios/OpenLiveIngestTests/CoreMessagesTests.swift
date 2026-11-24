@@ -253,13 +253,19 @@ final class CoreMessagesTests: XCTestCase {
     }
 
     /// The `media` start event exactly as mobile/src/core.rs builds it.
-    static func mediaStart(passphrase: String?, device: String? = "cam-1") -> String {
+    /// `relay`: through Open Live's SRT relay, as with one (#161): the relay's host and port, the
+    /// stream id, the relay's name and its dial-in address.
+    static func mediaStart(passphrase: String?, device: String? = "cam-1", relay: Bool = false) -> String {
         let pass = passphrase.map { #", "passphrase": "\#($0)", "pbkeylen": 32"# } ?? ""
         let device = device.map { #""\#($0)""# } ?? "null"
+        let place =
+            relay
+            ? #""host": "relay.example.com", "port": 6000, "latency_ms": 200, "streamid": "phonerelayid0000000001", "relay": "default", "dial_in": "srt://relay.example.com:6000?streamid=phonerelayid0000000001""#
+            : #""host": "127.0.0.1", "port": 47250, "latency_ms": 200"#
         return #"""
             {"event": "media", "data": {"input": "in-1", "name": "iPhone 3F2A — Back camera", "action": "start",
              "device": \#(device), "microphone": "mic-1", "test_pattern": false,
-             "uplink": {"host": "127.0.0.1", "port": 47250, "latency_ms": 200\#(pass)},
+             "uplink": {\#(place)\#(pass)},
              "video": {"width": 1280, "height": 720, "fps": 30.0, "bitrate_kbps": 4000, "keyframe_interval": 30},
              "audio": {"sample_rate": 48000, "channels": 2, "bitrate_kbps": 128}}}
             """#
@@ -279,9 +285,36 @@ final class CoreMessagesTests: XCTestCase {
         XCTAssertEqual(start.audio, AudioSettings(sampleRate: 48_000, channels: 2, bitrateKbps: 128))
         XCTAssertEqual(String(describing: decoded), "media start in-1")
 
+        XCTAssertNil(start.uplink.streamid, "no relay: caller mode to a port")
+        XCTAssertNil(start.uplink.relayRoute)
+        XCTAssertNil(start.senderOptions.streamId)
+
         let plain = try event(Self.mediaStart(passphrase: nil, device: nil))
         guard case .media(.start(let pattern)) = plain else { return XCTFail("\(plain)") }
         XCTAssertNil(pattern.uplink.passphrase)
         XCTAssertTrue(pattern.usesTestPattern)
+    }
+
+    func testAMediaStartThroughARelayDecodes() throws {
+        let decoded = try event(Self.mediaStart(passphrase: "known-passphrase-4711", relay: true))
+        guard case .media(.start(let start)) = decoded else { return XCTFail("\(decoded)") }
+        XCTAssertEqual(
+            start.uplink,
+            UplinkSettings(
+                host: "relay.example.com", port: 6000, latencyMs: 200, passphrase: "known-passphrase-4711", pbkeylen: 32,
+                streamid: "phonerelayid0000000001", relay: "default",
+                dialIn: "srt://relay.example.com:6000?streamid=phonerelayid0000000001"))
+        XCTAssertEqual(
+            start.uplink.relayRoute,
+            RelayRoute(
+                name: "default", dialIn: "srt://relay.example.com:6000?streamid=phonerelayid0000000001", encrypted: true))
+        let options = start.senderOptions
+        XCTAssertEqual(options.host, "relay.example.com")
+        XCTAssertEqual(options.port, 6000)
+        XCTAssertEqual(options.streamId, "phonerelayid0000000001")
+        XCTAssertEqual(
+            "\(start)".components(separatedBy: ",").first,
+            "media start in-1: srt://relay.example.com:6000?streamid=phonerelayid0000000001&mode=caller&latency=200&passphrase=***&pbkeylen=32")
+        XCTAssertFalse(String(reflecting: start).contains("known-passphrase-4711"))
     }
 }

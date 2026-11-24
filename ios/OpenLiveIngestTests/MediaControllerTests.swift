@@ -173,6 +173,54 @@ final class MediaControllerTests: XCTestCase {
         XCTAssertEqual(effective.uplink, start.uplink)
     }
 
+    /// Through Open Live's SRT relay (#161): the stream id reaches the sender's options, the model
+    /// shows the relay, and a reconnect on a network change or a restart keeps the same stream id.
+    @MainActor
+    func testARelayStartKeepsItsStreamIdThroughReconnectsAndRestarts() throws {
+        let (model, channel) = makeModel()
+        model.phone.pathChanged(.wifi)
+        model.goLiveOrStop()
+        XCTAssertTrue(model.live)
+        channel.receive(CoreMessagesTests.mediaStart(passphrase: "known-passphrase-4711", relay: true))
+        settle()
+        let media = try XCTUnwrap(made.first)
+        XCTAssertEqual(media.start.senderOptions.streamId, "phonerelayid0000000001")
+        XCTAssertEqual(media.start.senderOptions.host, "relay.example.com")
+        XCTAssertEqual(model.relay?.name, "default")
+        XCTAssertEqual(
+            StatusText.uplinkLine(model.relay),
+            "Uplink: via relay default to srt://relay.example.com:6000?streamid=phonerelayid0000000001&passphrase=***")
+
+        // Wi-Fi to cellular: the same media calls again, with the options it has.
+        model.phone.pathChanged(.cellular)
+        settle()
+        XCTAssertEqual(made.count, 1, "a reconnect makes no new media")
+        XCTAssertEqual(media.reconnects, 1)
+        XCTAssertEqual(media.start.senderOptions.streamId, "phonerelayid0000000001")
+
+        // The stall restart: new media, the same stream id.
+        channel.receive(#"{"event": "media", "data": {"input": "in-1", "action": "restart"}}"#)
+        settle()
+        XCTAssertEqual(made.count, 2)
+        XCTAssertEqual(made.last?.start.senderOptions.streamId, "phonerelayid0000000001")
+        XCTAssertEqual(model.relay?.name, "default")
+
+        channel.receive(#"{"event": "media", "data": {"input": "in-1", "action": "stop"}}"#)
+        settle()
+        XCTAssertNil(model.relay, "nothing runs, so no relay line")
+    }
+
+    /// Without a relay (caller mode, as before relays) there is no stream id and no relay line.
+    @MainActor
+    func testACallerStartHasNoStreamIdAndNoRelay() throws {
+        let (model, channel) = makeModel()
+        channel.receive(CoreMessagesTests.mediaStart(passphrase: nil))
+        settle()
+        XCTAssertNil(try XCTUnwrap(made.first).start.senderOptions.streamId)
+        XCTAssertNil(model.relay)
+        XCTAssertNil(StatusText.uplinkLine(model.relay))
+    }
+
     @MainActor
     func testTheStateAndStatusLinesFollowTheEvents() throws {
         let (model, channel) = makeModel()

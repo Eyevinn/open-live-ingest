@@ -20,9 +20,10 @@ final class SRTSenderTests: XCTestCase {
             "no listener passphrase: run the tests with ios/run-tests.sh")
     }
 
-    private func options(port: UInt16, passphrase: String? = nil) -> SRTSenderOptions {
+    private func options(port: UInt16, passphrase: String? = nil, streamId: String? = nil) -> SRTSenderOptions {
         SRTSenderOptions(
-            host: "127.0.0.1", port: port, latencyMs: 200, passphrase: passphrase ?? self.passphrase, pbkeylen: 16,
+            host: "127.0.0.1", port: port, streamId: streamId, latencyMs: 200, passphrase: passphrase ?? self.passphrase,
+            pbkeylen: 16,
             bitrateBitsPerSecond: 4_128_000,
             // Generous: a CI runner is busy while the simulator settles.
             connectTimeoutMs: 10_000)
@@ -104,8 +105,10 @@ final class SRTSenderTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(after.rttMs, 0)
     }
 
+    /// With a stream id, as through Open Live's SRT relay (#161): the listener here takes any, so
+    /// this shows the option is set before the call and kept for the reconnect.
     func testReconnectRestartsTheCountersFromZero() throws {
-        let sender = SRTSender(options: options(port: Self.reconnectPort))
+        let sender = SRTSender(options: options(port: Self.reconnectPort, streamId: "phonerelayid0000000001"))
         defer { sender.stop() }
         try sender.connect()
         for chunk in chunks(50) { try sender.send(chunk) }
@@ -122,6 +125,19 @@ final class SRTSenderTests: XCTestCase {
 
         for chunk in chunks(10) { try sender.send(chunk) }
         waitFor("the new connection counting", timeout: 5) { (sender.stats()?.packetsSent ?? 0) >= 10 }
+        XCTAssertEqual(sender.options.streamId, "phonerelayid0000000001")
+    }
+
+    /// libsrt refuses a stream id over 512 bytes (`MAX_SID_LENGTH`) when it is set, before any call.
+    func testAStreamIdTooLongIsRefusedBeforeTheCall() {
+        let sender = SRTSender(
+            options: options(port: Self.deliveryPort, streamId: String(repeating: "x", count: 513)))
+        defer { sender.stop() }
+        XCTAssertThrowsError(try sender.connect()) { error in
+            guard case .option(let name, _)? = error as? SRTSenderError else { return XCTFail("\(error)") }
+            XCTAssertEqual(name, "SRTO_STREAMID")
+        }
+        XCTAssertNotEqual(sender.state, .connected)
     }
 
     func testLinksTheRecordedLibsrt() {
@@ -141,6 +157,9 @@ final class SRTSenderTests: XCTestCase {
         let opts = options(port: Self.deliveryPort)
         XCTAssertEqual("\(opts)", "srt://127.0.0.1:4201?mode=caller&latency=200&passphrase=***&pbkeylen=16")
         XCTAssertFalse(String(reflecting: opts).contains(passphrase))
+        XCTAssertEqual(
+            "\(options(port: 6000, streamId: "phonerelayid0000000001"))",
+            "srt://127.0.0.1:6000?streamid=phonerelayid0000000001&mode=caller&latency=200&passphrase=***&pbkeylen=16")
     }
 }
 

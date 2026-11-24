@@ -26,7 +26,9 @@
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use open_live_ingest::api::{self, OscCredential, SaveError, Workspace};
-use open_live_ingest::config::{self, AuthMode, Config, CredentialStore, InputSettings, Problem};
+use open_live_ingest::config::{
+    self, AuthMode, Config, CredentialStore, InputSettings, Problem, RelayLink,
+};
 use open_live_ingest::devices;
 use open_live_ingest::flow::{Input, Source};
 use open_live_ingest::gateway::{self, InputState};
@@ -863,6 +865,21 @@ fn media_event(request: &MediaRequest, capture: &Capture) -> Value {
             }
             if let Some(len) = endpoint.pbkeylen() {
                 uplink.insert("pbkeylen".into(), json!(len));
+            }
+            // Through Open Live's SRT relay `host` and `port` are the relay's, and the
+            // stream id is what pairs this caller with the cloud Strom there: Swift sets
+            // it on the socket before it calls, and keeps it for every reconnect.
+            // `relay` and `dial_in` (Open Live's `connect.uri`, never with a passphrase)
+            // are for the status lines. None of the three without a relay (caller mode).
+            if let Some(RelayLink {
+                name,
+                stream_id: Some(stream_id),
+                dial_in,
+            }) = &endpoint.relay
+            {
+                uplink.insert("streamid".into(), json!(stream_id));
+                uplink.insert("relay".into(), json!(name));
+                uplink.insert("dial_in".into(), json!(dial_in));
             }
             json!({
                 "input": input.id,

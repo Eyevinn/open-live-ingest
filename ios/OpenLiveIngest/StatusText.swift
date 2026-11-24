@@ -64,6 +64,29 @@ enum StatusText {
         return text
     }
 
+    /// Through Open Live's SRT relay, `Uplink: via relay default to
+    /// srt://relay.example.com:6000?streamid=<id>&passphrase=***`; nil without a relay (a port of the
+    /// cloud Strom, as before relays). A passphrase is always shown masked.
+    static func uplinkLine(_ relay: RelayRoute?) -> String? {
+        guard let relay else { return nil }
+        var text = "Uplink: via relay \(relay.name)"
+        if let dialIn = relay.dialIn.map(masked), !dialIn.isEmpty {
+            text += " to " + dialIn
+            if relay.encrypted && !dialIn.contains("passphrase=") {
+                text += (dialIn.contains("?") ? "&" : "?") + "passphrase=***"
+            }
+        }
+        return text
+    }
+
+    /// `address` with the value of any `passphrase=` replaced by `***`.
+    static func masked(_ address: String) -> String {
+        guard let query = address.firstIndex(of: "?") else { return address }
+        let parts = address[address.index(after: query)...].split(separator: "&", omittingEmptySubsequences: false)
+        let shown = parts.map { $0.hasPrefix("passphrase=") ? "passphrase=***" : String($0) }
+        return String(address[...query]) + shown.joined(separator: "&")
+    }
+
     /// `Network: Wi-Fi, 4.1 Mbit/s`.
     static func networkLine(_ network: NetworkKind?, bitrateKbps: Int?) -> String {
         var text = "Network: " + (network?.label ?? "unknown")
