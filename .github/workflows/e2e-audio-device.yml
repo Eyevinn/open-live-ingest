@@ -3,8 +3,10 @@ name: E2E audio device
 # A device source with a paired audio device, end to end against the `openlivedev`
 # Open Live instance (OL-61b, #70): a v4l2loopback camera and a PulseAudio
 # microphone, the pinned Strom, `up --audio`, a check that the source is registered
-# and carries an audio track, then its removal. The script's header says what is
-# checked and how: .github/scripts/e2e-audio-device.sh.
+# and carries an audio track, then its removal. The uplink goes through Open Live's
+# SRT relay (`uplink.mode = "relay"`, #159), as openlivedev is relay-only and
+# publishes no SRT ports. The script's header says what is checked and how:
+# .github/scripts/e2e-audio-device.sh.
 #
 # Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
 # token for the workspace that owns `openlivedev`. Without it, a run by hand fails and

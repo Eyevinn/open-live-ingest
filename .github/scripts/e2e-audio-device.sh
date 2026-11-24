@@ -19,9 +19,13 @@
 #      has seen both devices before the gateway asks. The gateway adopts it.
 #   4. `up --all --devices CAMERA --audio CAMERA=MICROPHONE` against the Open Live
 #      instance OPEN_LIVE_INSTANCE (default openlivedev) in the token's OSC workspace,
-#      with a gateway name unique to the run.
+#      with a gateway name unique to the run. The uplink goes through Open Live's SRT
+#      relay (`uplink.mode = "relay"`, #159): openlivedev is relay-only and publishes
+#      no SRT ports, so an instance that reports no relay fails `up` with the reason
+#      instead of quietly sending to a port nothing serves.
 #   5. Checks, each logged and written to the step summary:
-#      - the source is registered in Open Live under the gateway's name;
+#      - the source is registered in Open Live under the gateway's name, through the
+#        relay, with a dial-in address (`status --json`: `.source.relay`/`.dial_in`);
 #      - the flow Strom runs for it captures `audio_video` from the microphone and
 #        declares one audio track on the uplink;
 #      - audio buffers reach the uplink's audio input (A0): a Strom buffer probe on
@@ -59,11 +63,14 @@ work="${RUNNER_TEMP:-$(mktemp -d)}/oli-e2e"
 mkdir -p "$work"
 
 instance="${OPEN_LIVE_INSTANCE:-openlivedev}"
-# openlivedev publishes no SRT port range (its port reservation is off), so the
-# settings name one. Nothing listens on the cloud side until a production is
-# activated, which this run does not do; the uplink keeps retrying, as it does at a
-# venue before the show.
-port_range="${E2E_PORT_RANGE:-47290-47299}"
+# The uplink dials Open Live's SRT relay with the stream id Open Live gives the
+# source; with no passphrase in the settings, `up` generates one and keeps it in the
+# run's settings file. The cloud Strom only dials the relay once a production holding
+# the source is active, which this run does not do, so the relay has nothing to pair
+# the uplink with; the audio is checked where it enters the uplink, on the venue
+# Strom. The relay is E2E_RELAY when set, otherwise picked from Open Live's
+# server-info below: `default` when it reports one, else the first.
+relay_name="${E2E_RELAY:-}"
 strom_port="${E2E_STROM_PORT:-18080}"
 strom_url="http://127.0.0.1:$strom_port"
 gateway_name="oli-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-$$}"
@@ -280,6 +287,17 @@ for id in $stale_ids; do
 done
 [[ -z "$stale_ids" ]] || note "removed $removed of $(wc -w <<<"$stale_ids") stale oli-e2e- source(s) left by an earlier run"
 
+srt_info="$(ol_get /api/v1/server-info | jq -c '.srt // null')" \
+    || fail "GET /api/v1/server-info on '$instance' failed"
+relays="$(jq -r '(.relays // [])[] | .name' <<<"$srt_info")"
+[[ -n "$relays" ]] || fail "missing capability: Open Live '$instance' reports no SRT relay (srt.state '$(jq -r '.state // "absent"' <<<"$srt_info")'), and it publishes no SRT ports, so a device source has nowhere to send"
+if [[ -z "$relay_name" ]]; then
+    if grep -qx default <<<"$relays"; then relay_name=default; else relay_name="$(head -n 1 <<<"$relays")"; fi
+fi
+grep -qxF "$relay_name" <<<"$relays" \
+    || fail "Open Live '$instance' has no SRT relay named '$relay_name'; it has: $(tr '\n' ' ' <<<"$relays")"
+pass "Open Live '$instance' reports SRT relay(s) $(tr '\n' ' ' <<<"$relays")(state $(jq -r '.state // "unknown"' <<<"$srt_info")); sending through '$relay_name'"
+
 # --- 4. up --audio ------------------------------------------------------------------------
 
 # The instance address and the token stay in the environment, never in the file.
@@ -296,8 +314,8 @@ auth_mode = "osc"
 register = true
 
 [uplink]
-mode = "caller"
-port_range = "$port_range"
+mode = "relay"
+relay = "$relay_name"
 latency_ms = 200
 
 [video]
@@ -327,6 +345,22 @@ done
 source_json="$(ol_get "/api/v1/sources/$source_id")"
 source_name="$(jq -r .name <<<"$source_json")"
 pass "source '$source_name' ($source_id) registered in Open Live '$instance' (streamType $(jq -r .streamType <<<"$source_json"), status $(jq -r .status <<<"$source_json"))"
+
+# Through the relay: the gateway's own view of the source names the relay and has a
+# dial-in address (srt://<relay>?streamid=<id>, never with the passphrase). Neither
+# is printed; only whether they are there.
+via_relay=""
+for _ in $(seq 30); do
+    via_relay="$("$gateway_bin" --config "$work/gateway.toml" status --json 2>/dev/null \
+        | jq -r --arg n "$source_name" '.inputs[] | select(.name == $n) | .source
+            | select(. != null and (.relay // "") != "") | "\(.relay) \(if (.dial_in // "") != "" then "dial-in" else "no-dial-in: \(.dial_in_error // "no reason")" end)"' \
+        | head -n 1)" || true
+    [[ "$via_relay" == *" dial-in" ]] && break
+    sleep 2
+done
+[[ -n "$via_relay" ]] || fail "the source '$source_name' is not registered through an SRT relay (status --json reports no source.relay)"
+[[ "$via_relay" == *" dial-in" ]] || fail "the source '$source_name' is on relay '${via_relay%% *}' but Open Live gave no dial-in address (${via_relay#* })"
+pass "the source goes through Open Live's SRT relay '${via_relay%% *}', which gave it a dial-in address"
 
 # --- 5. audio checks ------------------------------------------------------------------------
 
