@@ -19,12 +19,16 @@ struct FakeControl {
         self.port = port16
     }
 
-    /// `method path`, the JSON object it answers with.
-    func call(_ method: String, _ path: String) throws -> [String: Any] {
+    /// `method path`, the JSON object it answers with, waiting up to `timeout` seconds for each
+    /// read and write. An error names the path without its query string: the end to end's
+    /// queries can carry what the job log masks (an uplink line), and an error lands in the
+    /// public test results.
+    func call(_ method: String, _ path: String, timeout seconds: Int = 10) throws -> [String: Any] {
+        let what = "\(method) \(path.split(separator: "?", maxSplits: 1).first.map(String.init) ?? "")"
         let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw Failed(description: "no socket: errno \(errno)") }
+        guard fd >= 0 else { throw Failed(description: "\(what): no socket, errno \(errno)") }
         defer { close(fd) }
-        var timeout = timeval(tv_sec: 10, tv_usec: 0)
+        var timeout = timeval(tv_sec: seconds, tv_usec: 0)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         var address = sockaddr_in()
@@ -37,31 +41,36 @@ struct FakeControl {
                 connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard connected == 0 else { throw Failed(description: "\(method) \(path): cannot connect, errno \(errno)") }
+        guard connected == 0 else { throw Failed(description: "\(what): cannot connect, errno \(errno)") }
 
         let request = Array(
             "\(method) \(path) HTTP/1.1\r\nHost: \(host):\(port)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
         var offset = 0
         while offset < request.count {
             let n = request[offset...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
-            guard n > 0 else { throw Failed(description: "\(method) \(path): write failed, errno \(errno)") }
+            guard n > 0 else { throw Failed(description: "\(what): write failed, errno \(errno)") }
             offset += n
         }
         var received: [UInt8] = []
         var buffer = [UInt8](repeating: 0, count: 65_536)
+        var readErrno: Int32 = 0
         while true {
             let n = buffer.withUnsafeMutableBytes { read(fd, $0.baseAddress, $0.count) }
+            if n < 0 { readErrno = errno }
             if n <= 0 { break }
             received.append(contentsOf: buffer[0..<n])
+        }
+        guard !received.isEmpty else {
+            throw Failed(description: "\(what): no answer within \(seconds) s (errno \(readErrno))")
         }
 
         let text = String(decoding: received, as: UTF8.self)
         guard text.hasPrefix("HTTP/1.1 200"), let split = text.range(of: "\r\n\r\n") else {
-            throw Failed(description: "\(method) \(path): \(text)")
+            throw Failed(description: "\(what): \(text)")
         }
         let body = Data(text[split.upperBound...].utf8)
         guard let object = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
-            throw Failed(description: "\(method) \(path): not a JSON object: \(text)")
+            throw Failed(description: "\(what): not a JSON object: \(text)")
         }
         return object
     }

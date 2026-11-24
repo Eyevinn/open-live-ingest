@@ -48,7 +48,7 @@ struct GoLiveView: View {
                         Text(StatusText.linkLine(model.status?.link))
                             .accessibilityValue(StatusText.linkCounters(model.status?.link))
                             .accessibilityIdentifier("linkLine")
-                        if let uplink = StatusText.uplinkLine(model.relay) {
+                        if let uplink = StatusText.uplinkLine(model.relay, redacted: model.redactUplink) {
                             Text(uplink)
                                 .accessibilityIdentifier("uplinkLine")
                         }

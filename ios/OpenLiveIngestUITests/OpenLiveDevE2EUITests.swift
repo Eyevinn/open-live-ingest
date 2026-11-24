@@ -20,9 +20,17 @@ import XCTest
 /// (`relay` in `/config`) the uplink has to go through Open Live's SRT relay: the Go live screen's
 /// uplink line (`uplinkLine`, StatusText.uplinkLine) is handed to the control server, which
 /// holds its relay, stream id and dial-in address against what Open Live reports for the source.
+///
+/// The results bundle is a public artifact, and GitHub's log masking does not reach it. So the app
+/// runs with `-OLIRedactUplink`: its uplink line names the relay and a fingerprint of the dial-in
+/// address (`Uplink: via relay default, route <hex>, encrypted`), never the relay host or the
+/// stream id. Nothing on the screen carries them, so no screenshot (ours, or XCTest's own on a
+/// failure) and no UI hierarchy in the bundle does either.
 final class OpenLiveDevE2EUITests: XCTestCase {
     private var control: FakeControl!
     private var app: XCUIApplication!
+    /// Over e2e-ios.py's PASTEBOARD_TIMEOUT (60 s).
+    private static let pasteboardTimeout = 90
 
     private func shot(_ name: String) {
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
@@ -38,9 +46,11 @@ final class OpenLiveDevE2EUITests: XCTestCase {
     }
 
     @discardableResult
-    private func call(_ method: String, _ path: String, _ query: [String: String] = [:]) throws -> [String: Any] {
+    private func call(
+        _ method: String, _ path: String, _ query: [String: String] = [:], timeout: Int = 10
+    ) throws -> [String: Any] {
         let items = query.keys.sorted().map { "\($0)=\(Self.encode(query[$0] ?? ""))" }
-        return try control.call(method, items.isEmpty ? path : path + "?" + items.joined(separator: "&"))
+        return try control.call(method, items.isEmpty ? path : path + "?" + items.joined(separator: "&"), timeout: timeout)
     }
 
     /// Posts a passed check for the report, or fails the test with it.
@@ -94,8 +104,8 @@ final class OpenLiveDevE2EUITests: XCTestCase {
 
     private func production() throws -> [String: Any] { try call("GET", "/production") }
 
-    /// The uplink line, `Uplink: via relay <name> to srt://<relay>?streamid=<id>&passphrase=***`,
-    /// judged by the control server against the source as Open Live has it (its relay, stream id
+    /// The uplink line, `Uplink: via relay <name>, route <fingerprint>, encrypted` (redacted, see
+    /// above), judged by the control server against the source as Open Live has it (its relay, stream id
     /// and dial-in address), and against the stream id of the first connect after that.
     private func relayCheck(_ phase: String, _ id: String) throws {
         let line = app.staticTexts["uplinkLine"]
@@ -184,7 +194,7 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let relay = config["relay"] as? Bool ?? true
 
         app = XCUIApplication()
-        app.launchArguments = ["-OLIReset"]
+        app.launchArguments = ["-OLIReset", "-OLIRedactUplink"]
         app.launch()
 
         // 1. Sign in with a personal access token, pick the instance.
@@ -192,9 +202,11 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         app.buttons["whereAdvanced"].tap()
         let field = app.secureTextFields["patField"]
         XCTAssertTrue(field.waitForExistence(timeout: 10))
-        try call("POST", "/pasteboard/token")
+        // The control server bounds `simctl pbcopy` at 60 s and answers with the reason; wait
+        // longer than that, so a slow pasteboard fails with it rather than with no answer.
+        try call("POST", "/pasteboard/token", timeout: Self.pasteboardTimeout)
         paste(into: field)
-        try call("POST", "/pasteboard/clear")
+        try call("POST", "/pasteboard/clear", timeout: Self.pasteboardTimeout)
         let use = app.buttons["patSubmit"]
         XCTAssertTrue(use.waitForExistence(timeout: 5))
         let enabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: use)
