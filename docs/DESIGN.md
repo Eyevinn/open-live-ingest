@@ -306,8 +306,7 @@ nothing. The app remembers no window size, tab or recent list (ADR-001, spec sec
 
 **One loop.** Every ten seconds, sequentially over all inputs: make sure the flow exists and runs,
 read its SRT statistics, then list the Open Live sources once and create or patch what differs. No
-task per input, no shared state, no file written by concurrent writers. Between ticks, an uplink the
-gateway started that has had no peer yet is looked at every second (§7, late connect).
+task per input, no shared state, no file written by concurrent writers.
 
 ## 7. Source status
 
@@ -321,13 +320,6 @@ treat the counter reset of a reconnect as a stall. A feed that was on air is hel
 polls before it is reported inactive, because each status flip rewrites the source and CouchDB keeps
 a revision per write. When Strom itself is unreachable the status is left as it was: losing contact
 with Strom is not evidence that the feed stopped.
-
-**Late connect (#111).** An uplink whose first peer appears more than 5 s after the gateway started
-it is stopped and started once, at once: a caller that connects into an Open Live receiver that came
-up after it started dialling stalls that receiver (Eyevinn/strom#1277), while a connect into a
-receiver that is already running is clean. It is the same restart as for a stall (sender drops at
-the stream rate), but only for a first connect, and it does not count toward the stall restarts'
-cap. The fault is the receiver's; this only keeps the gateway clear of it until Strom is fixed.
 
 A source left by an earlier run is adopted by name rather than recreated, so a Studio assignment
 that references its id survives a restart.

@@ -77,16 +77,23 @@
 //! | `--listener-delay 0`, `sync: true` | PASS: 0 dropped |
 //! | `--listener-delay 35 --receiver-sync false` | PASS: 0 dropped |
 //!
-//! `--restart-on-late-connect` does what `up` does since #111's ingest-side
-//! workaround: it looks for the uplink's peer every `run::CONNECT_POLL` (1 s), and
-//! when the first peer appears more than `run::LATE_CONNECT_AFTER` (5 s) after the
-//! flow started, it stops and starts the flow once, so the caller connects again
-//! into the receiver that is now running. The window and its counters then start at
-//! that second connect. Expected with the Strom receiver:
+//! `--restart-on-late-connect` tries the ingest-side workaround that #111's
+//! 2026-11-24 triage proposed for `up` (not shipped): it looks for the uplink's peer
+//! every `CONNECT_POLL` (1 s), and when the first peer appears more than
+//! `LATE_CONNECT_AFTER` (5 s) after the flow started, it stops and starts the flow
+//! once, so the caller connects again into the receiver that is now running. The
+//! window and its counters then start at that second connect. Measured with the
+//! Strom receiver (PR #170, late-connect run 45480983729, Strom 0.8.2 on both ends),
+//! and expected until a Strom release fixes strom#1277:
 //!
 //! | run | expected |
 //! |---|---|
-//! | `--listener-delay 35 --restart-on-late-connect`, `sync: true` | PASS: 0 dropped after the restart, both sinks' PTS reach the end of the window |
+//! | `--listener-delay 35 --restart-on-late-connect`, `sync: true` | FAIL: the restart connects about 1 s after the receiver came up and stalls it the same way (0 dropped at +10 s, about 28 % at +20 s, 52 % at +30 s), until the caller reconnects on its own between +30 and +40 s (31-41 s after the receiver came up) |
+//!
+//! So the stall depends on how long the receiver has been running when the caller
+//! connects, not on how long the caller has been dialling, and an immediate restart
+//! does not avoid it. That is why `up` has no such restart; #127's stall restart
+//! covers the later window.
 //!
 //! With the default `srt-live-transmit` receiver both the late run and the control
 //! pass (0 dropped, #120 and the Mac run on #111). With a Strom carrying the
@@ -107,7 +114,6 @@
 use anyhow::{bail, Context, Result};
 use open_live_ingest::config::{Uplink, Video};
 use open_live_ingest::flow::{self, Input, Source, TEST_INPUT_ID};
-use open_live_ingest::run::{CONNECT_POLL, LATE_CONNECT_AFTER};
 use open_live_ingest::strom::{StromClient, PINNED_VERSION};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -127,6 +133,11 @@ const RECEIVER_LATENCY_MS: u64 = 125;
 const MAX_DROP_RATIO: f64 = 0.01;
 /// How long to wait for the uplink to report a peer once the listener is up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// `--restart-on-late-connect`: how often the peer is looked for while dialling.
+const CONNECT_POLL: Duration = Duration::from_secs(1);
+/// `--restart-on-late-connect`: a first peer later than this after the flow started
+/// counts as a late connect and restarts the flow once.
+const LATE_CONNECT_AFTER: Duration = Duration::from_secs(5);
 /// Time between two samples of the uplink's counters.
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 /// How far a Strom receiver sink's PTS may fall behind the wall time between its first
@@ -326,8 +337,8 @@ async fn main() -> Result<ExitCode> {
             );
         }
 
-        // With the gateway's workaround, the peer is looked for as `up` does, every
-        // CONNECT_POLL, and a late first peer restarts the flow once.
+        // With the proposed workaround, the peer is looked for every CONNECT_POLL, and
+        // a late first peer restarts the flow once.
         let poll = if o.restart_on_late_connect {
             CONNECT_POLL
         } else {

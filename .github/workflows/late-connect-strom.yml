@@ -8,16 +8,18 @@ name: Late connect (Strom receiver)
 #   1. late:    the receiver flow starts 35 s after the uplink, sinks `sync: true`
 #   2. first:   the receiver flow is up before the uplink starts
 #   3. nosync:  late as in 1, sinks `sync: false`
-#   4. late+restart: late as in 1, with `--restart-on-late-connect`: the gateway's
-#      ingest-side workaround (#111), restarting the uplink once at a late first
-#      connect so it connects again into the running receiver
+#   4. late+restart: late as in 1, with `--restart-on-late-connect`: the ingest-side
+#      workaround #111's triage proposed (restart the uplink once at a late first
+#      connect, so it connects again into the running receiver). It does not avoid
+#      the stall (PR #170, run 45480983729), so it is kept as a recorded negative
+#      result, and `up` has no such restart
 #
 # Until a Strom release carries the strom#1277 fix, the expected pattern is
-# FAIL / PASS / PASS / PASS, and the job succeeds only on that pattern: it shows the
-# reproduction still catches the stall, that its controls stay clean, and that the
-# workaround avoids it. After the fix is released and pinned
-# (.github/scripts/bump-strom-pin.sh), run 1 must PASS and the expected pattern here
-# becomes PASS / PASS / PASS / PASS.
+# FAIL / PASS / PASS / FAIL, and the job succeeds only on that pattern: it shows the
+# reproduction still catches the stall, that its controls stay clean, and that an
+# immediate restart does not get around it. After the fix is released and pinned
+# (.github/scripts/bump-strom-pin.sh), runs 1 and 4 must PASS and the expected
+# pattern here becomes PASS / PASS / PASS / PASS.
 #
 # The Strom setup is ci.yml's real-strom job: GStreamer from apt, the
 # strom-<tag>-linux-x86_64 release asset at the strom-types pin in Cargo.toml,
@@ -178,7 +180,7 @@ jobs:
           out="$RUNNER_TEMP/late-connect"
           results="$out/results.tsv"
           summary="$out/summary.md"
-          declare -A expected=([late]=FAIL [first]=PASS [nosync]=PASS [late+restart]=PASS)
+          declare -A expected=([late]=FAIL [first]=PASS [nosync]=PASS [late+restart]=FAIL)
           ok=true
           {
             echo "## Late connect (Strom receiver), #111 / strom#1277"
@@ -200,9 +202,9 @@ jobs:
             done
             echo
             if $ok; then
-              echo "Pattern FAIL / PASS / PASS / PASS as expected: the late receiver with clock-synced sinks still stalls the uplink (strom#1277 not fixed in this Strom), both controls are clean, and the restart on a late connect avoids the stall."
+              echo "Pattern FAIL / PASS / PASS / FAIL as expected: the late receiver with clock-synced sinks still stalls the uplink (strom#1277 not fixed in this Strom), both controls are clean, and an immediate restart on a late connect does not avoid the stall."
             else
-              echo "**Pattern differs from the expected FAIL / PASS / PASS / PASS.** If run \`late\` passed with the others, this Strom may carry the strom#1277 fix: check, then flip its expectation here. If \`late+restart\` failed, the ingest-side restart does not avoid the stall."
+              echo "**Pattern differs from the expected FAIL / PASS / PASS / FAIL.** If runs \`late\` and \`late+restart\` passed with the others, this Strom may carry the strom#1277 fix: check, then flip both expectations here."
             fi
             echo
             for name in late first nosync late+restart; do
@@ -218,7 +220,7 @@ jobs:
           } > "$summary"
           cat "$summary" >> "$GITHUB_STEP_SUMMARY"
           cat "$summary"
-          $ok || { echo "::error title=late-connect::the pattern is not FAIL / PASS / PASS / PASS, see the job summary"; exit 1; }
+          $ok || { echo "::error title=late-connect::the pattern is not FAIL / PASS / PASS / FAIL, see the job summary"; exit 1; }
 
       - name: Stop Strom, logs (tail)
         if: always()

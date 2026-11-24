@@ -38,8 +38,7 @@ use std::time::Duration;
 use strom_types::api::SrtCallerStats;
 use strom_types::discovery::DeviceResponse;
 use strom_types::FlowId;
-use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 const TICK: Duration = Duration::from_secs(10);
 
@@ -84,20 +83,6 @@ const STALL_MIN_SENT: u64 = 500;
 /// with less capacity than the stream can drop a large share and still deliver a
 /// degraded, live picture, and must not be torn down.
 const STALL_DROP_PERCENT: u64 = 90;
-
-/// How long an uplink the gateway started may dial with no peer before a connect
-/// counts as late (#111). A late first connect into an Open Live production's Strom
-/// (an `mpegtssrt_input` whose receiver came up after the caller started dialling)
-/// stalls (Eyevinn/strom#1277), while a connect into a receiver that is already
-/// running is clean; so a late first connect is restarted once, at once, rather than
-/// after [`STALLED_POLLS`] stalled polls. A receiver that is up connects within a
-/// second or two of the flow starting.
-pub const LATE_CONNECT_AFTER: Duration = Duration::from_secs(5);
-
-/// How often an uplink that is dialling with no peer yet is looked at, so a late
-/// first connect is restarted within a second of the peer appearing, before the
-/// receiver's stall sets in (drops start within about 20 s).
-pub const CONNECT_POLL: Duration = Duration::from_secs(1);
 
 /// Where the receiver-side fault behind a stall is tracked.
 const STALL_UPSTREAM_ISSUE: &str = "https://github.com/Eyevinn/strom/issues/1277";
@@ -515,10 +500,6 @@ struct Live {
     /// Whether the gateway has given up restarting this input's stalled uplink, so the
     /// warning saying so is emitted once.
     stall_given_up: bool,
-    /// When the gateway last started this input's uplink, while it has had no peer
-    /// since: the late-connect watch ([`LATE_CONNECT_AFTER`]). Cleared at the first
-    /// peer, so a reconnect after that is never taken for a late first connect.
-    dialling_since: Option<Instant>,
     source_id: Option<String>,
     /// The `connect.warning` Open Live last reported for the source, so one that
     /// persists is logged once per run rather than every tick.
@@ -973,7 +954,6 @@ async fn start_inputs<M: Media>(
                 stalled_polls: 0,
                 stall_restarts: 0,
                 stall_given_up: false,
-                dialling_since: (!armed).then(Instant::now),
                 source_id,
                 connect_warning,
                 uplink: None,
@@ -1479,10 +1459,7 @@ async fn run_until_stopped<M: Media>(
     let mut unreadable = false;
     let next_look = tokio::time::sleep(Duration::ZERO);
     tokio::pin!(next_look);
-    let next_watch = tokio::time::sleep(CONNECT_POLL);
-    tokio::pin!(next_watch);
     loop {
-        let dialling = live.iter().any(|l| l.sending && l.dialling_since.is_some());
         tokio::select! {
             () = &mut next_look, if gated.is_some() => {
                 let client = gated.expect("guarded");
@@ -1532,31 +1509,6 @@ async fn run_until_stopped<M: Media>(
                 }
                 tell_changes(live, events);
                 events.emit(stats_of(live));
-            }
-            // An uplink dialling with no peer yet: looked at every second, so a late
-            // first connect is restarted before the receiver stalls (#111).
-            () = &mut next_watch, if dialling => {
-                let mut changed = false;
-                for l in live.iter_mut().filter(|l| l.sending && l.dialling_since.is_some()) {
-                    match watch_connect(media, l, events).await {
-                        Ok(Some(state)) => {
-                            l.state = state;
-                            changed = true;
-                        }
-                        Ok(None) => {}
-                        // The tick reports a Strom that cannot be reached.
-                        Err(err) => {
-                            debug!(input = %l.input.name, err = %format_args!("{err:#}"), "could not look at the dialling uplink, retrying");
-                        }
-                    }
-                }
-                if changed {
-                    if let Some(reporter) = reporter {
-                        reporter.publish(live);
-                    }
-                    tell_changes(live, events);
-                }
-                next_watch.as_mut().reset(tokio::time::Instant::now() + CONNECT_POLL);
             }
             // The hold changed: look at the productions now.
             () = media.hold_changed(), if gated.is_some() => {
@@ -1678,7 +1630,6 @@ async fn send_uplink<M: Media>(
     l.forget_uplink();
     match ensure_started(media, video, l).await {
         Ok(()) => {
-            l.dialling_since = Some(Instant::now());
             l.sending = true;
             l.gate_error = None;
             l.state = State::Starting;
@@ -1761,7 +1712,6 @@ async fn poll_input<M: Media>(
             l.uplink = None;
             l.forget_counters();
             media.start(&l.input, video).await?;
-            l.dialling_since = Some(Instant::now());
             return Ok(State::Starting);
         }
     }
@@ -1773,9 +1723,6 @@ async fn poll_input<M: Media>(
         l.forget_counters();
         return Ok(State::Waiting);
     };
-    if connected_late(l, Instant::now()) {
-        return restart_late_connect(media, l, events).await;
-    }
     l.uplink = Some(sample.clone());
 
     // A connected uplink whose sender drops about as much as it sends delivers
@@ -1850,65 +1797,18 @@ async fn poll_input<M: Media>(
 }
 
 /// Starts an uplink again (Strom: `stop_flow` + `start_flow`), whether it stalled or
-/// is not running, forgetting what was measured on its last run. The new connection
-/// is watched for a late connect like any start ([`LATE_CONNECT_AFTER`]).
+/// is not running, forgetting what was measured on its last run.
 async fn start_again<M: Media>(media: &M, l: &mut Live) -> Result<State> {
     l.last_bytes = None;
     l.uplink = None;
     l.forget_counters();
     Ok(if media.restart(&l.input).await? {
-        l.dialling_since = Some(Instant::now());
         State::Starting
     } else {
         State::Failed {
             reason: "Strom did not report the flow running after start".to_string(),
         }
     })
-}
-
-/// Whether the uplink's first peer, which it has now, came late: the gateway started
-/// it more than [`LATE_CONNECT_AFTER`] before `now` and it had no peer since. Ends
-/// the watch either way, so only a first connect is ever judged.
-fn connected_late(l: &mut Live, now: Instant) -> bool {
-    l.dialling_since
-        .take()
-        .is_some_and(|since| now.saturating_duration_since(since) > LATE_CONNECT_AFTER)
-}
-
-/// The late-connect watch, every [`CONNECT_POLL`] while an input's uplink dials with
-/// no peer: restarts it once if its first peer came late. Returns the input's new
-/// state when it restarted; `None` while it still dials or connected in time.
-async fn watch_connect<M: Media>(
-    media: &M,
-    l: &mut Live,
-    events: &Events,
-) -> Result<Option<State>> {
-    if l.dialling_since.is_none() || media.uplink(&l.input).await?.is_none() {
-        return Ok(None);
-    }
-    if connected_late(l, Instant::now()) {
-        return restart_late_connect(media, l, events).await.map(Some);
-    }
-    Ok(None)
-}
-
-/// Restarts an uplink whose first peer came late, once (#111). The receiver behind a
-/// late connect stalls (Eyevinn/strom#1277); a connect into one already running is
-/// clean, so the flow is stopped and started to connect again at once, before the
-/// stall. Not a stall restart: [`MAX_RESTARTS`] and the backoff are left alone, and
-/// the watch stays off for the new connection, so it never restarts twice.
-async fn restart_late_connect<M: Media>(media: &M, l: &mut Live, events: &Events) -> Result<State> {
-    info!(input = %l.input.name, upstream = STALL_UPSTREAM_ISSUE, "the uplink connected more than {} s after it started dialling; restarting it once to connect into the running receiver", LATE_CONNECT_AFTER.as_secs());
-    events.emit(Event::Warning {
-        message: format!(
-            "{}: the uplink connected more than {} s after it started, which can stall the receiver ({STALL_UPSTREAM_ISSUE}); restarting the flow once to connect again",
-            l.input.name,
-            LATE_CONNECT_AFTER.as_secs(),
-        ),
-    });
-    let state = start_again(media, l).await;
-    l.dialling_since = None;
-    state
 }
 
 /// An uplink connection's cumulative packet counters. libsrt keeps them per
@@ -1943,7 +1843,6 @@ impl Live {
         self.quiet_polls = 0;
         self.stall_restarts = 0;
         self.stall_given_up = false;
-        self.dialling_since = None;
     }
 }
 
@@ -3734,7 +3633,6 @@ mod tests {
             stalled_polls: 0,
             stall_restarts: 0,
             stall_given_up: false,
-            dialling_since: None,
             source_id: source_id.map(str::to_string),
             connect_warning: None,
             uplink,
@@ -4007,12 +3905,7 @@ mod tests {
     }
 
     async fn run_script(initial: State, samples: &[Option<(u64, u64)>]) -> Script {
-        run_script_on(live("A", initial, None, None), samples).await
-    }
-
-    /// [`run_script`] from a given input, for one that is dialling (the late-connect
-    /// watch on).
-    async fn run_script_on(mut l: Live, samples: &[Option<(u64, u64)>]) -> Script {
+        let mut l = live("A", initial, None, None);
         let video = Video::default();
         let state = Arc::new(Mutex::new(FakeStrom {
             flow: serde_json::to_value(flow::build("gw", &l.input, &video)).unwrap(),
@@ -4229,151 +4122,6 @@ mod tests {
             .unwrap();
         assert_eq!(l.stall_restarts, 0);
         assert!(!l.stall_given_up);
-    }
-
-    /// An input whose uplink the gateway started `ago` and that has had no peer since.
-    fn dialling_for(ago: Duration) -> Live {
-        let mut l = live("A", State::Starting, None, None);
-        l.dialling_since = Some(Instant::now() - ago);
-        l
-    }
-
-    #[test]
-    fn a_connect_is_late_only_past_the_threshold_and_only_the_first_one() {
-        let now = Instant::now();
-        let mut l = live("A", State::Starting, None, None);
-        l.dialling_since = Some(now - Duration::from_secs(2));
-        assert!(!connected_late(&mut l, now));
-        assert_eq!(l.dialling_since, None, "the watch ends at the first peer");
-        // Long after: a reconnect, not a first connect, is never late.
-        assert!(!connected_late(&mut l, now + Duration::from_secs(60)));
-
-        l.dialling_since = Some(now - LATE_CONNECT_AFTER);
-        assert!(!connected_late(&mut l, now));
-        l.dialling_since = Some(now - LATE_CONNECT_AFTER - Duration::from_millis(100));
-        assert!(connected_late(&mut l, now));
-        assert_eq!(l.dialling_since, None);
-    }
-
-    /// strom#1277 / the `late` CI run: the receiver comes up 35 s after the uplink
-    /// started dialling. The first peer is restarted at once, with a warning that
-    /// points at strom#1277, and only once: the new connection, and a stall on it
-    /// later, are judged as usual, and the late restart does not count toward
-    /// `MAX_RESTARTS`.
-    #[tokio::test]
-    async fn a_late_first_connect_is_restarted_once() {
-        let run = run_script_on(
-            dialling_for(Duration::from_secs(35)),
-            &[
-                None,
-                Some((1_900, 0)),
-                clean(1),
-                clean(2),
-                Some((3 * STALL, STALL)),
-                Some((4 * STALL, 2 * STALL)),
-            ],
-        )
-        .await;
-        assert_eq!(
-            run.states,
-            [
-                State::Waiting,
-                State::Starting,
-                State::Waiting,
-                State::OnAir,
-                State::Waiting,
-                State::Starting
-            ]
-        );
-        // The late connect's restart, then #127's stall restart.
-        assert_eq!(run.restarts, ["stop", "start", "stop", "start"]);
-        assert_eq!(run.warnings.len(), 2, "{:?}", run.warnings);
-        let late = &run.warnings[0];
-        assert!(late.contains("Venue — A"), "{late}");
-        assert!(late.contains("more than 5 s"), "{late}");
-        assert!(late.contains("strom/issues/1277"), "{late}");
-        assert!(
-            run.warnings[1].contains("restart 1 of 4"),
-            "{:?}",
-            run.warnings
-        );
-        assert_eq!(run.live.stall_restarts, 1);
-        // The stall restart dials again, so its connect is watched again.
-        assert!(run.live.dialling_since.is_some());
-    }
-
-    /// A receiver that is up: the peer appears within a second or two of the start.
-    /// No restart, no warning, and the watch is off for good.
-    #[tokio::test]
-    async fn a_peer_that_appears_promptly_is_not_restarted() {
-        let run = run_script_on(
-            dialling_for(Duration::from_secs(1)),
-            &[None, Some((0, 0)), clean(1), clean(2)],
-        )
-        .await;
-        assert_eq!(
-            run.states,
-            [State::Waiting, State::Waiting, State::OnAir, State::OnAir]
-        );
-        assert!(run.restarts.is_empty(), "{:?}", run.restarts);
-        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
-        assert_eq!(run.live.dialling_since, None);
-    }
-
-    /// An uplink that delivered, then lost its peer and connected again (libsrt's own
-    /// reconnect), however long that took, is not a late first connect.
-    #[tokio::test]
-    async fn a_reconnect_after_delivering_is_not_restarted() {
-        let mut samples = vec![clean(1), clean(2), clean(3)];
-        samples.extend([None; 6]);
-        samples.extend([clean(1), clean(2)]);
-        let run = run_script_on(dialling_for(Duration::from_secs(1)), &samples).await;
-        assert!(run.restarts.is_empty(), "{:?}", run.restarts);
-        assert!(run.warnings.is_empty(), "{:?}", run.warnings);
-        assert_eq!(*run.states.last().unwrap(), State::OnAir);
-    }
-
-    /// The one-second watch between ticks does the same: nothing while there is no
-    /// peer, one restart at a late first peer, and nothing after.
-    #[tokio::test]
-    async fn the_connect_watch_restarts_a_late_first_connect_once() {
-        let mut l = dialling_for(Duration::from_secs(35));
-        let video = Video::default();
-        let state = Arc::new(Mutex::new(FakeStrom {
-            flow: serde_json::to_value(flow::build("gw", &l.input, &video)).unwrap(),
-            running: true,
-            stats: [None, Some((1_900, 0)), Some((10, 0))]
-                .into_iter()
-                .collect(),
-            calls: Vec::new(),
-        }));
-        let strom = StromClient::new(&fake_strom(state.clone()).await, None).unwrap();
-        let media = StromMedia::over(&strom, "gw");
-        let events = Events::discard();
-        assert_eq!(watch_connect(&media, &mut l, &events).await.unwrap(), None);
-        assert!(l.dialling_since.is_some(), "still dialling");
-        assert_eq!(
-            watch_connect(&media, &mut l, &events).await.unwrap(),
-            Some(State::Starting)
-        );
-        assert_eq!(l.dialling_since, None);
-        assert_eq!(l.stall_restarts, 0);
-        // The watch is off: no Strom call, no restart.
-        assert_eq!(watch_connect(&media, &mut l, &events).await.unwrap(), None);
-        let posts: Vec<String> = state
-            .lock()
-            .unwrap()
-            .calls
-            .iter()
-            .filter(|c| c.starts_with("POST"))
-            .map(|c| c.rsplit('/').next().unwrap().to_string())
-            .collect();
-        assert_eq!(posts, ["stop", "start"]);
-        assert_eq!(
-            state.lock().unwrap().stats.len(),
-            1,
-            "the third sample is never read"
-        );
     }
 
     #[test]
