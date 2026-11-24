@@ -449,7 +449,8 @@ unknown command or bad arguments is an error reply, never a panic.
 | `self_hosted` | `{url, api_key}` | view model | `check_self_hosted` (#73), `save` |
 | `devices` | `{show_all}` | `{video[], audio[]}` | `devices` (#73, audio from #69) |
 | `set_inputs` | `{inputs: [{device, audio?, label?}]}` | view model | `validate`, `save` |
-| `set_advanced` | the Advanced values | view model, or `problems[]` | `validate` (#73), `save` |
+| `set_advanced` | the Advanced values | view model, or `problems[]` | `validate` (#73), `save`. So far only `{uplink: {relay}}` is saved (OL-66): the relay picked, `null` for `default`; anything else replies "cannot do that yet" |
+| `relays` | — | `{relays[], chosen, offer}` | `GET /api/v1/server-info` `srt.relays` (OL-65). `offer` is true when Open Live reports more than one relay, or none named `chosen` while it reports others: only then does Advanced show the picker (OL-66) |
 | `go_live` | — | `null` (progress arrives as events) | §4 checks, `Session::start` (#72) |
 | `stop` | — | `null` | `SessionHandle::stop` |
 | `stop_other` | — | `null` | `down` (another gateway named by `gateway.pid`) |
@@ -465,7 +466,9 @@ unknown command or bad arguments is an error reply, never a panic.
 |---|---|---|
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
 | `input` | `{input, state, message?, action?}` | per-input registering / armed / waiting_for_production / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
-| `summary` | `{inputs: [{input, port, uplink, registered}]}` | the start summary: `uplink` is where the gateway sends (in caller mode `srt://<host>:<port>?mode=caller&latency=<ms>`), `registered` the address registered with Open Live; passphrases masked |
+| `uplink` | `{via: "relay", relay, public}` | `BringingUpViaRelay` (OL-66): the session sends through Open Live's SRT relay `relay`, at `public` (`host:port`, or `null` when not reported). Not sent without a relay, so a session against an Open Live without one (v0.8.0) hears what it did before |
+| `passphrase` | `{generated: true, kept}` | `PassphraseGenerated`: a passphrase was made for the relay, whose port is public, and saved in the settings file (`kept`), or used for this session only, which is also a `relay_passphrase_not_kept` notice. Never the passphrase itself |
+| `summary` | `{inputs: [{input, port, uplink, registered, relay?}]}` | the start summary: `uplink` is where the gateway sends (in caller mode `srt://<host>:<port>?mode=caller&latency=<ms>`; through the relay the dial-in address `srt://<relay>?streamid=<id>&mode=caller&...`, and `relay` names it), `registered` the address registered with Open Live; passphrases masked. The row reads "Sending via relay `<relay>` to `<uplink>`" |
 | `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
 | `status` | `{inputs: [{input, productions: null \| [{name, state, slots: []}], link: {state: "not_sending" \| "connecting" \| "connected" \| "unknown", dropped_pct, rtt_ms}}]}` | the status lines of §5.1, every 4 s while live; not a library event (the app polls Open Live and the local Strom itself). `productions` is `null` when unknown, `[]` when none holds the source |
 | `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |
@@ -524,6 +527,11 @@ row can be added.
 | API key refused (self-hosted, 401/403) | Open Live refused the API key. Check it under Where to send. | Change |
 | No free SRT port (no range published and none set; Open Live cannot assign one) | Open Live has no free port for `<input>`. Remove an unused source in Studio, or ask the Open Live admin to add ports. | Open Studio |
 | Port held by another gateway's source (`run.rs` clash, not ours) | Port `<n>` is used by the source "`<name>`" in Studio. Remove that source in Studio, then press Go live. | Open Studio |
+| Through the SRT relay (OL-66): Open Live reports no relay any more (`connect.reason` `srt-relay-not-configured`, or a 422 with that `code`, or `srt-relay-unknown` naming no relays) | Open Live has no SRT relay to send through any more. Press Go live again to send to it directly. | Retry |
+| Through the SRT relay: Open Live has no relay of that name (`srt-relay-unknown`, a 422 with `code` and `relays`, or `uplink.relay` not among the relays) | Open Live has no SRT relay named "`<relay>`". Pick one of "`<a>`", "`<b>`" under Advanced. | Advanced |
+| Through the SRT relay: Open Live cannot ask its Strom about the relay (`srt-relay-unreachable`) | Open Live can't reach its SRT relay right now. Wait a moment, then press Go live again. | Retry |
+| Through the SRT relay: the relay has no public address (`srt-relay-public-unknown`) | Open Live's SRT relay has no public address to send to. Ask the Open Live admin to set one, then press Go live again. | Retry |
+| Through the SRT relay: the passphrase generated for it could not be saved in the settings file | Banner: The passphrase made for the SRT relay could not be saved, so it protects this session only. The next Go live makes a new one. | Show file |
 | Port held by our leftover source in an active production (`Refused`) | "`<name>`" from an earlier session is still in an active production. Deactivate that production in Studio, then press Go live. | Open Studio |
 | Camera or microphone access denied (macOS, AVFoundation status) | Open Live Ingest is not allowed to use the camera (microphone). Allow it in System Settings → Privacy & Security, then press Go live. | Open Settings |
 | Camera busy or failed to open (flow does not reach running; Strom error) | `<camera>` could not be opened. Close other apps that use it, then press Go live. | Retry |
