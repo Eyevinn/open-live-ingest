@@ -57,13 +57,20 @@ register = true
 # inside the range it publishes, and a source left by an earlier run keeps its port;
 # in listener mode the lowest free port in port_range, in device-name order.
 [uplink]
-# caller:   this machine dials the cloud. Nothing inbound here; the ports are the
-#           cloud Strom's, and Open Live publishes the range it has leased from it
-#           (GET /api/v1/server-info), so port_range is not needed. Set it only for an
-#           Open Live that publishes no range; it is ignored when one is published.
+# caller:   this machine dials the cloud. Nothing inbound here. Through Open Live's SRT
+#           relay when Open Live reports one (GET /api/v1/server-info, srt.relays):
+#           no ports at all, and a passphrase is generated and saved here if none is
+#           set. Otherwise the ports are the cloud Strom's, and Open Live publishes
+#           the range it has leased from it, so port_range is not needed. Set it only
+#           for an Open Live that publishes no range; it is ignored when one is
+#           published.
+# relay:    always through Open Live's SRT relay; an Open Live without one is an
+#           error rather than a port on its Strom.
 # listener: the cloud dials this machine. Needs public_host and inbound UDP here, and
-#           port_range names this machine's own ports.
+#           port_range names this machine's own ports. Never uses the relay.
 mode = "caller"
+# The relay to send through, by the name Open Live reports; "default" when unset.
+# relay = "default"
 # port_range = "47110-47129"
 # Rule of thumb: 3-4x the measured RTT.
 latency_ms = 200

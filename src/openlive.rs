@@ -88,10 +88,32 @@ pub struct Source {
     pub connect: Option<Connect>,
 }
 
-/// The part of a source's server-derived `connect` block the gateway reads. Its
-/// `uri` is deliberately not decoded: only the address, masked, is ever printed.
+/// The part of a source's server-derived `connect` block the gateway reads: where
+/// the outside party sends to. Every field is optional, as an older Open Live sends
+/// fewer of them. It never carries a passphrase.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct Connect {
+    /// The address the outside party dials, or `None` when Open Live cannot resolve
+    /// it (`reason` then says why). For a relay address
+    /// `srt://<relay public host:port>?streamid=<id>`.
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// The host and port in `uri`.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Why `uri` is null: for a relay address `srt-relay-not-configured`,
+    /// `srt-relay-unknown`, `srt-relay-unreachable` or `srt-relay-public-unknown`.
+    /// Kept as a string so a code this gateway does not know still shows.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Relay addresses only: the relay's name (`default` when the address names none).
+    #[serde(default)]
+    pub relay: Option<String>,
+    /// Relay addresses only: the stream id the outside party sends with.
+    #[serde(default)]
+    pub streamid: Option<String>,
     /// A reason the address may not work against the cloud Strom, such as
     /// `srt-listener-unsupported`. Reported, never enforced: the source is stored all
     /// the same. Kept as a string so a code this gateway does not know still shows.
@@ -103,6 +125,70 @@ impl Source {
     /// Open Live's `connect.warning` for this source, if it reports one.
     pub fn connect_warning(&self) -> Option<&str> {
         self.connect.as_ref()?.warning.as_deref()
+    }
+
+    /// The relay this source goes through, as Open Live reports it in `connect`.
+    pub fn relay(&self) -> Option<&str> {
+        self.connect.as_ref()?.relay.as_deref()
+    }
+
+    /// Where the outside party dials this source (`connect.uri`), if Open Live
+    /// resolved it.
+    pub fn dial_in(&self) -> Option<&str> {
+        self.connect.as_ref()?.uri.as_deref()
+    }
+
+    /// For a source through the relay: the stream id, dial-in address, host and port
+    /// Open Live resolved for it, or the operator's words for why it could not.
+    pub fn relay_dial_in(&self) -> std::result::Result<RelayDialIn, String> {
+        let connect = self.connect.as_ref().ok_or_else(|| {
+            "Open Live returned no dial-in address for it; it is too old to send through an SRT relay".to_string()
+        })?;
+        let relay = connect.relay.as_deref().unwrap_or(config::DEFAULT_RELAY);
+        match (
+            connect.uri.as_deref(),
+            connect.streamid.as_deref(),
+            connect.host.as_deref(),
+            connect.port,
+        ) {
+            (Some(uri), Some(streamid), Some(host), Some(port)) => Ok(RelayDialIn {
+                stream_id: streamid.to_string(),
+                uri: uri.to_string(),
+                host: host.to_string(),
+                port,
+            }),
+            _ => Err(relay_reason_message(connect.reason.as_deref(), relay)),
+        }
+    }
+}
+
+/// Where the gateway dials a source through the relay, from Open Live's `connect`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDialIn {
+    pub stream_id: String,
+    /// `srt://<relay public host:port>?streamid=<id>`, never with a passphrase.
+    pub uri: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Open Live's `connect.reason` for a relay address, in an operator's words.
+pub fn relay_reason_message(reason: Option<&str>, relay: &str) -> String {
+    match reason {
+        Some("srt-relay-not-configured") => format!(
+            "Open Live reports no SRT relay, so it cannot give an address for relay {relay:?} (srt-relay-not-configured)"
+        ),
+        Some("srt-relay-unknown") => format!(
+            "Open Live has no SRT relay named {relay:?} (srt-relay-unknown); set uplink.relay to one it has"
+        ),
+        Some("srt-relay-unreachable") => format!(
+            "Open Live could not ask its Strom about SRT relay {relay:?} (srt-relay-unreachable); try again shortly"
+        ),
+        Some("srt-relay-public-unknown") => format!(
+            "Open Live's Strom reports SRT relay {relay:?} without a public address to dial (srt-relay-public-unknown)"
+        ),
+        Some(other) => format!("Open Live gave no address to dial relay {relay:?} ({other})"),
+        None => format!("Open Live gave no address to dial relay {relay:?}"),
     }
 }
 
@@ -255,12 +341,74 @@ pub struct ServerInfo {
     /// `reserved`, `pending`, `unsupported`, or `disabled`. `pending` means Open Live
     /// has not yet obtained its ports from Strom and is still retrying.
     pub srt_port_state: Option<String>,
+    /// What SRT can do on the cloud Strom, the SRT relays above all. `None` from an
+    /// Open Live older than the block (v0.8.0 and before).
+    pub srt: Option<SrtInfo>,
 }
 
 impl ServerInfo {
     pub fn lease_pending(&self) -> bool {
         self.srt_port_state.as_deref() == Some("pending")
     }
+
+    /// The SRT relays Open Live reports, `default` first. Empty when it reports none
+    /// or is older than relays.
+    pub fn relays(&self) -> &[Relay] {
+        self.srt
+            .as_ref()
+            .map(|s| s.relays.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The relay called `name`, if Open Live reports it.
+    pub fn relay(&self, name: &str) -> Option<&Relay> {
+        self.relays().iter().find(|r| r.name == name)
+    }
+}
+
+/// Server-info's `srt` block: what Strom reports about SRT, from its capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SrtInfo {
+    /// `ok`, `unsupported` (an older Strom: every mode, no relay), `unreachable` (the
+    /// values are the last known ones) or `unknown` (not asked yet).
+    #[serde(default)]
+    pub state: Option<String>,
+    /// The SRT modes that can work on the cloud Strom.
+    #[serde(default)]
+    pub modes: Option<SrtModes>,
+    /// The SRT relays the cloud Strom can use, `default` first.
+    #[serde(default)]
+    pub relays: Vec<Relay>,
+    /// Whether a port the cloud Strom binds can be reached from outside; `None` when
+    /// not known.
+    #[serde(default)]
+    pub inbound_reachable: Option<bool>,
+    /// The cloud Strom's port spans, or `None` (any port, or not known).
+    #[serde(default)]
+    pub ports: Option<Vec<PortSpan>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct SrtModes {
+    pub listener: bool,
+    pub caller: bool,
+    pub rendezvous: bool,
+}
+
+/// One SRT relay: its name, and its public `host:port`, which the dial-in addresses
+/// of its sources carry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Relay {
+    pub name: String,
+    #[serde(default)]
+    pub public: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PortSpan {
+    pub first: u16,
+    pub last: u16,
 }
 
 /// Pure, so the shapes the route has had can be tested without a server.
@@ -313,10 +461,19 @@ fn parse_server_info(body: &serde_json::Value) -> Result<ServerInfo> {
         .or_else(|| body.get("srtPortLease"))
         .and_then(|v| v.as_str())
         .map(|s| if s == "leased" { "reserved" } else { s }.to_string());
+    // Absent or null from an Open Live older than relays, which then runs as before.
+    let srt = match body.get("srt").filter(|v| !v.is_null()) {
+        Some(srt) => Some(
+            SrtInfo::deserialize(srt)
+                .context("Open Live published an srt block that does not decode")?,
+        ),
+        None => None,
+    };
     Ok(ServerInfo {
         strom_host,
         srt_ports,
         srt_port_state,
+        srt,
     })
 }
 
@@ -598,6 +755,11 @@ pub struct Refused {
     pub status: reqwest::StatusCode,
     /// Open Live's `error` field, when the body carried one.
     pub reason: Option<String>,
+    /// Open Live's machine-readable `code`, for a relay refusal
+    /// `srt-relay-not-configured` or `srt-relay-unknown`.
+    pub code: Option<String>,
+    /// With `code`: the relays Open Live does have (empty when none).
+    pub relays: Vec<String>,
 }
 
 impl std::fmt::Display for Refused {
@@ -613,12 +775,52 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 impl Refused {
+    /// For a relay refusal (`code`), what to do about it in an operator's words:
+    /// which relays Open Live does have. `None` for any other refusal.
+    pub fn relay_advice(&self) -> Option<String> {
+        match self.code.as_deref()? {
+            "srt-relay-not-configured" => Some(
+                "Open Live reports no SRT relay; set uplink.mode = \"caller\" to send to a port on its Strom instead".to_string(),
+            ),
+            "srt-relay-unknown" if !self.relays.is_empty() => Some(format!(
+                "Open Live has the relay(s) {}; set uplink.relay to one of them",
+                self.relays.join(", ")
+            )),
+            _ => None,
+        }
+    }
+
     /// Open Live's own words when it gave any, the status line otherwise.
     pub fn explain(&self) -> String {
         self.reason
             .clone()
             .unwrap_or_else(|| format!("HTTP {}", self.status))
     }
+}
+
+/// The relay refusal of an Open Live error body: its `code` and, with it, the
+/// `relays` it has. Short strings only, so nothing the request carried is echoed.
+fn error_code(body: &[u8]) -> (Option<String>, Vec<String>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (None, Vec::new());
+    };
+    let code = value
+        .get("code")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty() && c.len() <= 64)
+        .map(str::to_string);
+    let relays = value
+        .get("relays")
+        .and_then(|r| r.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|r| r.as_str())
+                .filter(|r| config::is_relay_name(r))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    (code, relays)
 }
 
 /// The `error` field of an Open Live error body. Only the short message is taken,
@@ -644,11 +846,15 @@ async fn ok_or_refused(res: reqwest::Response, what: &str) -> Result<reqwest::Re
     if status == reqwest::StatusCode::CONFLICT
         || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
     {
-        let reason = res.bytes().await.ok().and_then(|b| error_reason(&b));
+        let body = res.bytes().await.ok();
+        let reason = body.as_deref().and_then(error_reason);
+        let (code, relays) = body.as_deref().map(error_code).unwrap_or_default();
         return Err(Refused {
             what: what.to_string(),
             status,
             reason,
+            code,
+            relays,
         }
         .into());
     }
@@ -1088,6 +1294,7 @@ mod tests {
                 strom_host: Some("strom.example.com".into()),
                 srt_ports: Some((47110..=47129).collect()),
                 srt_port_state: Some("reserved".into()),
+                srt: None,
             }
         );
         assert!(!current.lease_pending());
@@ -1126,6 +1333,7 @@ mod tests {
                 strom_host: Some("strom.example.com".into()),
                 srt_ports: Some([47110, 47111, 47250].into_iter().collect()),
                 srt_port_state: Some("reserved".into()),
+                srt: None,
             }
         );
         assert!(!info.lease_pending());
@@ -1635,6 +1843,185 @@ mod tests {
             err.to_string(),
             "POST production source failed with HTTP 404 Not Found"
         );
+    }
+
+    /// The `srt` block of an Open Live with relays (open-live `src/routes/status.ts`):
+    /// relays, modes, reachability and Strom's port spans.
+    #[test]
+    fn server_info_decodes_the_srt_block_with_its_relays() {
+        let info = parse_server_info(&serde_json::json!({
+            "stromHost": "strom.example.com",
+            "srtPorts": null,
+            "srtPortState": "unsupported",
+            "srt": {
+                "state": "ok",
+                "modes": { "listener": false, "caller": true, "rendezvous": false },
+                "relays": [
+                    { "name": "default", "public": "relay.example.com:6000" },
+                    { "name": "eu-north", "public": "relay-eu.example.com:6000" }
+                ],
+                "inboundReachable": false,
+                "ports": [{ "first": 47100, "last": 47199 }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(info.srt_ports, None);
+        let srt = info.srt.as_ref().unwrap();
+        assert_eq!(srt.state.as_deref(), Some("ok"));
+        assert_eq!(
+            srt.modes,
+            Some(SrtModes {
+                listener: false,
+                caller: true,
+                rendezvous: false
+            })
+        );
+        assert_eq!(srt.inbound_reachable, Some(false));
+        assert_eq!(
+            srt.ports,
+            Some(vec![PortSpan {
+                first: 47100,
+                last: 47199
+            }])
+        );
+        let names: Vec<&str> = info.relays().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["default", "eu-north"]);
+        assert_eq!(
+            info.relay("eu-north").map(|r| r.public.as_str()),
+            Some("relay-eu.example.com:6000")
+        );
+        assert_eq!(info.relay("nowhere"), None);
+
+        // Strom not asked yet: every field may be null or empty, and no relay.
+        let unknown = parse_server_info(&serde_json::json!({
+            "srt": { "state": "unknown", "relays": [], "inboundReachable": null, "ports": null }
+        }))
+        .unwrap();
+        assert!(unknown.srt.is_some());
+        assert!(unknown.relays().is_empty());
+
+        assert!(parse_server_info(&serde_json::json!({ "srt": { "relays": "default" } })).is_err());
+    }
+
+    /// v0.8.0, the latest release when relays came: no `srt` at all. Nothing about
+    /// relays is read, and the ports are read as before (AC5).
+    #[test]
+    fn server_info_of_open_live_0_8_0_has_no_relays() {
+        let info = parse_server_info(&serde_json::json!({
+            "stromHost": "strom.example.com",
+            "srtPorts": [47110, 47111],
+            "srtPortState": "reserved"
+        }))
+        .unwrap();
+        assert_eq!(info.srt, None);
+        assert!(info.relays().is_empty());
+        assert_eq!(info.srt_ports, Some([47110, 47111].into_iter().collect()));
+        let null = parse_server_info(&serde_json::json!({ "srt": null })).unwrap();
+        assert_eq!(null.srt, None);
+    }
+
+    /// A relay source's `connect`, as open-live `src/lib/srt-connect.ts` resolves it:
+    /// the address to dial with the stream id, or a reason in words.
+    #[test]
+    fn a_relay_source_gives_its_dial_in_address_or_says_why_not() {
+        let relayed = decode(serde_json::json!({
+            "id": "src-1",
+            "name": "Venue — cam",
+            "address": "srt+relay://AbCdEfGhIjKlMnOpQrStUv?latency=200&passphrase=***",
+            "streamType": "srt",
+            "status": "inactive",
+            "connect": {
+                "uri": "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv",
+                "host": "relay.example.com",
+                "port": 6000,
+                "mode": "caller",
+                "source": "srt-relay",
+                "streamid": "AbCdEfGhIjKlMnOpQrStUv",
+                "relay": "default"
+            }
+        }));
+        assert_eq!(relayed.relay(), Some("default"));
+        assert_eq!(
+            relayed.relay_dial_in(),
+            Ok(RelayDialIn {
+                stream_id: "AbCdEfGhIjKlMnOpQrStUv".into(),
+                uri: "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv".into(),
+                host: "relay.example.com".into(),
+                port: 6000,
+            })
+        );
+
+        let unresolved = |reason: &str| {
+            decode(serde_json::json!({
+                "id": "src-1",
+                "name": "Venue — cam",
+                "address": "srt+relay://AbCdEfGhIjKlMnOpQrStUv@eu?latency=200",
+                "connect": {
+                    "uri": null, "host": null, "port": null, "mode": "caller",
+                    "source": "srt-relay", "streamid": "AbCdEfGhIjKlMnOpQrStUv",
+                    "relay": "eu", "reason": reason
+                }
+            }))
+            .relay_dial_in()
+            .unwrap_err()
+        };
+        assert!(unresolved("srt-relay-not-configured").contains("reports no SRT relay"));
+        assert!(unresolved("srt-relay-unknown").contains(r#"no SRT relay named "eu""#));
+        assert!(unresolved("srt-relay-unreachable").contains("could not ask its Strom"));
+        assert!(unresolved("srt-relay-public-unknown").contains("without a public address"));
+        assert!(unresolved("srt-relay-new").contains("(srt-relay-new)"));
+
+        // An Open Live too old to send `connect` at all.
+        let older = decode(serde_json::json!({
+            "id": "src-1", "name": "Venue — cam", "address": "srt+relay://x"
+        }));
+        assert!(older.relay_dial_in().unwrap_err().contains("too old"));
+    }
+
+    /// The 422 open-live `src/services/listener-ports.ts` sends for a relay it does
+    /// not have: the code and the relays it does have reach the error.
+    #[tokio::test]
+    async fn a_422_relay_refusal_names_the_relays_open_live_has() {
+        let base = serve_once(
+            "422 Unprocessable Entity",
+            r#"{"error":"Strom has no SRT relay named \"eu\"; configured: default, us-east","statusCode":422,"code":"srt-relay-unknown","relays":["default","us-east"]}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let payload = SourcePayload::new(
+            "Venue — cam",
+            "srt+relay://auto@eu?latency=200",
+            false,
+            200,
+            None,
+        );
+        let err = client.create_source(&payload).await.unwrap_err();
+        let refused = err.downcast_ref::<Refused>().expect("a Refused error");
+        assert_eq!(refused.status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused.code.as_deref(), Some("srt-relay-unknown"));
+        assert_eq!(refused.relays, ["default", "us-east"]);
+        assert_eq!(
+            refused.relay_advice().as_deref(),
+            Some("Open Live has the relay(s) default, us-east; set uplink.relay to one of them")
+        );
+
+        let base = serve_once(
+            "422 Unprocessable Entity",
+            r#"{"error":"Strom reports no SRT relay configured","statusCode":422,"code":"srt-relay-not-configured","relays":[]}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client.create_source(&payload).await.unwrap_err();
+        let refused = err.downcast_ref::<Refused>().unwrap();
+        assert!(refused.relays.is_empty());
+        assert!(refused
+            .relay_advice()
+            .unwrap()
+            .contains("reports no SRT relay"));
+
+        // Any other refusal carries no code, and no advice about relays.
+        let (code, relays) = error_code(br#"{"error":"port taken","statusCode":409}"#);
+        assert_eq!((code, relays), (None, Vec::new()));
     }
 
     #[test]

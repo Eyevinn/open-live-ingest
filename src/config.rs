@@ -31,6 +31,11 @@ pub struct Config {
     /// `[[input]]`: settings for one input, by device.
     #[serde(rename = "input", skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputSettings>,
+    /// The settings file these were loaded from ([`load_or_default`]), so a value the
+    /// gateway generates for itself, the relay passphrase ([`keep_passphrase`]), can
+    /// be kept there. Never written to the file.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
 }
 
 /// One `[[input]]` entry: an input to send. With any present, `up` sends exactly these
@@ -219,8 +224,10 @@ impl std::str::FromStr for AuthMode {
     }
 }
 
-/// The SRT link template. A port is allocated per input from a range: the one Open
-/// Live publishes for its Strom in caller mode, or `port_range` otherwise.
+/// The SRT link template. In caller mode the uplink goes through Open Live's SRT
+/// relay when it offers one, with no port at all; otherwise a port is allocated per
+/// input from a range: the one Open Live publishes for its Strom in caller mode, or
+/// `port_range` otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Uplink {
@@ -240,6 +247,10 @@ pub struct Uplink {
     pub passphrase: Option<String>,
     /// AES key length in bytes: 16, 24, or 32.
     pub pbkeylen: Option<u32>,
+    /// The SRT relay to send through, by the name Open Live reports
+    /// (`GET /api/v1/server-info`, `srt.relays[].name`). Unset is the relay called
+    /// [`DEFAULT_RELAY`]. Only read when the uplink goes through a relay.
+    pub relay: Option<String>,
 }
 
 impl Default for Uplink {
@@ -252,8 +263,21 @@ impl Default for Uplink {
             latency_ms: 200,
             passphrase: None,
             pbkeylen: None,
+            relay: None,
         }
     }
+}
+
+/// The relay an uplink without `uplink.relay` uses, as Open Live and Strom name it.
+pub const DEFAULT_RELAY: &str = "default";
+
+/// Whether `name` is a relay name Open Live and Strom accept: 1 to 32 characters
+/// from `a-z 0-9 -`.
+pub fn is_relay_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 /// Which end of the SRT link dials. A deployment constraint, not a preference:
@@ -266,12 +290,20 @@ impl Default for Uplink {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum UplinkMode {
-    /// The venue dials the cloud. Nothing inbound at the venue.
+    /// The venue dials the cloud. Nothing inbound at the venue. Through Open Live's
+    /// SRT relay when it reports one (`relay`), otherwise to a port on the cloud
+    /// Strom, as an Open Live without a relay has always had it.
     #[default]
     Caller,
     /// The cloud dials the venue. Matches the convention Open Live's own seeded
     /// sources use, at the cost of a public address or port forward at the venue.
     Listener,
+    /// The venue and the cloud Strom both dial Open Live's SRT relay, which pairs
+    /// them by stream id: one public port for every source, nothing inbound at
+    /// either end. Chosen by `caller` whenever Open Live reports a relay; set it to
+    /// insist on the relay, so an Open Live without one is an error rather than a
+    /// port on its Strom.
+    Relay,
 }
 
 /// The range suggested when setup has to ask for one.
@@ -354,7 +386,19 @@ impl Uplink {
             .transpose()
     }
 
-    /// One concrete link, once a cloud host and a port are known.
+    /// The relay this uplink sends through when it uses one: `uplink.relay`, or
+    /// [`DEFAULT_RELAY`].
+    pub fn relay_name(&self) -> &str {
+        self.relay
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or(DEFAULT_RELAY)
+    }
+
+    /// One concrete link, once a cloud host and a port are known. In relay mode the
+    /// host and port are those of the relay, known once Open Live has registered the
+    /// source ([`Endpoint::dial_relay`]); until then they are whatever was passed.
     pub fn endpoint(&self, cloud_host: &str, port: u16) -> Endpoint {
         Endpoint {
             mode: self.mode,
@@ -364,8 +408,27 @@ impl Uplink {
             latency_ms: self.latency_ms,
             passphrase: self.passphrase.clone().filter(|p| !p.is_empty()),
             pbkeylen: self.pbkeylen,
+            relay: (self.mode == UplinkMode::Relay).then(|| RelayLink {
+                name: self.relay_name().to_string(),
+                stream_id: None,
+                dial_in: None,
+            }),
         }
     }
+}
+
+/// The relay end of a link in relay mode: which relay, and once Open Live has
+/// registered the source, the stream id it gave it and the address to dial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayLink {
+    /// The relay's name, as Open Live reports it.
+    pub name: String,
+    /// The id Open Live gave the source, which is also the SRT stream id. `None`
+    /// until it has registered one: the address then asks it for one (`auto`).
+    pub stream_id: Option<String>,
+    /// Open Live's `connect.uri`: `srt://<relay public host:port>?streamid=<id>`,
+    /// never with a passphrase. `None` until registered.
+    pub dial_in: Option<String>,
 }
 
 /// One SRT link, described by the two URIs that mirror each other: the one on the
@@ -380,13 +443,24 @@ pub struct Endpoint {
     pub latency_ms: u32,
     passphrase: Option<String>,
     pbkeylen: Option<u32>,
+    /// Set in relay mode only.
+    pub relay: Option<RelayLink>,
 }
 
 impl Endpoint {
-    /// For `builtin.mpegtssrt_output` on the venue Strom.
+    /// For `builtin.mpegtssrt_output` on the venue Strom. In relay mode Open Live's
+    /// dial-in address (`srt://<relay>?streamid=<id>`) in caller mode.
     pub fn venue_uri(&self) -> String {
+        if let Some(dial_in) = self.relay.as_ref().and_then(|r| r.dial_in.as_deref()) {
+            let join = if dial_in.contains('?') { '&' } else { '?' };
+            return format!(
+                "{dial_in}{join}mode=caller&latency={}{}",
+                self.latency_ms,
+                self.crypto()
+            );
+        }
         let mut uri = match self.mode {
-            UplinkMode::Caller => format!(
+            UplinkMode::Caller | UplinkMode::Relay => format!(
                 "srt://{}:{}?mode=caller&latency={}",
                 self.cloud_host, self.port, self.latency_ms
             ),
@@ -403,13 +477,55 @@ impl Endpoint {
 
     /// Registered on the Open Live source, which becomes the cloud Strom's `srt_uri`.
     /// `srtsrc` defaults to caller mode, so the mode is always explicit here.
+    ///
+    /// In relay mode `srt+relay://auto@<relay>?latency=<ms>...` until Open Live has
+    /// given the source a stream id: `auto` asks it for one, or keeps the one the
+    /// source already has, and naming the relay keeps a source of an earlier run from
+    /// staying on another one. Once it has, the id itself, as Open Live stores it (the
+    /// default relay without `@`), so the source stays the same through a recreate
+    /// and compares equal to what Open Live returns.
     pub fn cloud_uri(&self) -> String {
+        if let Some(relay) = &self.relay {
+            let at = match relay.stream_id.as_deref() {
+                Some(id) if relay.name == DEFAULT_RELAY => id.to_string(),
+                Some(id) => format!("{id}@{}", relay.name),
+                None => format!("auto@{}", relay.name),
+            };
+            return format!(
+                "srt+relay://{at}?latency={}{}",
+                self.latency_ms,
+                self.crypto()
+            );
+        }
         let mut uri = match self.mode {
-            UplinkMode::Caller => format!("srt://:{}?mode=listener", self.port),
+            UplinkMode::Caller | UplinkMode::Relay => format!("srt://:{}?mode=listener", self.port),
             UplinkMode::Listener => format!("srt://{}:{}?mode=caller", self.public_host, self.port),
         };
         uri.push_str(&self.crypto());
         uri
+    }
+
+    /// Takes what Open Live answered for the source of a link in relay mode: its
+    /// stream id, and the address to dial (`connect.uri`), whose host and port become
+    /// this link's. Nothing for a link not in relay mode.
+    pub fn dial_relay(&mut self, stream_id: &str, dial_in: &str, host: &str, port: u16) {
+        if let Some(relay) = &mut self.relay {
+            relay.stream_id = Some(stream_id.to_string());
+            relay.dial_in = Some(dial_in.to_string());
+            self.cloud_host = host.to_string();
+            self.port = port;
+        }
+    }
+
+    /// The relay's name, in relay mode.
+    pub fn relay_name(&self) -> Option<&str> {
+        self.relay.as_ref().map(|r| r.name.as_str())
+    }
+
+    /// The address the uplink dials through the relay, without a passphrase, once
+    /// Open Live has given one.
+    pub fn dial_in(&self) -> Option<&str> {
+        self.relay.as_ref()?.dial_in.as_deref()
     }
 
     /// The SRT passphrase, when the link is encrypted. For a host that does the media
@@ -536,7 +652,61 @@ pub fn load_or_default(path: &Path) -> Result<Config> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(err) => return Err(err).context("reading the settings file"),
     };
-    with_env_overrides(cfg)
+    let mut cfg = with_env_overrides(cfg)?;
+    cfg.file = Some(path.to_path_buf());
+    Ok(cfg)
+}
+
+/// Characters of a generated passphrase: letters and digits, which pass the
+/// gateway's own check and need no escaping in a URI.
+const PASSPHRASE_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Length of a generated passphrase: about 190 bits from the OS random source,
+/// inside libsrt's 10 to 79 and Open Live's 10 to 80 bytes.
+const GENERATED_PASSPHRASE_LEN: usize = 32;
+
+/// A new SRT passphrase from the OS random source, for a link through the relay,
+/// whose port is public: without one, anyone with the stream id could connect.
+pub fn generate_passphrase() -> Result<String> {
+    // 248 is the largest multiple of 62 up to 256: bytes from it up are drawn again,
+    // so every character is equally likely.
+    let limit = 256 - 256 % PASSPHRASE_ALPHABET.len();
+    let mut out = String::with_capacity(GENERATED_PASSPHRASE_LEN);
+    while out.len() < GENERATED_PASSPHRASE_LEN {
+        let mut bytes = [0u8; GENERATED_PASSPHRASE_LEN];
+        getrandom::fill(&mut bytes).map_err(|err| anyhow!("the OS random source failed: {err}"))?;
+        let wanted = GENERATED_PASSPHRASE_LEN - out.len();
+        out.extend(
+            bytes
+                .iter()
+                .map(|b| usize::from(*b))
+                .filter(|b| *b < limit)
+                .map(|b| char::from(PASSPHRASE_ALPHABET[b % PASSPHRASE_ALPHABET.len()]))
+                .take(wanted),
+        );
+    }
+    Ok(out)
+}
+
+/// Writes `passphrase` into the settings file at `path` as `uplink.passphrase`,
+/// unless the file already has one, which is then returned instead: the file wins,
+/// so two writers end up with the same passphrase. Only that value changes: the file
+/// is read as it is, without the environment overrides [`load_or_default`] applies,
+/// so no credential from the environment is written into it. A missing file is
+/// created with the defaults and the passphrase.
+pub fn keep_passphrase(path: &Path, passphrase: &str) -> Result<String> {
+    let mut cfg: Config = match std::fs::read_to_string(path) {
+        Ok(raw) => toml::from_str(&raw).context("parsing the settings file")?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(err) => return Err(err).context("reading the settings file"),
+    };
+    if let Some(kept) = cfg.uplink.passphrase.as_deref().filter(|p| !p.is_empty()) {
+        return Ok(kept.to_string());
+    }
+    cfg.uplink.passphrase = Some(passphrase.to_string());
+    write(path, &cfg)?;
+    Ok(passphrase.to_string())
 }
 
 /// The handful of values a deployment tool needs to inject without templating a file.
@@ -837,6 +1007,30 @@ fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
                 ),
             ));
         }
+    }
+    if let Some(relay) = cfg
+        .uplink
+        .relay
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        if !is_relay_name(relay) {
+            found.push((
+                "uplink.relay",
+                anyhow!(
+                    "uplink.relay must be 1 to 32 characters of a-z, 0-9 and -, as Open Live names its relays, got {relay:?}"
+                ),
+            ));
+        }
+    }
+    if cfg.uplink.mode == UplinkMode::Relay && !cfg.open_live.register {
+        found.push((
+            "uplink.mode",
+            anyhow!(
+                "uplink.mode is \"relay\", whose address only Open Live can give, so [open_live] register must be on"
+            ),
+        ));
     }
     if let Some(len) = cfg.uplink.pbkeylen {
         if !matches!(len, 16 | 24 | 32) {
@@ -1225,6 +1419,130 @@ mod tests {
         assert!(e
             .cloud_uri()
             .ends_with("&passphrase=s3cret-s3cret&pbkeylen=16"));
+    }
+
+    /// Through the relay: the source asks Open Live for a stream id on the named
+    /// relay, with latency and passphrase; the venue dials the address Open Live
+    /// gives, in caller mode, with the same latency and passphrase.
+    #[test]
+    fn relay_mode_registers_auto_and_dials_the_address_open_live_gives() {
+        let mut u = uplink(UplinkMode::Relay);
+        u.passphrase = Some("s3cret-s3cret".to_string());
+        u.pbkeylen = Some(16);
+        let mut e = u.endpoint("", 0);
+        assert_eq!(e.relay_name(), Some(DEFAULT_RELAY));
+        assert_eq!(
+            e.cloud_uri(),
+            "srt+relay://auto@default?latency=200&passphrase=s3cret-s3cret&pbkeylen=16"
+        );
+        assert_eq!(e.dial_in(), None);
+
+        e.dial_relay(
+            "AbCdEfGhIjKlMnOpQrStUv",
+            "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv",
+            "relay.example.com",
+            6000,
+        );
+        assert_eq!(
+            e.cloud_uri(),
+            "srt+relay://AbCdEfGhIjKlMnOpQrStUv?latency=200&passphrase=s3cret-s3cret&pbkeylen=16"
+        );
+        assert_eq!(
+            e.venue_uri(),
+            "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv&mode=caller&latency=200&passphrase=s3cret-s3cret&pbkeylen=16"
+        );
+        assert_eq!((e.cloud_host.as_str(), e.port), ("relay.example.com", 6000));
+        assert_eq!(
+            e.dial_in(),
+            Some("srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv")
+        );
+
+        // A named relay stays named, with `auto` and with the id.
+        u.relay = Some("eu-north".to_string());
+        let mut e = u.endpoint("", 0);
+        assert!(e
+            .cloud_uri()
+            .starts_with("srt+relay://auto@eu-north?latency=200&"));
+        e.dial_relay("AbCdEfGhIjKlMnOpQrStUv", "srt://r:1?streamid=x", "r", 1);
+        assert!(e
+            .cloud_uri()
+            .starts_with("srt+relay://AbCdEfGhIjKlMnOpQrStUv@eu-north?latency=200&"));
+
+        // Caller and listener links have no relay end, and ignore one given.
+        let mut caller = uplink(UplinkMode::Caller).endpoint("strom.example.com", 9000);
+        caller.dial_relay("x", "srt://r:1?streamid=x", "r", 1);
+        assert_eq!(caller.relay_name(), None);
+        assert_eq!(caller.cloud_uri(), "srt://:9000?mode=listener");
+    }
+
+    /// A generated passphrase passes the gateway's own check, and two differ.
+    #[test]
+    fn a_generated_passphrase_passes_the_check_and_is_random() {
+        let a = generate_passphrase().unwrap();
+        let b = generate_passphrase().unwrap();
+        assert_ne!(a, b);
+        let mut cfg = valid();
+        cfg.uplink.passphrase = Some(a.clone());
+        validate(&cfg).expect("a generated passphrase validates");
+        assert_eq!(a.len(), GENERATED_PASSPHRASE_LEN);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// The generated passphrase goes into the file as it is, with nothing from the
+    /// environment, and a passphrase already in the file wins.
+    #[test]
+    fn a_kept_passphrase_is_written_once_without_the_environment() {
+        let path = temp_path("keep-passphrase");
+        let mut cfg = valid();
+        cfg.open_live.api_key = None;
+        save(&path, &cfg).unwrap();
+
+        let kept = keep_passphrase(&path, "generated-0123456789").unwrap();
+        assert_eq!(kept, "generated-0123456789");
+        let loaded = load_or_default(&path).unwrap();
+        assert_eq!(
+            loaded.uplink.passphrase.as_deref(),
+            Some("generated-0123456789")
+        );
+        assert_eq!(loaded.file.as_deref(), Some(path.as_path()));
+        assert_eq!(loaded.gateway.name, "Venue A");
+
+        // A second writer gets the first one's.
+        assert_eq!(
+            keep_passphrase(&path, "another-0123456789").unwrap(),
+            "generated-0123456789"
+        );
+        // The file has only what was in it plus the passphrase.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("api_key"), "{raw}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn relay_names_are_checked_as_open_live_checks_them() {
+        assert!(is_relay_name("default"));
+        assert!(is_relay_name("eu-north-1"));
+        for bad in ["", "EU", "eu_north", "eu.north", &"a".repeat(33)] {
+            assert!(!is_relay_name(bad), "{bad:?}");
+        }
+        let mut cfg = valid();
+        cfg.uplink.relay = Some("EU North".to_string());
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("uplink.relay must be 1 to 32 characters"));
+        cfg.uplink.relay = Some("eu-north".to_string());
+        validate(&cfg).unwrap();
+
+        // Only Open Live gives a relay address, so relay mode needs registration.
+        cfg.uplink.mode = UplinkMode::Relay;
+        validate(&cfg).unwrap();
+        cfg.open_live.register = false;
+        cfg.uplink.host = Some("strom.example.com".to_string());
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("register must be on"));
     }
 
     #[test]

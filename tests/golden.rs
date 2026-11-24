@@ -182,6 +182,64 @@ const PUBLISHED_PORTS: [u16; 3] = [47110, 47111, 47112];
 struct OpenLiveState {
     sources: Vec<Value>,
     next_id: u32,
+    /// Reports an SRT relay in server-info and takes `srt+relay://` addresses, as
+    /// Open Live after relays does; without, it answers as v0.8.0 and before.
+    relay: bool,
+    /// Relay stream ids handed out so far.
+    next_relay_id: u32,
+}
+
+/// The relay the fake Open Live reports, and its public address.
+const RELAY_PUBLIC: &str = "relay.example.com:6000";
+
+/// What the fake stores for a relay address, as Open Live does: `auto` becomes the
+/// id the source already has, or a new one; the default relay is written without
+/// `@`. Plain addresses are left to `assign`.
+fn relay_address(state: &mut OpenLiveState, address: &str, stored: Option<&str>) -> Option<String> {
+    let rest = address.strip_prefix("srt+relay://")?;
+    let (authority, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (id, relay) = match authority.split_once('@') {
+        Some((id, relay)) => (id, Some(relay)),
+        None => (authority, None),
+    };
+    let kept = stored
+        .and_then(|s| s.strip_prefix("srt+relay://"))
+        .map(|s| s.split(['?', '@']).next().unwrap_or_default().to_string());
+    let id = match (id, kept) {
+        ("auto", Some(kept)) => kept,
+        ("auto", None) => {
+            state.next_relay_id += 1;
+            format!("relayid{:016}", state.next_relay_id)
+        }
+        (id, _) => id.to_string(),
+    };
+    let at = match relay {
+        Some(relay) if relay != "default" => format!("@{relay}"),
+        _ => String::new(),
+    };
+    let query = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{query}")
+    };
+    Some(masked(&format!("srt+relay://{id}{at}{query}")))
+}
+
+/// The `connect` block Open Live derives for a relay address: the relay's public
+/// address with the stream id, never the passphrase.
+fn relay_connect(address: &str) -> Option<Value> {
+    let rest = address.strip_prefix("srt+relay://")?;
+    let id = rest.split(['?', '@']).next().unwrap_or_default();
+    let (host, port) = RELAY_PUBLIC.split_once(':').unwrap();
+    Some(json!({
+        "uri": format!("srt://{RELAY_PUBLIC}?streamid={id}"),
+        "host": host,
+        "port": port.parse::<u16>().unwrap(),
+        "mode": "caller",
+        "source": "srt-relay",
+        "streamid": id,
+        "relay": "default",
+    }))
 }
 
 /// Open Live answers addresses with the passphrase masked.
@@ -230,6 +288,21 @@ fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
             .strip_prefix("/api/v1/sources/")
             .map(str::to_string);
         match (req.method.as_str(), req.path.as_str(), id) {
+            ("GET", "/api/v1/server-info", _) if s.relay => (
+                200,
+                json!({
+                    "stromHost": "cloud.example.com",
+                    "srtPorts": null,
+                    "srtPortState": "unsupported",
+                    "srt": {
+                        "state": "ok",
+                        "modes": { "listener": false, "caller": true, "rendezvous": false },
+                        "relays": [{ "name": "default", "public": RELAY_PUBLIC }],
+                        "inboundReachable": false,
+                        "ports": null,
+                    },
+                }),
+            ),
             ("GET", "/api/v1/server-info", _) => (
                 200,
                 json!({
@@ -242,8 +315,12 @@ fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
             ("POST", "/api/v1/sources", _) => {
                 let payload = req.json();
                 s.next_id += 1;
-                let address = assign(&s, payload["address"].as_str().unwrap_or_default(), None);
-                let source = json!({
+                let requested = payload["address"].as_str().unwrap_or_default();
+                let address = match relay_address(&mut s, requested, None) {
+                    Some(address) => address,
+                    None => assign(&s, requested, None),
+                };
+                let mut source = json!({
                     "id": format!("src-{}", s.next_id),
                     "name": payload["name"],
                     "address": address,
@@ -251,6 +328,9 @@ fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
                     "status": payload["status"],
                     "latency": payload["latency"],
                 });
+                if let Some(connect) = relay_connect(&address) {
+                    source["connect"] = connect;
+                }
                 s.sources.push(source.clone());
                 (201, source)
             }
@@ -261,13 +341,22 @@ fn fake_open_live(state: Arc<Mutex<OpenLiveState>>) -> String {
                 match method {
                     "PATCH" => {
                         let payload = req.json();
-                        let address = assign(
-                            &s,
-                            payload["address"].as_str().unwrap_or_default(),
-                            Some(&id),
-                        );
+                        let requested = payload["address"].as_str().unwrap_or_default();
+                        let stored = s.sources[at]["address"].as_str().map(str::to_string);
+                        let address = match relay_address(&mut s, requested, stored.as_deref()) {
+                            Some(address) => address,
+                            None => assign(&s, requested, Some(&id)),
+                        };
                         let source = &mut s.sources[at];
                         source["address"] = json!(address);
+                        match relay_connect(&address) {
+                            Some(connect) => source["connect"] = connect,
+                            None => {
+                                if let Some(o) = source.as_object_mut() {
+                                    o.remove("connect");
+                                }
+                            }
+                        }
                         source["status"] = payload["status"].clone();
                         source["latency"] = payload["latency"].clone();
                         (200, source.clone())
@@ -648,7 +737,7 @@ fn up_status_and_down_print_as_before() {
     let strom = fake_strom(strom_state.clone());
     let ol_state = Arc::new(Mutex::new(OpenLiveState {
         sources: vec![leftover_source()],
-        next_id: 0,
+        ..OpenLiveState::default()
     }));
     let open_live = fake_open_live(ol_state.clone());
     let scratch = Scratch::new("lifecycle", &strom, &open_live);
@@ -706,7 +795,7 @@ fn up_stopped_by_a_signal_tears_down_as_before() {
     let strom = fake_strom(strom_state.clone());
     let ol_state = Arc::new(Mutex::new(OpenLiveState {
         sources: vec![leftover_source()],
-        next_id: 0,
+        ..OpenLiveState::default()
     }));
     let open_live = fake_open_live(ol_state.clone());
     let scratch = Scratch::new("stop", &strom, &open_live);
@@ -987,5 +1076,214 @@ audio = "dev-mic"
     assert!(
         stderr.contains(r#"audio source "dev-mic" is paired with both "dev-cam" and "dev-obs""#),
         "{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Through the SRT relay (#159): an Open Live that reports one.
+// ---------------------------------------------------------------------------
+
+impl Scratch {
+    /// The settings file's text.
+    fn settings(&self) -> String {
+        std::fs::read_to_string(self.0.join("gateway.toml")).unwrap()
+    }
+
+    /// Removes the `passphrase = ...` line from the settings.
+    fn forget_passphrase(&self) {
+        let kept: String = self
+            .settings()
+            .lines()
+            .filter(|l| !l.starts_with("passphrase"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(self.0.join("gateway.toml"), kept).unwrap();
+    }
+
+    /// The `uplink.passphrase` in the settings file, if any.
+    fn passphrase(&self) -> Option<String> {
+        let settings: toml::Value = toml::from_str(&self.settings()).unwrap();
+        settings
+            .get("uplink")?
+            .get("passphrase")?
+            .as_str()
+            .map(str::to_string)
+    }
+}
+
+const UP_RELAY_FIRST: &str = "  generated an SRT passphrase for the relay and saved it in SETTINGS
+Bringing up 1 input(s) through Open Live's SRT relay \"default\" at relay.example.com:6000, about 6 Mbps in total.
+
+INPUT                                PORT   ADDRESSES
+Venue — Test pattern                 6000   sends to:   srt://relay.example.com:6000?streamid=relayid0000000000000001&mode=caller&latency=200&passphrase=***
+                                            registered: srt+relay://relayid0000000000000001?latency=200&passphrase=***
+
+Assign these in Studio and activate the production; they read as inactive until
+something is receiving them. Ctrl-C stops and removes them.
+
+  Venue — Test pattern — waiting for a receiver
+";
+
+const UP_RELAY_AGAIN: &str = "\
+Bringing up 1 input(s) through Open Live's SRT relay \"default\" at relay.example.com:6000, about 6 Mbps in total.
+  removed Strom flow \"Venue — Test pattern\", left over from an earlier run
+
+INPUT                                PORT   ADDRESSES
+Venue — Test pattern                 6000   sends to:   srt://relay.example.com:6000?streamid=relayid0000000000000001&mode=caller&latency=200&passphrase=***
+                                            registered: srt+relay://relayid0000000000000001?latency=200&passphrase=***
+
+Assign these in Studio and activate the production; they read as inactive until
+something is receiving them. Ctrl-C stops and removes them.
+
+  Venue — Test pattern — waiting for a receiver
+";
+
+const STATUS_RELAY: &str = "\
+No gateway process running.
+Uplink through Open Live's SRT relay \"default\" at relay.example.com:6000.
+
+INPUT                                FLOW      UPLINK                     OPEN LIVE
+Venue — Test pattern                 running   no receiver                inactive, via relay \"default\" to srt://relay.example.com:6000?streamid=relayid0000000000000001
+";
+
+/// A source of an older gateway, registered in caller mode on a port of the cloud
+/// Strom, with the name the test pattern registers under.
+fn caller_mode_source() -> Value {
+    json!({
+        "id": "src-caller",
+        "name": "Venue — Test pattern",
+        "address": "srt://:47110?mode=listener",
+        "streamType": "srt",
+        "status": "inactive",
+        "latency": 200,
+    })
+}
+
+/// Against an Open Live that reports a relay, `caller` (the default) sends through
+/// it: a source left in caller mode by an older gateway is moved to the relay with
+/// its id (AC6), and without a passphrase in the settings one is generated and kept
+/// there (AC4). A second `up` keeps the source id, the stream id and the passphrase
+/// (AC3, AC4), and the flow dials the relay with the stream id. `status` and
+/// `status --json` say so; `down` removes it all.
+#[test]
+fn up_sends_through_the_relay_when_open_live_reports_one() {
+    let strom_state = Arc::new(Mutex::new(StromState::default()));
+    let strom = fake_strom(strom_state.clone());
+    let ol_state = Arc::new(Mutex::new(OpenLiveState {
+        sources: vec![caller_mode_source()],
+        relay: true,
+        ..OpenLiveState::default()
+    }));
+    let open_live = fake_open_live(ol_state.clone());
+    let scratch = Scratch::new("relay", &strom, &open_live);
+    scratch.forget_passphrase();
+    let settings_file = scratch.0.join("gateway.toml");
+
+    let mut up = Running::start(&scratch, &["up", "--test"]);
+    let out = up
+        .until("waiting for a receiver")
+        .replace(&settings_file.display().to_string(), "SETTINGS");
+    up.kill();
+    assert_golden(&out, UP_RELAY_FIRST);
+
+    // Kept in the settings, and what Open Live holds and the flow dials with.
+    let passphrase = scratch.passphrase().expect("a passphrase was kept");
+    assert!(
+        (10..=79).contains(&passphrase.len())
+            && passphrase.chars().all(|c| c.is_ascii_alphanumeric()),
+        "{passphrase:?}"
+    );
+    scratch.run(&["check"]);
+    {
+        let s = ol_state.lock().unwrap();
+        assert_eq!(s.sources.len(), 1);
+        assert_eq!(s.sources[0]["id"], "src-caller", "the source keeps its id");
+        assert_eq!(
+            s.sources[0]["address"],
+            "srt+relay://relayid0000000000000001?latency=200&passphrase=***"
+        );
+    }
+    let flow = strom_state.lock().unwrap().flows[0].to_string();
+    assert!(
+        flow.contains(&format!(
+            "srt://relay.example.com:6000?streamid=relayid0000000000000001&mode=caller&latency=200&passphrase={passphrase}"
+        )),
+        "{flow}"
+    );
+
+    assert_golden(&scratch.stdout(&["status"]), STATUS_RELAY);
+    let json: Value = serde_json::from_str(&scratch.stdout(&["status", "--json"])).unwrap();
+    assert_eq!(
+        json["uplink"],
+        json!({ "host": RELAY_PUBLIC, "relay": "default" })
+    );
+    assert_eq!(json["inputs"][0]["source"]["relay"], "default");
+    assert_eq!(
+        json["inputs"][0]["source"]["dial_in"],
+        "srt://relay.example.com:6000?streamid=relayid0000000000000001"
+    );
+    assert!(!json.to_string().contains(&passphrase));
+
+    // Again: same source, same stream id, same passphrase, nothing generated.
+    let mut up = Running::start(&scratch, &["up", "--test"]);
+    assert_golden(up.until("waiting for a receiver"), UP_RELAY_AGAIN);
+    up.kill();
+    assert_eq!(scratch.passphrase().as_deref(), Some(passphrase.as_str()));
+    {
+        let s = ol_state.lock().unwrap();
+        assert_eq!(s.sources.len(), 1);
+        assert_eq!(s.sources[0]["id"], "src-caller");
+        assert_eq!(s.next_relay_id, 1, "no second stream id");
+    }
+
+    scratch.run(&["down"]);
+    assert!(strom_state.lock().unwrap().flows.is_empty());
+    assert!(ol_state.lock().unwrap().sources.is_empty());
+}
+
+/// `uplink.mode = "listener"` stays listener against an Open Live with a relay, and
+/// `uplink.mode = "relay"` against one without refuses to start, saying why, with
+/// nothing registered.
+#[test]
+fn listener_ignores_the_relay_and_relay_mode_needs_one() {
+    let strom_state = Arc::new(Mutex::new(StromState::default()));
+    let strom = fake_strom(strom_state.clone());
+    let ol_state = Arc::new(Mutex::new(OpenLiveState::default()));
+    let open_live = fake_open_live(ol_state.clone());
+    let scratch = Scratch::new("relay-mode", &strom, &open_live);
+    let settings = scratch
+        .settings()
+        .replace(r#"mode = "caller""#, r#"mode = "relay""#);
+    std::fs::write(scratch.0.join("gateway.toml"), settings).unwrap();
+
+    let out = scratch.command(&["up", "--test"]).output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(r#"uplink.mode is "relay", but Open Live is older than SRT relays"#),
+        "{stderr}"
+    );
+    assert!(ol_state.lock().unwrap().sources.is_empty());
+    assert!(strom_state.lock().unwrap().flows.is_empty());
+
+    ol_state.lock().unwrap().relay = true;
+    let settings = scratch.settings().replace(
+        r#"mode = "relay""#,
+        "mode = \"listener\"\npublic_host = \"venue.example.com\"\nport_range = \"47300-47301\"",
+    );
+    std::fs::write(scratch.0.join("gateway.toml"), settings).unwrap();
+    let mut up = Running::start(&scratch, &["up", "--test"]);
+    let out = up.until("waiting for a receiver").to_string();
+    up.kill();
+    assert!(
+        out.starts_with(
+            "Bringing up 1 input(s) to cloud.example.com, SRT ports 47300-47301 from the settings"
+        ),
+        "{out}"
+    );
+    let s = ol_state.lock().unwrap();
+    assert_eq!(
+        s.sources[0]["address"],
+        "srt://venue.example.com:47300?mode=caller&passphrase=***"
     );
 }

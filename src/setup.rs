@@ -201,10 +201,16 @@ pub struct Answers {
     #[arg(long)]
     pub strom_url: Option<String>,
 
-    /// Which end dials: `caller` (this machine dials the cloud; nothing inbound here)
-    /// or `listener` (the cloud dials this machine).
+    /// Which end dials: `caller` (this machine dials the cloud, through Open Live's
+    /// SRT relay when it has one; nothing inbound here), `relay` (always through the
+    /// relay) or `listener` (the cloud dials this machine).
     #[arg(long)]
     pub uplink_mode: Option<UplinkMode>,
+
+    /// The SRT relay to send through, by the name Open Live reports; `default` when
+    /// unset. Blank clears it.
+    #[arg(long)]
+    pub relay: Option<String>,
 
     /// This machine's address as the cloud sees it. Listener mode only.
     #[arg(long)]
@@ -261,6 +267,9 @@ impl Answers {
         }
         if let Some(mode) = self.uplink_mode {
             cfg.uplink.mode = mode;
+        }
+        if let Some(relay) = &self.relay {
+            cfg.uplink.relay = blank_to_none(relay.trim().to_string());
         }
         if let Some(host) = &self.public_host {
             cfg.uplink.public_host = blank_to_none(host.clone());
@@ -376,7 +385,7 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     }
     // Checked before asking anything else, so a bad address or credential is
     // corrected while the operator is still looking at it.
-    let mut published = None;
+    let mut published = (None, Relays::default());
     match check_open_live(cfg).await {
         Ok(info) => published = report_server_info(cfg, info),
         Err(err) => fail(format!("could not reach Open Live: {err:#}")),
@@ -418,17 +427,22 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
                 "Listener",
                 "the cloud dials this machine; needs a public address and inbound UDP",
             ),
+            choice(
+                "Relay",
+                "always through Open Live's SRT relay, which caller uses whenever Open Live has one",
+            ),
         ],
         match cfg.uplink.mode {
             UplinkMode::Caller => 0,
             UplinkMode::Listener => 1,
+            UplinkMode::Relay => 2,
         },
     )
     .await?;
-    cfg.uplink.mode = if mode == 1 {
-        UplinkMode::Listener
-    } else {
-        UplinkMode::Caller
+    cfg.uplink.mode = match mode {
+        1 => UplinkMode::Listener,
+        2 => UplinkMode::Relay,
+        _ => UplinkMode::Caller,
     };
     if cfg.uplink.mode == UplinkMode::Listener {
         cfg.uplink.public_host = blank_to_none(
@@ -441,8 +455,12 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     }
     // In caller mode the ports are the cloud Strom's, and Open Live publishes the
     // range it leased; only when it publishes none, or in listener mode where the
-    // ports are this machine's own, is there anything to ask.
+    // ports are this machine's own, is there anything to ask. Through the relay
+    // there are no ports at all.
+    let (published, relay) = published;
     match (&published, cfg.uplink.mode) {
+        _ if relay.through(cfg) => good(relay.describe(cfg)),
+        _ if relay.applies(cfg) => warn(relay.describe(cfg)),
         (Some(ports), UplinkMode::Caller) => {
             good(format!(
                 "SRT ports {} come from Open Live",
@@ -490,15 +508,63 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// The SRT relays Open Live reports, for setup to say whether the uplink goes
+/// through one.
+#[derive(Debug, Default)]
+struct Relays(Vec<String>);
+
+impl Relays {
+    /// Whether `up` tries a relay with these settings: in caller mode when Open Live
+    /// reports any, in relay mode always.
+    fn applies(&self, cfg: &Config) -> bool {
+        match cfg.uplink.mode {
+            UplinkMode::Listener => false,
+            UplinkMode::Caller => !self.0.is_empty(),
+            UplinkMode::Relay => true,
+        }
+    }
+
+    /// Whether it gets one: Open Live reports the relay the settings name.
+    fn through(&self, cfg: &Config) -> bool {
+        match cfg.uplink.mode {
+            UplinkMode::Listener => false,
+            UplinkMode::Caller | UplinkMode::Relay => {
+                self.0.iter().any(|r| r == cfg.uplink.relay_name())
+            }
+        }
+    }
+
+    fn describe(&self, cfg: &Config) -> String {
+        let name = cfg.uplink.relay_name();
+        if self.through(cfg) {
+            format!("through Open Live's SRT relay {name:?}; no SRT ports needed, and a passphrase is generated if none is set")
+        } else if self.0.is_empty() {
+            "uplink.mode is \"relay\", but Open Live reports no SRT relay; set uplink.mode = \"caller\"".to_string()
+        } else {
+            format!(
+                "Open Live has no SRT relay named {name:?}; it has {}: set uplink.relay to one of them",
+                self.0.join(", ")
+            )
+        }
+    }
+}
+
 /// What Open Live said about its cloud Strom, read back to the operator. Returns the
-/// SRT port range it publishes, which callers use.
-fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<BTreeSet<u16>> {
+/// SRT port range it publishes, which callers use, and the SRT relays it reports.
+fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> (Option<BTreeSet<u16>>, Relays) {
     let Some(info) = info else {
         warn(
             "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
         );
-        return None;
+        return (None, Relays::default());
     };
+    let relays = Relays(info.relays().iter().map(|r| r.name.clone()).collect());
+    if !relays.0.is_empty() {
+        good(format!(
+            "it reports the SRT relay(s) {}, which callers send through",
+            relays.0.join(", ")
+        ));
+    }
     match &info.strom_host {
         Some(host) if cfg.uplink.host.is_none() => {
             good(format!("reached Open Live; feeds will go to its Strom at {host}"))
@@ -516,9 +582,10 @@ fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<BTreeSet
         None if info.lease_pending() => warn(
             "Open Live is still waiting for its SRT ports from Strom; it retries every minute, so run setup again later or set a range here",
         ),
+        None if !relays.0.is_empty() => {}
         None => note("Open Live publishes no SRT ports; a range has to be set here"),
     }
-    info.srt_ports
+    (info.srt_ports, relays)
 }
 
 /// The same checks as the prompts, with nothing asked. Every setting must already be
@@ -540,7 +607,7 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
     good(format!("gateway name {}", style(&cfg.gateway.name).bold()));
 
     section("Open Live");
-    let mut published = None;
+    let mut published = (None, Relays::default());
     if !cfg.open_live.register {
         note("registration is off; only streaming to the cloud Strom");
         if cfg
@@ -602,7 +669,11 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
     }
 
     section("Uplink");
+    let (published, relay) = published;
     match (&published, cfg.uplink.mode) {
+        _ if relay.through(cfg) => good(format!("caller; {}", relay.describe(cfg))),
+        (_, UplinkMode::Relay) => bail!("{}", relay.describe(cfg)),
+        _ if relay.applies(cfg) => bail!("{}", relay.describe(cfg)),
         (Some(ports), UplinkMode::Caller) => {
             good(format!(
                 "caller; SRT ports {} come from Open Live",
@@ -854,6 +925,7 @@ mod tests {
             strom_url: Some("http://127.0.0.1:9090".to_string()),
             uplink_mode: Some(UplinkMode::Listener),
             public_host: Some("198.51.100.7".to_string()),
+            relay: Some(" eu-north ".to_string()),
             port_range: Some("47110-47129".to_string()),
             latency_ms: Some(400),
             resolution: Some("1280x720".to_string()),
@@ -876,6 +948,7 @@ mod tests {
         assert_eq!(cfg.uplink.mode, UplinkMode::Listener);
         assert_eq!(cfg.uplink.public_host.as_deref(), Some("198.51.100.7"));
         assert_eq!(cfg.uplink.port_range.as_deref(), Some("47110-47129"));
+        assert_eq!(cfg.uplink.relay.as_deref(), Some("eu-north"));
         assert_eq!(cfg.uplink.latency_ms, 400);
         assert_eq!(cfg.capture.video_resolution.as_deref(), Some("1280x720"));
         assert_eq!(cfg.capture.video_framerate, None, "auto means unset");

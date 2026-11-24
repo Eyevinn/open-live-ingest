@@ -129,6 +129,7 @@ listens is the end that needs an inbound UDP port.**
 |---|---|---|---|
 | `caller` (default) | `srt://cloud:9000?mode=caller` | `srt://:9000?mode=listener` | the cloud |
 | `listener` | `srt://:9000?mode=listener` | `srt://venue:9000?mode=caller` | the venue |
+| through the relay | `srt://relay:6000?streamid=<id>&mode=caller` | `srt+relay://<id>` | neither (the relay's one public port) |
 
 `srtsrc` defaults to caller mode, so the registered address always carries an explicit `mode=`.
 Ports come from a range, one per input. In listener mode the gateway allocates them itself, lowest
@@ -159,6 +160,21 @@ comes back. A source of the same name left by an earlier run keeps its port when
 the range, and is reassigned when it is not. Registration therefore precedes the flows in caller
 mode, where it used to follow them; Open Live being down at start-up is then a start-up error rather
 than a warning, which is right, since without a port there is nothing to build.
+
+**Through the relay when there is one.** An Open Live with an SRT relay (open-live#629) lets both
+ends dial out: Strom and the venue call the relay's one public port, and the relay pairs them by
+stream id. Nothing inbound anywhere and no port lease, so `caller`, the default, takes it whenever
+Open Live reports a relay, and stays on a port of the cloud Strom when it does not, so an Open Live
+without relays sees no change. `listener` is a deliberate choice of the venue and never moves;
+`relay` insists on the relay, and a missing one is an error rather than a quiet fallback. Open Live
+owns the stream id as it owns the ports: the gateway registers `srt+relay://auto@<relay>`, takes the
+id and the dial-in address from the answer (`connect.uri`), and from then on registers the id
+itself, so a source recreated mid-run keeps the address the venue dials. Registering again keeps
+the id (`auto` keeps it), and a source registered in caller mode by an older gateway is moved with a
+PATCH, keeping its source id. The relay's port is public, so the stream id is no secret: a relay
+link always carries a passphrase, generated and kept in the settings file when the operator set
+none. A phone cannot dial a stream id yet (#161), so its media says so (`Media::dials_relay`) and it
+stays on a port.
 
 ## 6. The front ends own what they start
 

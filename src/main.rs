@@ -282,6 +282,26 @@ fn render(event: &Event) -> Option<String> {
         } => format!(
             "Bringing up {inputs} input(s) to {host}, SRT ports {ports} from {port_source}, about {total_mbps:.0} Mbps in total.\n"
         ),
+        Event::BringingUpViaRelay {
+            inputs,
+            relay,
+            public,
+            total_mbps,
+        } => match public {
+            Some(public) => format!(
+                "Bringing up {inputs} input(s) through Open Live's SRT relay {relay:?} at {public}, about {total_mbps:.0} Mbps in total.\n"
+            ),
+            None => format!(
+                "Bringing up {inputs} input(s) through Open Live's SRT relay {relay:?}, about {total_mbps:.0} Mbps in total.\n"
+            ),
+        },
+        Event::PassphraseGenerated { kept_in } => match kept_in {
+            Some(file) => format!(
+                "  generated an SRT passphrase for the relay and saved it in {}\n",
+                file.display()
+            ),
+            None => "  generated an SRT passphrase for the relay, for this run only\n".to_string(),
+        },
         Event::LeftoverSourceRemoved { name, port } => format!(
             "  removed Open Live source {name:?}, left over from an earlier run (it held port {port})\n"
         ),
@@ -539,6 +559,8 @@ mod tests {
             what: "DELETE source".into(),
             status: reqwest::StatusCode::CONFLICT,
             reason: Some(r#"Source is in use by active production "Morning Show""#.into()),
+            code: None,
+            relays: Vec::new(),
         };
         assert_eq!(
             kept_message("Venue — Camera", &refused.explain()),
