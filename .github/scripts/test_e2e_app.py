@@ -437,6 +437,51 @@ class Rows(unittest.TestCase):
         self.assertIn("Go live: the row of 'gw — Test pattern' is 'connecting', not armed or waiting_for_production", str(caught.exception))
 
 
+class EventsSaidBeforeTheReply(unittest.TestCase):
+    """`quit_requested` comes before the reply to `quit`: `ok()` reads it into `seen`
+    while it waits for the reply, and the wait for the event must still find it (#145)."""
+
+    def quit_app(self, before_reply):
+        app = FakeApp(before_reply + [{"id": 1, "ok": None}])
+        app.send = lambda cmd, args=None: 1
+        return app
+
+    def test_an_event_read_while_waiting_for_the_reply_is_found(self):
+        app = self.quit_app([{"event": "quit_requested", "data": {"inputs_live": 1}}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mark = len(app.seen)
+            app.ok("quit", {"confirmed": False})
+            asked = app.event_since("quit_requested", mark, 0.2)
+        self.assertEqual(asked, {"inputs_live": 1})
+
+    def test_waiting_only_for_a_new_event_misses_it(self):
+        app = self.quit_app([{"event": "quit_requested", "data": {"inputs_live": 1}}])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(e2e.Failed):
+            app.ok("quit", {"confirmed": False})
+            app.event("quit_requested", 0.2)
+
+    def test_an_event_from_before_the_mark_does_not_count(self):
+        app = FakeApp([{"event": "stopped", "data": {"error": None}}, {"id": 1, "ok": None}])
+        app.send = lambda cmd, args=None: 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(e2e.Failed):
+            app.drain()
+            mark = len(app.seen)
+            app.ok("stop")
+            app.event_since("stopped", mark, 0.2)
+
+    def test_an_event_after_the_reply_is_still_waited_for(self):
+        app = FakeApp([{"id": 1, "ok": None}, {"event": "stopped", "data": {"left_behind": []}}])
+        app.send = lambda cmd, args=None: 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            mark = len(app.seen)
+            app.ok("stop")
+            self.assertEqual(app.event_since("stopped", mark, 0.2), {"left_behind": []})
+
+
 class FakeOpenLive:
     """Open Live's activate, with no network: `while_activating` runs once, as for a
     production that is still activating at the first look."""
@@ -522,6 +567,57 @@ class Reactivated(unittest.TestCase):
             e2e.reactivated_check(FakeApp([]), FakeOpenLive(), strom, "p-1", "gw — Test pattern", 0)
         self.assertIn("Go live again: production reactivated (activating): Strom runs flow f-2", str(caught.exception))
         self.assertEqual(strom.watched, [])
+
+
+class ProductionStatusPolls(unittest.TestCase):
+    """#145: Open Live reports `ended`, not `inactive`, once an active production is
+    deactivated; `deactivate` takes either as done, and activating again from `ended`
+    goes through `activating` to `active`. Open Live's HTTP is scripted, no network."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.saved = (e2e.time.monotonic, e2e.time.sleep, e2e.http)
+        e2e.time.monotonic, e2e.time.sleep = self.clock.monotonic, self.clock.sleep
+        self.calls = []
+        self.statuses = []
+        e2e.http = self.http
+        self.open_live = e2e.OpenLive("https://open-live.example", "pat")
+        self.open_live._bearer = lambda: {}
+
+    def tearDown(self):
+        e2e.time.monotonic, e2e.time.sleep, e2e.http = self.saved
+
+    def http(self, method, url, headers=None, body=None, timeout=30):
+        self.calls.append((method, url.rsplit("/", 1)[-1]))
+        if method == "POST":
+            return 200, {}
+        status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        return 200, {"_id": "p-1", "status": status}
+
+    def test_deactivate_takes_ended_as_done(self):
+        self.statuses = ["active", "ended"]
+        self.open_live.deactivate("p-1", 180)
+        self.assertEqual(self.calls, [("POST", "deactivate"), ("GET", "p-1"), ("GET", "p-1")])
+
+    def test_deactivate_still_takes_inactive_as_done(self):
+        self.statuses = ["inactive"]
+        self.open_live.deactivate("p-1", 180)
+        self.assertEqual(self.calls, [("POST", "deactivate"), ("GET", "p-1")])
+
+    def test_deactivate_that_never_gets_idle_fails_naming_the_status(self):
+        self.statuses = ["active"]
+        with self.assertRaises(e2e.Failed) as caught:
+            self.open_live.deactivate("p-1", 180)
+        self.assertIn("production p-1 was still 'active' 180 s after its deactivation", str(caught.exception))
+
+    def test_activating_again_from_ended_reaches_active(self):
+        self.statuses = ["ended", "active"]
+        self.open_live.deactivate("p-1", 180)
+        self.statuses = ["activating", "active"]
+        looks = []
+        self.open_live.activate("p-1", 300, lambda: looks.append(self.clock.now))
+        self.assertEqual(len(looks), 1)
+        self.assertEqual(self.calls[-3:], [("POST", "activate"), ("GET", "p-1"), ("GET", "p-1")])
 
 
 if __name__ == "__main__":
