@@ -384,7 +384,7 @@ Events: the desktop §9.3 set where it applies (`where`, `osc_sign_in_page`, `in
 | `event` | `data` | Meaning |
 |---|---|---|
 | `osc_signed_in` | `{}` | the loopback callback arrived; Swift cancels the authentication sheet |
-| `media` | `{input, action: "start", uplink: {host, port, latency_ms, passphrase?, pbkeylen?}, video: {width, height, fps, bitrate_kbps, keyframe_interval}, audio: {sample_rate: 48000, channels: 2, bitrate_kbps: 128}}` | `ExternalMedia::start`: open capture, encoders and the SRT caller |
+| `media` | `{input, action: "start", uplink: {host, port, latency_ms, passphrase?, pbkeylen?, streamid?, relay?, dial_in?}, video: {width, height, fps, bitrate_kbps, keyframe_interval}, audio: {sample_rate: 48000, channels: 2, bitrate_kbps: 128}}` | `ExternalMedia::start`: open capture, encoders and the SRT caller. Through Open Live's SRT relay (#161) `host` and `port` are the relay's, `streamid` is set on the socket (`SRTO_STREAMID`) before it calls and kept for every reconnect, and `relay` (its name) and `dial_in` (Open Live's `connect.uri`, never with a passphrase) are for the status lines; without a relay none of the three is there and the caller dials a port of the cloud Strom |
 | `media` | `{input, action: "stop" \| "restart"}` | `ExternalMedia::stop` / `restart` |
 | `fatal` | `{message}` | a panic was caught at the ABI; the app shows "Something went wrong" and offers Share logs |
 
