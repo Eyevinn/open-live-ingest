@@ -26,7 +26,7 @@
 # Cargo.toml; a test in tests/pins.rs checks it.
 
 & {
-$StromVersion = "v0.8.2"
+$StromVersion = "v0.8.4"
 
 $ErrorActionPreference = 'Stop'
 # Invoke-WebRequest's progress bar slows downloads down by an order of magnitude in 5.1.

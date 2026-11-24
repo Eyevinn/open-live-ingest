@@ -26,13 +26,15 @@ name: Late connect (Strom receiver)
 # checked against GitHub's SHA-256 digest. No secrets.
 #
 # Not part of every CI run (about 7 minutes of live media): by hand, or on a pull
-# request that changes this workflow or the example.
+# request that changes this workflow, the example or Cargo.toml (where the Strom pin
+# lives, so a pin bump runs the reproduction against the new Strom on both ends).
 on:
   workflow_dispatch:
   pull_request:
     paths:
       - .github/workflows/late-connect-strom.yml
       - examples/late_connect.rs
+      - Cargo.toml
 
 permissions:
   contents: read
@@ -165,6 +167,14 @@ jobs:
             elif grep -q '^FAIL:' "$out/$name.log" && [[ "$status" == 1 ]]; then
               verdict=FAIL
             else
+              verdict=ERROR
+            fi
+            # late+restart tests the restart: without its restart line in the log
+            # (the first peer came in time, so nothing restarted) the run did not
+            # test it, and its verdict, FAIL or PASS, must not count.
+            if [[ "$name" == late+restart && "$verdict" != ERROR ]] \
+                && ! grep -q '^late connect: first peer .*restarting the uplink once' "$out/$name.log"; then
+              echo "run $name: no restart line in its log, so it did not exercise the restart"
               verdict=ERROR
             fi
             echo "run $name: $verdict (exit status $status)"
