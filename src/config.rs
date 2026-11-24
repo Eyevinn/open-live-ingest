@@ -28,6 +28,11 @@ pub struct Config {
     pub video: Video,
     pub capture: Capture,
     pub log: Log,
+    /// `[app]`: the desktop app's own settings. Written only when one differs from its
+    /// default, so a file the app saves still loads in a release that predates the
+    /// section (unknown keys are an error there).
+    #[serde(skip_serializing_if = "App::is_default")]
+    pub app: App,
     /// `[[input]]`: settings for one input, by device.
     #[serde(rename = "input", skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputSettings>,
@@ -606,6 +611,28 @@ impl Default for Log {
         Self {
             level: "info".to_string(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct App {
+    /// Ask GitHub once at startup and once a day whether a newer release is out
+    /// (`update::check`), and say so in the window. On unless turned off.
+    pub check_for_updates: bool,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            check_for_updates: true,
+        }
+    }
+}
+
+impl App {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -2009,5 +2036,27 @@ mod layout_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("port_rnage"), "{err}");
+    }
+
+    /// On by default; written only when turned off, so a file the app saves keeps
+    /// loading in a release from before `[app]` existed.
+    #[test]
+    fn the_update_check_is_on_by_default_and_written_only_when_off() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.app.check_for_updates);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!text.contains("[app]"), "{text}");
+
+        let cfg: Config = toml::from_str("[app]\ncheck_for_updates = false\n").unwrap();
+        assert!(!cfg.app.check_for_updates);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("[app]\ncheck_for_updates = false"), "{text}");
+        let again: Config = toml::from_str(&text).unwrap();
+        assert!(!again.app.check_for_updates);
+
+        let err = toml::from_str::<Config>("[app]\ncheck_for_update = false\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("check_for_update"), "{err}");
     }
 }

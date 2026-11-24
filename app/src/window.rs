@@ -131,6 +131,8 @@ pub fn run() -> ExitCode {
     let mut core =
         ipc::Core::new(open_live_ingest::config::default_path(), deliver).with_exit(exit);
     let quitting = core.quit_handle();
+    // In the background on the core's runtime; off with `[app] check_for_updates`.
+    core.check_for_updates();
 
     // `open-live-ingest down` sends SIGTERM: Stop without asking, then quit.
     #[cfg(target_os = "macos")]

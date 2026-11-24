@@ -455,7 +455,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `stop_other` | — | `null` | `down` (another gateway named by `gateway.pid`) |
 | `quit` | `{confirmed, anyway?}` | `null` | quit guard (§8): `confirmed: false` asks (the question when live), `true` is Stop and quit, `anyway: true` is Quit anyway once offered |
 | `show_logs` | `{which: "app" \| "strom"}` | `null` | reveal in Finder/Explorer |
-| `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy" \| "privacy_microphone"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`, `privacy_microphone`: macOS Privacy & Security → Camera or Microphone, for §10's camera/microphone row) |
+| `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy" \| "privacy_microphone" \| "release"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`, `privacy_microphone`: macOS Privacy & Security → Camera or Microphone, for §10's camera/microphone row; `release`: the GitHub page of the newer release the update check found, built by the core from its version number) |
 
 `open_url` takes a name, not a URL, so the page cannot make the app open an arbitrary address.
 
@@ -475,6 +475,7 @@ unknown command or bad arguments is an error reply, never a panic.
 | `quit_anyway` | `{}` | Stop and quit has run for 15 s: the question adds "Quit anyway" (§8) |
 | `osc_sign_in_page` | `{url}` | the sign-in page was opened in the browser; the window shows its address too, for when no browser opens |
 | `where` | step 1's view (as `state`'s `where`) | after `state`, the workspace and instance names looked up with the kept sign-in |
+| `update` | `{version}` | not a library event: the app's update check (`update::check`, at startup and every 24 h unless `[app] check_for_updates = false`) found a newer release; also in `state` as `update` (`null` when none) |
 
 The variant names on the right are #71's; the app maps whatever names #71 merges with. `message`
 is always produced by `app/src/messages.rs` (§10), never passed through from an error chain.

@@ -19,6 +19,7 @@ use crate::what_to_send::{self, DeviceSource};
 use crate::where_to_send::{Opener, WhereToSend, WhereView};
 use open_live_ingest::api::{self, Devices, SaveError};
 use open_live_ingest::keychain::OsKeychain;
+use open_live_ingest::update::{self, Version};
 use open_live_ingest::{local_strom, osc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -95,6 +96,8 @@ pub enum Link {
     Privacy,
     /// macOS System Settings → Privacy & Security → Microphone.
     PrivacyMicrophone,
+    /// The GitHub page of the newer release the update check found, if it found one.
+    Release,
 }
 
 /// Every command the page can send (section 9.2).
@@ -305,6 +308,9 @@ pub struct ViewModel {
     /// Step 1, "Where to send".
     #[serde(rename = "where")]
     pub where_to_send: WhereView,
+    /// A newer release the update check found, as `MAJOR.MINOR.PATCH`; `null` when
+    /// none was found, the check is off, or it failed.
+    pub update: Option<String>,
 }
 
 /// Hands a script to the page: how replies that come later, and events, reach it. The
@@ -338,6 +344,8 @@ pub struct Core {
     quit: Arc<Mutex<QuitGuard>>,
     /// Ends the window's event loop.
     exit: Exit,
+    /// The newer release the update check found, if any.
+    newer: Arc<Mutex<Option<Version>>>,
 }
 
 impl Core {
@@ -396,6 +404,7 @@ impl Core {
             show_all: false,
             quit: Arc::default(),
             exit: Arc::new(|| tracing::warn!("asked to quit with no window to close")),
+            newer: Arc::default(),
         }
     }
 
@@ -478,7 +487,41 @@ impl Core {
     }
 
     fn view_model(&self) -> ViewModel {
-        view_model(&self.settings_file, self.live(), self.where_to_send.view())
+        view_model(
+            &self.settings_file,
+            self.live(),
+            self.where_to_send.view(),
+            self.newer(),
+        )
+    }
+
+    /// The newer release the update check found, if any.
+    fn newer(&self) -> Option<Version> {
+        *self.newer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Asks GitHub whether a newer release is out, now and then every
+    /// [`update::INTERVAL`], on the core's runtime: nothing waits for it, Go live
+    /// included. A release found is in `state` from then on and is sent as an `update`
+    /// event. Each round reads `[app] check_for_updates` first and asks nothing when
+    /// it is off; a failure is logged and shows nothing.
+    pub fn check_for_updates(&self) {
+        self.check_for_updates_at(update::GITHUB_API.to_string(), update::INTERVAL);
+    }
+
+    /// [`check_for_updates`](Self::check_for_updates) against `api`, every `every`:
+    /// a fake GitHub, in tests.
+    pub fn check_for_updates_at(&self, api: String, every: std::time::Duration) {
+        let settings_file = self.settings_file.clone();
+        let newer = self.newer.clone();
+        let deliver = self.deliver.clone();
+        let task = async move {
+            loop {
+                check_once(&settings_file, &api, &newer, &deliver).await;
+                tokio::time::sleep(every).await;
+            }
+        };
+        self.runtime.spawn(task.with_current_subscriber());
     }
 
     /// Handle one message from the page. `None` when the reply comes later through
@@ -537,7 +580,7 @@ impl Core {
             Command::ChooseInstance { url } => {
                 let reply = match model.choose_instance(&url) {
                     Ok(view) => {
-                        let vm = view_model(&self.settings_file, self.live(), view);
+                        let vm = view_model(&self.settings_file, self.live(), view, self.newer());
                         Reply::ok(id, to_json(&vm))
                     }
                     Err(err) => failed(id, name, &err, &[]),
@@ -546,10 +589,12 @@ impl Core {
             }
             Command::SelfHosted { url, api_key } => {
                 let (settings_file, live) = (self.settings_file.clone(), self.live());
+                let newer = self.newer.clone();
                 let secret = api_key.expose().to_string();
                 self.later(id, name, vec![secret], async move {
                     let view = model.self_hosted(&url, api_key.expose()).await?;
-                    Ok(to_json(&view_model(&settings_file, live, view)))
+                    let newer = *newer.lock().unwrap_or_else(|e| e.into_inner());
+                    Ok(to_json(&view_model(&settings_file, live, view, newer)))
                 });
                 None
             }
@@ -575,7 +620,11 @@ impl Core {
                 None
             }
             Command::OpenUrl { which } => {
-                let reply = match link_url(&self.settings_file, which) {
+                let url = match which {
+                    Link::Release => self.newer().map(|version| version.release_page()),
+                    _ => link_url(&self.settings_file, which),
+                };
+                let reply = match url {
                     Some(url) => match osc::open_browser(&url) {
                         Ok(()) => Reply::ok(id, Value::Null),
                         Err(err) => failed(id, name, &err, &[]),
@@ -748,6 +797,8 @@ fn link_url(settings_file: &std::path::Path, which: Link) -> Option<String> {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
                 .to_string(),
         ),
+        // Only the core's own update check knows it (`Core::newer`).
+        Link::Release => None,
         Link::Strom | Link::Studio => {
             let settings = open_live_ingest::api::load_from(settings_file).ok()?;
             match which {
@@ -758,12 +809,56 @@ fn link_url(settings_file: &std::path::Path, which: Link) -> Option<String> {
     }
 }
 
-fn view_model(settings_file: &std::path::Path, live: bool, where_to_send: WhereView) -> ViewModel {
+fn view_model(
+    settings_file: &std::path::Path,
+    live: bool,
+    where_to_send: WhereView,
+    newer: Option<Version>,
+) -> ViewModel {
     ViewModel {
         version: env!("CARGO_PKG_VERSION"),
         settings_file: settings_file.display().to_string(),
         live,
         where_to_send,
+        update: newer.map(|version| version.to_string()),
+    }
+}
+
+/// One round of the update check (`Core::check_for_updates`). Asks nothing when the
+/// settings turn it off or cannot be read; a newer release is kept in `newer` and sent
+/// to the page once; anything else is logged and shows nothing.
+async fn check_once(
+    settings_file: &Path,
+    api: &str,
+    newer: &Mutex<Option<Version>>,
+    deliver: &Deliver,
+) {
+    match api::load_from(settings_file) {
+        Ok(settings) if settings.app.check_for_updates => {}
+        Ok(_) => {
+            tracing::debug!("the update check is off ([app] check_for_updates)");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("the settings cannot be read; no update check this time");
+            return;
+        }
+    }
+    match update::check(api, crate::VERSION).await {
+        Ok(Some(version)) => {
+            let new = newer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .replace(version)
+                != Some(version);
+            if new {
+                tracing::info!(%version, "a newer release is out");
+                let data = json!({ "version": version.to_string() });
+                deliver(Event::new("update", data).script());
+            }
+        }
+        Ok(None) => tracing::debug!("no newer release"),
+        Err(err) => tracing::info!("could not check for a newer release: {err:#}"),
     }
 }
 
@@ -882,6 +977,7 @@ mod tests {
                         "summary": null,
                         "problem": null,
                     },
+                    "update": null,
                 }
             })
         );
@@ -1642,6 +1738,121 @@ mod tests {
             .ends_with("?Privacy_Microphone"));
         let empty = testing::Scratch::new("ipc-links-empty");
         assert_eq!(link_url(&empty.settings(), Link::Studio), None);
+    }
+
+    /// A fake GitHub answering every request with `status` and `body`, and how many
+    /// requests it has had.
+    fn fake_github(status: u16, body: Value) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let api = testing::serve(Arc::new(move |request: &testing::Request| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                request.path,
+                "/repos/Eyevinn/open-live-ingest/releases/latest"
+            );
+            (status, body.clone())
+        }));
+        (api, asked)
+    }
+
+    /// One round of the update check on a runtime of its own, with what it delivers.
+    fn check_once_against(settings_file: &Path, api: &str) -> (Option<Version>, Vec<String>) {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let sink = delivered.clone();
+        let deliver: Deliver = Arc::new(move |script| sink.lock().unwrap().push(script));
+        let newer = Mutex::new(None);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(check_once(settings_file, api, &newer, &deliver));
+        let found = *newer.lock().unwrap();
+        let scripts = delivered.lock().unwrap().clone();
+        (found, scripts)
+    }
+
+    /// AC1: a newer release is an `update` event, is in `state` from then on, and is
+    /// what `open_url` `release` opens, its address built by the core.
+    #[test]
+    fn a_newer_release_is_an_event_in_state_and_a_link() {
+        let (api, asked) = fake_github(
+            200,
+            json!({"tag_name": "v99.0.0", "draft": false, "prerelease": false,
+                   "html_url": "https://example.com/not-this"}),
+        );
+        let dir = testing::Scratch::new("ipc-update");
+        let (mut core, rx) = core_with(dir.settings(), nowhere());
+        let none = reply_json(&mut core, r#"{"id": 1, "cmd": "state"}"#);
+        assert_eq!(none["ok"]["update"], Value::Null);
+
+        core.check_for_updates_at(api, Duration::from_secs(3600));
+        assert_eq!(
+            next_delivered(&rx),
+            json!({"event": "update", "data": {"version": "99.0.0"}})
+        );
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let state = reply_json(&mut core, r#"{"id": 2, "cmd": "state"}"#);
+        assert_eq!(state["ok"]["update"], "99.0.0");
+        assert_eq!(
+            core.newer().map(|v| v.release_page()).as_deref(),
+            Some("https://github.com/Eyevinn/open-live-ingest/releases/tag/v99.0.0")
+        );
+    }
+
+    /// AC2: the running version itself is no update.
+    #[test]
+    fn the_running_version_shows_nothing() {
+        let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let (api, asked) = fake_github(200, json!({ "tag_name": tag }));
+        let dir = testing::Scratch::new("ipc-update-same");
+        let (found, delivered) = check_once_against(&dir.settings(), &api);
+        assert_eq!((found, delivered.len()), (None, 0));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// AC3: a GitHub error, its rate limit or no GitHub at all shows nothing.
+    #[test]
+    fn a_failed_check_shows_nothing() {
+        let dir = testing::Scratch::new("ipc-update-failed");
+        let (error, _) = fake_github(500, json!({"message": "oops"}));
+        let (limited, _) = fake_github(429, json!({"message": "API rate limit exceeded"}));
+        let (garbled, _) = fake_github(200, json!(["not", "a", "release"]));
+        for api in [error, limited, garbled, "http://127.0.0.1:9".to_string()] {
+            let (found, delivered) = check_once_against(&dir.settings(), &api);
+            assert_eq!((found, delivered.len()), (None, 0), "{api}");
+        }
+    }
+
+    /// AC4: with the setting off, GitHub is not asked at all; nor when the settings
+    /// cannot be read.
+    #[test]
+    fn with_the_setting_off_nothing_is_asked() {
+        let (api, asked) = fake_github(200, json!({"tag_name": "v99.0.0"}));
+        let dir = testing::Scratch::new("ipc-update-off");
+        std::fs::write(dir.settings(), "[app]\ncheck_for_updates = false\n").unwrap();
+        let (found, delivered) = check_once_against(&dir.settings(), &api);
+        assert_eq!((found, delivered.len()), (None, 0));
+        std::fs::write(dir.settings(), "[gateway\n").unwrap();
+        let (found, delivered) = check_once_against(&dir.settings(), &api);
+        assert_eq!((found, delivered.len()), (None, 0));
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// With no newer release found there is nothing for `release` to open.
+    #[test]
+    fn the_release_link_needs_a_release_found() {
+        let dir = testing::Scratch::new("ipc-update-no-link");
+        assert_eq!(link_url(&dir.settings(), Link::Release), None);
+        let (mut core, _rx) = core_with(dir.settings(), nowhere());
+        let reply = reply_json(
+            &mut core,
+            r#"{"id": 3, "cmd": "open_url", "args": {"which": "release"}}"#,
+        );
+        assert_eq!(
+            reply["error"]["message"],
+            "There is no address for that yet."
+        );
     }
 
     /// A core whose `reveal` records the paths it is asked to show, and fails when

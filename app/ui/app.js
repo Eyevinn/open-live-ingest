@@ -686,13 +686,39 @@ function wireLogs() {
   byId("show-strom-log").addEventListener("click", () => showLog("strom"));
 }
 
+// ---------------------------------------------------------------------------
+// A newer release
+// ---------------------------------------------------------------------------
+
+// The core's update check found a newer release: one quiet line in the footer. The
+// link is opened by name; the core builds its address.
+function showUpdate(version) {
+  if (typeof version !== "string" || version === "") {
+    return;
+  }
+  byId("update-text").textContent = "Version " + version + " is available.";
+  byId("update").hidden = false;
+}
+
+function wireUpdate() {
+  document.addEventListener("oli:update", (event) => {
+    showUpdate(event.detail && event.detail.version);
+  });
+  byId("update-open").addEventListener("click", () => {
+    clearProblem();
+    call("open_url", { which: "release" }).catch(showProblem);
+  });
+}
+
 async function start() {
   wireWhere();
   wireGoLive();
   wireQuit();
   wireLogs();
+  wireUpdate();
   const state = await call("state");
   document.getElementById("version").textContent = "Version " + state.version;
+  showUpdate(state.update);
   setLive(state.live);
   renderWhere(state.where);
   byId("show-all").addEventListener("change", (event) => {

@@ -128,6 +128,27 @@ on macOS, `%APPDATA%\open-live-ingest\gateway.toml` on Windows, or wherever `--c
 | `OLI_OPEN_LIVE_GATEWAY_TOKEN` | `open_live.gateway_token` |
 | `OLI_LOG_LEVEL` | `log.level` |
 
+### Update check (desktop app)
+
+The desktop app asks GitHub whether a newer release is out: one request, when it starts and then
+once a day while it runs, to `https://api.github.com/repos/Eyevinn/open-live-ingest/releases/latest`.
+It sends no settings, credential or identifier, only the app's version in the User-Agent. A newer
+release shows a quiet "Version X is available" line at the bottom of the window, with a link to the
+release page; nothing is downloaded or installed. Without a network, or if GitHub answers with an
+error or its rate limit, the app logs it and shows nothing, and Go live is never held up. The
+command-line gateway makes no such request.
+
+To turn it off, add this to `gateway.toml` (the app reads it before each check):
+
+```toml
+[app]
+check_for_updates = false
+```
+
+The section is written to the file only when the check is off. Release 0.6.0 and older do not know
+`[app]` and refuse a settings file that has it (unknown keys are an error), so remove the section
+before going back to one of them.
+
 ### Without a terminal
 
 Every question has a flag, and `--non-interactive` runs the same checks without asking, failing
