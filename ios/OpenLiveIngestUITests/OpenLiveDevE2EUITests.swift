@@ -15,9 +15,22 @@ import XCTest
 ///
 /// Each check that passes is posted to the control server for the report; a failure stops the
 /// test, and the run fails on the test's result.
+///
+/// openlivedev takes SRT through its relay only (#159, #161), so unless the run says otherwise
+/// (`relay` in `/config`) the uplink has to go through Open Live's SRT relay: the Go live screen's
+/// uplink line (`uplinkLine`, StatusText.uplinkLine) is handed to the control server, which
+/// holds its relay, stream id and dial-in address against what Open Live reports for the source.
+///
+/// The results bundle is a public artifact, and GitHub's log masking does not reach it. So the app
+/// runs with `-OLIRedactUplink`: its uplink line names the relay and a fingerprint of the dial-in
+/// address (`Uplink: via relay default, route <hex>, encrypted`), never the relay host or the
+/// stream id. Nothing on the screen carries them, so no screenshot (ours, or XCTest's own on a
+/// failure) and no UI hierarchy in the bundle does either.
 final class OpenLiveDevE2EUITests: XCTestCase {
     private var control: FakeControl!
     private var app: XCUIApplication!
+    /// Over e2e-ios.py's PASTEBOARD_TIMEOUT (60 s).
+    private static let pasteboardTimeout = 90
 
     private func shot(_ name: String) {
         let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
@@ -33,9 +46,11 @@ final class OpenLiveDevE2EUITests: XCTestCase {
     }
 
     @discardableResult
-    private func call(_ method: String, _ path: String, _ query: [String: String] = [:]) throws -> [String: Any] {
+    private func call(
+        _ method: String, _ path: String, _ query: [String: String] = [:], timeout: Int = 10
+    ) throws -> [String: Any] {
         let items = query.keys.sorted().map { "\($0)=\(Self.encode(query[$0] ?? ""))" }
-        return try control.call(method, items.isEmpty ? path : path + "?" + items.joined(separator: "&"))
+        return try control.call(method, items.isEmpty ? path : path + "?" + items.joined(separator: "&"), timeout: timeout)
     }
 
     /// Posts a passed check for the report, or fails the test with it.
@@ -88,6 +103,17 @@ final class OpenLiveDevE2EUITests: XCTestCase {
     }
 
     private func production() throws -> [String: Any] { try call("GET", "/production") }
+
+    /// The uplink line, `Uplink: via relay <name>, route <fingerprint>, encrypted` (redacted, see
+    /// above), judged by the control server against the source as Open Live has it (its relay, stream id
+    /// and dial-in address), and against the stream id of the first connect after that.
+    private func relayCheck(_ phase: String, _ id: String) throws {
+        let line = app.staticTexts["uplinkLine"]
+        _ = line.waitForExistence(timeout: 30)
+        let shown = line.exists ? line.label : ""
+        let verdict = try call("POST", "/uplink", ["phase": phase, "line": shown])
+        try verify(verdict["ok"] as? Bool == true, id, verdict["detail"] as? String ?? "no verdict from the control server")
+    }
 
     /// The SRT sender's counters on the link line (its accessibility value): packets sent,
     /// dropped and bytes sent, or nil while it carries none.
@@ -165,9 +191,10 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let armedHold = config["armed_hold"] as? Int ?? 10
         let backgroundLimit = config["background_limit"] as? Double ?? 10
         let phoneBound = config["phone_background_bound"] as? Double ?? 4
+        let relay = config["relay"] as? Bool ?? true
 
         app = XCUIApplication()
-        app.launchArguments = ["-OLIReset"]
+        app.launchArguments = ["-OLIReset", "-OLIRedactUplink"]
         app.launch()
 
         // 1. Sign in with a personal access token, pick the instance.
@@ -175,24 +202,47 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         app.buttons["whereAdvanced"].tap()
         let field = app.secureTextFields["patField"]
         XCTAssertTrue(field.waitForExistence(timeout: 10))
-        try call("POST", "/pasteboard/token")
+        // The control server bounds `simctl pbcopy` at 60 s and answers with the reason; wait
+        // longer than that, so a slow pasteboard fails with it rather than with no answer.
+        try call("POST", "/pasteboard/token", timeout: Self.pasteboardTimeout)
         paste(into: field)
-        try call("POST", "/pasteboard/clear")
+        try call("POST", "/pasteboard/clear", timeout: Self.pasteboardTimeout)
         let use = app.buttons["patSubmit"]
         XCTAssertTrue(use.waitForExistence(timeout: 5))
         let enabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == true"), object: use)
         XCTAssertEqual(XCTWaiter().wait(for: [enabled], timeout: 10), .completed, "nothing was pasted into the token field")
         use.tap()
+        // With two or more instances in the workspace the app lists them; with one it picks it
+        // itself (mobile/src/core.rs `signed_in`) and shows the summary straight away.
         let pick = app.buttons["instance \(instance)"]
-        let listed = pick.waitForExistence(timeout: 90)
-        if !listed, app.staticTexts["problem"].exists {
-            try verify(false, "PAT sign-in", "the app says: \(app.staticTexts["problem"].label)")
+        let summary = app.staticTexts["whereSummary"]
+        let problem = app.staticTexts["problem"]
+        enum SignedIn { case listed, picked, problem }
+        let signedIn = poll(90) { () -> SignedIn? in
+            if pick.exists { return .listed }
+            if summary.exists, summary.label.hasPrefix("Sending to \(instance)") { return .picked }
+            if problem.exists { return .problem }
+            return nil
         }
-        try verify(listed, "PAT sign-in", "the token was taken and the workspace's instances listed, '\(instance)' among them")
-        shot("1 instances")
-        pick.tap()
-        wait(app.staticTexts["whereSummary"], "label BEGINSWITH %@", "Sending to \(instance)", within: 30)
-        try verify(true, "instance pick", app.staticTexts["whereSummary"].label)
+        switch signedIn {
+        case .listed?:
+            try verify(true, "PAT sign-in", "the token was taken and the workspace's instances listed, '\(instance)' among them")
+            shot("1 instances")
+            pick.tap()
+        case .picked?:
+            try verify(
+                true, "PAT sign-in",
+                "the token was taken; '\(instance)' is the workspace's only Open Live instance and was picked by the app")
+            shot("1 instances")
+        case .problem?:
+            try verify(false, "PAT sign-in", "the app says: \(problem.label)")
+        case nil:
+            try verify(
+                false, "PAT sign-in",
+                "neither the instance list with '\(instance)' nor 'Sending to \(instance)' showed within 90 s")
+        }
+        wait(summary, "label BEGINSWITH %@", "Sending to \(instance)", within: 30)
+        try verify(true, "instance pick", summary.label)
         app.buttons["toWhat"].tap()
 
         // What to send: the test pattern (no camera on a simulator), the run's label.
@@ -224,7 +274,11 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let start = Date()
         var sentAnything = false
         while Date().timeIntervalSince(start) < TimeInterval(armedHold) {
-            if counters() != nil || !link.label.hasPrefix("Link: not sending") || state.label != "Armed" { sentAnything = true }
+            if counters() != nil || !link.label.hasPrefix("Link: not sending") || state.label != "Armed"
+                || app.staticTexts["uplinkLine"].exists
+            {
+                sentAnything = true
+            }
             if try sources().contains(where: { $0.status == "active" }) { sentAnything = true }
             Thread.sleep(forTimeInterval: 1)
         }
@@ -232,7 +286,8 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         let armedSources = try sources()
         try verify(
             !sentAnything && armedSources.count == 1, "AC2: Go live before activation arms and sends nothing",
-            "Armed for \(armedHold) s, link '\(link.label)', no SRT counters, source \(source.id) registered and not active")
+            "Armed for \(armedHold) s, link '\(link.label)', no SRT counters, no uplink line, source \(source.id) "
+                + "registered and not active")
 
         // 3. The production holding the source goes active: the uplink starts; AC1's numbers.
         try activate(source.id)
@@ -243,6 +298,9 @@ final class OpenLiveDevE2EUITests: XCTestCase {
         try verify(
             active == true, "AC2: activation starts the uplink",
             "Live, '\(link.label)', \(app.staticTexts["productionLine"].label), source active in Open Live")
+        if relay {
+            try relayCheck("first connect", "relay: the uplink goes through Open Live's SRT relay with the source's stream id")
+        }
         let first = try measure("first connect", seconds: seconds)
         shot("5 measured")
         let share = (first["drop_share"] as? Double).map { String(format: "%.3f %%", $0 * 100) } ?? "n/a"
@@ -319,6 +377,9 @@ final class OpenLiveDevE2EUITests: XCTestCase {
             "foreground resumes the uplink",
             "Live, source \(source.id) active again, a new SRT connection (\(after.map { String($0) } ?? "?") packets "
                 + "after resuming, \(before) before the background), cloud picture \(picture ?? "none")")
+        if relay {
+            try relayCheck("foreground", "relay: the foreground reconnect keeps the relay and the stream id")
+        }
 
         // 7. Stop; the control server removes the production and the source after the test.
         go.tap()

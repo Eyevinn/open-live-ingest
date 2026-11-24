@@ -18,6 +18,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var status: StatusRow?
     /// The SRT relay the uplink goes through while it runs; nil without one.
     @Published private(set) var relay: RelayRoute?
+    /// The uplink line without the relay host and the stream id (`-OLIRedactUplink`, a debug
+    /// build's agent-run end to end only, whose screenshots are published).
+    private(set) var redactUplink = false
     @Published private(set) var network: NetworkKind?
     @Published private(set) var bitrateKbps: Int?
     @Published private(set) var stopping: StoppingProgress?
@@ -70,7 +73,7 @@ final class AppModel: ObservableObject {
     /// The app's own: the Rust core over the app's Application Support and Logs folders. A debug
     /// build takes two launch arguments, for the UI tests only: `-OLITestOSCURL <url>` points the
     /// core at a fake Open Source Cloud (`OLI_TEST_OSC_URL`), and `-OLIReset` starts from no
-    /// settings.
+    /// settings. `-OLIRedactUplink` keeps the relay host and the stream id off the screen.
     static func app() -> AppModel {
         let files = FileManager.default
         let support = files.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -98,6 +101,9 @@ final class AppModel: ObservableObject {
         let observer = PhoneObserver(phone: model.phone)
         observer.start()
         model.observer = observer
+        #if DEBUG
+            model.redactUplink = ProcessInfo.processInfo.arguments.contains("-OLIRedactUplink")
+        #endif
         model.refresh()
         return model
     }

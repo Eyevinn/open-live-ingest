@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// The words of step 3 (docs/specs/ios-app.md, section 5; desktop spec, section 5.1), from the
@@ -67,8 +68,19 @@ enum StatusText {
     /// Through Open Live's SRT relay, `Uplink: via relay default to
     /// srt://relay.example.com:6000?streamid=<id>&passphrase=***`; nil without a relay (a port of the
     /// cloud Strom, as before relays). A passphrase is always shown masked.
-    static func uplinkLine(_ relay: RelayRoute?) -> String? {
+    ///
+    /// `redacted` (the agent-run end to end, `-OLIRedactUplink`, whose screenshots are published)
+    /// shows no relay host and no stream id: `Uplink: via relay default, route <fingerprint>,
+    /// encrypted`, the fingerprint being `routeFingerprint` of the dial-in address.
+    static func uplinkLine(_ relay: RelayRoute?, redacted: Bool = false) -> String? {
         guard let relay else { return nil }
+        if redacted {
+            var text = "Uplink: via relay \(relay.name)"
+            if let dialIn = relay.dialIn, !dialIn.isEmpty {
+                text += ", route " + routeFingerprint(dialIn)
+            }
+            return relay.encrypted ? text + ", encrypted" : text
+        }
         var text = "Uplink: via relay \(relay.name)"
         if let dialIn = relay.dialIn.map(masked), !dialIn.isEmpty {
             text += " to " + dialIn
@@ -77,6 +89,20 @@ enum StatusText {
             }
         }
         return text
+    }
+
+    /// The first 16 hex digits of the SHA-256 of `address` with any `passphrase=` dropped: the same
+    /// address gives the same fingerprint, which .github/scripts/e2e-ios.py (`route_fingerprint`)
+    /// holds against Open Live's `connect.uri`.
+    static func routeFingerprint(_ address: String) -> String {
+        var bare = address
+        if let query = address.firstIndex(of: "?") {
+            let kept = address[address.index(after: query)...].split(separator: "&").filter {
+                !$0.hasPrefix("passphrase=")
+            }
+            bare = String(address[..<query]) + (kept.isEmpty ? "" : "?" + kept.joined(separator: "&"))
+        }
+        return SHA256.hash(data: Data(bare.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     /// `address` with the value of any `passphrase=` replaced by `***`.

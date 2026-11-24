@@ -82,4 +82,25 @@ final class StatusTextTests: XCTestCase {
             StatusText.masked("srt://r:1?passphrase=s3cret&streamid=x"), "srt://r:1?passphrase=***&streamid=x")
         XCTAssertEqual(StatusText.masked("srt://r:1"), "srt://r:1")
     }
+
+    /// The end to end's line (`-OLIRedactUplink`): no relay host, no stream id, a fingerprint of the
+    /// dial-in address that e2e-ios.py computes the same way (`route_fingerprint`).
+    func testTheRedactedUplinkLine() {
+        let dialIn = "srt://relay.example.com:6000?streamid=phonerelayid0000000001"
+        // The SHA-256 of dialIn, first 16 hex digits, computed apart.
+        let route = "41c726935c13222b"
+        XCTAssertEqual(StatusText.routeFingerprint(dialIn), route)
+        XCTAssertEqual(StatusText.routeFingerprint(dialIn + "&passphrase=s3cret-s3cret"), route)
+        let line = StatusText.uplinkLine(RelayRoute(name: "default", dialIn: dialIn, encrypted: true), redacted: true)
+        XCTAssertEqual(line, "Uplink: via relay default, route \(route), encrypted")
+        XCTAssertFalse(line?.contains("relay.example.com") ?? true)
+        XCTAssertFalse(line?.contains("phonerelayid") ?? true)
+        XCTAssertEqual(
+            StatusText.uplinkLine(RelayRoute(name: "eu", dialIn: dialIn, encrypted: false), redacted: true),
+            "Uplink: via relay eu, route \(route)")
+        XCTAssertEqual(
+            StatusText.uplinkLine(RelayRoute(name: "eu", dialIn: nil, encrypted: true), redacted: true),
+            "Uplink: via relay eu, encrypted")
+        XCTAssertNil(StatusText.uplinkLine(nil, redacted: true))
+    }
 }

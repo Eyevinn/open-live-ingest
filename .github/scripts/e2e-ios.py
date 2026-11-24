@@ -17,9 +17,11 @@ not the app (the simulator shares the host's loopback), runs the test with
      field. The token never reaches the test: this script puts OSC_ACCESS_TOKEN on the
      simulator's pasteboard (`xcrun simctl pbcopy`, the token on stdin) just before the
      paste and empties the pasteboard right after. Then the instance named
-     OPEN_LIVE_INSTANCE (default openlivedev) is picked, and the test pattern, with a
-     label unique to the run (`oli-ios-e2e-<run id>-<attempt>`), so the source is
-     `<venue> — <label>`.
+     OPEN_LIVE_INSTANCE (default openlivedev) is picked: the test taps it in the app's
+     list when the workspace has two or more instances; when it is the workspace's only
+     one the app picks it itself and the test finds `Sending to <instance>` already
+     showing. Then the test pattern, with a label unique to the run
+     (`oli-ios-e2e-<run id>-<attempt>`), so the source is `<venue> — <label>`.
   2. Go live with no production: the app says Armed, the source is registered in Open
      Live, and nothing is sent for ARMED_HOLD seconds: the link line says
      `Link: not sending`, it carries no SRT counters and the source is not `active` (AC2).
@@ -40,6 +42,18 @@ not the app (the simulator shares the host's loopback), runs the test with
      that was refused, broke or closed, or one that got no frame. The report never says
      "all checks passed" unless every measured phase heard sound. The peak-to-average
      bitrate of what was sent is noted from the bytes counter (spec section 16).
+     Before the measurement, the uplink has to go through Open Live's SRT relay (the
+     only way into openlivedev, #159/#161): the Go live screen's uplink line
+     (`uplinkLine`). The test launches the app with `-OLIRedactUplink`, so that line is
+     `Uplink: via relay <name>, route <fingerprint>, encrypted` (StatusText.uplinkLine,
+     redacted): the fingerprint is the first 16 hex digits of the SHA-256 of the dial-in
+     address the app dials, `srt://<relay>?streamid=<id>` with no passphrase. The relay's
+     name has to be Open Live's `connect.relay` for the source, whose address is an
+     `srt+relay://` one, and the fingerprint that of Open Live's `connect.uri`, which has
+     to carry `connect.streamid`: the same check as the address in clear, with no relay
+     host and no stream id on the screen. A line with the address in clear fails. Armed,
+     there is no uplink line at all. E2E_RELAY=0 drops this for an instance without a
+     relay (the default is to require it).
   4. Deactivate: the app is back to waiting (Armed, or Waiting for production while the
      inactive production still holds the source), `Link: not sending` (AC2).
   5. Stop: the source is kept, `inactive`, with its id. Go live again: no input fails
@@ -51,6 +65,8 @@ not the app (the simulator shares the host's loopback), runs the test with
      (its counters started again), with the same source, and the cloud decodes again:
      only looks at Open Live that began after the app was Live and connected again count
      (a `/measure/start` window), so a picture left from before the background does not.
+     The uplink goes through the same relay with the same stream id as at the first
+     connect (the app keeps it for every reconnect): the same route fingerprint.
   7. Stop, then this script deactivates and deletes the production and deletes the
      source, whatever happened before. Sources and productions carrying
      `oli-ios-e2e-` left by an earlier run that was killed are removed first.
@@ -69,7 +85,15 @@ request run).
 Needs IOS_UDID (a booted or bootable simulator, from `simulator`) and E2E_DERIVED (the
 DerivedData folder `xcodebuild build-for-testing` wrote). Python standard library only.
 OSC_ACCESS_TOKEN, the service token, the instance address and the cloud Strom's host
-are masked in the log as soon as they are known; no response body is printed; xcodebuild
+are masked in the log as soon as they are known, and so are the relay's dial-in address
+and the source's stream id (a report shows only its first characters). Masking covers the
+job log only, not the artifact, and the repository is public: the relay host and the stream
+id never reach the screen (the app runs with `-OLIRedactUplink`), so neither the test's
+screenshots nor XCTest's own failure screenshots and UI hierarchies in `e2e.xcresult` hold
+them, and the test's control calls never put a query string in an error. The token goes to
+the simulator's pasteboard through `simctl pbcopy`'s stdin and never into an error either;
+pbcopy is warmed up before the test and bounded by PASTEBOARD_TIMEOUT. A source's address,
+which may carry the SRT passphrase, is never kept; no response body is printed; xcodebuild
 is started with OSC_ACCESS_TOKEN, GH_TOKEN and GITHUB_TOKEN removed from its
 environment. The pure parts are unit tested: `python3 -I .github/scripts/test_e2e_ios.py`.
 """
@@ -115,6 +139,11 @@ POLL_EVERY = 1.0
 # A meter peak above this (dBFS) is sound; the test pattern's tone is at -20 dBFS.
 SILENCE_DB = -60.0
 TEST_TIMEOUT = 45 * 60
+# `xcrun simctl pbcopy` on a simulator that has not used its pasteboard yet can take longer
+# than a test's control call would wait: it is warmed up before the test (WARM_PASTEBOARD) and
+# bounded during it (PASTEBOARD_TIMEOUT, under FakeControl's 90 s for the pasteboard calls).
+PASTEBOARD_TIMEOUT = 60
+WARM_PASTEBOARD = 180
 WITHHELD_ENV = ("OSC_ACCESS_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -210,17 +239,113 @@ def listener_port(address):
 
 
 def ours(sources, label):
-    """The sources of this run: named `<venue> — <label>`."""
+    """The sources of this run: named `<venue> — <label>`. Through a relay, whether the
+    address is an `srt+relay://` one and what Open Live's `connect` block says (the
+    relay, the stream id, the dial-in address); never the address itself, which may
+    carry the SRT passphrase."""
     out = []
     for s in sources if isinstance(sources, list) else []:
         if isinstance(s, dict) and str(s.get("name", "")).endswith(f" — {label}"):
+            connect = s.get("connect") if isinstance(s.get("connect"), dict) else {}
             out.append({
                 "id": s.get("_id") or s.get("id"),
                 "name": s.get("name"),
                 "status": s.get("status"),
                 "port": listener_port(s.get("address")),
+                "relay_address": str(s.get("address") or "").startswith("srt+relay://"),
+                "relay": connect.get("relay"),
+                "streamid": connect.get("streamid"),
+                "dial_in": connect.get("uri"),
             })
     return out
+
+
+def without_passphrase(address):
+    """`address` with any `passphrase=` parameter dropped (and the `?` with no parameter left)."""
+    base, sep, rest = str(address or "").partition("?")
+    kept = [p for p in rest.split("&") if p and p.split("=", 1)[0] != "passphrase"]
+    return base + ("?" + "&".join(kept) if sep and kept else "")
+
+
+def route_fingerprint(dial_in):
+    """The first 16 hex digits of the SHA-256 of a dial-in address without its passphrase:
+    what the app shows for it under `-OLIRedactUplink` (StatusText.routeFingerprint)."""
+    if not dial_in:
+        return None
+    return hashlib.sha256(without_passphrase(dial_in).encode()).hexdigest()[:16]
+
+
+def uplink_route(line):
+    """The app's uplink line (StatusText.uplinkLine): a dict with the relay's name, the
+    route fingerprint, whether the line says the link is encrypted, and the dial-in
+    address and its stream id when the line shows them in clear (`Uplink: via relay
+    <name> to srt://<relay>?streamid=<id>&passphrase=***`, without -OLIRedactUplink) or
+    None when it does not (`Uplink: via relay <name>, route <hex>, encrypted`). None
+    when the line names no relay."""
+    text = str(line or "").strip()
+    redacted = re.fullmatch(r"Uplink: via relay ([^\s,]+)(?:, route ([0-9a-f]{16}))?(, encrypted)?", text)
+    if redacted:
+        return {"relay": redacted[1], "route": redacted[2], "dial_in": None, "streamid": None,
+                "encrypted": bool(redacted[3])}
+    m = re.fullmatch(r"Uplink: via relay ([^\s,]+) to (\S+)", text)
+    if not m:
+        return None
+    base, _, rest = m[2].partition("?")
+    params = [p for p in rest.split("&") if p]
+    secret = [p for p in params if p.split("=", 1)[0] == "passphrase"]
+    kept = [p for p in params if p not in secret]
+    dial_in = base + ("?" + "&".join(kept) if kept else "")
+    return {"relay": m[1], "route": route_fingerprint(dial_in), "dial_in": dial_in,
+            "streamid": next((p[len("streamid="):] for p in kept if p.startswith("streamid=")), None) or None,
+            "encrypted": bool(secret)}
+
+
+def short_id(value):
+    """The first characters of a stream id and its length, for a report."""
+    value = str(value or "")
+    return f"`{value[:4]}…` ({len(value)} chars)" if value else "none"
+
+
+def relay_verdict(line, sources, first=None):
+    """Whether the uplink goes through Open Live's SRT relay as Open Live has the source:
+    `line` is the app's uplink line, `sources` the run's sources (`ours`), `first` the
+    route fingerprint seen at the first connect (a reconnect has to keep it). (ok,
+    detail, route fingerprint); the detail names no host and only the start of the
+    stream id."""
+    route = uplink_route(line)
+    if route is None:
+        shown = "nothing" if not line else ("an address in clear" if "srt://" in str(line) else line)
+        return False, f"the app shows no relay uplink line (it says: '{shown}')", None
+    fingerprint = route["route"]
+    problems = []
+    if route["dial_in"] is not None:
+        problems.append("the uplink line shows the relay's address and the stream id in clear, which the "
+                        "screenshots in the public artifact would keep (the app has to run with -OLIRedactUplink)")
+    if not fingerprint:
+        problems.append("the uplink line carries no dial-in address")
+    if len(sources) != 1:
+        problems.append(f"Open Live lists {len(sources)} sources of the run, not one")
+    source = sources[0] if sources else {}
+    sid = source.get("streamid")
+    if not source.get("relay_address"):
+        problems.append("the source's address in Open Live is not an srt+relay:// one")
+    if source.get("relay") != route["relay"]:
+        problems.append(f"Open Live reports relay '{source.get('relay')}' for the source (connect.relay)")
+    if not sid:
+        problems.append("Open Live reports no stream id for the source (connect.streamid)")
+    elif f"streamid={sid}" not in str(source.get("dial_in") or "").partition("?")[2].split("&"):
+        problems.append(f"Open Live's connect.uri does not carry its connect.streamid {short_id(sid)}")
+    if fingerprint and fingerprint != route_fingerprint(source.get("dial_in")):
+        problems.append("the dial-in address the app uses (relay and stream id) differs from Open Live's connect.uri")
+    if first and fingerprint != first:
+        problems.append("the dial-in address (relay or stream id) changed since the first connect")
+    detail = (f"'Uplink: via relay {route['relay']}', stream id {short_id(sid)}"
+              f"{', encrypted' if route['encrypted'] else ''}")
+    if problems:
+        return False, detail + "; " + "; ".join(problems), fingerprint
+    detail += (", the relay, stream id and dial-in address Open Live reports for the srt+relay:// source"
+               + (", the same stream id as at the first connect" if first else ""))
+    return True, detail, fingerprint
 
 
 def stale(name, label):
@@ -731,6 +856,8 @@ class Session:
         self.samples = {}
         self.windows = {}
         self.watch = None
+        self.relay = os.environ.get("E2E_RELAY", "1").strip() != "0"
+        self.first_route = None
         self.lock = threading.Lock()
         self.stopping = threading.Event()
         self.poller = threading.Thread(target=self.poll, daemon=True)
@@ -739,6 +866,10 @@ class Session:
         while not self.stopping.is_set():
             try:
                 found = ours(self.ol.sources(), self.label)
+                for s in found:
+                    if s.get("dial_in"):
+                        mask_url(s["dial_in"])
+                    mask(s.get("streamid"))
                 with self.lock:
                     self.sources, self.sources_at = found, time.monotonic()
                 if self.production_id:
@@ -755,9 +886,19 @@ class Session:
                 say(f"a look at Open Live failed (retried): {err}")
             self.stopping.wait(POLL_EVERY)
 
-    def pasteboard(self, text):
-        subprocess.run(["xcrun", "simctl", "pbcopy", self.udid], input=text.encode(), check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    def pasteboard(self, text, timeout=PASTEBOARD_TIMEOUT):
+        """Puts `text` on the simulator's pasteboard (on pbcopy's stdin). A pbcopy that fails
+        or takes over `timeout` seconds is a Failed naming neither the text nor anything
+        pbcopy said, so the token can reach no error."""
+        try:
+            subprocess.run(["xcrun", "simctl", "pbcopy", self.udid], input=text.encode(), check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise Failed(f"the simulator's pasteboard did not take the text within {timeout} s") from None
+        except subprocess.CalledProcessError as err:
+            raise Failed(f"the simulator's pasteboard did not take the text (simctl pbcopy exit {err.returncode})") from None
+        except OSError as err:
+            raise Failed(f"simctl pbcopy could not be started ({type(err).__name__})") from None
 
     def activate(self, source_id):
         try:
@@ -839,7 +980,7 @@ class Session:
         if method == "GET" and path == "/config":
             return {"instance": self.instance, "label": self.label, "seconds": self.seconds,
                     "armed_hold": ARMED_HOLD, "background_limit": BACKGROUND_LIMIT,
-                    "phone_background_bound": PHONE_BACKGROUND_BOUND}
+                    "phone_background_bound": PHONE_BACKGROUND_BOUND, "relay": self.relay}
         if method == "POST" and path == "/pasteboard/token":
             self.pasteboard(self.pat)
             return {"ok": True}
@@ -907,6 +1048,17 @@ class Session:
                     "drop_share": gap.get("drop_share"), "packets_sent": gap.get("packets_sent"),
                     "resolution": result["decode"]["resolution"],
                     "audio": result["audio"][0]}
+        if method == "POST" and path == "/uplink":
+            # The app's uplink line against Open Live's source; the first route (relay and
+            # stream id) that passes is the one every later reconnect has to keep.
+            with self.lock:
+                found = list(self.sources)
+                first = self.first_route
+            ok, detail, route = relay_verdict(args.get("line", ""), found, first)
+            if ok and first is None:
+                with self.lock:
+                    self.first_route = route
+            return {"ok": ok, "detail": detail}
         if method == "POST" and path == "/check":
             check = {"id": args.get("id", "?"), "ok": args.get("ok") == "1", "detail": args.get("detail", "")}
             with self.lock:
@@ -1009,6 +1161,42 @@ def env_int(name, default, floor):
     return value
 
 
+def empty_pasteboard(session):
+    """Empties the simulator's pasteboard at cleanup, so the PAT is not left on it. A pbcopy
+    that fails is tried once more, after `simctl bootstatus -b` has waited for the simulator
+    (which xcodebuild may have left mid-shutdown or not yet booted). Returns None, or the
+    problem with the reason; that reason is a Failed from `Session.pasteboard`, which never
+    names the text or what pbcopy said."""
+    try:
+        session.pasteboard("")
+        return None
+    except Failed as err:
+        say(f"emptying the simulator's pasteboard failed ({err}); waiting for the simulator and trying once more")
+    try:
+        subprocess.run(["xcrun", "simctl", "bootstatus", session.udid, "-b"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=WARM_PASTEBOARD)
+    except (subprocess.TimeoutExpired, OSError) as err:
+        say(f"simctl bootstatus did not finish ({type(err).__name__})")
+    try:
+        session.pasteboard("")
+        return None
+    except Failed as err:
+        return f"the simulator's pasteboard could not be emptied ({err})"
+
+
+def cleanup_text(touched, unremoved, other):
+    """The report's cleanup line: what could not be removed from Open Live (`unremoved`,
+    names), then any other problem (`other`, whole phrases), or what was done when nothing
+    went wrong. `touched` is whether the run reached Open Live at all."""
+    parts = []
+    if unremoved:
+        parts.append(f"could not remove {', '.join(unremoved)}")
+    parts.extend(other)
+    if parts:
+        return "; ".join(parts)
+    return "the test production and source were deactivated and deleted" if touched else "nothing was created"
+
+
 def simulator():
     listing = json.loads(subprocess.run(["xcrun", "simctl", "list", "devices", "available", "--json"],
                                         capture_output=True, text=True, check=True).stdout)
@@ -1069,7 +1257,6 @@ def run():
     session = None
     server = None
     code = 1
-    cleanup = "nothing was created"
     try:
         ol.resolve(instance)
         say(f"instance '{instance}' found")
@@ -1081,6 +1268,15 @@ def run():
         server = serve(session)
         control = f"http://127.0.0.1:{server.server_address[1]}"
         say(f"control server at {control}")
+        # The first pbcopy on a fresh simulator boots its pasteboard service; done here, off
+        # the test's clock, with harmless text. A failure here is only noted: the test's own
+        # call then fails with the reason.
+        warmed = time.monotonic()
+        try:
+            session.pasteboard("", timeout=WARM_PASTEBOARD)
+            say(f"the simulator's pasteboard answered in {time.monotonic() - warmed:.1f} s")
+        except Failed as err:
+            say(f"warming up the pasteboard failed: {err}")
         code, _ = run_test(udid, derived, out, control)
         if code != 0:
             print(f"::error title=e2e ios::the end-to-end test failed (xcodebuild exit {code}); "
@@ -1089,32 +1285,29 @@ def run():
         print(f"::error title=e2e ios::{err}", flush=True)
         code = 1
     finally:
-        problems = []
+        unremoved, other = [], []
         if session is not None:
             session.stopping.set()
             session.stop_meters()
-            try:
-                session.pasteboard("")
-            except (OSError, subprocess.CalledProcessError):
-                problems.append("the simulator's pasteboard could not be emptied")
+            problem = empty_pasteboard(session)
+            if problem:
+                other.append(problem)
         if server is not None:
             server.shutdown()
         if ol.url:
             try:
                 if session is not None and session.production_id:
                     if not ol.remove_production(session.production_id):
-                        problems.append(f"production {session.production_id}")
+                        unremoved.append(f"production {session.production_id}")
                 for s in ours(ol.sources(), label):
                     if not ol.remove_source(s["id"]):
-                        problems.append(f"source {s['id']}")
+                        unremoved.append(f"source {s['id']}")
                 if any(ours(ol.sources(), label)):
-                    problems.append("a source of the run is still listed")
-                cleanup = ("the test production and source were deactivated and deleted"
-                           if not problems else f"could not remove {', '.join(problems)}")
+                    other.append("a source of the run is still listed")
             except Failed as err:
-                cleanup = f"could not finish: {err}"
-                problems.append(cleanup)
-        if problems:
+                other.append(f"could not finish: {err}")
+        cleanup = cleanup_text(bool(ol.url), unremoved, other)
+        if unremoved or other:
             print(f"::error title=e2e ios::cleanup: {cleanup}", flush=True)
             code = 1
 
