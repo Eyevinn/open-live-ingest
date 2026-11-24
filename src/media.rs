@@ -346,7 +346,9 @@ pub enum MediaRequest {
     /// AVFoundation unique id of the lens and `audio_device` the microphone's port
     /// UID), encode as `video` says, MPEG-TS over SRT to `input.endpoint`
     /// (`venue_uri()`, or its parts: `cloud_host`, `port`, `latency_ms`,
-    /// `passphrase()`, `pbkeylen()`). Then report with [`ExternalMedia::report`].
+    /// `passphrase()`, `pbkeylen()`, and through a relay the stream id of
+    /// `relay`, set on the socket before it calls). Then report with
+    /// [`ExternalMedia::report`].
     Start { input: Input, video: Video },
     /// Stop sending the input with this id, and forget it.
     Stop { input_id: String },
@@ -538,10 +540,11 @@ impl Media for ExternalMedia {
         Ok(self.reports().get(&input.id).and_then(|r| r.uplink.clone()))
     }
 
-    /// Not yet: the phone's SRT sender takes a host and a port, and no stream id
-    /// (#161), so its links stay on a port of the cloud Strom.
+    /// Yes: `Start` hands the host the relay's host, port and stream id
+    /// (`input.endpoint`), and the phone's SRT sender sets the stream id on its
+    /// socket before it calls.
     fn dials_relay(&self) -> bool {
-        false
+        true
     }
 
     fn held_back(&self) -> bool {

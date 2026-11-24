@@ -327,6 +327,73 @@ pub struct OpenLiveState {
     pub patched: Vec<String>,
     /// What `GET /api/v1/productions` lists.
     pub productions: Vec<Value>,
+    /// Reports an SRT relay, [`RELAY_PUBLIC`], in server-info and takes
+    /// `srt+relay://` addresses, as an Open Live with relays does; without, it answers
+    /// as one before relays (v0.8.0).
+    pub relay: bool,
+    /// Relay stream ids handed out so far.
+    pub relay_ids: usize,
+}
+
+/// The public address of the relay a fake Open Live with `relay` reports.
+pub const RELAY_PUBLIC: &str = "relay.example.com:6000";
+
+/// What a fake Open Live stores for a relay address, as Open Live does: `auto`
+/// becomes the stream id the source already has (`stored`), or a new one; the
+/// default relay is written without `@`, and the passphrase is masked. None for an
+/// address not through a relay.
+fn relay_address(state: &mut OpenLiveState, address: &str, stored: Option<&str>) -> Option<String> {
+    let rest = address.strip_prefix("srt+relay://")?;
+    let (authority, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (id, relay) = authority.split_once('@').unwrap_or((authority, "default"));
+    let kept = stored
+        .and_then(|s| s.strip_prefix("srt+relay://"))
+        .and_then(|s| s.split(['?', '@']).next())
+        .map(str::to_string);
+    let id = match (id, kept) {
+        ("auto", Some(kept)) => kept,
+        ("auto", None) => {
+            state.relay_ids += 1;
+            format!("phonerelayid{:010}", state.relay_ids)
+        }
+        (id, _) => id.to_string(),
+    };
+    let at = if relay == "default" {
+        String::new()
+    } else {
+        format!("@{relay}")
+    };
+    let query: Vec<String> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some(("passphrase", _)) => "passphrase=***".to_string(),
+            _ => p.to_string(),
+        })
+        .collect();
+    let query = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
+    };
+    Some(format!("srt+relay://{id}{at}{query}"))
+}
+
+/// The `connect` block Open Live derives for a stored relay address: the relay's
+/// public address with the stream id, never the passphrase.
+fn relay_connect(address: &str) -> Option<Value> {
+    let rest = address.strip_prefix("srt+relay://")?;
+    let id = rest.split(['?', '@']).next().unwrap_or_default();
+    let (host, port) = RELAY_PUBLIC.split_once(':').unwrap();
+    Some(json!({
+        "uri": format!("srt://{RELAY_PUBLIC}?streamid={id}"),
+        "host": host,
+        "port": port.parse::<u16>().unwrap(),
+        "mode": "caller",
+        "source": "srt-relay",
+        "streamid": id,
+        "relay": "default",
+    }))
 }
 
 /// A fake Open Live that wants `Bearer <bearer>`: server info publishing a cloud
@@ -354,6 +421,18 @@ pub fn fake_open_live_at(
             path,
             path.strip_prefix("/api/v1/sources/"),
         ) {
+            ("GET", "/api/v1/server-info", _) if s.relay => (
+                200,
+                json!({"stromHost": strom_host, "srtPorts": null,
+                "srtPortState": "unsupported",
+                "srt": {
+                    "state": "ok",
+                    "modes": {"listener": false, "caller": true, "rendezvous": false},
+                    "relays": [{"name": "default", "public": RELAY_PUBLIC}],
+                    "inboundReachable": false,
+                    "ports": null,
+                }}),
+            ),
             ("GET", "/api/v1/server-info", _) => (
                 200,
                 json!({"stromHost": strom_host, "srtPorts": PUBLISHED_PORTS,
@@ -362,6 +441,21 @@ pub fn fake_open_live_at(
             ("GET", "/api/v1/sources", _) => (200, Value::Array(s.sources.clone())),
             ("GET", "/api/v1/productions", _) => (200, Value::Array(s.productions.clone())),
             ("POST", "/api/v1/sources", _) => {
+                let requested = body["address"].as_str().unwrap_or_default();
+                if let Some(address) = relay_address(&mut s, requested, None) {
+                    s.created += 1;
+                    let source = json!({
+                        "id": format!("src-{}", s.created),
+                        "name": body["name"],
+                        "address": address,
+                        "streamType": body["streamType"],
+                        "status": body["status"],
+                        "latency": body["latency"],
+                        "connect": relay_connect(&address),
+                    });
+                    s.sources.push(source.clone());
+                    return (201, source);
+                }
                 let held: Vec<String> = s
                     .sources
                     .iter()
@@ -389,13 +483,22 @@ pub fn fake_open_live_at(
                 (201, source)
             }
             ("PATCH", _, Some(id)) => {
-                let Some(source) = s.sources.iter_mut().find(|x| x["id"] == id) else {
+                let Some(at) = s.sources.iter().position(|x| x["id"] == id) else {
                     return (404, json!({"error": "Source not found"}));
                 };
+                let stored = s.sources[at]["address"].as_str().map(str::to_string);
+                let relay = body["address"]
+                    .as_str()
+                    .and_then(|a| relay_address(&mut s, a, stored.as_deref()));
+                let source = &mut s.sources[at];
                 for field in ["name", "address", "streamType", "status", "latency"] {
                     if !body[field].is_null() {
                         source[field] = body[field].clone();
                     }
+                }
+                if let Some(address) = relay {
+                    source["connect"] = json!(relay_connect(&address));
+                    source["address"] = json!(address);
                 }
                 let source = source.clone();
                 s.patched

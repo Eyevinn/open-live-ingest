@@ -490,6 +490,13 @@ fn paste_token_choose_go_live_send_while_active_and_stop_keeping_the_source() {
     assert_eq!(data["uplink"]["latency_ms"], 200);
     assert_eq!(data["uplink"]["passphrase"], PASSPHRASE);
     assert_eq!(data["uplink"]["pbkeylen"], 32);
+    // An Open Live without an SRT relay: caller mode to a port, as before relays (AC3).
+    for relay_only in ["streamid", "relay", "dial_in"] {
+        assert!(
+            data["uplink"].get(relay_only).is_none(),
+            "{relay_only} without a relay: {data}"
+        );
+    }
     assert_eq!(
         data["video"],
         json!({"width": 1280, "height": 720, "fps": 30.0, "bitrate_kbps": 4000,
@@ -614,6 +621,135 @@ fn paste_token_choose_go_live_send_while_active_and_stop_keeping_the_source() {
             "the token was logged: {line}"
         );
     }
+}
+
+/// Against an Open Live with an SRT relay (#161): the source is registered through
+/// it, and `media` start hands Swift the relay's host and port, the stream id to set
+/// on the socket, and the relay's name and dial-in address for the status lines. A
+/// passphrase is generated, the relay's port being public. Every later start of the
+/// same input (back from the background, and the next Go live, which adopts the
+/// source) carries the same stream id.
+#[test]
+fn go_live_through_an_srt_relay_hands_swift_the_stream_id() {
+    let scratch = Scratch::new("go-live-relay");
+    let open_live_state = Arc::new(Mutex::new(OpenLiveState {
+        relay: true,
+        ..OpenLiveState::default()
+    }));
+    let open_live = testing::fake_open_live(testing::SERVICE_TOKEN, open_live_state.clone());
+    let osc = FakeOsc::start(&[("Venue", &open_live)]);
+    let (core, mut swift) = core_over(&scratch, osc.endpoints(), None);
+    let within = Duration::from_secs(30);
+
+    send(
+        &core,
+        &mut swift,
+        1,
+        "osc_paste_token",
+        json!({"token": testing::ACCESS}),
+    );
+    let chosen = send(
+        &core,
+        &mut swift,
+        2,
+        "choose_instance",
+        json!({"url": open_live}),
+    );
+    assert_eq!(chosen["ok"]["where"]["ready"], true, "{chosen}");
+    let input = send(
+        &core,
+        &mut swift,
+        3,
+        "set_input",
+        json!({"device": "com.apple.avfoundation.avcapturedevice.built-in_video:0",
+               "label": "Back camera"}),
+    );
+    let name = input["ok"]["input"]["studio_name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        send(&core, &mut swift, 4, "go_live", Value::Null),
+        json!({"id": 4, "ok": null})
+    );
+    swift.event("input", within, |d| {
+        d["input"] == name && d["state"] == "armed"
+    });
+    let (source, address) = {
+        let ol = open_live_state.lock().unwrap();
+        assert_eq!(ol.sources.len(), 1, "{:?}", ol.sources);
+        (
+            ol.sources[0]["id"].as_str().unwrap().to_string(),
+            ol.sources[0]["address"].as_str().unwrap().to_string(),
+        )
+    };
+    assert!(
+        address.starts_with("srt+relay://phonerelayid"),
+        "registered through the relay: {address}"
+    );
+    open_live_state.lock().unwrap().productions = vec![testing::production(
+        "prod-1",
+        "Morning Show",
+        "active",
+        &[&source],
+    )];
+
+    let start = swift.event("media", within, |d| d["action"] == "start");
+    let uplink = &start["data"]["uplink"];
+    let input_id = start["data"]["input"].as_str().unwrap().to_string();
+    let stream_id = uplink["streamid"]
+        .as_str()
+        .expect("a stream id")
+        .to_string();
+    assert!(stream_id.starts_with("phonerelayid"), "{uplink}");
+    assert_eq!(uplink["host"], "relay.example.com", "{uplink}");
+    assert_eq!(uplink["port"], 6000, "{uplink}");
+    assert_eq!(uplink["relay"], "default", "{uplink}");
+    assert_eq!(
+        uplink["dial_in"],
+        format!("srt://{}?streamid={stream_id}", testing::RELAY_PUBLIC)
+    );
+    assert_eq!(uplink["latency_ms"], 200);
+    let passphrase = uplink["passphrase"]
+        .as_str()
+        .expect("a generated passphrase: the relay's port is public");
+    assert!(
+        !uplink["dial_in"].as_str().unwrap().contains(passphrase),
+        "{uplink}"
+    );
+
+    // Away and back: the uplink starts again with the same stream id.
+    core.send(r#"{"id": 5, "cmd": "phone", "args": {"foreground": false, "interrupted": false, "network": "wifi"}}"#);
+    swift.event("media", within, |d| {
+        d["action"] == "stop" && d["input"] == input_id
+    });
+    core.send(r#"{"id": 6, "cmd": "phone", "args": {"foreground": true, "interrupted": false, "network": "cellular"}}"#);
+    let again = swift.event("media", within, |d| {
+        d["action"] == "start" && d["input"] == input_id
+    });
+    assert_eq!(again["data"]["uplink"], *uplink);
+
+    // Stop, then Go live again: the source is adopted, and so is its stream id.
+    send(&core, &mut swift, 7, "stop", Value::Null);
+    swift.event("stopped", within, |_| true);
+    let mut tries = 0;
+    while core.live() && tries < 50 {
+        std::thread::sleep(Duration::from_millis(50));
+        tries += 1;
+    }
+    swift.seen.clear();
+    send(&core, &mut swift, 8, "go_live", Value::Null);
+    let next = swift.event("media", within, |d| d["action"] == "start");
+    assert_eq!(next["data"]["uplink"]["streamid"], stream_id.as_str());
+    assert_eq!(next["data"]["uplink"]["passphrase"], passphrase);
+    {
+        let ol = open_live_state.lock().unwrap();
+        assert_eq!(ol.created, 1, "the source was adopted, not created again");
+        assert_eq!(ol.sources[0]["id"], source.as_str());
+    }
+    send(&core, &mut swift, 9, "stop", Value::Null);
+    swift.event("stopped", within, |_| true);
 }
 
 #[test]
