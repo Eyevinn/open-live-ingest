@@ -1,0 +1,278 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0A0000000000000000000101 /* SignInCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A0000000000000000000201 /* SignInCheck.swift */; };
+		0A0000000000000000000102 /* SignInCheckUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A0000000000000000000202 /* SignInCheckUITests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0A0000000000000000000301 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0A0000000000000000000901 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0A0000000000000000000701;
+			remoteInfo = SignInCheck;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		0A0000000000000000000201 /* SignInCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInCheck.swift; sourceTree = "<group>"; };
+		0A0000000000000000000202 /* SignInCheckUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInCheckUITests.swift; sourceTree = "<group>"; };
+		0A0000000000000000000203 /* SignInCheck-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SignInCheck-Bridging-Header.h"; sourceTree = "<group>"; };
+		0A0000000000000000000204 /* SignInCheck.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SignInCheck.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0A0000000000000000000205 /* SignInCheckUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SignInCheckUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		0A0000000000000000000401 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0A0000000000000000000402 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0A0000000000000000000501 = {
+			isa = PBXGroup;
+			children = (
+				0A0000000000000000000502 /* SignInCheck */,
+				0A0000000000000000000503 /* SignInCheckUITests */,
+				0A0000000000000000000504 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		0A0000000000000000000502 /* SignInCheck */ = {
+			isa = PBXGroup;
+			children = (
+				0A0000000000000000000201 /* SignInCheck.swift */,
+				0A0000000000000000000203 /* SignInCheck-Bridging-Header.h */,
+			);
+			path = SignInCheck;
+			sourceTree = "<group>";
+		};
+		0A0000000000000000000503 /* SignInCheckUITests */ = {
+			isa = PBXGroup;
+			children = (
+				0A0000000000000000000202 /* SignInCheckUITests.swift */,
+			);
+			path = SignInCheckUITests;
+			sourceTree = "<group>";
+		};
+		0A0000000000000000000504 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				0A0000000000000000000204 /* SignInCheck.app */,
+				0A0000000000000000000205 /* SignInCheckUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0A0000000000000000000701 /* SignInCheck */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0A0000000000000000000A02 /* Build configuration list for PBXNativeTarget "SignInCheck" */;
+			buildPhases = (
+				0A0000000000000000000601 /* Sources */,
+				0A0000000000000000000401 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = SignInCheck;
+			productName = SignInCheck;
+			productReference = 0A0000000000000000000204 /* SignInCheck.app */;
+			productType = "com.apple.product-type.application";
+		};
+		0A0000000000000000000702 /* SignInCheckUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0A0000000000000000000A03 /* Build configuration list for PBXNativeTarget "SignInCheckUITests" */;
+			buildPhases = (
+				0A0000000000000000000602 /* Sources */,
+				0A0000000000000000000402 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0A0000000000000000000801 /* PBXTargetDependency */,
+			);
+			name = SignInCheckUITests;
+			productName = SignInCheckUITests;
+			productReference = 0A0000000000000000000205 /* SignInCheckUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		0A0000000000000000000901 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					0A0000000000000000000701 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					0A0000000000000000000702 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = 0A0000000000000000000701;
+					};
+				};
+			};
+			buildConfigurationList = 0A0000000000000000000A01 /* Build configuration list for PBXProject "SignInCheck" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 0A0000000000000000000501;
+			productRefGroup = 0A0000000000000000000504 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				0A0000000000000000000701 /* SignInCheck */,
+				0A0000000000000000000702 /* SignInCheckUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		0A0000000000000000000601 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0A0000000000000000000101 /* SignInCheck.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0A0000000000000000000602 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0A0000000000000000000102 /* SignInCheckUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0A0000000000000000000801 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0A0000000000000000000701 /* SignInCheck */;
+			targetProxy = 0A0000000000000000000301 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0A0000000000000000000B01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		0A0000000000000000000B02 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.0.0;
+				CURRENT_PROJECT_VERSION = 1;
+				OLI_RUST_LIB = "$(SRCROOT)/../../target/aarch64-apple-ios-sim/debug/libopen_live_ingest_mobile.a";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"$(OLI_RUST_LIB)",
+					"$(OLI_RUST_NATIVE_LIBS)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.sign-in-check";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_OBJC_BRIDGING_HEADER = "SignInCheck/SignInCheck-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+		0A0000000000000000000B03 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.0.0;
+				CURRENT_PROJECT_VERSION = 1;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.sign-in-check.uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = SignInCheck;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0A0000000000000000000A01 /* Build configuration list for PBXProject "SignInCheck" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0A0000000000000000000B01 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		0A0000000000000000000A02 /* Build configuration list for PBXNativeTarget "SignInCheck" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0A0000000000000000000B02 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		0A0000000000000000000A03 /* Build configuration list for PBXNativeTarget "SignInCheckUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0A0000000000000000000B03 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 0A0000000000000000000901 /* Project object */;
+}

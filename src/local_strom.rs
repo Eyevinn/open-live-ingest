@@ -7,11 +7,13 @@
 //! not stay open with nothing supervising it.
 
 use crate::config::{self, Config};
+use crate::gateway::{Event, Events};
 use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -23,13 +25,17 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum LocalStrom {
     /// Already running. Left alone entirely.
     Adopted,
-    /// Started here, and stopped when this is dropped.
-    Managed { child: Child, log_path: PathBuf },
+    /// Started here, and stopped when this is dropped, which is told to `events`.
+    Managed {
+        child: Child,
+        log_path: PathBuf,
+        events: Events,
+    },
 }
 
 impl Drop for LocalStrom {
     fn drop(&mut self) {
-        let LocalStrom::Managed { child, .. } = self else {
+        let LocalStrom::Managed { child, events, .. } = self else {
             return;
         };
         // Already exited and reaped: its pid may belong to another process by now.
@@ -67,15 +73,43 @@ impl Drop for LocalStrom {
             }
         }
         std::fs::remove_file(config::strom_pidfile()).ok();
-        // Not `println!`: this also runs while Windows closes the console, when a write
-        // to it can fail, and a panic here would skip the rest of `up`'s cleanup.
-        use std::io::Write as _;
-        let _ = writeln!(std::io::stdout(), "  strom — stopped");
+        events.emit(Event::StromStopped);
+    }
+}
+
+/// Whether a Strom this process starts gets no console window (Windows). Set once by
+/// a GUI-subsystem app through [`start_without_console_window`]; the CLI leaves it
+/// off and keeps its console behaviour.
+static NO_CONSOLE_WINDOW: AtomicBool = AtomicBool::new(false);
+
+/// Windows `CREATE_NEW_PROCESS_GROUP`: Strom gets a Ctrl-C of its own, not the
+/// gateway's.
+#[cfg_attr(not(windows), allow(dead_code))]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+/// Windows `CREATE_NO_WINDOW`: a console program started from a GUI process would
+/// otherwise get a console window of its own.
+#[cfg_attr(not(windows), allow(dead_code))]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// For an app with no console of its own (a Windows GUI-subsystem executable): every
+/// Strom this process starts from now on is started with `CREATE_NO_WINDOW`, so no
+/// console window opens next to the app. Has no effect elsewhere than on Windows.
+pub fn start_without_console_window() {
+    NO_CONSOLE_WINDOW.store(true, Ordering::Relaxed);
+}
+
+/// The creation flags a Strom is started with on Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn creation_flags(no_console_window: bool) -> u32 {
+    if no_console_window {
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+    } else {
+        CREATE_NEW_PROCESS_GROUP
     }
 }
 
 /// Returns a usable local Strom, starting one if nothing is listening.
-pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
+pub async fn ensure_running(cfg: &Config, events: &Events) -> Result<LocalStrom> {
     let client = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
     match client.probe().await {
         Reachability::Ok { .. } => {
@@ -110,15 +144,15 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
     let data_dir = data_dir(cfg);
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating Strom's data directory at {}", data_dir.display()))?;
-    let log_path = data_dir.join("strom.log");
+    let log_path = log_path(cfg);
     let log = std::fs::File::create(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
     let log_err = log.try_clone().context("duplicating the log file handle")?;
 
-    println!(
-        "Starting Strom on port {port} (logging to {}).",
-        log_path.display()
-    );
+    events.emit(Event::StromStarting {
+        port,
+        log_path: log_path.clone(),
+    });
     let mut command = Command::new(&strom.path);
     command
         .args(["--headless", "--port", &port.to_string(), "--data-dir"])
@@ -138,8 +172,7 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        command.creation_flags(creation_flags(NO_CONSOLE_WINDOW.load(Ordering::Relaxed)));
     }
     let child = command
         .spawn()
@@ -153,15 +186,26 @@ pub async fn ensure_running(cfg: &Config) -> Result<LocalStrom> {
     }
     std::fs::write(&pidfile, child.id().to_string()).ok();
 
-    let mut managed = LocalStrom::Managed { child, log_path };
-    wait_until_ready(&client, &mut managed).await?;
+    let mut managed = LocalStrom::Managed {
+        child,
+        log_path,
+        events: events.clone(),
+    };
+    wait_until_ready(&client, &mut managed, events).await?;
     Ok(managed)
 }
 
-async fn wait_until_ready(client: &StromClient, strom: &mut LocalStrom) -> Result<()> {
+async fn wait_until_ready(
+    client: &StromClient,
+    strom: &mut LocalStrom,
+    events: &Events,
+) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
-        if let LocalStrom::Managed { child, log_path } = &mut *strom {
+        if let LocalStrom::Managed {
+            child, log_path, ..
+        } = &mut *strom
+        {
             if let Some(status) = child
                 .try_wait()
                 .context("checking on the Strom we started")?
@@ -174,7 +218,7 @@ async fn wait_until_ready(client: &StromClient, strom: &mut LocalStrom) -> Resul
         }
         match client.probe().await {
             Reachability::Ok { video_sources } => {
-                println!("  Strom is up; it can see {video_sources} video source(s).");
+                events.emit(Event::StromReady { video_sources });
                 return Ok(());
             }
             // We set no key on the Strom we started, so this is someone else's on the port.
@@ -222,11 +266,14 @@ fn tail_of_log(path: &Path) -> String {
 ///
 /// ```text
 /// Open Live Ingest.app/Contents/
-///     MacOS/open-live-ingest
+///     MacOS/open-live-ingest-app   the desktop app, the bundle's main executable
+///     MacOS/open-live-ingest       the CLI
 ///     MacOS/strom
 ///     Frameworks/                  GStreamer and GLib libraries
 ///     PlugIns/gstreamer/           GStreamer plugins
+///     PlugIns/gio/                 GIO modules (none)
 ///     Helpers/gst-plugin-scanner   the plugin scanner
+///     Resources/                   the icon; GLib's shared data directory
 /// ```
 ///
 /// No directory in those places may have a dot in its name: `codesign` takes such a
@@ -234,7 +281,8 @@ fn tail_of_log(path: &Path) -> String {
 ///
 /// The paths below are relative to `Contents`, the parent of the directory holding
 /// the executables. `.github/scripts/build-macos-app.sh` puts the files exactly
-/// there (`PLUGIN_DIR_REL`, `SCANNER_REL`); a test below keeps the two in step.
+/// there (`PLUGIN_DIR_REL`, `SCANNER_REL`, `GIO_MODULE_DIR_REL`); a test below keeps
+/// the two in step.
 ///
 /// A `strom` next to the gateway counts as bundled only when this directory exists
 /// relative to it. That is what tells the app apart from a plain install such as
@@ -246,6 +294,16 @@ pub const BUNDLE_PLUGIN_SCANNER: &str = "Helpers/gst-plugin-scanner";
 /// The GStreamer registry of a bundled Strom, kept in the managed Strom's data
 /// directory so it never shares a registry with another GStreamer on the machine.
 pub const BUNDLE_REGISTRY_FILE: &str = "gstreamer-registry.bin";
+/// See [`BUNDLE_PLUGIN_DIR`]. Where the bundled GLib looks for GIO modules
+/// (`GIO_MODULE_DIR`): a directory of the bundle's own, kept empty. Left unset, GLib
+/// looks in the module directory of the prefix it was built for, which is Homebrew's,
+/// and loads whatever it finds there into Strom. No flow of ours needs a GIO module:
+/// the SRT uplink encrypts with libsrt's own crypto, not through GIO's TLS.
+pub const BUNDLE_GIO_MODULE_DIR: &str = "PlugIns/gio";
+/// See [`BUNDLE_PLUGIN_DIR`]. The only directory the bundled GLib searches for shared
+/// data such as GSettings schemas (`XDG_DATA_DIRS`), instead of its default of
+/// `/usr/local/share` and `/usr/share`.
+pub const BUNDLE_DATA_DIR: &str = "Resources";
 
 #[cfg(not(windows))]
 const INSTALL_HINT: &str =
@@ -297,11 +355,14 @@ impl LocatedStrom {
         }
     }
 
-    /// The GStreamer environment for starting this Strom. Empty unless it is the
-    /// bundled one: a Strom on `PATH`, set explicitly, or next to the gateway outside
-    /// a bundle brings its own GStreamer.
-    /// For the bundled one, plugins and the scanner come from the bundle only, and
-    /// the registry lives in `data_dir`, so a Homebrew GStreamer is never mixed in.
+    /// The GStreamer and GLib environment for starting this Strom. Empty unless it is
+    /// the bundled one: a Strom on `PATH`, set explicitly, or next to the gateway
+    /// outside a bundle brings its own GStreamer.
+    /// For the bundled one, plugins and the scanner come from the bundle only, the
+    /// registry lives in `data_dir`, GIO modules come from the bundle's empty module
+    /// directory and from nowhere else, and GLib's shared data from the bundle, so a
+    /// Homebrew GStreamer or GLib is never mixed in. gst-plugin-scanner inherits this
+    /// environment from Strom.
     pub fn gst_env(&self, data_dir: &Path) -> Vec<(&'static str, OsString)> {
         let StromOrigin::Bundled { contents } = &self.origin else {
             return Vec::new();
@@ -309,6 +370,8 @@ impl LocatedStrom {
         let plugins = contents.join(BUNDLE_PLUGIN_DIR).into_os_string();
         let scanner = contents.join(BUNDLE_PLUGIN_SCANNER).into_os_string();
         let registry = data_dir.join(BUNDLE_REGISTRY_FILE).into_os_string();
+        let gio_modules = contents.join(BUNDLE_GIO_MODULE_DIR).into_os_string();
+        let data = contents.join(BUNDLE_DATA_DIR).into_os_string();
         vec![
             ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.clone()),
             ("GST_PLUGIN_SYSTEM_PATH", plugins),
@@ -318,6 +381,9 @@ impl LocatedStrom {
             ("GST_PLUGIN_SCANNER", scanner),
             ("GST_REGISTRY_1_0", registry.clone()),
             ("GST_REGISTRY", registry),
+            ("GIO_MODULE_DIR", gio_modules),
+            ("GIO_EXTRA_MODULES", OsString::new()),
+            ("XDG_DATA_DIRS", data),
         ]
     }
 }
@@ -475,6 +541,12 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Where a Strom the gateway starts writes its output (`<data_dir>/strom.log`),
+/// replaced at each start. An adopted Strom logs wherever it was started to.
+pub fn log_path(cfg: &Config) -> PathBuf {
+    data_dir(cfg).join("strom.log")
+}
+
 /// Beside our own settings by default, so a managed Strom never writes into an
 /// existing install's data directory.
 fn data_dir(cfg: &Config) -> PathBuf {
@@ -502,7 +574,7 @@ pub fn port_of(url: &str) -> Option<u16> {
 /// killed hard and left it holding the cameras. Checked against the process name,
 /// because pids are reused after a reboot. An adopted Strom is never recorded, so it
 /// is never stopped.
-pub fn stop_recorded() {
+pub fn stop_recorded(events: &Events) {
     let pidfile = config::strom_pidfile();
     let Some(pid) = std::fs::read_to_string(&pidfile)
         .ok()
@@ -511,10 +583,73 @@ pub fn stop_recorded() {
         return;
     };
     if crate::run::process_named(pid, "strom") {
-        println!("  strom (pid {pid}) — stopping the one an earlier run started");
+        events.emit(Event::StromLeftOverStopping { pid });
         signal_term(pid);
     }
     std::fs::remove_file(&pidfile).ok();
+}
+
+/// Reclaims a Strom left behind by a gateway that ended without its teardown (a
+/// crash, a force quit): when `strom.pid` names a running Strom, it is stopped and
+/// waited for, so the Strom the next session starts is one it owns and stops again.
+/// Adopting the leftover instead would leave a camera open after the next Stop,
+/// because an adopted Strom is never stopped.
+///
+/// Nothing is stopped while another gateway is running (see
+/// [`crate::run::running_gateway`]): its Strom is not left behind, it is in use. That
+/// check is made here, after `strom.pid` is read, not by the caller beforehand. `up`
+/// writes `gateway.pid` before it starts Strom and writes `strom.pid`, so a
+/// `strom.pid` that belongs to a running gateway, or to one that is still starting,
+/// is always covered by a `gateway.pid` by the time it is read here: a gateway that
+/// starts while the caller is busy (the app waiting on the macOS camera prompt) is
+/// never mistaken for a crash's leftover.
+/// Returns whether a Strom was stopped. Blocks for up to [`STOP_TIMEOUT`].
+pub fn reclaim_recorded(events: &Events) -> bool {
+    reclaim_recorded_at(&config::strom_pidfile(), &config::pidfile(), events)
+}
+
+fn reclaim_recorded_at(pidfile: &Path, gateway_pidfile: &Path, events: &Events) -> bool {
+    let Some(pid) = read_pid(pidfile) else {
+        return false;
+    };
+    // Only after the read: see above.
+    if let Some(gateway) = crate::run::running_gateway_in(gateway_pidfile) {
+        info!(
+            pid,
+            gateway, "a gateway is running: its Strom is not reclaimed"
+        );
+        return false;
+    }
+    if !crate::run::process_named(pid, "strom") {
+        remove_if_still(pidfile, pid);
+        return false;
+    }
+    info!(pid, "stopping the Strom an earlier session left behind");
+    events.emit(Event::StromLeftOverStopping { pid });
+    signal_term(pid);
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while crate::run::process_named(pid, "strom") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if crate::run::process_named(pid, "strom") {
+        warn!(pid, "the Strom left behind did not stop in time");
+    }
+    remove_if_still(pidfile, pid);
+    true
+}
+
+fn read_pid(pidfile: &Path) -> Option<u32> {
+    std::fs::read_to_string(pidfile)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+}
+
+/// Removes `pidfile` only while it still names `pid`: a gateway that started in the
+/// meantime has recorded its own Strom there.
+fn remove_if_still(pidfile: &Path, pid: u32) {
+    if read_pid(pidfile) == Some(pid) {
+        std::fs::remove_file(pidfile).ok();
+    }
 }
 
 #[cfg(unix)]
@@ -542,6 +677,231 @@ fn signal_term(_pid: u32) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app's launch option adds `CREATE_NO_WINDOW`; the CLI keeps today's flags.
+    #[test]
+    fn a_gui_app_starts_strom_without_a_console_window() {
+        assert_eq!(creation_flags(false), 0x0000_0200);
+        assert_eq!(creation_flags(true), 0x0800_0200);
+    }
+
+    /// A pidfile naming no Strom is stale: removed, and nothing is stopped.
+    #[test]
+    fn a_stale_strom_pidfile_is_removed_and_nothing_stopped() {
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("strom.pid");
+        let no_gateway = dir.join("gateway.pid");
+        // This test process: alive, but not a Strom.
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let (events, seen) = recording();
+        assert!(!reclaim_recorded_at(&pidfile, &no_gateway, &events));
+        assert!(!pidfile.exists());
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(
+            !reclaim_recorded_at(&pidfile, &no_gateway, &events),
+            "no pidfile at all"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Events that are kept, to be looked at after.
+    fn recording() -> (Events, std::sync::Arc<std::sync::Mutex<Vec<Event>>>) {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = {
+            let seen = seen.clone();
+            Events::new(move |e| seen.lock().unwrap().push(e))
+        };
+        (events, seen)
+    }
+
+    /// Whether this machine can tell processes apart by name: process names come from
+    /// `ps`, which every CI runner has; a bare container may not, and then there is
+    /// nothing to check against.
+    #[cfg(unix)]
+    fn ps_works() -> bool {
+        Command::new("ps").arg("-p").arg("1").output().is_ok()
+    }
+
+    /// A process named `name`, started from `dir`, that runs until it is stopped or
+    /// 60 s have passed, so a test that fails before stopping it leaves nothing
+    /// running for long. It stands in for a Strom or a gateway. The test fails here,
+    /// saying so, if it exits at once rather than later on an assertion that cannot
+    /// tell why.
+    #[cfg(unix)]
+    fn spawn_named(dir: &Path, name: &str) -> std::process::Child {
+        let fake = write_stand_in(dir, name);
+        let mut child = spawn_retrying(&fake);
+        std::thread::sleep(Duration::from_millis(200));
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("the stand-in {} exited at once ({status})", fake.display());
+        }
+        child
+    }
+
+    /// On Linux, a shell script named `name` that sleeps in a loop for as many seconds
+    /// as its first argument says (60 if none). The kernel names a process after the
+    /// file it executed, so `ps -o comm=` shows `name`, as long as the script never
+    /// `exec`s. A copy of `sleep` would not do: on Ubuntu 26.04
+    /// `sleep` is the uutils coreutils multicall binary, which picks the utility from
+    /// the name it was started under and exits at once as `strom`.
+    #[cfg(target_os = "linux")]
+    fn write_stand_in(dir: &Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = dir.join(name);
+        let script = concat!(
+            "#!/bin/sh\n",
+            "n=0\n",
+            "while [ \"$n\" -lt \"${1:-60}\" ]; do sleep 1; n=$((n + 1)); done\n",
+        );
+        std::fs::write(&fake, script).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    /// Elsewhere (macOS), a copy of `sleep` named `name`, as before: `sleep` there is a
+    /// single-purpose binary that runs under any name.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn write_stand_in(dir: &Path, name: &str) -> std::path::PathBuf {
+        let fake = dir.join(name);
+        let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .expect("a sleep executable");
+        std::fs::copy(sleep, &fake).unwrap();
+        fake
+    }
+
+    /// Runs `fake` with `60`, the seconds the stand-in (`sleep` or the script) runs
+    /// before it exits by itself. A file just written may be briefly "text file busy"
+    /// while another test thread forks with its write handle still open, so that is
+    /// retried.
+    #[cfg(unix)]
+    fn spawn_retrying(fake: &Path) -> std::process::Child {
+        let started = Instant::now();
+        loop {
+            match Command::new(fake).arg("60").spawn() {
+                Ok(child) => return child,
+                Err(err)
+                    if err.raw_os_error() == Some(libc::ETXTBSY)
+                        && started.elapsed() < Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => panic!("starting {}: {err}", fake.display()),
+            }
+        }
+    }
+
+    /// Waits until `seen` holds: `ps` may not show a new process's name at once.
+    #[cfg(unix)]
+    fn wait_until(what: &str, seen: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !seen() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{what} never showed up"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    fn a_strom(pid: u32) -> bool {
+        crate::run::process_named(pid, "strom")
+    }
+
+    /// A Strom left running by a crashed session is stopped and waited for, not
+    /// adopted.
+    #[cfg(unix)]
+    #[test]
+    fn a_strom_left_behind_is_stopped_and_waited_for() {
+        if !ps_works() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = spawn_named(&dir, "strom");
+        wait_until("the fake Strom", || a_strom(child.id()));
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        let (events, seen) = recording();
+        // Reaped on a thread, as a parent would: an unreaped child stays a zombie
+        // that `ps` still lists.
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || child.wait());
+        assert!(reclaim_recorded_at(
+            &pidfile,
+            &dir.join("gateway.pid"),
+            &events
+        ));
+        assert!(!pidfile.exists());
+        assert!(!a_strom(pid));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![Event::StromLeftOverStopping { pid }]
+        );
+        reaper.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Strom `strom.pid` names belongs to a gateway that `gateway.pid` names and
+    /// that is running (one started while the app waited on its checks): it is not
+    /// signalled, and its `strom.pid` is left for that gateway.
+    #[cfg(unix)]
+    #[test]
+    fn the_strom_of_a_running_gateway_is_never_reclaimed() {
+        if !ps_works() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-gw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gateway_pidfile = dir.join("gateway.pid");
+        let mut strom = spawn_named(&dir, "strom");
+        let mut gateway = spawn_named(&dir, env!("CARGO_PKG_NAME"));
+        std::fs::write(&gateway_pidfile, gateway.id().to_string()).unwrap();
+        wait_until("the fake Strom", || a_strom(strom.id()));
+        wait_until("the fake gateway", || {
+            crate::run::running_gateway_in(&gateway_pidfile) == Some(gateway.id())
+        });
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, strom.id().to_string()).unwrap();
+        let (events, seen) = recording();
+
+        assert!(!reclaim_recorded_at(&pidfile, &gateway_pidfile, &events));
+        assert!(a_strom(strom.id()), "the gateway's Strom is still running");
+        assert_eq!(
+            std::fs::read_to_string(&pidfile).unwrap(),
+            strom.id().to_string()
+        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        // Once that gateway has gone, the same Strom is a leftover again.
+        gateway.kill().unwrap();
+        gateway.wait().unwrap();
+        let pid = strom.id();
+        let reaper = std::thread::spawn(move || strom.wait());
+        assert!(reclaim_recorded_at(&pidfile, &gateway_pidfile, &events));
+        assert!(!a_strom(pid));
+        assert!(!pidfile.exists());
+        reaper.join().unwrap().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A gateway that started after `strom.pid` was read and recorded its own Strom
+    /// there keeps that record when the stale one it replaced is cleaned up.
+    #[test]
+    fn a_newer_strom_pid_is_not_removed() {
+        let dir = std::env::temp_dir().join(format!("oli-reclaim-newer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, "4242").unwrap();
+        remove_if_still(&pidfile, 4141);
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), "4242");
+        remove_if_still(&pidfile, 4242);
+        assert!(!pidfile.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn the_port_is_read_from_the_url_and_a_default_port_is_not_guessed() {
@@ -626,10 +986,14 @@ mod tests {
             .port();
         let client = StromClient::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
         // Not dropped: `Drop` would remove the user's real Strom pidfile.
-        let mut managed = std::mem::ManuallyDrop::new(LocalStrom::Managed { child, log_path });
+        let mut managed = std::mem::ManuallyDrop::new(LocalStrom::Managed {
+            child,
+            log_path,
+            events: Events::discard(),
+        });
 
         let started = Instant::now();
-        let err = wait_until_ready(&client, &mut managed)
+        let err = wait_until_ready(&client, &mut managed, &Events::discard())
             .await
             .unwrap_err()
             .to_string();
@@ -778,6 +1142,8 @@ mod tests {
         let plugins = contents.join("PlugIns/gstreamer");
         let scanner = contents.join("Helpers/gst-plugin-scanner");
         let registry = data_dir.join("gstreamer-registry.bin");
+        let gio_modules = contents.join("PlugIns/gio");
+        let data = contents.join("Resources");
         for (key, want) in [
             ("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.as_os_str()),
             ("GST_PLUGIN_SYSTEM_PATH", plugins.as_os_str()),
@@ -787,11 +1153,19 @@ mod tests {
             ("GST_PLUGIN_SCANNER", scanner.as_os_str()),
             ("GST_REGISTRY_1_0", registry.as_os_str()),
             ("GST_REGISTRY", registry.as_os_str()),
+            ("GIO_MODULE_DIR", gio_modules.as_os_str()),
+            ("GIO_EXTRA_MODULES", OsStr::new("")),
+            ("XDG_DATA_DIRS", data.as_os_str()),
         ] {
             assert_eq!(env.get(key).map(OsString::as_os_str), Some(want), "{key}");
         }
-        assert_eq!(env.len(), 8);
-        for key in ["GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SCANNER_1_0"] {
+        assert_eq!(env.len(), 11);
+        for key in [
+            "GST_PLUGIN_SYSTEM_PATH_1_0",
+            "GST_PLUGIN_SCANNER_1_0",
+            "GIO_MODULE_DIR",
+            "XDG_DATA_DIRS",
+        ] {
             assert!(Path::new(&env[key]).starts_with(&contents), "{key}");
         }
         assert!(Path::new(&env["GST_REGISTRY_1_0"]).starts_with(&data_dir));
@@ -915,6 +1289,17 @@ mod tests {
         assert_eq!(data_dir(&cfg), PathBuf::from("/tmp/somewhere"));
     }
 
+    #[test]
+    fn strom_logs_into_its_data_directory() {
+        let mut cfg = Config::default();
+        assert!(log_path(&cfg).ends_with(Path::new("strom-data").join("strom.log")));
+        cfg.strom.data_dir = Some("/tmp/somewhere".to_string());
+        assert_eq!(
+            log_path(&cfg),
+            Path::new("/tmp/somewhere").join("strom.log")
+        );
+    }
+
     /// The value of `NAME="..."` in the script that builds the macOS app.
     fn app_script_value(name: &str) -> &'static str {
         let script = include_str!("../.github/scripts/build-macos-app.sh");
@@ -931,6 +1316,10 @@ mod tests {
     fn the_app_script_puts_plugins_and_scanner_where_we_look() {
         assert_eq!(app_script_value("PLUGIN_DIR_REL"), BUNDLE_PLUGIN_DIR);
         assert_eq!(app_script_value("SCANNER_REL"), BUNDLE_PLUGIN_SCANNER);
+        assert_eq!(
+            app_script_value("GIO_MODULE_DIR_REL"),
+            BUNDLE_GIO_MODULE_DIR
+        );
     }
 
     /// `codesign` accepts nested code only in a bundle's code locations, and takes a
@@ -941,10 +1330,11 @@ mod tests {
         for (path, location) in [
             (BUNDLE_PLUGIN_DIR, "PlugIns"),
             (BUNDLE_PLUGIN_SCANNER, "Helpers"),
+            (BUNDLE_GIO_MODULE_DIR, "PlugIns"),
         ] {
             let parts: Vec<&str> = path.split('/').collect();
             assert_eq!(parts[0], location, "{path}");
-            let dirs = if path == BUNDLE_PLUGIN_DIR {
+            let dirs = if path != BUNDLE_PLUGIN_SCANNER {
                 &parts[..]
             } else {
                 &parts[..parts.len() - 1]

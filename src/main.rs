@@ -7,20 +7,19 @@
 //!
 //! Strom does the media: capture, encode, mux, SRT. This drives it over HTTP and
 //! registers the result with Open Live. See docs/DESIGN.md for the reasoning.
+//!
+//! This is the command line layer over the `open_live_ingest` library: argument
+//! parsing, logging, the setup prompts, signal handling, and rendering the library's
+//! events and reports as text. Everything else is the library's.
 
-mod config;
-mod devices;
-mod flow;
-mod heartbeat;
-mod local_strom;
-mod openlive;
-mod osc;
-mod run;
 mod setup;
-mod strom;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use open_live_ingest::gateway::{Event, Events};
+use open_live_ingest::run::{self, Stop};
+use open_live_ingest::session::{Inputs, Session};
+use open_live_ingest::{config, devices};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -42,15 +41,18 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Register every capture device with Open Live and stream it. Stays running:
-    /// Ctrl-C stops and removes the feeds, while a closed SSH session does not.
+    /// Register every capture device with Open Live and stream it, or exactly the
+    /// inputs the settings' [[input]] entries name. Stays running: Ctrl-C stops and
+    /// removes the feeds, while a closed SSH session does not.
     Up {
         /// Include virtual devices, which are skipped by default because they
-        /// produce nothing unless another application is running.
+        /// produce nothing unless another application is running. Overrides the
+        /// settings' [[input]] selection for this run.
         #[arg(long)]
         all: bool,
 
         /// Only these devices, by id or name fragment, e.g. `--devices "FaceTime,DeckLink"`.
+        /// Overrides the settings' [[input]] selection for this run.
         #[arg(long)]
         devices: Option<String>,
 
@@ -62,13 +64,21 @@ enum Command {
         audio: Vec<devices::AudioPairing>,
 
         /// Stream a test pattern and tone instead of any device, to commission the
-        /// link before the cameras arrive.
+        /// link before the cameras arrive. Overrides the settings' [[input]]
+        /// selection for this run.
         #[arg(long)]
         test: bool,
 
         /// Ask for every setting again, even the ones already stored.
         #[arg(long)]
         reconfigure: bool,
+
+        /// Register the inputs, but send each one only while a production holding
+        /// its source is active in Open Live, as the desktop app does: its uplink
+        /// starts when such a production is activated and stops when none is. Needs
+        /// registration with Open Live.
+        #[arg(long)]
+        wait_for_production: bool,
     },
     /// Stop a running gateway and remove its flows and Open Live sources.
     Down,
@@ -113,6 +123,7 @@ async fn main() -> Result<()> {
         audio: Vec::new(),
         test: false,
         reconfigure: false,
+        wait_for_production: false,
     });
 
     match command {
@@ -141,25 +152,322 @@ async fn main() -> Result<()> {
             audio,
             test,
             reconfigure,
+            wait_for_production,
         } => {
             if setup::configure(&mut cfg, reconfigure).await? {
                 config::save(&path, &cfg)?;
                 setup::report_saved(&path);
             }
             config::validate(&cfg)?;
-            run::up(cfg, all, devices, audio, test).await
+            up(
+                cfg,
+                Inputs {
+                    include_virtual: all,
+                    selection: devices,
+                    audio,
+                    test_pattern: test,
+                },
+                if wait_for_production {
+                    run::Sending::WhileLive
+                } else {
+                    run::Sending::Always
+                },
+            )
+            .await
         }
         Command::Down => {
             config::validate(&cfg)?;
-            run::down(cfg).await
+            run::down(&cfg, &reporter()).await
         }
         Command::Status { json } => {
             config::validate(&cfg)?;
-            run::status(cfg, json).await
+            let report = run::status(&cfg).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", run::render_status(&report));
+            }
+            Ok(())
         }
         // Listing devices needs only Strom, so an unfinished Open Live setup must not
         // stand in the way.
-        Command::Devices { json } => run::devices(cfg, json).await,
+        Command::Devices { json } => {
+            let report = run::devices(&cfg, &reporter()).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", run::render_devices(&report));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `up`: a session, its events printed as they arrive, stopped on Ctrl-C or SIGTERM
+/// (or, on Windows, the console closing). Returns how the session ended, so the exit
+/// code is the one `up` has always had.
+async fn up(cfg: config::Config, inputs: Inputs, sending: run::Sending) -> Result<()> {
+    let (mut session, mut events) = match sending {
+        run::Sending::Always => Session::start(cfg, inputs),
+        run::Sending::WhileLive => Session::start_armed(cfg, inputs, None, run::Sources::Remove),
+    };
+    let print = reporter();
+    // The signal handlers go in once the inputs are up, as they did when `up` polled
+    // them from its loop: until then a Ctrl-C ends the process the default way.
+    let mut stop: Option<std::pin::Pin<Box<dyn std::future::Future<Output = Stop>>>> = None;
+    let mut stopping = false;
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => {
+                    if matches!(event, Event::Summary { .. }) && stop.is_none() && !stopping {
+                        stop = Some(Box::pin(stop_signal()));
+                    }
+                    print.emit(event);
+                }
+                // The session has ended and every event it emitted is printed.
+                None => return session.wait().await,
+            },
+            why = async { stop.as_mut().expect("guarded").await }, if stop.is_some() => {
+                // Polled no more: further signals are swallowed by the handlers,
+                // which stay installed, as before.
+                stop = None;
+                stopping = true;
+                session.request_stop(why);
+            }
+        }
+    }
+}
+
+/// The library's events, printed to stdout as the lines the gateway has always
+/// printed.
+///
+/// A failed write is ignored rather than a panic, as `println!` would: events arrive
+/// during teardown, including from the drop of a managed Strom, and on Windows that
+/// runs while the console is closing, logging off or shutting down, when Microsoft
+/// documents that console I/O may not work reliably. A panic there would skip the
+/// rest of the cleanup.
+fn reporter() -> Events {
+    Events::new(|event| {
+        if let Some(text) = render(&event) {
+            use std::io::Write as _;
+            let mut out = std::io::stdout().lock();
+            let _ = out.write_all(text.as_bytes());
+            let _ = out.flush();
+        }
+    })
+}
+
+/// The text for one event, newline included, or None for an event the log already
+/// reports: warnings are logged through `tracing` where they happen.
+fn render(event: &Event) -> Option<String> {
+    Some(match event {
+        Event::StromStarting { port, log_path } => format!(
+            "Starting Strom on port {port} (logging to {}).\n",
+            log_path.display()
+        ),
+        Event::StromReady { video_sources } => {
+            format!("  Strom is up; it can see {video_sources} video source(s).\n")
+        }
+        Event::StromStopped => "  strom — stopped\n".to_string(),
+        Event::StromLeftOverStopping { pid } => {
+            format!("  strom (pid {pid}) — stopping the one an earlier run started\n")
+        }
+        Event::BringingUp {
+            inputs,
+            host,
+            ports,
+            port_source,
+            total_mbps,
+        } => format!(
+            "Bringing up {inputs} input(s) to {host}, SRT ports {ports} from {port_source}, about {total_mbps:.0} Mbps in total.\n"
+        ),
+        Event::BringingUpViaRelay {
+            inputs,
+            relay,
+            public,
+            total_mbps,
+        } => match public {
+            Some(public) => format!(
+                "Bringing up {inputs} input(s) through Open Live's SRT relay {relay:?} at {public}, about {total_mbps:.0} Mbps in total.\n"
+            ),
+            None => format!(
+                "Bringing up {inputs} input(s) through Open Live's SRT relay {relay:?}, about {total_mbps:.0} Mbps in total.\n"
+            ),
+        },
+        Event::PassphraseGenerated { kept_in } => match kept_in {
+            Some(file) => format!(
+                "  generated an SRT passphrase for the relay and saved it in {}\n",
+                file.display()
+            ),
+            None => "  generated an SRT passphrase for the relay, for this run only\n".to_string(),
+        },
+        Event::LeftoverSourceRemoved { name, port } => format!(
+            "  removed Open Live source {name:?}, left over from an earlier run (it held port {port})\n"
+        ),
+        Event::ConflictingFlowRemoved { name, ours } => {
+            let why = if *ours {
+                "left over from an earlier run"
+            } else {
+                "which was holding one of these devices"
+            };
+            format!("  removed Strom flow {name:?}, {why}\n")
+        }
+        Event::Summary { inputs } => {
+            // Two labelled addresses per input: where the uplink is sent, and the
+            // address registered with Open Live (its receiving end).
+            let mut out = format!("\n{:<36} {:<6} ADDRESSES\n", "INPUT", "PORT");
+            for row in inputs {
+                out += &format!(
+                    "{:<36} {:<6} sends to:   {}\n",
+                    run::truncate(&row.name, 36),
+                    row.port,
+                    row.uplink
+                );
+                out += &format!("{:<43} registered: {}\n", "", row.address);
+            }
+            out += "\nAssign these in Studio and activate the production; they read as inactive until\n";
+            out += "something is receiving them. Ctrl-C stops and removes them.\n\n";
+            out
+        }
+        Event::HeartbeatStarted { gateway_id } => {
+            format!("Status is pushed to Open Live as gateway {gateway_id}.\n")
+        }
+        Event::Input { input, state } => format!("  {input} — {}\n", state.describe()),
+        Event::ProductionLive { input, productions } => {
+            let which = match quoted(productions).as_slice() {
+                [one] => format!("production {one} is"),
+                many => format!("productions {} are", many.join(", ")),
+            };
+            format!("  {input} — {which} live, starting the uplink\n")
+        }
+        // #128: the operator relays it to the director, who has to reactivate.
+        Event::SlotAddedWhileLive { input, productions } => match quoted(productions).as_slice() {
+            [] => format!("  {input} — no live production waits for a reactivation any more\n"),
+            [one] => format!(
+                "  {input} — production {one} got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate it in Studio\n"
+            ),
+            many => format!(
+                "  {input} — productions {} got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate them in Studio\n",
+                many.join(", ")
+            ),
+        },
+        Event::NoProductionLive { input } => {
+            format!("  {input} — no production holding its source is live, uplink stopped\n")
+        }
+        Event::Stopping => "\nStopping.\n".to_string(),
+        Event::FlowRemoved { input } => format!("  {input} — flow stopped and removed\n"),
+        Event::SourceRemoved { input } => {
+            format!("  {input} — source removed from Open Live\n")
+        }
+        Event::SourceKept { input, reason } => format!("  {}\n", kept_message(input, reason)),
+        Event::SourceRetained { input } => {
+            format!("  {input} — source kept in Open Live for the next run\n")
+        }
+        Event::AskingRunningToStop { pid } => {
+            format!("Asking the running gateway (pid {pid}) to stop.\n")
+        }
+        Event::RunningDidNotStop => {
+            "It has not finished stopping; removing what is left anyway.\n".to_string()
+        }
+        Event::StromUnreachable { url, error } => {
+            format!("Strom at {url} is not reachable ({error}); leaving its flows alone.\n")
+        }
+        Event::NothingToRemove => "Nothing of ours left to remove.\n".to_string(),
+        // A failure is printed once, as `Error:` when `up` returns it.
+        Event::Registering { .. }
+        | Event::Registered { .. }
+        | Event::SourceAdopted { .. }
+        | Event::ConnectWarning { .. }
+        | Event::InputFailed { .. }
+        | Event::Warning { .. }
+        | Event::OscSignInEnds { .. }
+        | Event::Stats { .. }
+        | Event::Stopped
+        | Event::Failed { .. } => return None,
+    })
+}
+
+/// Production names as the lines quote them.
+fn quoted(productions: &[String]) -> Vec<String> {
+    productions.iter().map(|p| format!("{p:?}")).collect()
+}
+
+/// The line for a source Open Live would not remove, `reason` being its refusal.
+fn kept_message(name: &str, reason: &str) -> String {
+    format!(
+        "{name} stays in Open Live: {reason}. Deactivate that production, then run `open-live-ingest down`."
+    )
+}
+
+/// Resolves on Ctrl-C or SIGTERM. SIGHUP is deliberately swallowed: closing an SSH
+/// session, or a link dropping mid-show, must not tear down a venue's feeds. The
+/// signal streams live for the whole run, so a signal is never lost between polls.
+#[cfg(unix)]
+async fn stop_signal() -> Stop {
+    use tokio::signal::unix::{signal, Signal, SignalKind};
+
+    async fn recv(sig: &mut Option<Signal>) {
+        match sig {
+            Some(s) => {
+                s.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    let mut interrupt = signal(SignalKind::interrupt()).ok();
+    let mut terminate = signal(SignalKind::terminate()).ok();
+    let mut hangup = signal(SignalKind::hangup()).ok();
+    if interrupt.is_none() && terminate.is_none() {
+        let _ = tokio::signal::ctrl_c().await;
+        return Stop::Interrupt;
+    }
+    loop {
+        tokio::select! {
+            _ = recv(&mut interrupt) => return Stop::Interrupt,
+            _ = recv(&mut terminate) => return Stop::Interrupt,
+            _ = recv(&mut hangup) => tracing::info!("ignoring SIGHUP so the feeds survive a closed session"),
+        }
+    }
+}
+
+/// Resolves on Ctrl-C, Ctrl-Break, closing the console window, logoff or shutdown.
+/// The last three come with a deadline: Windows ends the process about five seconds
+/// later whatever it is doing. The streams live for the whole run, as on Unix.
+#[cfg(windows)]
+async fn stop_signal() -> Stop {
+    use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+
+    // Each event has its own stream type; one that could not be registered never fires.
+    macro_rules! recv {
+        ($stream:expr) => {
+            async {
+                match $stream.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            }
+        };
+    }
+
+    let mut interrupt = ctrl_c().ok();
+    let mut brk = ctrl_break().ok();
+    let mut close = ctrl_close().ok();
+    let mut logoff = ctrl_logoff().ok();
+    let mut shutdown = ctrl_shutdown().ok();
+    if interrupt.is_none() && brk.is_none() {
+        let _ = tokio::signal::ctrl_c().await;
+        return Stop::Interrupt;
+    }
+    tokio::select! {
+        _ = recv!(interrupt) => Stop::Interrupt,
+        _ = recv!(brk) => Stop::Interrupt,
+        _ = recv!(close) => Stop::Ending,
+        _ = recv!(logoff) => Stop::Ending,
+        _ = recv!(shutdown) => Stop::Ending,
     }
 }
 
@@ -240,6 +548,235 @@ mod tests {
     fn status_and_devices_take_json() {
         for sub in ["status", "devices"] {
             Cli::try_parse_from(["open-live-ingest", sub, "--json"]).expect(sub);
+        }
+    }
+
+    /// The line printed when Open Live keeps a source names the production holding
+    /// it and what to do, rather than a bare status.
+    #[test]
+    fn a_kept_source_names_the_production_and_the_way_out() {
+        let refused = open_live_ingest::openlive::Refused {
+            what: "DELETE source".into(),
+            status: reqwest::StatusCode::CONFLICT,
+            reason: Some(r#"Source is in use by active production "Morning Show""#.into()),
+            code: None,
+            relays: Vec::new(),
+        };
+        assert_eq!(
+            kept_message("Venue — Camera", &refused.explain()),
+            r#"Venue — Camera stays in Open Live: Source is in use by active production "Morning Show". Deactivate that production, then run `open-live-ingest down`."#
+        );
+        let bare = open_live_ingest::openlive::Refused {
+            reason: None,
+            ..refused
+        };
+        assert!(kept_message("Venue — Camera", &bare.explain()).contains("HTTP 409 Conflict"));
+    }
+
+    /// The lines the golden tests do not reach, worded exactly as the gateway printed
+    /// them before its output became events.
+    #[test]
+    fn events_render_as_the_lines_printed_before() {
+        use open_live_ingest::gateway::{InputState, SummaryRow};
+        let cases = [
+            (
+                Event::StromStarting {
+                    port: 8080,
+                    log_path: PathBuf::from("strom-data").join("strom.log"),
+                },
+                format!(
+                    "Starting Strom on port 8080 (logging to {}).\n",
+                    PathBuf::from("strom-data").join("strom.log").display()
+                ),
+            ),
+            (
+                Event::StromReady { video_sources: 2 },
+                "  Strom is up; it can see 2 video source(s).\n".to_string(),
+            ),
+            (Event::StromStopped, "  strom — stopped\n".to_string()),
+            (
+                Event::StromLeftOverStopping { pid: 4242 },
+                "  strom (pid 4242) — stopping the one an earlier run started\n".to_string(),
+            ),
+            (
+                Event::LeftoverSourceRemoved {
+                    name: "Venue — Camera".to_string(),
+                    port: 47110,
+                },
+                "  removed Open Live source \"Venue — Camera\", left over from an earlier run (it held port 47110)\n".to_string(),
+            ),
+            (
+                Event::ConflictingFlowRemoved {
+                    name: "Studio cam".to_string(),
+                    ours: false,
+                },
+                "  removed Strom flow \"Studio cam\", which was holding one of these devices\n"
+                    .to_string(),
+            ),
+            (
+                Event::HeartbeatStarted {
+                    gateway_id: "gw-1".to_string(),
+                },
+                "Status is pushed to Open Live as gateway gw-1.\n".to_string(),
+            ),
+            (
+                Event::Input {
+                    input: "Venue — Camera".to_string(),
+                    state: InputState::OnAir,
+                },
+                "  Venue — Camera — on air, the far end is receiving\n".to_string(),
+            ),
+            (
+                Event::Input {
+                    input: "Venue — Camera".to_string(),
+                    state: InputState::Armed,
+                },
+                "  Venue — Camera — armed, sends once a production holding its source is live\n"
+                    .to_string(),
+            ),
+            (
+                Event::ProductionLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string()],
+                },
+                "  Venue — Camera — production \"Morning Show\" is live, starting the uplink\n"
+                    .to_string(),
+            ),
+            (
+                Event::ProductionLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string(), "Rehearsal".to_string()],
+                },
+                "  Venue — Camera — productions \"Morning Show\", \"Rehearsal\" are live, starting the uplink\n"
+                    .to_string(),
+            ),
+            (
+                Event::SlotAddedWhileLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string()],
+                },
+                "  Venue — Camera — production \"Morning Show\" got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate it in Studio\n"
+                    .to_string(),
+            ),
+            (
+                Event::SlotAddedWhileLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec!["Morning Show".to_string(), "Rehearsal".to_string()],
+                },
+                "  Venue — Camera — productions \"Morning Show\", \"Rehearsal\" got this source while live, so Open Live has no receiver for it; the director has to deactivate and reactivate them in Studio\n"
+                    .to_string(),
+            ),
+            (
+                Event::SlotAddedWhileLive {
+                    input: "Venue — Camera".to_string(),
+                    productions: vec![],
+                },
+                "  Venue — Camera — no live production waits for a reactivation any more\n"
+                    .to_string(),
+            ),
+            (
+                Event::NoProductionLive {
+                    input: "Venue — Camera".to_string(),
+                },
+                "  Venue — Camera — no production holding its source is live, uplink stopped\n"
+                    .to_string(),
+            ),
+            (
+                Event::SourceKept {
+                    input: "Venue — Camera".to_string(),
+                    reason: "HTTP 409 Conflict".to_string(),
+                },
+                "  Venue — Camera stays in Open Live: HTTP 409 Conflict. Deactivate that production, then run `open-live-ingest down`.\n".to_string(),
+            ),
+            (
+                Event::SourceRetained {
+                    input: "Venue — Camera".to_string(),
+                },
+                "  Venue — Camera — source kept in Open Live for the next run\n".to_string(),
+            ),
+            (
+                Event::AskingRunningToStop { pid: 4242 },
+                "Asking the running gateway (pid 4242) to stop.\n".to_string(),
+            ),
+            (
+                Event::RunningDidNotStop,
+                "It has not finished stopping; removing what is left anyway.\n".to_string(),
+            ),
+            (
+                Event::StromUnreachable {
+                    url: "http://127.0.0.1:8080".to_string(),
+                    error: "GET flows".to_string(),
+                },
+                "Strom at http://127.0.0.1:8080 is not reachable (GET flows); leaving its flows alone.\n"
+                    .to_string(),
+            ),
+        ];
+        for (event, text) in cases {
+            assert_eq!(render(&event).as_deref(), Some(text.as_str()), "{event:?}");
+        }
+
+        // A name longer than the column is cut, as before.
+        let summary = render(&Event::Summary {
+            inputs: vec![SummaryRow {
+                name: "Venue — a camera with a name far too long for the column".to_string(),
+                port: 47110,
+                address: "srt://:47110?mode=listener".to_string(),
+                uplink: "srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***"
+                    .to_string(),
+            }],
+        })
+        .unwrap();
+        let lines: Vec<&str> = summary.lines().collect();
+        assert_eq!(
+            lines[1],
+            "INPUT                                PORT   ADDRESSES"
+        );
+        // The uplink, where the gateway sends, is on the input's line; the address
+        // registered with Open Live under it, both labelled.
+        assert_eq!(
+            lines[2],
+            "Venue — a camera with a name far to… 47110  sends to:   srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***"
+        );
+        assert_eq!(
+            lines[3],
+            "                                            registered: srt://:47110?mode=listener"
+        );
+    }
+
+    /// Warnings are already in the log, so the CLI does not print them twice.
+    #[test]
+    fn warnings_and_registrations_print_nothing() {
+        for event in [
+            Event::Warning {
+                message: "x".to_string(),
+            },
+            Event::InputFailed {
+                input: "x".to_string(),
+                reason: "y".to_string(),
+            },
+            Event::ConnectWarning {
+                input: "x".to_string(),
+                warning: "srt-listener-unsupported".to_string(),
+            },
+            Event::Registering {
+                input: "x".to_string(),
+            },
+            Event::Registered {
+                input: "x".to_string(),
+                source_id: "s".to_string(),
+            },
+            Event::SourceAdopted {
+                input: "x".to_string(),
+                source_id: "s".to_string(),
+                port: 47110,
+            },
+            Event::Stats { inputs: Vec::new() },
+            Event::Stopped,
+            Event::Failed {
+                reason: "y".to_string(),
+            },
+        ] {
+            assert_eq!(render(&event), None, "{event:?}");
         }
     }
 }

@@ -27,6 +27,15 @@ orchestration API with no media plane.
 **The gateway talks to both sides, and that is the whole design.** Local Strom over REST to create
 and start the flow; Open Live over HTTPS to register the source.
 
+**The library owns no media** (ADR-002). On a computer Strom owns the media plane, as above. On an
+iPhone (#133) there is no Strom: the iOS app's own Swift code captures, encodes, muxes and sends
+over SRT, and links this library for everything else (sign-in, registration, the gate, the
+heartbeat, the teardown). The session reaches the media only through a narrow seam, `Media`: which
+inputs there are, start an input's uplink to its endpoint, stop it, restart it, whether it runs,
+and its SRT counters. `StromMedia` is the computer's (flows by derived id, Strom's device list, the
+pidfile); `ExternalMedia` hands start, stop and restart to the app and answers from what it
+reports. Flow ids and other Strom concepts stay on the Strom side of the seam.
+
 ### Why a venue-side tool, and not Open Live driving the venue Strom
 
 - Open Live has a single `STROM_URL`. One engine per instance.
@@ -57,6 +66,11 @@ Strom already does these, and a worse copy here would have to be maintained:
 The gateway expresses intent, a bitrate and an encoder preference, and lets Strom satisfy it. A
 transient SRT drop is likewise not its business: restarting a flow over a network blip would turn a
 recoverable gap into an encoder restart.
+
+On the phone the same concerns belong to the iOS app's media code over Apple's frameworks and
+libsrt (ADR-002), not to the library: the library still only says what to send where, and judges
+the uplink from the same SRT counters. Whatever the media side, the gateway never links the Strom
+engine: the process boundary on a computer is unchanged.
 
 **A Strom bug is fixed in Strom.** An earlier version restarted a flow whose SRT socket had frozen
 at `connected` with no bytes moving. That papered over an srtsink fault, and the restart trigger
@@ -115,6 +129,7 @@ listens is the end that needs an inbound UDP port.**
 |---|---|---|---|
 | `caller` (default) | `srt://cloud:9000?mode=caller` | `srt://:9000?mode=listener` | the cloud |
 | `listener` | `srt://:9000?mode=listener` | `srt://venue:9000?mode=caller` | the venue |
+| through the relay | `srt://relay:6000?streamid=<id>&mode=caller` | `srt+relay://<id>` | neither (the relay's one public port) |
 
 `srtsrc` defaults to caller mode, so the registered address always carries an explicit `mode=`.
 Ports come from a range, one per input. In listener mode the gateway allocates them itself, lowest
@@ -146,9 +161,29 @@ the range, and is reassigned when it is not. Registration therefore precedes the
 mode, where it used to follow them; Open Live being down at start-up is then a start-up error rather
 than a warning, which is right, since without a port there is nothing to build.
 
-## 6. The command line owns what it starts
+**Through the relay when there is one.** An Open Live with an SRT relay (open-live#629) lets both
+ends dial out: Strom and the venue call the relay's one public port, and the relay pairs them by
+stream id. Nothing inbound anywhere and no port lease, so `caller`, the default, takes it whenever
+Open Live reports a relay, and stays on a port of the cloud Strom when it does not, so an Open Live
+without relays sees no change. `listener` is a deliberate choice of the venue and never moves;
+`relay` insists on the relay, and a missing one is an error rather than a quiet fallback. Open Live
+owns the stream id as it owns the ports: the gateway registers `srt+relay://auto@<relay>`, takes the
+id and the dial-in address from the answer (`connect.uri`), and from then on registers the id
+itself, so a source recreated mid-run keeps the address the venue dials. Registering again keeps
+the id (`auto` keeps it), and a source registered in caller mode by an older gateway is moved with a
+PATCH, keeping its source id. The relay's port is public, so the stream id is no secret: a relay
+link always carries a passphrase, generated and kept in the settings file when the operator set
+none. The phone goes through the relay too: its own SRT sender sets the stream id on the socket
+before it calls (`Media::dials_relay` is whether a media can).
 
-There is one front end and it is a terminal, because the machine is reached over SSH.
+## 6. The front ends own what they start
+
+There are two front ends: a terminal, because a venue box is often reached over SSH, and a desktop
+app for a person at the machine (ADR-001). Both drive the same library and own what they start.
+The app is a peer of the command line, not a daemon or a control API: it runs in the foreground,
+starts or adopts Strom through the same `local_strom` code, and everything below holds for it as it
+does for `up`. The terminal stays the front end for SSH and headless boxes, and nothing in it
+changes for the app.
 
 **Setup is running it.** Anything missing is asked for, checked immediately, and written to the
 settings file. The Open Live credential kind is inferred from the address, since nobody can answer
@@ -166,6 +201,23 @@ token carries the show. A token in the settings or the environment wins over the
 deployment tool that injects one must not be overridden by whoever last signed in on the box. A
 typed address and a pasted token remain the way in on a machine with no browser, since the login's
 redirect lands on the machine running the CLI.
+
+**An app sign-in is kept in the OS keychain and renewed during the show.** The app signs in natively
+(`osc::browser_login`) and keeps OSC's refresh token, not the one-hour access token, in the macOS
+Keychain or the Windows Credential Manager; the settings file gets only `open_live.credential =
+"keychain"`, so the file never holds that secret and stays safe to copy between machines. A pasted
+personal access token goes to the keychain the same way. While running, the access token is renewed
+from the refresh token five minutes before it expires and the new refresh token is written back, so a
+show of any length runs on one sign-in; the keychain is read again before each refresh so two
+processes sharing the entry do not undo each other. A token endpoint that is down is waited out on the
+access token in hand; a refused refresh means signing in again. A credential that cannot be renewed
+and ends within twelve hours is announced before going live (`Event::OscSignInEnds`), when signing in
+again is still easy, rather than discovered when Open Live starts refusing mid-show. The keychain is
+reached through a trait, so the refresh logic is tested against an in-memory store and a fake token
+endpoint on a fake clock; the platform calls are own code (`security-framework`'s generic-password
+calls on macOS, Credential Manager through the `windows-sys` already in the tree), which costs four
+crates on macOS and none on Windows, where the `keyring` crate would cost five on each. The CLI keeps
+`OSC_ACCESS_TOKEN` and `~/.osc/token`; a token in `open_live.api_key` still wins over the keychain.
 
 **`up` stays in the foreground and owns what it started.** Ctrl-C and SIGTERM tear the feeds down.
 SIGHUP does not: a closed SSH session must not take a venue off air. A deliberate stop stops, an
@@ -185,6 +237,14 @@ agent and be reconciled forever from a config file. Carrying both models meant d
 per-input supervisor tasks, a persisted state file, and a control API that the command line never
 used. The daemon is a different product; if it is ever wanted, it should be built as one.
 
+**The app's Stop keeps its Open Live sources.** A Studio production slot references a source by id,
+and the source is the venue's stable identity for an input, not part of a run. So the app's Stop
+and quit remove the flows but leave each input's source in Open Live, marked inactive
+(`run::Sources::Keep`), and the next Go live adopts it by name with the same id and port, as `up`
+already adopts a source left by a run that ended without cleanup. Removing it instead left every
+slot pointing at a deleted id after Stop and Go live. The CLI `up` still removes its sources: `down`
+is the way to clear the app's too.
+
 **Adopt, never replace.** A Strom already listening at the configured URL is used as it is and
 never stopped: it may be a service the box depends on, or another operator's session. Only when
 nothing answers does `up` start a headless Strom itself, with its own data directory so it never
@@ -203,7 +263,12 @@ nested bundles. With `strom.binary` at its default, a `strom` next to the runnin
 executable is *bundled* only when the bundle layout is really there: the parent of the executable's
 directory (the bundle's `Contents`) holds `PlugIns/gstreamer`. Only a bundled Strom is started with
 the GStreamer plugin path, scanner and registry pointed into the bundle and the managed data
-directory, so a Homebrew GStreamer on the same Mac is never mixed in. A `strom` next to the
+directory, so a Homebrew GStreamer on the same Mac is never mixed in. The same goes for the bundled
+GLib, which was built for Homebrew's prefix and would otherwise load GIO modules from
+`/opt/homebrew/lib/gio/modules` and look for shared data under `/usr/local/share`: a bundled Strom
+gets `GIO_MODULE_DIR` pointed at an empty `Contents/PlugIns/gio`, `GIO_EXTRA_MODULES` cleared and
+`XDG_DATA_DIRS` set to `Contents/Resources`. The bundle ships no GIO module because no flow of ours
+needs one: the SRT uplink encrypts with libsrt, not with GIO's TLS. A `strom` next to the
 executable without that layout, as `install.sh` leaves it in `/usr/local/bin` or `~/.local/bin`, is
 still preferred over `PATH` but is not bundled: like a Strom from `PATH` or an explicit path, it
 brings its own GStreamer and gets no GStreamer environment. Pointing `GST_PLUGIN_SYSTEM_PATH` at a
@@ -217,7 +282,11 @@ has no Developer ID certificate and with that certificate when it has. The ad ho
 the same hardened-runtime rules the notarized one will, on every pull request that touches the
 build, and the workflow starts the bundled Strom from the DMG to prove it still loads its GStreamer.
 Only `strom` and `open-live-ingest` carry entitlements, camera and microphone, because Strom opens
-the devices. A Developer ID build gets no hardened-runtime exception: every library and plugin is in
+the devices. `strom` alone also carries `com.apple.security.cs.allow-jit`, so GStreamer's ORC can compile the
+inner loops of videoconvert, videoscale and audioconvert at run time instead of falling back to
+slower C (#113); the bundle script's check refuses it on any other signature, and the workflow's
+start check runs a test-pattern flow and fails on an `ORC: ERROR` line in Strom's log. Apart from
+that, a Developer ID build gets no hardened-runtime exception: every library and plugin is in
 the bundle and signed with the same Team ID, so library validation stays on. An ad hoc signature has
 no Team ID, and macOS 27 refuses to map the bundled libraries into an ad hoc signed `strom` under
 library validation (#66), so an ad hoc build alone adds
@@ -229,7 +298,11 @@ macOS, so a release is also checked by hand on macOS 27 (README, "Releasing").
 **No local state.** Flows are found by derived id, sources by the gateway's name prefix. The
 exceptions are two pidfiles: the running `up`, so `down` can ask it to stop before sweeping, and a
 Strom the gateway started, so `down` can stop it after a hard kill. Both pids are checked against
-the process name before they are signalled, because pids are reused after a reboot.
+the process name before they are signalled, because pids are reused after a reboot. A sign-in from
+the app adds one entry in the OS keychain (above). The desktop app adds two more and nothing else:
+its log file, `app.log` with one rotated copy, and on Windows the WebView2 cache folder
+(`%LOCALAPPDATA%\open-live-ingest\webview`), which WebView2 keeps even for a page that stores
+nothing. The app remembers no window size, tab or recent list (ADR-001, spec section 6).
 
 **One loop.** Every ten seconds, sequentially over all inputs: make sure the flow exists and runs,
 read its SRT statistics, then list the Open Live sources once and create or patch what differs. No

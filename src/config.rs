@@ -3,7 +3,7 @@
 //! Section and property names mirror the Strom blocks they end up on, so a value in
 //! the file can be traced to the block it configures.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -31,18 +31,47 @@ pub struct Config {
     /// `[[input]]`: settings for one input, by device.
     #[serde(rename = "input", skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputSettings>,
+    /// The settings file these were loaded from ([`load_or_default`]), so a value the
+    /// gateway generates for itself, the relay passphrase ([`keep_passphrase`]), can
+    /// be kept there. Never written to the file.
+    #[serde(skip)]
+    pub file: Option<PathBuf>,
 }
 
-/// One `[[input]]` entry. Today it pairs an audio source with a camera; `up --audio`
-/// replaces these for that run.
+/// One `[[input]]` entry: an input to send. With any present, `up` sends exactly these
+/// (`--devices`, `--all` and `--test` override that for a run); without, it sends every
+/// device. `up --audio` replaces the audio pairings for a run.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InputSettings {
-    /// The camera, by Strom device id or name fragment, as `--devices` takes it.
+    /// The camera, by Strom device id or name fragment, as `--devices` takes it, or
+    /// [`TEST_PATTERN_DEVICE`] for the test pattern. An exact id wins over a fragment.
     pub device: String,
     /// An audio source to send with it, by Strom device id or name fragment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<String>,
+    /// The source's name in Studio after `<gateway.name> — `; the device's name when
+    /// unset. Only this part is the operator's: cleanup finds sources by the prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// The `device` of the `[[input]]` entry that sends the test pattern and tone.
+pub const TEST_PATTERN_DEVICE: &str = "test";
+
+impl InputSettings {
+    /// Whether this entry is the test pattern rather than a device.
+    pub fn is_test_pattern(&self) -> bool {
+        self.device.trim().eq_ignore_ascii_case(TEST_PATTERN_DEVICE)
+    }
+
+    /// The label, trimmed, when one is set and not blank.
+    pub fn label(&self) -> Option<&str> {
+        self.label
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -118,6 +147,11 @@ pub struct OpenLive {
     /// Bearer token or OSC personal access token, depending on `auth_mode`. In osc
     /// mode it can stay unset, and the login saved by `npx @osaas/cli login` is used.
     pub api_key: Option<String>,
+    /// Where the Open Source Cloud credential is kept when it is not `api_key`:
+    /// `"keychain"` after a sign-in from the app, which stores it in the OS keychain
+    /// (`credential.rs`). Only a marker; the file never holds that secret. A token in
+    /// `api_key` still wins over it.
+    pub credential: Option<CredentialStore>,
     /// Register a source per input. Off for a box that only streams to a Strom.
     pub register: bool,
     /// This gateway's id in Open Live, from `POST /api/v1/gateways`. With its token
@@ -135,10 +169,33 @@ impl Default for OpenLive {
             url: None,
             auth_mode: AuthMode::Direct,
             api_key: None,
+            credential: None,
             register: true,
             gateway_id: None,
             gateway_token: None,
         }
+    }
+}
+
+/// Where a credential kept outside the settings file is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CredentialStore {
+    /// The OS keychain: the macOS Keychain, the Windows Credential Manager.
+    Keychain,
+}
+
+impl OpenLive {
+    /// Whether the Open Source Cloud credential comes from the keychain: the marker
+    /// is set and no token in `api_key` takes precedence over it.
+    pub fn uses_keychain(&self) -> bool {
+        self.auth_mode == AuthMode::Osc
+            && self.credential == Some(CredentialStore::Keychain)
+            && self
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
     }
 }
 
@@ -167,8 +224,10 @@ impl std::str::FromStr for AuthMode {
     }
 }
 
-/// The SRT link template. A port is allocated per input from a range: the one Open
-/// Live publishes for its Strom in caller mode, or `port_range` otherwise.
+/// The SRT link template. In caller mode the uplink goes through Open Live's SRT
+/// relay when it offers one, with no port at all; otherwise a port is allocated per
+/// input from a range: the one Open Live publishes for its Strom in caller mode, or
+/// `port_range` otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Uplink {
@@ -188,6 +247,10 @@ pub struct Uplink {
     pub passphrase: Option<String>,
     /// AES key length in bytes: 16, 24, or 32.
     pub pbkeylen: Option<u32>,
+    /// The SRT relay to send through, by the name Open Live reports
+    /// (`GET /api/v1/server-info`, `srt.relays[].name`). Unset is the relay called
+    /// [`DEFAULT_RELAY`]. Only read when the uplink goes through a relay.
+    pub relay: Option<String>,
 }
 
 impl Default for Uplink {
@@ -200,22 +263,47 @@ impl Default for Uplink {
             latency_ms: 200,
             passphrase: None,
             pbkeylen: None,
+            relay: None,
         }
     }
 }
 
+/// The relay an uplink without `uplink.relay` uses, as Open Live and Strom name it.
+pub const DEFAULT_RELAY: &str = "default";
+
+/// Whether `name` is a relay name Open Live and Strom accept: 1 to 32 characters
+/// from `a-z 0-9 -`.
+pub fn is_relay_name(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
 /// Which end of the SRT link dials. A deployment constraint, not a preference:
 /// whichever end listens needs an inbound UDP port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(
+    feature = "cli",
+    derive(clap::ValueEnum),
+    value(rename_all = "lowercase")
+)]
 #[serde(rename_all = "lowercase")]
-#[value(rename_all = "lowercase")]
 pub enum UplinkMode {
-    /// The venue dials the cloud. Nothing inbound at the venue.
+    /// The venue dials the cloud. Nothing inbound at the venue. Through Open Live's
+    /// SRT relay when it reports one (`relay`), otherwise to a port on the cloud
+    /// Strom, as an Open Live without a relay has always had it.
     #[default]
     Caller,
     /// The cloud dials the venue. Matches the convention Open Live's own seeded
     /// sources use, at the cost of a public address or port forward at the venue.
     Listener,
+    /// The venue and the cloud Strom both dial Open Live's SRT relay, which pairs
+    /// them by stream id: one public port for every source, nothing inbound at
+    /// either end. Chosen by `caller` whenever Open Live reports a relay; set it to
+    /// insist on the relay, so an Open Live without one is an error rather than a
+    /// port on its Strom.
+    Relay,
 }
 
 /// The range suggested when setup has to ask for one.
@@ -298,7 +386,19 @@ impl Uplink {
             .transpose()
     }
 
-    /// One concrete link, once a cloud host and a port are known.
+    /// The relay this uplink sends through when it uses one: `uplink.relay`, or
+    /// [`DEFAULT_RELAY`].
+    pub fn relay_name(&self) -> &str {
+        self.relay
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or(DEFAULT_RELAY)
+    }
+
+    /// One concrete link, once a cloud host and a port are known. In relay mode the
+    /// host and port are those of the relay, known once Open Live has registered the
+    /// source ([`Endpoint::dial_relay`]); until then they are whatever was passed.
     pub fn endpoint(&self, cloud_host: &str, port: u16) -> Endpoint {
         Endpoint {
             mode: self.mode,
@@ -308,8 +408,27 @@ impl Uplink {
             latency_ms: self.latency_ms,
             passphrase: self.passphrase.clone().filter(|p| !p.is_empty()),
             pbkeylen: self.pbkeylen,
+            relay: (self.mode == UplinkMode::Relay).then(|| RelayLink {
+                name: self.relay_name().to_string(),
+                stream_id: None,
+                dial_in: None,
+            }),
         }
     }
+}
+
+/// The relay end of a link in relay mode: which relay, and once Open Live has
+/// registered the source, the stream id it gave it and the address to dial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayLink {
+    /// The relay's name, as Open Live reports it.
+    pub name: String,
+    /// The id Open Live gave the source, which is also the SRT stream id. `None`
+    /// until it has registered one: the address then asks it for one (`auto`).
+    pub stream_id: Option<String>,
+    /// Open Live's `connect.uri`: `srt://<relay public host:port>?streamid=<id>`,
+    /// never with a passphrase. `None` until registered.
+    pub dial_in: Option<String>,
 }
 
 /// One SRT link, described by the two URIs that mirror each other: the one on the
@@ -324,13 +443,24 @@ pub struct Endpoint {
     pub latency_ms: u32,
     passphrase: Option<String>,
     pbkeylen: Option<u32>,
+    /// Set in relay mode only.
+    pub relay: Option<RelayLink>,
 }
 
 impl Endpoint {
-    /// For `builtin.mpegtssrt_output` on the venue Strom.
+    /// For `builtin.mpegtssrt_output` on the venue Strom. In relay mode Open Live's
+    /// dial-in address (`srt://<relay>?streamid=<id>`) in caller mode.
     pub fn venue_uri(&self) -> String {
+        if let Some(dial_in) = self.relay.as_ref().and_then(|r| r.dial_in.as_deref()) {
+            let join = if dial_in.contains('?') { '&' } else { '?' };
+            return format!(
+                "{dial_in}{join}mode=caller&latency={}{}",
+                self.latency_ms,
+                self.crypto()
+            );
+        }
         let mut uri = match self.mode {
-            UplinkMode::Caller => format!(
+            UplinkMode::Caller | UplinkMode::Relay => format!(
                 "srt://{}:{}?mode=caller&latency={}",
                 self.cloud_host, self.port, self.latency_ms
             ),
@@ -347,13 +477,66 @@ impl Endpoint {
 
     /// Registered on the Open Live source, which becomes the cloud Strom's `srt_uri`.
     /// `srtsrc` defaults to caller mode, so the mode is always explicit here.
+    ///
+    /// In relay mode `srt+relay://auto@<relay>?latency=<ms>...` until Open Live has
+    /// given the source a stream id: `auto` asks it for one, or keeps the one the
+    /// source already has, and naming the relay keeps a source of an earlier run from
+    /// staying on another one. Once it has, the id itself, as Open Live stores it (the
+    /// default relay without `@`), so the source stays the same through a recreate
+    /// and compares equal to what Open Live returns.
     pub fn cloud_uri(&self) -> String {
+        if let Some(relay) = &self.relay {
+            let at = match relay.stream_id.as_deref() {
+                Some(id) if relay.name == DEFAULT_RELAY => id.to_string(),
+                Some(id) => format!("{id}@{}", relay.name),
+                None => format!("auto@{}", relay.name),
+            };
+            return format!(
+                "srt+relay://{at}?latency={}{}",
+                self.latency_ms,
+                self.crypto()
+            );
+        }
         let mut uri = match self.mode {
-            UplinkMode::Caller => format!("srt://:{}?mode=listener", self.port),
+            UplinkMode::Caller | UplinkMode::Relay => format!("srt://:{}?mode=listener", self.port),
             UplinkMode::Listener => format!("srt://{}:{}?mode=caller", self.public_host, self.port),
         };
         uri.push_str(&self.crypto());
         uri
+    }
+
+    /// Takes what Open Live answered for the source of a link in relay mode: its
+    /// stream id, and the address to dial (`connect.uri`), whose host and port become
+    /// this link's. Nothing for a link not in relay mode.
+    pub fn dial_relay(&mut self, stream_id: &str, dial_in: &str, host: &str, port: u16) {
+        if let Some(relay) = &mut self.relay {
+            relay.stream_id = Some(stream_id.to_string());
+            relay.dial_in = Some(dial_in.to_string());
+            self.cloud_host = host.to_string();
+            self.port = port;
+        }
+    }
+
+    /// The relay's name, in relay mode.
+    pub fn relay_name(&self) -> Option<&str> {
+        self.relay.as_ref().map(|r| r.name.as_str())
+    }
+
+    /// The address the uplink dials through the relay, without a passphrase, once
+    /// Open Live has given one.
+    pub fn dial_in(&self) -> Option<&str> {
+        self.relay.as_ref()?.dial_in.as_deref()
+    }
+
+    /// The SRT passphrase, when the link is encrypted. For a host that does the media
+    /// itself ([`crate::media::ExternalMedia`]); never log it.
+    pub fn passphrase(&self) -> Option<&str> {
+        self.passphrase.as_deref()
+    }
+
+    /// The SRT key length, when set next to a passphrase.
+    pub fn pbkeylen(&self) -> Option<u32> {
+        self.pbkeylen
     }
 
     fn crypto(&self) -> String {
@@ -433,7 +616,8 @@ pub fn user_dir() -> PathBuf {
         std::env::var_os("APPDATA")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
+    } else if cfg!(any(target_os = "macos", target_os = "ios")) {
+        // On iOS, HOME is the app's sandbox, and Application Support in it is backed up.
         std::env::var_os("HOME")
             .map(|h| PathBuf::from(h).join("Library").join("Application Support"))
     } else {
@@ -468,7 +652,61 @@ pub fn load_or_default(path: &Path) -> Result<Config> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(err) => return Err(err).context("reading the settings file"),
     };
-    with_env_overrides(cfg)
+    let mut cfg = with_env_overrides(cfg)?;
+    cfg.file = Some(path.to_path_buf());
+    Ok(cfg)
+}
+
+/// Characters of a generated passphrase: letters and digits, which pass the
+/// gateway's own check and need no escaping in a URI.
+const PASSPHRASE_ALPHABET: &[u8] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Length of a generated passphrase: about 190 bits from the OS random source,
+/// inside libsrt's 10 to 79 and Open Live's 10 to 80 bytes.
+const GENERATED_PASSPHRASE_LEN: usize = 32;
+
+/// A new SRT passphrase from the OS random source, for a link through the relay,
+/// whose port is public: without one, anyone with the stream id could connect.
+pub fn generate_passphrase() -> Result<String> {
+    // 248 is the largest multiple of 62 up to 256: bytes from it up are drawn again,
+    // so every character is equally likely.
+    let limit = 256 - 256 % PASSPHRASE_ALPHABET.len();
+    let mut out = String::with_capacity(GENERATED_PASSPHRASE_LEN);
+    while out.len() < GENERATED_PASSPHRASE_LEN {
+        let mut bytes = [0u8; GENERATED_PASSPHRASE_LEN];
+        getrandom::fill(&mut bytes).map_err(|err| anyhow!("the OS random source failed: {err}"))?;
+        let wanted = GENERATED_PASSPHRASE_LEN - out.len();
+        out.extend(
+            bytes
+                .iter()
+                .map(|b| usize::from(*b))
+                .filter(|b| *b < limit)
+                .map(|b| char::from(PASSPHRASE_ALPHABET[b % PASSPHRASE_ALPHABET.len()]))
+                .take(wanted),
+        );
+    }
+    Ok(out)
+}
+
+/// Writes `passphrase` into the settings file at `path` as `uplink.passphrase`,
+/// unless the file already has one, which is then returned instead: the file wins,
+/// so two writers end up with the same passphrase. Only that value changes: the file
+/// is read as it is, without the environment overrides [`load_or_default`] applies,
+/// so no credential from the environment is written into it. A missing file is
+/// created with the defaults and the passphrase.
+pub fn keep_passphrase(path: &Path, passphrase: &str) -> Result<String> {
+    let mut cfg: Config = match std::fs::read_to_string(path) {
+        Ok(raw) => toml::from_str(&raw).context("parsing the settings file")?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(err) => return Err(err).context("reading the settings file"),
+    };
+    if let Some(kept) = cfg.uplink.passphrase.as_deref().filter(|p| !p.is_empty()) {
+        return Ok(kept.to_string());
+    }
+    cfg.uplink.passphrase = Some(passphrase.to_string());
+    write(path, &cfg)?;
+    Ok(passphrase.to_string())
 }
 
 /// The handful of values a deployment tool needs to inject without templating a file.
@@ -503,6 +741,10 @@ fn with_env_overrides(mut cfg: Config) -> Result<Config> {
 /// holds the Open Live credential and any SRT passphrase.
 pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     validate(cfg)?;
+    write(path, cfg)
+}
+
+fn write(path: &Path, cfg: &Config) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).context("creating the settings directory")?;
     }
@@ -522,6 +764,22 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     }
     std::fs::rename(&tmp, path).context("replacing the settings file")?;
     Ok(())
+}
+
+/// Writes settings that are not finished yet, as [`save`] does, refusing only what
+/// would be wrong whatever is chosen later: every problem but a missing Open Live
+/// address or credential. For a front end that keeps its choices one by one before
+/// anyone has said where to send: the phone's first launch, a camera picked before
+/// the instance, a sign-in forgotten.
+pub fn save_unfinished(path: &Path, cfg: &Config) -> Result<()> {
+    let unfinished = |setting: &str| matches!(setting, "open_live.url" | "open_live.api_key");
+    if let Some((_, err)) = check(cfg, crate::osc::saved_token().is_some())
+        .into_iter()
+        .find(|(setting, _)| !unfinished(setting))
+    {
+        return Err(err);
+    }
+    write(path, cfg)
 }
 
 /// Replaces the file's ACL with full control for the current user, SYSTEM and
@@ -568,22 +826,160 @@ fn sid_from_whoami(output: &str) -> Option<String> {
     valid.then(|| sid.to_string())
 }
 
-/// Rejects settings that would otherwise fail confusingly at runtime.
+/// Rejects settings that would otherwise fail confusingly at runtime. The error is
+/// the first of [`problems`], unchanged.
 pub fn validate(cfg: &Config) -> Result<()> {
     validate_with(cfg, crate::osc::saved_token().is_some())
 }
 
-/// `osc_login` says whether the OSC CLI has a saved login, which stands in for
-/// `open_live.api_key` in osc mode. Passed in so the check itself stays pure.
-fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
+/// One thing wrong with the settings, in words an operator can act on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Problem {
+    /// The settings key or section it concerns, as written in the file, e.g.
+    /// `uplink.public_host` or `open_live`. None when it concerns no one setting.
+    pub setting: Option<&'static str>,
+    /// One line, shown as is.
+    pub message: String,
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Problem {
+    pub fn new(setting: impl Into<Option<&'static str>>, message: impl Into<String>) -> Self {
+        Problem {
+            setting: setting.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Every check [`validate`] makes, each failure reported instead of only the first.
+/// Checks the settings alone; nothing is contacted.
+pub fn problems(cfg: &Config) -> Vec<Problem> {
+    problems_with(cfg, crate::osc::saved_token().is_some())
+}
+
+pub(crate) fn problems_with(cfg: &Config, osc_login: bool) -> Vec<Problem> {
+    check(cfg, osc_login)
+        .into_iter()
+        .map(|(setting, err)| Problem::new(setting, format!("{err:#}")))
+        .collect()
+}
+
+/// `osc_login` says whether the OSC CLI has a saved login, or the app passes an Open
+/// Source Cloud credential of its own; either stands in for `open_live.api_key` in
+/// osc mode. Passed in so the check itself stays pure.
+pub(crate) fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
+    match check(cfg, osc_login).into_iter().next() {
+        Some((_, err)) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// What is wrong with the `[[input]]` entries alone, each reported. An app saving
+/// its selection checks only these: the rest of the file may still be unfinished.
+pub fn input_problems(inputs: &[InputSettings]) -> Vec<Problem> {
+    check_inputs(inputs)
+        .into_iter()
+        .map(|(setting, err)| Problem::new(setting, format!("{err:#}")))
+        .collect()
+}
+
+// The same checks `up` makes against the resolved devices, made early on the text so
+// the settings file is refused before anything starts.
+fn check_inputs(inputs: &[InputSettings]) -> Vec<(&'static str, anyhow::Error)> {
+    let mut found = Vec::new();
+    let mut devices: Vec<&str> = Vec::new();
+    let mut labels: Vec<(&str, &str)> = Vec::new();
+    let mut paired: Vec<(&str, &str)> = Vec::new();
+    for entry in inputs {
+        let device = entry.device.trim();
+        if device.is_empty() {
+            found.push(("input", anyhow!("an [[input]] entry has no device")));
+            continue;
+        }
+        if devices.iter().any(|d| d.eq_ignore_ascii_case(device)) {
+            found.push((
+                "input",
+                anyhow!("{device:?} has two [[input]] entries; one entry per input"),
+            ));
+            continue;
+        }
+        devices.push(device);
+        match entry.label.as_deref().map(str::trim) {
+            Some("") => found.push((
+                "input",
+                anyhow!("the [[input]] entry for {device:?} has an empty label; remove the line to use the device name"),
+            )),
+            Some(label) => {
+                if let Some((other, _)) = labels.iter().find(|(_, l)| l.eq_ignore_ascii_case(label)) {
+                    found.push((
+                        "input",
+                        anyhow!("{other:?} and {device:?} are both labelled {label:?} in [[input]]; two sources cannot share a name"),
+                    ));
+                } else {
+                    labels.push((device, label));
+                }
+            }
+            None => {}
+        }
+        let Some(audio) = entry.audio.as_deref().map(str::trim) else {
+            continue;
+        };
+        if audio.is_empty() {
+            found.push((
+                "input",
+                anyhow!("the [[input]] entry for {device:?} has an empty audio; remove the line for no audio"),
+            ));
+            continue;
+        }
+        if entry.is_test_pattern() {
+            found.push((
+                "input",
+                anyhow!(
+                    "the test pattern carries its own tone, so its [[input]] entry takes no audio"
+                ),
+            ));
+            continue;
+        }
+        if let Some((other, _)) = paired.iter().find(|(_, a)| a.eq_ignore_ascii_case(audio)) {
+            found.push((
+                "input",
+                anyhow!("audio source {audio:?} is paired with both {other:?} and {device:?} in [[input]]; one audio source goes with one camera"),
+            ));
+            continue;
+        }
+        paired.push((device, audio));
+    }
+    found
+}
+
+/// The checks, in the order `validate` has always made them, each failure with the
+/// setting it concerns.
+fn check(cfg: &Config, osc_login: bool) -> Vec<(&'static str, anyhow::Error)> {
+    let mut found: Vec<(&'static str, anyhow::Error)> = Vec::new();
     if !cfg.strom.url.starts_with("http://") && !cfg.strom.url.starts_with("https://") {
-        bail!(
-            "strom.url must be an http or https URL, got {:?}",
-            cfg.strom.url
-        );
+        found.push((
+            "strom.url",
+            anyhow!(
+                "strom.url must be an http or https URL, got {:?}",
+                cfg.strom.url
+            ),
+        ));
     }
 
-    let local_ports = cfg.uplink.local_ports()?;
+    // None when the range does not parse, which is reported here and nowhere else.
+    let local_ports = match cfg.uplink.local_ports() {
+        Ok(ports) => Some(ports),
+        Err(err) => {
+            found.push(("uplink.port_range", err));
+            None
+        }
+    };
     if cfg.uplink.mode == UplinkMode::Listener {
         if cfg
             .uplink
@@ -592,36 +988,75 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            bail!(
-                "uplink.mode is \"listener\", where the cloud dials this machine, so \
-                 uplink.public_host must be its address as the cloud sees it"
-            );
+            found.push((
+                "uplink.public_host",
+                anyhow!(
+                    "uplink.mode is \"listener\", where the cloud dials this machine, so \
+                     uplink.public_host must be its address as the cloud sees it"
+                ),
+            ));
         }
         // In caller mode the ports are the cloud Strom's and Open Live publishes them;
         // here they are this machine's own, and nobody else can know them.
-        if local_ports.is_none() {
-            bail!(
-                "uplink.mode is \"listener\", where this machine listens, so \
-                 uplink.port_range must name its own SRT ports"
-            );
+        if matches!(local_ports, Some(None)) {
+            found.push((
+                "uplink.port_range",
+                anyhow!(
+                    "uplink.mode is \"listener\", where this machine listens, so \
+                     uplink.port_range must name its own SRT ports"
+                ),
+            ));
         }
+    }
+    if let Some(relay) = cfg
+        .uplink
+        .relay
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        if !is_relay_name(relay) {
+            found.push((
+                "uplink.relay",
+                anyhow!(
+                    "uplink.relay must be 1 to 32 characters of a-z, 0-9 and -, as Open Live names its relays, got {relay:?}"
+                ),
+            ));
+        }
+    }
+    if cfg.uplink.mode == UplinkMode::Relay && !cfg.open_live.register {
+        found.push((
+            "uplink.mode",
+            anyhow!(
+                "uplink.mode is \"relay\", whose address only Open Live can give, so [open_live] register must be on"
+            ),
+        ));
     }
     if let Some(len) = cfg.uplink.pbkeylen {
         if !matches!(len, 16 | 24 | 32) {
-            bail!("uplink.pbkeylen must be 16, 24, or 32, got {len}");
+            found.push((
+                "uplink.pbkeylen",
+                anyhow!("uplink.pbkeylen must be 16, 24, or 32, got {len}"),
+            ));
         }
     }
     if let Some(passphrase) = cfg.uplink.passphrase.as_deref().filter(|p| !p.is_empty()) {
         // libsrt's own limits, and the value travels unescaped inside two URIs.
         let n = passphrase.chars().count();
         if !(10..=79).contains(&n) {
-            bail!("uplink.passphrase must be 10 to 79 characters, got {n}");
+            found.push((
+                "uplink.passphrase",
+                anyhow!("uplink.passphrase must be 10 to 79 characters, got {n}"),
+            ));
         }
         if !passphrase
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_.~!*".contains(c))
         {
-            bail!("uplink.passphrase may only contain letters, digits, and - _ . ~ ! *");
+            found.push((
+                "uplink.passphrase",
+                anyhow!("uplink.passphrase may only contain letters, digits, and - _ . ~ ! *"),
+            ));
         }
     }
 
@@ -631,7 +1066,9 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
         .as_deref()
         .filter(|r| !r.is_empty())
     {
-        parse_resolution(res)?;
+        if let Err(err) = parse_resolution(res) {
+            found.push(("capture.video_resolution", err));
+        }
     }
     if let Some(rate) = cfg
         .capture
@@ -643,29 +1080,14 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
             n.parse::<u32>().is_ok() && d.parse::<u32>().is_ok_and(|d| d > 0)
         });
         if !ok {
-            bail!("capture.video_framerate must be N/D, e.g. 25/1, got {rate:?}");
+            found.push((
+                "capture.video_framerate",
+                anyhow!("capture.video_framerate must be N/D, e.g. 25/1, got {rate:?}"),
+            ));
         }
     }
 
-    // The same check `up` makes against the resolved devices, made early on the text
-    // so the settings file is refused before anything starts.
-    let mut paired: Vec<(&str, &str)> = Vec::new();
-    for entry in &cfg.inputs {
-        let device = entry.device.trim();
-        if device.is_empty() {
-            bail!("an [[input]] entry has no device");
-        }
-        let Some(audio) = entry.audio.as_deref().map(str::trim) else {
-            continue;
-        };
-        if audio.is_empty() {
-            bail!("the [[input]] entry for {device:?} has an empty audio; remove the line for no audio");
-        }
-        if let Some((other, _)) = paired.iter().find(|(_, a)| a.eq_ignore_ascii_case(audio)) {
-            bail!("audio source {audio:?} is paired with both {other:?} and {device:?} in [[input]]; one audio source goes with one camera");
-        }
-        paired.push((device, audio));
-    }
+    found.extend(check_inputs(&cfg.inputs));
 
     if cfg.open_live.register {
         if cfg
@@ -675,13 +1097,17 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            bail!("open_live.register is on but open_live.url is unset");
+            found.push((
+                "open_live.url",
+                anyhow!("open_live.register is on but open_live.url is unset"),
+            ));
         }
         // Only osc mode needs a credential: a self-hosted Open Live with API_KEY
         // unset leaves /api/v1 open, which is the normal local development case.
         // The OSC CLI's saved login serves in place of a token in the file.
         if cfg.open_live.auth_mode == AuthMode::Osc
             && !osc_login
+            && cfg.open_live.credential.is_none()
             && cfg
                 .open_live
                 .api_key
@@ -689,16 +1115,114 @@ fn validate_with(cfg: &Config, osc_login: bool) -> Result<()> {
                 .map(str::trim)
                 .is_none_or(str::is_empty)
         {
-            bail!(
-                "open_live.auth_mode is \"osc\" but there is no OSC token: log in with `{}`, or set open_live.api_key",
-                crate::osc::LOGIN_COMMAND
-            );
+            found.push((
+                "open_live.api_key",
+                anyhow!(
+                    "open_live.auth_mode is \"osc\" but there is no OSC token: log in with `{}`, or set open_live.api_key",
+                    crate::osc::LOGIN_COMMAND
+                ),
+            ));
         }
+    }
+    // A sign-in is for an Open Source Cloud instance; a direct one would never use it.
+    if cfg.open_live.credential.is_some() && cfg.open_live.auth_mode != AuthMode::Osc {
+        found.push((
+            "open_live.credential",
+            anyhow!(
+                "open_live.credential keeps an Open Source Cloud sign-in, but open_live.auth_mode is \"direct\", which does not use one"
+            ),
+        ));
     }
     // An id without its token, or the reverse, is a half-finished provisioning step;
     // it is refused here rather than warned about on every retry during the show.
-    crate::heartbeat::Target::from_config(&cfg.open_live)?;
-    Ok(())
+    if let Err(err) = crate::heartbeat::Target::from_config(&cfg.open_live) {
+        found.push(("open_live.gateway_id", err));
+    }
+    if cfg!(target_os = "ios") {
+        found.extend(check_phone(cfg));
+    }
+    found
+}
+
+/// What the phone's encoder can do: H.264 in hardware at a constant bitrate. The
+/// other `[video]` choices are the desktop's, for Strom's encoders.
+const PHONE_CODEC: &str = "h264";
+const PHONE_ENCODER: &str = "hardware";
+const PHONE_RATE_CONTROL: &str = "cbr";
+
+/// What is wrong with settings for the iPhone app, on top of [`problems`]: the
+/// phone always sends H.264, encoded in hardware at a constant bitrate (VideoToolbox),
+/// so a `[video] codec`, `encoder_preference`, `quality_preset`, `tune` or
+/// `rate_control` other than that (the last three: other than the defaults, which
+/// it does not use) is refused rather than silently ignored, as a settings file
+/// copied from a desktop that asks for AV1 would be. [`problems`] includes these on
+/// iOS; this is them alone, on any OS.
+pub fn phone_problems(cfg: &Config) -> Vec<Problem> {
+    check_phone(cfg)
+        .into_iter()
+        .map(|(setting, err)| Problem::new(setting, format!("{err:#}")))
+        .collect()
+}
+
+fn check_phone(cfg: &Config) -> Vec<(&'static str, anyhow::Error)> {
+    let (video, defaults) = (&cfg.video, Video::default());
+    [
+        ("video.codec", &video.codec, PHONE_CODEC),
+        (
+            "video.encoder_preference",
+            &video.encoder_preference,
+            PHONE_ENCODER,
+        ),
+        (
+            "video.quality_preset",
+            &video.quality_preset,
+            defaults.quality_preset.as_str(),
+        ),
+        ("video.tune", &video.tune, defaults.tune.as_str()),
+        (
+            "video.rate_control",
+            &video.rate_control,
+            PHONE_RATE_CONTROL,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, value, wanted)| !value.trim().eq_ignore_ascii_case(wanted))
+    .map(|(key, value, wanted)| {
+        (
+            key,
+            anyhow!("the iPhone app always sends with {key} = {wanted:?}, got {value:?}"),
+        )
+    })
+    .collect()
+}
+
+/// Settings for a phone's first launch (docs/specs/ios-app.md, sections 7 and 11): a
+/// new random `gateway.id`, so two phones never share flows or sources; `gateway.name`
+/// `iPhone <first 4 hex of the id>`, so two phones never share the source prefix
+/// that cleanup sweeps by; and the phone's defaults: 1280x720 at 30 fps, H.264 in
+/// hardware at a constant 4000 kbps, a keyframe every 30 frames, the library's
+/// 200 ms SRT latency. Where to send and what to send are chosen later.
+pub fn phone_settings() -> Result<Config> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|err| anyhow!("the OS random source failed: {err}"))?;
+    Ok(phone_settings_with(
+        uuid::Builder::from_random_bytes(bytes).into_uuid(),
+    ))
+}
+
+fn phone_settings_with(id: uuid::Uuid) -> Config {
+    let id = id.hyphenated().to_string();
+    let mut cfg = Config::default();
+    cfg.gateway.name = format!("iPhone {}", id[..4].to_uppercase());
+    cfg.gateway.id = Some(id);
+    cfg.video.codec = PHONE_CODEC.to_string();
+    cfg.video.encoder_preference = PHONE_ENCODER.to_string();
+    cfg.video.rate_control = PHONE_RATE_CONTROL.to_string();
+    cfg.video.bitrate_kbps = 4000;
+    cfg.video.keyframe_interval = 30;
+    cfg.capture.video_resolution = Some("1280x720".to_string());
+    cfg.capture.video_framerate = Some("30/1".to_string());
+    cfg
 }
 
 /// Splits a `WxH` string.
@@ -742,6 +1266,120 @@ pub fn init_tracing(level: &str) {
 mod tests {
     use super::*;
 
+    /// The phone's first launch (docs/specs/ios-app.md, section 7.1): the id is a
+    /// random UUID, the name its first four hex digits, the video the phone's.
+    #[test]
+    fn a_phone_starts_with_an_id_of_its_own_and_a_name_from_it() {
+        let id = uuid::Uuid::parse_str("3f2a9c1e-0000-4000-8000-000000000000").unwrap();
+        let cfg = phone_settings_with(id);
+        assert_eq!(
+            cfg.gateway.id.as_deref(),
+            Some("3f2a9c1e-0000-4000-8000-000000000000")
+        );
+        assert_eq!(cfg.gateway.name, "iPhone 3F2A");
+        assert_eq!(cfg.video.codec, "h264");
+        assert_eq!(cfg.video.encoder_preference, "hardware");
+        assert_eq!(cfg.video.rate_control, "cbr");
+        assert_eq!(cfg.video.bitrate_kbps, 4000);
+        assert_eq!(cfg.video.keyframe_interval, 30);
+        assert_eq!(cfg.capture.video_resolution.as_deref(), Some("1280x720"));
+        assert_eq!(cfg.capture.video_framerate.as_deref(), Some("30/1"));
+        assert_eq!(cfg.uplink.latency_ms, 200);
+        assert_eq!(cfg.uplink.mode, UplinkMode::Caller);
+        assert!(phone_problems(&cfg).is_empty());
+
+        let (a, b) = (phone_settings().unwrap(), phone_settings().unwrap());
+        assert_ne!(a.gateway.id, b.gateway.id, "two phones, two ids");
+        let a_id = a.gateway.id.unwrap();
+        assert_eq!(uuid::Uuid::parse_str(&a_id).unwrap().get_version_num(), 4);
+        assert_eq!(
+            a.gateway.name,
+            format!("iPhone {}", a_id[..4].to_uppercase())
+        );
+    }
+
+    /// The phone sends H.264 in hardware at a constant bitrate: a desktop's file
+    /// asking for anything else is refused, one problem per key.
+    #[test]
+    fn a_phone_refuses_video_settings_it_cannot_send() {
+        let mut cfg = phone_settings_with(uuid::Uuid::nil());
+        cfg.video.codec = "AV1".into();
+        cfg.video.encoder_preference = "auto".into();
+        cfg.video.quality_preset = "slow".into();
+        cfg.video.tune = "film".into();
+        cfg.video.rate_control = "vbr".into();
+        let problems = phone_problems(&cfg);
+        let keys: Vec<_> = problems.iter().filter_map(|p| p.setting).collect();
+        assert_eq!(
+            keys,
+            [
+                "video.codec",
+                "video.encoder_preference",
+                "video.quality_preset",
+                "video.tune",
+                "video.rate_control"
+            ]
+        );
+        assert!(
+            problems[0].message.contains("\"h264\"") && problems[0].message.contains("AV1"),
+            "{}",
+            problems[0].message
+        );
+        // Case and spaces do not matter; the desktop's defaults for the other two do.
+        cfg.video = Video {
+            codec: " H264 ".into(),
+            encoder_preference: "Hardware".into(),
+            rate_control: "CBR".into(),
+            ..Video::default()
+        };
+        assert!(phone_problems(&cfg).is_empty());
+        // The desktop's own defaults ask for an encoder the phone does not choose.
+        assert_eq!(
+            phone_problems(&Config::default())
+                .iter()
+                .filter_map(|p| p.setting)
+                .collect::<Vec<_>>(),
+            ["video.encoder_preference"]
+        );
+        // Part of `problems` on iOS only.
+        assert_eq!(
+            problems_with(&cfg_with_codec("av1"), true)
+                .iter()
+                .any(|p| p.setting == Some("video.codec")),
+            cfg!(target_os = "ios")
+        );
+    }
+
+    fn cfg_with_codec(codec: &str) -> Config {
+        let mut cfg = phone_settings_with(uuid::Uuid::nil());
+        cfg.open_live.register = false;
+        cfg.uplink.host = Some("cloud.example.com".into());
+        cfg.video.codec = codec.into();
+        cfg
+    }
+
+    /// Settings with no Open Live chosen yet are written, and read back the same;
+    /// anything else wrong with them is still refused.
+    #[test]
+    fn unfinished_settings_are_saved_but_wrong_ones_are_not() {
+        let dir = std::env::temp_dir().join(format!("oli-unfinished-{}", std::process::id()));
+        let path = dir.join("gateway.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = phone_settings_with(uuid::Uuid::nil());
+        cfg.open_live.auth_mode = AuthMode::Osc;
+        assert!(validate_with(&cfg, false).is_err(), "no url, no credential");
+        save_unfinished(&path, &cfg).unwrap();
+        let back = load_or_default(&path).unwrap();
+        assert_eq!(back.gateway.name, cfg.gateway.name);
+        assert_eq!(back.video.encoder_preference, "hardware");
+
+        cfg.uplink.pbkeylen = Some(20);
+        let err = save_unfinished(&path, &cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("pbkeylen"), "{err:#}");
+        assert_eq!(load_or_default(&path).unwrap().uplink.pbkeylen, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn uplink(mode: UplinkMode) -> Uplink {
         Uplink {
             mode,
@@ -781,6 +1419,130 @@ mod tests {
         assert!(e
             .cloud_uri()
             .ends_with("&passphrase=s3cret-s3cret&pbkeylen=16"));
+    }
+
+    /// Through the relay: the source asks Open Live for a stream id on the named
+    /// relay, with latency and passphrase; the venue dials the address Open Live
+    /// gives, in caller mode, with the same latency and passphrase.
+    #[test]
+    fn relay_mode_registers_auto_and_dials_the_address_open_live_gives() {
+        let mut u = uplink(UplinkMode::Relay);
+        u.passphrase = Some("s3cret-s3cret".to_string());
+        u.pbkeylen = Some(16);
+        let mut e = u.endpoint("", 0);
+        assert_eq!(e.relay_name(), Some(DEFAULT_RELAY));
+        assert_eq!(
+            e.cloud_uri(),
+            "srt+relay://auto@default?latency=200&passphrase=s3cret-s3cret&pbkeylen=16"
+        );
+        assert_eq!(e.dial_in(), None);
+
+        e.dial_relay(
+            "AbCdEfGhIjKlMnOpQrStUv",
+            "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv",
+            "relay.example.com",
+            6000,
+        );
+        assert_eq!(
+            e.cloud_uri(),
+            "srt+relay://AbCdEfGhIjKlMnOpQrStUv?latency=200&passphrase=s3cret-s3cret&pbkeylen=16"
+        );
+        assert_eq!(
+            e.venue_uri(),
+            "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv&mode=caller&latency=200&passphrase=s3cret-s3cret&pbkeylen=16"
+        );
+        assert_eq!((e.cloud_host.as_str(), e.port), ("relay.example.com", 6000));
+        assert_eq!(
+            e.dial_in(),
+            Some("srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv")
+        );
+
+        // A named relay stays named, with `auto` and with the id.
+        u.relay = Some("eu-north".to_string());
+        let mut e = u.endpoint("", 0);
+        assert!(e
+            .cloud_uri()
+            .starts_with("srt+relay://auto@eu-north?latency=200&"));
+        e.dial_relay("AbCdEfGhIjKlMnOpQrStUv", "srt://r:1?streamid=x", "r", 1);
+        assert!(e
+            .cloud_uri()
+            .starts_with("srt+relay://AbCdEfGhIjKlMnOpQrStUv@eu-north?latency=200&"));
+
+        // Caller and listener links have no relay end, and ignore one given.
+        let mut caller = uplink(UplinkMode::Caller).endpoint("strom.example.com", 9000);
+        caller.dial_relay("x", "srt://r:1?streamid=x", "r", 1);
+        assert_eq!(caller.relay_name(), None);
+        assert_eq!(caller.cloud_uri(), "srt://:9000?mode=listener");
+    }
+
+    /// A generated passphrase passes the gateway's own check, and two differ.
+    #[test]
+    fn a_generated_passphrase_passes_the_check_and_is_random() {
+        let a = generate_passphrase().unwrap();
+        let b = generate_passphrase().unwrap();
+        assert_ne!(a, b);
+        let mut cfg = valid();
+        cfg.uplink.passphrase = Some(a.clone());
+        validate(&cfg).expect("a generated passphrase validates");
+        assert_eq!(a.len(), GENERATED_PASSPHRASE_LEN);
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    /// The generated passphrase goes into the file as it is, with nothing from the
+    /// environment, and a passphrase already in the file wins.
+    #[test]
+    fn a_kept_passphrase_is_written_once_without_the_environment() {
+        let path = temp_path("keep-passphrase");
+        let mut cfg = valid();
+        cfg.open_live.api_key = None;
+        save(&path, &cfg).unwrap();
+
+        let kept = keep_passphrase(&path, "generated-0123456789").unwrap();
+        assert_eq!(kept, "generated-0123456789");
+        let loaded = load_or_default(&path).unwrap();
+        assert_eq!(
+            loaded.uplink.passphrase.as_deref(),
+            Some("generated-0123456789")
+        );
+        assert_eq!(loaded.file.as_deref(), Some(path.as_path()));
+        assert_eq!(loaded.gateway.name, "Venue A");
+
+        // A second writer gets the first one's.
+        assert_eq!(
+            keep_passphrase(&path, "another-0123456789").unwrap(),
+            "generated-0123456789"
+        );
+        // The file has only what was in it plus the passphrase.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("api_key"), "{raw}");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn relay_names_are_checked_as_open_live_checks_them() {
+        assert!(is_relay_name("default"));
+        assert!(is_relay_name("eu-north-1"));
+        for bad in ["", "EU", "eu_north", "eu.north", &"a".repeat(33)] {
+            assert!(!is_relay_name(bad), "{bad:?}");
+        }
+        let mut cfg = valid();
+        cfg.uplink.relay = Some("EU North".to_string());
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("uplink.relay must be 1 to 32 characters"));
+        cfg.uplink.relay = Some("eu-north".to_string());
+        validate(&cfg).unwrap();
+
+        // Only Open Live gives a relay address, so relay mode needs registration.
+        cfg.uplink.mode = UplinkMode::Relay;
+        validate(&cfg).unwrap();
+        cfg.open_live.register = false;
+        cfg.uplink.host = Some("strom.example.com".to_string());
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("register must be on"));
     }
 
     #[test]
@@ -832,10 +1594,12 @@ mod tests {
                 InputSettings {
                     device: "FaceTime".to_string(),
                     audio: Some("USB Microphone".to_string()),
+                    label: None,
                 },
                 InputSettings {
                     device: "DeckLink".to_string(),
                     audio: None,
+                    label: None,
                 },
             ]
         );
@@ -851,6 +1615,58 @@ mod tests {
         assert!(validate(&cfg).is_err());
 
         assert!(toml::from_str::<Config>("[[input]]\ndevice = \"x\"\nmic = \"y\"\n").is_err());
+    }
+
+    /// The app's selection: a label per input, the test pattern by name, and the
+    /// rules `up` relies on refused on the text, every one reported.
+    #[test]
+    fn input_entries_take_a_label_and_refuse_what_up_cannot_send() {
+        let cfg: Config = toml::from_str(
+            "[[input]]\ndevice = \"dev-cam\"\naudio = \"dev-mic\"\nlabel = \"Stage left\"\n\n[[input]]\ndevice = \"test\"\n",
+        )
+        .expect("parses");
+        assert_eq!(cfg.inputs[0].label(), Some("Stage left"));
+        assert!(!cfg.inputs[0].is_test_pattern());
+        assert!(cfg.inputs[1].is_test_pattern());
+        assert_eq!(cfg.inputs[1].label(), None);
+        assert_eq!(input_problems(&cfg.inputs), []);
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("label = \"Stage left\""), "{text}");
+        assert_eq!(text.matches("label").count(), 1, "{text}");
+
+        let entry = |device: &str, audio: Option<&str>, label: Option<&str>| InputSettings {
+            device: device.to_string(),
+            audio: audio.map(str::to_string),
+            label: label.map(str::to_string),
+        };
+        let refused = [
+            (
+                vec![entry("cam", None, None), entry("CAM", None, None)],
+                "two [[input]] entries",
+            ),
+            (vec![entry("cam", None, Some(" "))], "empty label"),
+            (
+                vec![
+                    entry("a", None, Some("Stage")),
+                    entry("b", None, Some("stage")),
+                ],
+                "cannot share a name",
+            ),
+            (vec![entry("test", Some("mic"), None)], "its own tone"),
+            (
+                vec![entry("a", Some("mic"), None), entry("b", Some("MIC"), None)],
+                "paired with both",
+            ),
+        ];
+        for (inputs, expected) in refused {
+            let found = input_problems(&inputs);
+            assert_eq!(found.len(), 1, "{inputs:?}: {found:?}");
+            assert_eq!(found[0].setting, Some("input"));
+            assert!(found[0].message.contains(expected), "{found:?}");
+            let mut cfg = valid();
+            cfg.inputs = inputs;
+            assert!(validate(&cfg).unwrap_err().to_string().contains(expected));
+        }
     }
 
     /// A file without `[[input]]` is written back without one.
@@ -893,6 +1709,34 @@ mod tests {
         validate_with(&cfg, true).expect("osc with a CLI login should validate");
         cfg.open_live.api_key = Some("pat".to_string());
         validate_with(&cfg, false).expect("osc with a token should validate");
+    }
+
+    /// #65 AC3: after a sign-in from the app the file says only where the credential
+    /// is. That marker stands in for a token, reads back as written, and makes no
+    /// sense for a self-hosted Open Live.
+    #[test]
+    fn the_keychain_marker_stands_in_for_a_token_in_osc_mode_only() {
+        let mut cfg = valid();
+        cfg.open_live.auth_mode = AuthMode::Osc;
+        cfg.open_live.credential = Some(CredentialStore::Keychain);
+        validate_with(&cfg, false).expect("the keychain counts as a credential");
+        assert!(cfg.open_live.uses_keychain());
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        assert!(text.contains("credential = \"keychain\""), "{text}");
+        assert!(!text.contains("api_key"), "{text}");
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.open_live.credential, Some(CredentialStore::Keychain));
+
+        cfg.open_live.api_key = Some("pat".to_string());
+        assert!(!cfg.open_live.uses_keychain(), "a token in the file wins");
+
+        cfg.open_live.api_key = None;
+        cfg.open_live.auth_mode = AuthMode::Direct;
+        let found = problems_with(&cfg, false);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].setting, Some("open_live.credential"));
+        assert!(toml::from_str::<Config>("[open_live]\ncredential = \"file\"\n").is_err());
     }
 
     /// The heartbeat is optional, but half of its credential is a mistake.
@@ -949,6 +1793,57 @@ mod tests {
         assert!(validate(&cfg).is_err());
         cfg.capture.video_framerate = Some("25/1".to_string());
         validate(&cfg).expect("a well-formed format should validate");
+    }
+
+    /// An app shows everything wrong at once; the CLI's `check` still reports the
+    /// first, worded as before.
+    #[test]
+    fn problems_lists_every_failure_and_validate_reports_the_first() {
+        assert_eq!(problems_with(&valid(), false), []);
+
+        let mut cfg = valid();
+        cfg.strom.url = "127.0.0.1:8080".to_string();
+        cfg.uplink.mode = UplinkMode::Listener;
+        cfg.uplink.port_range = Some("9100-9000".to_string());
+        cfg.uplink.passphrase = Some("short&".to_string());
+        cfg.capture.video_framerate = Some("25".to_string());
+        cfg.open_live.url = None;
+        cfg.open_live.gateway_id = Some("gw-1".to_string());
+        cfg.inputs = vec![
+            InputSettings {
+                device: "FaceTime".to_string(),
+                audio: Some("USB Microphone".to_string()),
+                label: None,
+            },
+            InputSettings {
+                device: "DeckLink".to_string(),
+                audio: Some("usb microphone".to_string()),
+                label: None,
+            },
+        ];
+        let found = problems_with(&cfg, false);
+        let settings: Vec<Option<&str>> = found.iter().map(|p| p.setting).collect();
+        assert_eq!(
+            settings,
+            [
+                Some("strom.url"),
+                Some("uplink.port_range"),
+                Some("uplink.public_host"),
+                Some("uplink.passphrase"),
+                Some("uplink.passphrase"),
+                Some("capture.video_framerate"),
+                Some("input"),
+                Some("open_live.url"),
+                Some("open_live.gateway_id"),
+            ],
+            "{found:#?}"
+        );
+        // A range that does not parse is not also called missing.
+        assert!(found[1].message.contains("9100-9000"), "{}", found[1]);
+        assert_eq!(
+            validate_with(&cfg, false).unwrap_err().to_string(),
+            found[0].message
+        );
     }
 
     #[test]

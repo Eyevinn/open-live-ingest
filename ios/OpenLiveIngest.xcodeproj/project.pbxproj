@@ -1,0 +1,661 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0C0000000000000000000101 /* OpenLiveIngestApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000201 /* OpenLiveIngestApp.swift */; };
+		0C0000000000000000000102 /* SRTSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000202 /* SRTSender.swift */; };
+		0C0000000000000000000103 /* ThirdPartyLicenses.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000203 /* ThirdPartyLicenses.swift */; };
+		0C0000000000000000000104 /* SRT.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000204 /* SRT.xcframework */; };
+		0C0000000000000000000105 /* SRTSenderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000205 /* SRTSenderTests.swift */; };
+		0C0000000000000000000106 /* LaunchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000206 /* LaunchTests.swift */; };
+		0C0000000000000000000110 /* TSMuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000210 /* TSMuxer.swift */; };
+		0C0000000000000000000111 /* MediaSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000211 /* MediaSettings.swift */; };
+		0C0000000000000000000112 /* Encoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000212 /* Encoder.swift */; };
+		0C0000000000000000000113 /* TestPattern.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000213 /* TestPattern.swift */; };
+		0C0000000000000000000114 /* Capture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000214 /* Capture.swift */; };
+		0C0000000000000000000115 /* MediaPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000215 /* MediaPipeline.swift */; };
+		0C0000000000000000000116 /* TSMuxerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000216 /* TSMuxerTests.swift */; };
+		0C0000000000000000000117 /* MediaPipelineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000217 /* MediaPipelineTests.swift */; };
+		0C0000000000000000000118 /* Core.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000218 /* Core.swift */; };
+		0C0000000000000000000119 /* Messages.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000219 /* Messages.swift */; };
+		0C000000000000000000011A /* AppLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021A /* AppLog.swift */; };
+		0C000000000000000000011B /* MediaController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021B /* MediaController.swift */; };
+		0C000000000000000000011C /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021C /* AppModel.swift */; };
+		0C000000000000000000011D /* WhereToSendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021D /* WhereToSendView.swift */; };
+		0C000000000000000000011E /* WhatToSendView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021E /* WhatToSendView.swift */; };
+		0C000000000000000000011F /* GoLiveView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000021F /* GoLiveView.swift */; };
+		0C0000000000000000000120 /* AdvancedView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000220 /* AdvancedView.swift */; };
+		0C0000000000000000000121 /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000221 /* CameraPreview.swift */; };
+		0C0000000000000000000122 /* Devices.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000222 /* Devices.swift */; };
+		0C0000000000000000000123 /* StatusText.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000223 /* StatusText.swift */; };
+		0C0000000000000000000124 /* SignInSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000224 /* SignInSheet.swift */; };
+		0C0000000000000000000125 /* CoreMessagesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000225 /* CoreMessagesTests.swift */; };
+		0C0000000000000000000126 /* MediaControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000226 /* MediaControllerTests.swift */; };
+		0C0000000000000000000127 /* AppInfoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000227 /* AppInfoTests.swift */; };
+		0C0000000000000000000128 /* StatusTextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000228 /* StatusTextTests.swift */; };
+		0C0000000000000000000129 /* ScreensUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000229 /* ScreensUITests.swift */; };
+		0C000000000000000000012B /* Phone.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022B /* Phone.swift */; };
+		0C000000000000000000012C /* PhoneObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022C /* PhoneObserver.swift */; };
+		0C000000000000000000012D /* PhoneTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022D /* PhoneTests.swift */; };
+		0C000000000000000000012E /* FakeControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022E /* FakeControl.swift */; };
+		0C000000000000000000012F /* FakeControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022E /* FakeControl.swift */; };
+		0C0000000000000000000130 /* OpenLiveDevE2EUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000230 /* OpenLiveDevE2EUITests.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		0C0000000000000000000301 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0C0000000000000000000901 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0C0000000000000000000701;
+			remoteInfo = OpenLiveIngest;
+		};
+		0C0000000000000000000302 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 0C0000000000000000000901 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 0C0000000000000000000701;
+			remoteInfo = OpenLiveIngest;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		0C0000000000000000000201 /* OpenLiveIngestApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenLiveIngestApp.swift; sourceTree = "<group>"; };
+		0C0000000000000000000202 /* SRTSender.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SRTSender.swift; sourceTree = "<group>"; };
+		0C0000000000000000000203 /* ThirdPartyLicenses.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThirdPartyLicenses.swift; sourceTree = "<group>"; };
+		0C0000000000000000000204 /* SRT.xcframework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = SRT.xcframework; sourceTree = "<group>"; };
+		0C0000000000000000000205 /* SRTSenderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SRTSenderTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000206 /* LaunchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000207 /* OpenLiveIngest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenLiveIngest.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		0C0000000000000000000208 /* OpenLiveIngestTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenLiveIngestTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0C0000000000000000000209 /* OpenLiveIngestUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenLiveIngestUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		0C0000000000000000000210 /* TSMuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSMuxer.swift; sourceTree = "<group>"; };
+		0C0000000000000000000211 /* MediaSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaSettings.swift; sourceTree = "<group>"; };
+		0C0000000000000000000212 /* Encoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Encoder.swift; sourceTree = "<group>"; };
+		0C0000000000000000000213 /* TestPattern.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestPattern.swift; sourceTree = "<group>"; };
+		0C0000000000000000000214 /* Capture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Capture.swift; sourceTree = "<group>"; };
+		0C0000000000000000000215 /* MediaPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPipeline.swift; sourceTree = "<group>"; };
+		0C0000000000000000000216 /* TSMuxerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TSMuxerTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000217 /* MediaPipelineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaPipelineTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000218 /* Core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Core.swift; sourceTree = "<group>"; };
+		0C0000000000000000000219 /* Messages.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Messages.swift; sourceTree = "<group>"; };
+		0C000000000000000000021A /* AppLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLog.swift; sourceTree = "<group>"; };
+		0C000000000000000000021B /* MediaController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaController.swift; sourceTree = "<group>"; };
+		0C000000000000000000021C /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		0C000000000000000000021D /* WhereToSendView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhereToSendView.swift; sourceTree = "<group>"; };
+		0C000000000000000000021E /* WhatToSendView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WhatToSendView.swift; sourceTree = "<group>"; };
+		0C000000000000000000021F /* GoLiveView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoLiveView.swift; sourceTree = "<group>"; };
+		0C0000000000000000000220 /* AdvancedView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdvancedView.swift; sourceTree = "<group>"; };
+		0C0000000000000000000221 /* CameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreview.swift; sourceTree = "<group>"; };
+		0C0000000000000000000222 /* Devices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Devices.swift; sourceTree = "<group>"; };
+		0C0000000000000000000223 /* StatusText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusText.swift; sourceTree = "<group>"; };
+		0C0000000000000000000224 /* SignInSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInSheet.swift; sourceTree = "<group>"; };
+		0C0000000000000000000225 /* CoreMessagesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoreMessagesTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000226 /* MediaControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaControllerTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000227 /* AppInfoTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInfoTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000228 /* StatusTextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusTextTests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000229 /* ScreensUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreensUITests.swift; sourceTree = "<group>"; };
+		0C000000000000000000022B /* Phone.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Phone.swift; sourceTree = "<group>"; };
+		0C000000000000000000022C /* PhoneObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneObserver.swift; sourceTree = "<group>"; };
+		0C000000000000000000022D /* PhoneTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneTests.swift; sourceTree = "<group>"; };
+		0C000000000000000000022E /* FakeControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FakeControl.swift; sourceTree = "<group>"; };
+		0C0000000000000000000230 /* OpenLiveDevE2EUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenLiveDevE2EUITests.swift; sourceTree = "<group>"; };
+		0C000000000000000000022A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		0C0000000000000000000401 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000104 /* SRT.xcframework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000402 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000403 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0C0000000000000000000501 = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000502 /* OpenLiveIngest */,
+				0C0000000000000000000503 /* OpenLiveIngestTests */,
+				0C0000000000000000000504 /* OpenLiveIngestUITests */,
+				0C0000000000000000000505 /* Vendor */,
+				0C0000000000000000000506 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000502 /* OpenLiveIngest */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000201 /* OpenLiveIngestApp.swift */,
+				0C0000000000000000000202 /* SRTSender.swift */,
+				0C0000000000000000000203 /* ThirdPartyLicenses.swift */,
+				0C0000000000000000000210 /* TSMuxer.swift */,
+				0C0000000000000000000211 /* MediaSettings.swift */,
+				0C0000000000000000000212 /* Encoder.swift */,
+				0C0000000000000000000213 /* TestPattern.swift */,
+				0C0000000000000000000214 /* Capture.swift */,
+				0C0000000000000000000215 /* MediaPipeline.swift */,
+				0C0000000000000000000218 /* Core.swift */,
+				0C0000000000000000000219 /* Messages.swift */,
+				0C000000000000000000021A /* AppLog.swift */,
+				0C000000000000000000021B /* MediaController.swift */,
+				0C000000000000000000021C /* AppModel.swift */,
+				0C000000000000000000021D /* WhereToSendView.swift */,
+				0C000000000000000000021E /* WhatToSendView.swift */,
+				0C000000000000000000021F /* GoLiveView.swift */,
+				0C0000000000000000000220 /* AdvancedView.swift */,
+				0C0000000000000000000221 /* CameraPreview.swift */,
+				0C0000000000000000000222 /* Devices.swift */,
+				0C0000000000000000000223 /* StatusText.swift */,
+				0C0000000000000000000224 /* SignInSheet.swift */,
+				0C000000000000000000022B /* Phone.swift */,
+				0C000000000000000000022C /* PhoneObserver.swift */,
+				0C000000000000000000022A /* Info.plist */,
+			);
+			path = OpenLiveIngest;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000503 /* OpenLiveIngestTests */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000205 /* SRTSenderTests.swift */,
+				0C0000000000000000000216 /* TSMuxerTests.swift */,
+				0C0000000000000000000217 /* MediaPipelineTests.swift */,
+				0C0000000000000000000225 /* CoreMessagesTests.swift */,
+				0C0000000000000000000226 /* MediaControllerTests.swift */,
+				0C0000000000000000000227 /* AppInfoTests.swift */,
+				0C0000000000000000000228 /* StatusTextTests.swift */,
+				0C000000000000000000022D /* PhoneTests.swift */,
+			);
+			path = OpenLiveIngestTests;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000504 /* OpenLiveIngestUITests */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000206 /* LaunchTests.swift */,
+				0C0000000000000000000229 /* ScreensUITests.swift */,
+				0C000000000000000000022E /* FakeControl.swift */,
+				0C0000000000000000000230 /* OpenLiveDevE2EUITests.swift */,
+			);
+			path = OpenLiveIngestUITests;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000505 /* Vendor */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000204 /* SRT.xcframework */,
+			);
+			path = Vendor;
+			sourceTree = "<group>";
+		};
+		0C0000000000000000000506 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				0C0000000000000000000207 /* OpenLiveIngest.app */,
+				0C0000000000000000000208 /* OpenLiveIngestTests.xctest */,
+				0C0000000000000000000209 /* OpenLiveIngestUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		0C0000000000000000000701 /* OpenLiveIngest */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0C0000000000000000000A02 /* Build configuration list for PBXNativeTarget "OpenLiveIngest" */;
+			buildPhases = (
+				0C0000000000000000000604 /* Build the Rust core */,
+				0C0000000000000000000601 /* Sources */,
+				0C0000000000000000000401 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = OpenLiveIngest;
+			productName = OpenLiveIngest;
+			productReference = 0C0000000000000000000207 /* OpenLiveIngest.app */;
+			productType = "com.apple.product-type.application";
+		};
+		0C0000000000000000000702 /* OpenLiveIngestTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0C0000000000000000000A03 /* Build configuration list for PBXNativeTarget "OpenLiveIngestTests" */;
+			buildPhases = (
+				0C0000000000000000000602 /* Sources */,
+				0C0000000000000000000402 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0C0000000000000000000801 /* PBXTargetDependency */,
+			);
+			name = OpenLiveIngestTests;
+			productName = OpenLiveIngestTests;
+			productReference = 0C0000000000000000000208 /* OpenLiveIngestTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		0C0000000000000000000703 /* OpenLiveIngestUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0C0000000000000000000A04 /* Build configuration list for PBXNativeTarget "OpenLiveIngestUITests" */;
+			buildPhases = (
+				0C0000000000000000000603 /* Sources */,
+				0C0000000000000000000403 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				0C0000000000000000000802 /* PBXTargetDependency */,
+			);
+			name = OpenLiveIngestUITests;
+			productName = OpenLiveIngestUITests;
+			productReference = 0C0000000000000000000209 /* OpenLiveIngestUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		0C0000000000000000000901 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					0C0000000000000000000701 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+					0C0000000000000000000702 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = 0C0000000000000000000701;
+					};
+					0C0000000000000000000703 = {
+						CreatedOnToolsVersion = 15.0;
+						TestTargetID = 0C0000000000000000000701;
+					};
+				};
+			};
+			buildConfigurationList = 0C0000000000000000000A01 /* Build configuration list for PBXProject "OpenLiveIngest" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 0C0000000000000000000501;
+			productRefGroup = 0C0000000000000000000506 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				0C0000000000000000000701 /* OpenLiveIngest */,
+				0C0000000000000000000702 /* OpenLiveIngestTests */,
+				0C0000000000000000000703 /* OpenLiveIngestUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		0C0000000000000000000604 /* Build the Rust core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build the Rust core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "exec \"$SRCROOT/build-core.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		0C0000000000000000000601 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000101 /* OpenLiveIngestApp.swift in Sources */,
+				0C0000000000000000000102 /* SRTSender.swift in Sources */,
+				0C0000000000000000000103 /* ThirdPartyLicenses.swift in Sources */,
+				0C0000000000000000000110 /* TSMuxer.swift in Sources */,
+				0C0000000000000000000111 /* MediaSettings.swift in Sources */,
+				0C0000000000000000000112 /* Encoder.swift in Sources */,
+				0C0000000000000000000113 /* TestPattern.swift in Sources */,
+				0C0000000000000000000114 /* Capture.swift in Sources */,
+				0C0000000000000000000115 /* MediaPipeline.swift in Sources */,
+				0C0000000000000000000118 /* Core.swift in Sources */,
+				0C0000000000000000000119 /* Messages.swift in Sources */,
+				0C000000000000000000011A /* AppLog.swift in Sources */,
+				0C000000000000000000011B /* MediaController.swift in Sources */,
+				0C000000000000000000011C /* AppModel.swift in Sources */,
+				0C000000000000000000011D /* WhereToSendView.swift in Sources */,
+				0C000000000000000000011E /* WhatToSendView.swift in Sources */,
+				0C000000000000000000011F /* GoLiveView.swift in Sources */,
+				0C0000000000000000000120 /* AdvancedView.swift in Sources */,
+				0C0000000000000000000121 /* CameraPreview.swift in Sources */,
+				0C0000000000000000000122 /* Devices.swift in Sources */,
+				0C0000000000000000000123 /* StatusText.swift in Sources */,
+				0C0000000000000000000124 /* SignInSheet.swift in Sources */,
+				0C000000000000000000012B /* Phone.swift in Sources */,
+				0C000000000000000000012C /* PhoneObserver.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000602 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000105 /* SRTSenderTests.swift in Sources */,
+				0C0000000000000000000116 /* TSMuxerTests.swift in Sources */,
+				0C0000000000000000000117 /* MediaPipelineTests.swift in Sources */,
+				0C0000000000000000000125 /* CoreMessagesTests.swift in Sources */,
+				0C0000000000000000000126 /* MediaControllerTests.swift in Sources */,
+				0C0000000000000000000127 /* AppInfoTests.swift in Sources */,
+				0C0000000000000000000128 /* StatusTextTests.swift in Sources */,
+				0C000000000000000000012D /* PhoneTests.swift in Sources */,
+				0C000000000000000000012F /* FakeControl.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		0C0000000000000000000603 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C0000000000000000000106 /* LaunchTests.swift in Sources */,
+				0C0000000000000000000129 /* ScreensUITests.swift in Sources */,
+				0C000000000000000000012E /* FakeControl.swift in Sources */,
+				0C0000000000000000000130 /* OpenLiveDevE2EUITests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0C0000000000000000000801 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0C0000000000000000000701 /* OpenLiveIngest */;
+			targetProxy = 0C0000000000000000000301 /* PBXContainerItemProxy */;
+		};
+		0C0000000000000000000802 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 0C0000000000000000000701 /* OpenLiveIngest */;
+			targetProxy = 0C0000000000000000000302 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0C0000000000000000000B01 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				ONLY_ACTIVE_ARCH = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B02 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 1;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		0C0000000000000000000B03 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+				INFOPLIST_FILE = OpenLiveIngest/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Live Ingest";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Open Live Ingest sends the camera's picture to your production.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Live Ingest sends the microphone's sound to your production.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.0.0;
+				OLI_RUST_LIB = "$(SRCROOT)/../target/$(OLI_RUST_TRIPLE)/$(OLI_RUST_PROFILE)/libopen_live_ingest_mobile.a";
+				OLI_RUST_PROFILE = debug;
+				OLI_RUST_TRIPLE = "aarch64-apple-ios-sim";
+				"OLI_RUST_TRIPLE[sdk=iphoneos*]" = "aarch64-apple-ios";
+				"OLI_RUST_TRIPLE[sdk=iphonesimulator*]" = "aarch64-apple-ios-sim";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lc++",
+					"$(OLI_RUST_LIB)",
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+					"-liconv",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
+				);
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B04 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				"EXCLUDED_ARCHS[sdk=iphonesimulator*]" = x86_64;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+				);
+				INFOPLIST_FILE = OpenLiveIngest/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Open Live Ingest";
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.video";
+				INFOPLIST_KEY_NSCameraUsageDescription = "Open Live Ingest sends the camera's picture to your production.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Open Live Ingest sends the microphone's sound to your production.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.0.0;
+				OLI_RUST_LIB = "$(SRCROOT)/../target/$(OLI_RUST_TRIPLE)/$(OLI_RUST_PROFILE)/libopen_live_ingest_mobile.a";
+				OLI_RUST_PROFILE = release;
+				OLI_RUST_TRIPLE = "aarch64-apple-ios-sim";
+				"OLI_RUST_TRIPLE[sdk=iphoneos*]" = "aarch64-apple-ios";
+				"OLI_RUST_TRIPLE[sdk=iphonesimulator*]" = "aarch64-apple-ios-sim";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-lc++",
+					"$(OLI_RUST_LIB)",
+					"-framework",
+					Security,
+					"-framework",
+					CoreFoundation,
+					"-liconv",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
+				);
+			};
+			name = Release;
+		};
+		0C0000000000000000000B05 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
+				);
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenLiveIngest.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/OpenLiveIngest";
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B06 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.tests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_INCLUDE_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)/include",
+					"$(SRCROOT)/../mobile/include",
+				);
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/OpenLiveIngest.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/OpenLiveIngest";
+			};
+			name = Release;
+		};
+		0C0000000000000000000B07 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = OpenLiveIngest;
+			};
+			name = Debug;
+		};
+		0C0000000000000000000B08 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 0.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.eyevinn.open-live-ingest.ios.uitests";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = OpenLiveIngest;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0C0000000000000000000A01 /* Build configuration list for PBXProject "OpenLiveIngest" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B01 /* Debug */,
+				0C0000000000000000000B02 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0C0000000000000000000A02 /* Build configuration list for PBXNativeTarget "OpenLiveIngest" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B03 /* Debug */,
+				0C0000000000000000000B04 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0C0000000000000000000A03 /* Build configuration list for PBXNativeTarget "OpenLiveIngestTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B05 /* Debug */,
+				0C0000000000000000000B06 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		0C0000000000000000000A04 /* Build configuration list for PBXNativeTarget "OpenLiveIngestUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				0C0000000000000000000B07 /* Debug */,
+				0C0000000000000000000B08 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 0C0000000000000000000901 /* Project object */;
+}

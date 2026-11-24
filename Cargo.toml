@@ -1,10 +1,39 @@
-[package]
-name = "open-live-ingest"
-version = "0.5.0"
+# Three packages, one version and one lockfile: this one (the library and the CLI),
+# the desktop app in app/ and the iPhone app's Rust core in mobile/. A plain
+# `cargo build`, `test` or `clippy` at the root builds this package only, so nothing
+# here needs the app's system webview libraries or an iOS target; the app is built
+# with `-p open-live-ingest-app` on macOS and Windows (docs/specs/desktop-app.md,
+# section 3), the phone's core with `-p open-live-ingest-mobile`
+# (docs/specs/ios-app.md, section 3).
+[workspace]
+members = [".", "app", "mobile"]
+default-members = ["."]
+
+[workspace.package]
+version = "0.6.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Eyevinn/open-live-ingest"
+
+[package]
+name = "open-live-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "SDI/UVC contribution gateway for Open Live"
+
+# The terminal front end: argument parsing and the setup prompts. On by default, so
+# `cargo install` and `cargo binstall` build the CLI as before; the app depends on the
+# library with default features off and links none of the terminal crates.
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:dialoguer", "dep:console"]
+
+[[bin]]
+name = "open-live-ingest"
+path = "src/main.rs"
+required-features = ["cli"]
 
 [dependencies]
 # Strom's own API types: Flow, BlockInstance, Link, device and SRT statistics
@@ -13,18 +42,21 @@ description = "SDI/UVC contribution gateway for Open Live"
 strom-types = { git = "https://github.com/Eyevinn/strom.git", tag = "v0.8.2", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+# At least the 0.8 the gateway was built with. The app's Linux-only GTK tree (one
+# lockfile for the workspace) pins an old toml_datetime through proc-macro-crate 2.0.1+,
+# which would otherwise pull toml back to 0.8.2 for the gateway as well.
+toml = "0.8.23"
 anyhow = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "net", "io-util"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hostname = "0.4"
 # Setup prompts: lists picked with the arrow keys, no-echo credential input, and a
 # coloured theme that steps back to plain text on a dumb terminal or under NO_COLOR.
-dialoguer = { version = "0.12", default-features = false, features = ["password"] }
-console = "0.16"
+dialoguer = { version = "0.12", default-features = false, features = ["password"], optional = true }
+console = { version = "0.16", optional = true }
 # v5 for flow ids derived from gateway id + input id, so nothing has to be stored to
 # find a flow again.
 uuid = { version = "1", features = ["v5"] }
@@ -32,11 +64,33 @@ uuid = { version = "1", features = ["v5"] }
 # stack reqwest already uses.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# PKCE for the OSC browser sign-in: SHA-256 for the S256 code challenge, and the OS
+# random source for the code verifier and the state. Crypto is not reimplemented.
+# Both are already in the tree (tungstenite pulls in sha1 on the same digest 0.11
+# stack, rand and uuid pull in getrandom 0.4), so only the sha2 crate itself is new.
+sha2 = { version = "0.11", default-features = false }
+getrandom = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # Signal 0 liveness checks and SIGTERM for `down`. Windows uses tasklist and
 # taskkill instead, so this is Unix only.
 libc = "0.2"
+
+# The OSC credential in the OS keychain (src/keychain.rs). Own code over the platform
+# APIs rather than the `keyring` crate: on macOS this crate's safe generic-password
+# calls are what `keyring` itself uses, minus `keyring` and `log`; on Windows the
+# Credential Manager calls come from the windows-sys already in the tree (through
+# tokio, mio, socket2, console), where `keyring` 3 would add a second windows-sys,
+# its windows-targets and byteorder. Linux has no keychain here and needs nothing.
+# security-framework 3.7's own manifest marks it "looking-for-maintainer"; it is
+# still the crate `keyring`, rustls-native-certs and native-tls depend on, and the
+# few calls used here are easy to move should it be abandoned. The iOS Keychain is the
+# same API, so the iPhone app (mobile/) uses the same crate, with no new one.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+security-framework = { version = "3.7", default-features = false, features = ["OSX_10_14"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
 
 # `cargo binstall open-live-ingest` fetches the release tarball instead of compiling.
 [package.metadata.binstall]

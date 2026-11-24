@@ -1,7 +1,9 @@
 # Quickstart
 
 An exact command sequence for a fresh Linux box or Mac (Windows: see [Windows](#windows) at the
-end), written to be followed by a script or an
+end; a Mac set up from the DMG instead: see
+[Mac: install from the DMG, open the app](#mac-install-from-the-dmg-open-the-app)), written to be
+followed by a script or an
 agent as well as a person. Each step gives the command, what success looks like, and what to do
 when it does not. Nothing here prompts.
 
@@ -14,7 +16,9 @@ You need, from whoever runs the production:
 | A name for this gateway | `Venue A` | prefixes every source name in Open Live |
 
 Both machines need to be able to reach the internet outbound. Nothing inbound is required in the
-default caller mode.
+default caller mode, which sends through Open Live's SRT relay when Open Live has one and to a port
+on its Strom when it does not. `--uplink-mode relay` insists on the relay; `--uplink-mode listener`
+has the cloud dial this machine instead (README, "Setup", has the three modes).
 
 ## 1. Install
 
@@ -111,6 +115,8 @@ Failure: exit code 1 and an `Error:` line. The message names the fix.
 | `up will start` names a different Strom than `which strom` | a `strom` in the same directory as `open-live-ingest` is used before `PATH`; to use another one, set `binary` under `[strom]` in `gateway.toml` to its full path |
 | `Strom at ... wants a credential` | an existing Strom runs with `STROM_API_KEY`; `export OLI_STROM_API_KEY='<that key>'` and rerun |
 | `Open Live publishes no SRT port range` | pass `--port-range 47110-47129` |
+| `no SRT relay named` | pass `--relay <name>` with one of the names the message lists |
+| `uplink.mode is "relay", but Open Live` | that Open Live has no relay: pass `--uplink-mode caller` |
 | `listener mode needs` | you chose `--uplink-mode listener`; pass `--public-host` and `--port-range` |
 
 Then validate the file on its own:
@@ -164,6 +170,11 @@ with a camera: `up --audio "DeckLink=USB Microphone"` (repeat for more cameras),
 entry in the settings with `device` and `audio`. One audio source goes with one camera. An empty array means no capture device
 is connected or recognised; `up --test` streams a test pattern and tone instead, to commission the
 link before cameras arrive.
+
+With `[[input]]` entries in the settings (the desktop app writes them; `gateway.toml.example` shows
+the fields), `up` sends exactly those inputs, each optionally with an audio source and a `label` for
+its Studio name, and skips one that is not connected. `--devices`, `--all` and `--test` pick for
+one run instead.
 
 ## 5. Start
 
@@ -249,6 +260,41 @@ started. With a service installed, stop the service instead, which does the same
 systemctl --user disable --now open-live-ingest        # Linux
 launchctl bootout gui/$(id -u)/se.eyevinn.open-live-ingest   # macOS
 ```
+
+## Mac: install from the DMG, open the app
+
+On an Apple silicon Mac, the app replaces step 1 and needs no terminal. Only what differs is listed
+here.
+
+Install: download `open-live-ingest-macos-aarch64.dmg` from
+<https://github.com/Eyevinn/open-live-ingest/releases/latest>, open it, and drag
+**Open Live Ingest** onto the Applications folder next to it. Then open Open Live Ingest from
+Applications.
+
+Success: a window titled Open Live Ingest opens, and no terminal does. The app carries its own
+Strom and GStreamer; it neither installs nor uses another one. macOS asks once for the camera and
+the microphone, the first time a feed uses them: allow both.
+
+If the release has no DMG, it is not yet notarized with Apple (#25): use step 1's `install.sh`
+instead. A DMG from a release workflow run's artifacts is signed ad hoc, and macOS refuses to open
+the app once it has been downloaded.
+
+For SSH use, and for steps 2 to 7 as written, put the CLI that comes with the app on `PATH` (once,
+from Terminal on the Mac or over SSH):
+
+```bash
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest" /usr/local/bin/open-live-ingest
+open-live-ingest --version   # open-live-ingest X.Y.Z, the app's version
+```
+
+Success: exit 0 and the version line. `open-live-ingest: command not found` means `/usr/local/bin`
+is not on `PATH`; add it (`export PATH="/usr/local/bin:$PATH"`). Through the symlink the CLI runs
+the app's own Strom and reads the same settings file as the app, so a box set up in the window
+answers `open-live-ingest status` and `down`, and the launchd agent of step 5 (which runs
+`/usr/local/bin/open-live-ingest`) works unchanged. The symlink replaces an `open-live-ingest`
+that `install.sh` put there. Deleting the app breaks it: remove `/usr/local/bin/open-live-ingest`
+with the app.
 
 ## Windows
 

@@ -1,7 +1,9 @@
 //! The install scripts install the Strom release the gateway is built against. That
 //! version is written in Cargo.toml, install.sh and install.ps1, so this checks they
 //! agree, and that build.rs hands the same one to the binary. The macOS app script
-//! reads it from Cargo.toml, and the release workflow's DMG is built by that script.
+//! reads it from Cargo.toml, and the release workflow's DMG is built by that script; the
+//! Strom MSI script reads it too, and the release workflow's Windows installer embeds
+//! the MSI that script fetches.
 
 use std::fs;
 use std::path::Path;
@@ -141,8 +143,77 @@ fn the_release_dmg_bundles_the_strom_cargo_toml_pins() {
     }
 }
 
+/// The Windows installer embeds the Strom MSI the strom-types tag names:
+/// fetch-strom-msi.sh reads the tag from Cargo.toml, and release.yml gets the MSI from it.
+#[test]
+fn the_windows_installer_embeds_the_strom_cargo_toml_pins() {
+    let script = read(".github/scripts/fetch-strom-msi.sh");
+    assert!(
+        script
+            .lines()
+            .any(|l| l.trim_start().starts_with("strom_tag=")
+                && l.contains("strom-types")
+                && l.contains("Cargo.toml")),
+        "fetch-strom-msi.sh must derive strom_tag from the strom-types tag in Cargo.toml"
+    );
+    assert!(
+        !script.contains("STROM_VERSION="),
+        "fetch-strom-msi.sh must not carry its own STROM_VERSION"
+    );
+    let pinned = env!("STROM_PINNED_VERSION");
+    for literal in version_literals(&script) {
+        assert_eq!(
+            literal, pinned,
+            "fetch-strom-msi.sh names Strom {literal} but Cargo.toml pins strom-types to {pinned}"
+        );
+    }
+    let workflow = read(".github/workflows/release.yml");
+    assert!(
+        workflow.lines().any(|l| {
+            let l = l.trim_start();
+            !l.starts_with('#') && l.contains(".github/scripts/fetch-strom-msi.sh ")
+        }),
+        "release.yml must get the installer's Strom MSI from fetch-strom-msi.sh"
+    );
+}
+
 #[test]
 fn version_literals_finds_tags_and_skips_the_rest() {
     let text = "Strom v0.8.2, not v0.8, nor env1.2.3, regex ^v[0-9]+, and v1.10.0.";
     assert_eq!(version_literals(text), vec!["v0.8.2", "v1.10.0"]);
+}
+
+/// `strom-pin.yml`, `bump-strom-pin.sh`, the CI job against a real Strom and
+/// `build-macos-app.sh` all read the pin with `sed -n 's/^strom-types = ...'` on the
+/// root Cargo.toml, so it has to stay one line, at the start, in the root package's
+/// own `[dependencies]` table (not a `[workspace.dependencies]` entry the app inherits).
+#[test]
+fn the_strom_types_pin_is_one_line_in_the_root_dependencies() {
+    let cargo = read("Cargo.toml");
+    let mut table = "";
+    let mut found = Vec::new();
+    for line in cargo.lines() {
+        if line.starts_with('[') {
+            table = line.trim();
+        } else if line.starts_with("strom-types = ") {
+            found.push(table);
+        }
+    }
+    assert_eq!(found, ["[dependencies]"]);
+}
+
+/// `build-macos-app.sh` takes the bundle version from the first `version = "..."` line
+/// of Cargo.toml. With the workspace that is `[workspace.package]`'s, which this
+/// package inherits, so it is still the version the binary reports.
+#[test]
+fn the_first_version_line_of_cargo_toml_is_this_packages_version() {
+    let cargo = read("Cargo.toml");
+    let first = cargo
+        .lines()
+        .find(|l| l.starts_with("version = \""))
+        .expect("a version line");
+    assert_eq!(
+        first,
+        format!("version = \"{}\"", env!("CARGO_PKG_VERSION"))
+    );
 }

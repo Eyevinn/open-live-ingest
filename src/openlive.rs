@@ -1,20 +1,24 @@
-//! Client for the Open Live `/api/v1/sources` API, and the two ways of
-//! authenticating against it.
+//! Client for the Open Live `/api/v1/sources` API, the part of
+//! `/api/v1/productions` that tells which productions hold a source, and the two ways
+//! of authenticating against it.
 //!
 //! The credential must never reach the logs: errors are built from status codes, and
 //! request bodies are never dumped because the source address carries the passphrase.
 
-use crate::config::{mask_passphrase, port_range, AuthMode};
+use crate::config::{self, mask_passphrase, port_range, AuthMode};
+use crate::credential::{KeptCredential, OscCredential};
+use crate::keychain::{OsKeychain, SecretStore};
 use crate::osc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::debug;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const TOKEN_EXCHANGE_URL: &str = "https://token.svc.prod.osaas.io/servicetoken";
+pub(crate) const TOKEN_EXCHANGE_URL: &str = "https://token.svc.prod.osaas.io/servicetoken";
 pub const OPEN_LIVE_SERVICE_ID: &str = "eyevinn-open-live";
 /// Refresh this long before expiry, so a token never dies mid-request.
 const REFRESH_BUFFER: Duration = Duration::from_secs(5 * 60);
@@ -84,10 +88,32 @@ pub struct Source {
     pub connect: Option<Connect>,
 }
 
-/// The part of a source's server-derived `connect` block the gateway reads. Its
-/// `uri` is deliberately not decoded: only the address, masked, is ever printed.
+/// The part of a source's server-derived `connect` block the gateway reads: where
+/// the outside party sends to. Every field is optional, as an older Open Live sends
+/// fewer of them. It never carries a passphrase.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 pub struct Connect {
+    /// The address the outside party dials, or `None` when Open Live cannot resolve
+    /// it (`reason` then says why). For a relay address
+    /// `srt://<relay public host:port>?streamid=<id>`.
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// The host and port in `uri`.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Why `uri` is null: for a relay address `srt-relay-not-configured`,
+    /// `srt-relay-unknown`, `srt-relay-unreachable` or `srt-relay-public-unknown`.
+    /// Kept as a string so a code this gateway does not know still shows.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Relay addresses only: the relay's name (`default` when the address names none).
+    #[serde(default)]
+    pub relay: Option<String>,
+    /// Relay addresses only: the stream id the outside party sends with.
+    #[serde(default)]
+    pub streamid: Option<String>,
     /// A reason the address may not work against the cloud Strom, such as
     /// `srt-listener-unsupported`. Reported, never enforced: the source is stored all
     /// the same. Kept as a string so a code this gateway does not know still shows.
@@ -99,6 +125,165 @@ impl Source {
     /// Open Live's `connect.warning` for this source, if it reports one.
     pub fn connect_warning(&self) -> Option<&str> {
         self.connect.as_ref()?.warning.as_deref()
+    }
+
+    /// The relay this source goes through, as Open Live reports it in `connect`.
+    pub fn relay(&self) -> Option<&str> {
+        self.connect.as_ref()?.relay.as_deref()
+    }
+
+    /// Where the outside party dials this source (`connect.uri`), if Open Live
+    /// resolved it.
+    pub fn dial_in(&self) -> Option<&str> {
+        self.connect.as_ref()?.uri.as_deref()
+    }
+
+    /// For a source through the relay: the stream id, dial-in address, host and port
+    /// Open Live resolved for it, or the operator's words for why it could not.
+    pub fn relay_dial_in(&self) -> std::result::Result<RelayDialIn, String> {
+        let connect = self.connect.as_ref().ok_or_else(|| {
+            "Open Live returned no dial-in address for it; it is too old to send through an SRT relay".to_string()
+        })?;
+        let relay = connect.relay.as_deref().unwrap_or(config::DEFAULT_RELAY);
+        match (
+            connect.uri.as_deref(),
+            connect.streamid.as_deref(),
+            connect.host.as_deref(),
+            connect.port,
+        ) {
+            (Some(uri), Some(streamid), Some(host), Some(port)) => Ok(RelayDialIn {
+                stream_id: streamid.to_string(),
+                uri: uri.to_string(),
+                host: host.to_string(),
+                port,
+            }),
+            _ => Err(relay_reason_message(connect.reason.as_deref(), relay)),
+        }
+    }
+}
+
+/// Where the gateway dials a source through the relay, from Open Live's `connect`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayDialIn {
+    pub stream_id: String,
+    /// `srt://<relay public host:port>?streamid=<id>`, never with a passphrase.
+    pub uri: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Open Live's `connect.reason` for a relay address, in an operator's words.
+pub fn relay_reason_message(reason: Option<&str>, relay: &str) -> String {
+    match reason {
+        Some("srt-relay-not-configured") => format!(
+            "Open Live reports no SRT relay, so it cannot give an address for relay {relay:?} (srt-relay-not-configured)"
+        ),
+        Some("srt-relay-unknown") => format!(
+            "Open Live has no SRT relay named {relay:?} (srt-relay-unknown); set uplink.relay to one it has"
+        ),
+        Some("srt-relay-unreachable") => format!(
+            "Open Live could not ask its Strom about SRT relay {relay:?} (srt-relay-unreachable); try again shortly"
+        ),
+        Some("srt-relay-public-unknown") => format!(
+            "Open Live's Strom reports SRT relay {relay:?} without a public address to dial (srt-relay-public-unknown)"
+        ),
+        Some(other) => format!("Open Live gave no address to dial relay {relay:?} ({other})"),
+        None => format!("Open Live gave no address to dial relay {relay:?}"),
+    }
+}
+
+/// A production's state, as Open Live's `ProductionStatus` names it. A state this
+/// gateway does not know still decodes, as `Unknown`, so a newer Open Live does not
+/// break the production list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProductionState {
+    Inactive,
+    Activating,
+    Active,
+    /// Was active and has been stopped; it does not run again until activated.
+    Ended,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ProductionState {
+    /// The word for it, as Open Live spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProductionState::Inactive => "inactive",
+            ProductionState::Activating => "activating",
+            ProductionState::Active => "active",
+            ProductionState::Ended => "ended",
+            ProductionState::Unknown => "unknown",
+        }
+    }
+}
+
+/// One source assignment of a production: which source sits in which mixer input
+/// (the slot, `video_in_<n>`). Open Live's assignment carries more (a guest return
+/// feed, recording); only these two are read.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ProductionSlot {
+    #[serde(rename = "sourceId")]
+    pub source_id: String,
+    #[serde(rename = "mixerInput")]
+    pub mixer_input: String,
+}
+
+/// A production as `GET /api/v1/productions` lists it, reduced to what tells whether
+/// it holds a source of this gateway and whether it runs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawProduction")]
+pub struct Production {
+    pub id: String,
+    pub name: String,
+    pub state: ProductionState,
+    pub sources: Vec<ProductionSlot>,
+}
+
+impl Production {
+    /// The slots (mixer inputs) that hold `source_id`, in Open Live's order. Empty
+    /// when this production does not use the source.
+    pub fn slots_of<'a>(&'a self, source_id: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.sources
+            .iter()
+            .filter(move |s| s.source_id == source_id)
+            .map(|s| s.mixer_input.as_str())
+    }
+}
+
+/// The wire shape. The production routes return the CouchDB document, so the id is
+/// `_id` (as Studio reads it), although the OpenAPI document names it `id`; either is
+/// taken, `_id` first.
+#[derive(Deserialize)]
+struct RawProduction {
+    #[serde(rename = "_id", default)]
+    doc_id: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: String,
+    status: ProductionState,
+    #[serde(default)]
+    sources: Vec<ProductionSlot>,
+}
+
+impl TryFrom<RawProduction> for Production {
+    type Error = String;
+
+    fn try_from(raw: RawProduction) -> std::result::Result<Self, Self::Error> {
+        let id = raw
+            .doc_id
+            .or(raw.id)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "a production without an id".to_string())?;
+        Ok(Production {
+            id,
+            name: raw.name,
+            state: raw.status,
+            sources: raw.sources,
+        })
     }
 }
 
@@ -156,12 +341,74 @@ pub struct ServerInfo {
     /// `reserved`, `pending`, `unsupported`, or `disabled`. `pending` means Open Live
     /// has not yet obtained its ports from Strom and is still retrying.
     pub srt_port_state: Option<String>,
+    /// What SRT can do on the cloud Strom, the SRT relays above all. `None` from an
+    /// Open Live older than the block (v0.8.0 and before).
+    pub srt: Option<SrtInfo>,
 }
 
 impl ServerInfo {
     pub fn lease_pending(&self) -> bool {
         self.srt_port_state.as_deref() == Some("pending")
     }
+
+    /// The SRT relays Open Live reports, `default` first. Empty when it reports none
+    /// or is older than relays.
+    pub fn relays(&self) -> &[Relay] {
+        self.srt
+            .as_ref()
+            .map(|s| s.relays.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The relay called `name`, if Open Live reports it.
+    pub fn relay(&self, name: &str) -> Option<&Relay> {
+        self.relays().iter().find(|r| r.name == name)
+    }
+}
+
+/// Server-info's `srt` block: what Strom reports about SRT, from its capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SrtInfo {
+    /// `ok`, `unsupported` (an older Strom: every mode, no relay), `unreachable` (the
+    /// values are the last known ones) or `unknown` (not asked yet).
+    #[serde(default)]
+    pub state: Option<String>,
+    /// The SRT modes that can work on the cloud Strom.
+    #[serde(default)]
+    pub modes: Option<SrtModes>,
+    /// The SRT relays the cloud Strom can use, `default` first.
+    #[serde(default)]
+    pub relays: Vec<Relay>,
+    /// Whether a port the cloud Strom binds can be reached from outside; `None` when
+    /// not known.
+    #[serde(default)]
+    pub inbound_reachable: Option<bool>,
+    /// The cloud Strom's port spans, or `None` (any port, or not known).
+    #[serde(default)]
+    pub ports: Option<Vec<PortSpan>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct SrtModes {
+    pub listener: bool,
+    pub caller: bool,
+    pub rendezvous: bool,
+}
+
+/// One SRT relay: its name, and its public `host:port`, which the dial-in addresses
+/// of its sources carry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Relay {
+    pub name: String,
+    #[serde(default)]
+    pub public: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct PortSpan {
+    pub first: u16,
+    pub last: u16,
 }
 
 /// Pure, so the shapes the route has had can be tested without a server.
@@ -214,10 +461,19 @@ fn parse_server_info(body: &serde_json::Value) -> Result<ServerInfo> {
         .or_else(|| body.get("srtPortLease"))
         .and_then(|v| v.as_str())
         .map(|s| if s == "leased" { "reserved" } else { s }.to_string());
+    // Absent or null from an Open Live older than relays, which then runs as before.
+    let srt = match body.get("srt").filter(|v| !v.is_null()) {
+        Some(srt) => Some(
+            SrtInfo::deserialize(srt)
+                .context("Open Live published an srt block that does not decode")?,
+        ),
+        None => None,
+    };
     Ok(ServerInfo {
         strom_host,
         srt_ports,
         srt_port_state,
+        srt,
     })
 }
 
@@ -235,8 +491,95 @@ impl OpenLiveClient {
                 .build()
                 .context("building HTTP client")?,
             base_url: base_url.trim_end_matches('/').to_string(),
-            auth: Auth::new(auth_mode, api_key.filter(|k| !k.trim().is_empty()))?,
+            auth: Auth::new(auth_mode, api_key.filter(|k| !k.trim().is_empty()), None)?,
         })
+    }
+
+    /// A client for the Open Live in the settings, with its credential as `up` uses
+    /// it: from the OS keychain when the settings say so (`open_live.credential`).
+    pub fn from_settings(settings: &config::OpenLive) -> Result<Self> {
+        Self::from_settings_with(settings, Arc::new(OsKeychain::default()))
+    }
+
+    /// [`from_settings`](Self::from_settings), with `keychain` standing in for the OS
+    /// keychain.
+    pub fn from_settings_with(
+        settings: &config::OpenLive,
+        keychain: Arc<dyn SecretStore>,
+    ) -> Result<Self> {
+        let url = settings.url.as_deref().context("open_live.url is unset")?;
+        let api_key = settings.api_key.as_deref().filter(|k| !k.trim().is_empty());
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .context("building HTTP client")?,
+            base_url: url.trim_end_matches('/').to_string(),
+            auth: Auth::new(
+                settings.auth_mode,
+                api_key,
+                settings.uses_keychain().then_some(keychain),
+            )?,
+        })
+    }
+
+    /// A client for the Open Live in the settings, with `credential` from the app in
+    /// place of any the settings or the command line would supply: a token in hand,
+    /// or the sign-in in a keychain, renewed as it is used. Nothing is read from
+    /// `open_live.api_key`, `OSC_ACCESS_TOKEN` or `~/.osc/token`. A self-hosted Open
+    /// Live (`auth_mode = "direct"`) takes its key from the settings as ever, and
+    /// `credential` is not used.
+    pub fn with_osc_credential(
+        settings: &config::OpenLive,
+        credential: &OscCredential,
+    ) -> Result<Self> {
+        let url = settings.url.as_deref().context("open_live.url is unset")?;
+        if settings.auth_mode != AuthMode::Osc {
+            return Self::new(url, settings.auth_mode, settings.api_key.as_deref());
+        }
+        let mut exchange_url = TOKEN_EXCHANGE_URL.to_string();
+        let pat = match credential {
+            OscCredential::Token(token) => {
+                let token = token.trim();
+                if token.is_empty() {
+                    bail!("no Open Source Cloud credential");
+                }
+                OscToken::Configured(token.to_string())
+            }
+            OscCredential::Keychain(_) | OscCredential::KeychainAt(..) => {
+                let (kept, url) = credential.kept().expect("a kept credential")?;
+                exchange_url = url;
+                OscToken::Keychain(Box::new(kept))
+            }
+        };
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .context("building HTTP client")?,
+            base_url: url.trim_end_matches('/').to_string(),
+            auth: Auth::Osc {
+                pat,
+                cache: Mutex::new(None),
+                exchange: exchange_url,
+            },
+        })
+    }
+
+    /// When the Open Source Cloud credential in use stops working with no way to
+    /// renew it, if that falls within `within` from now: Unix seconds. None for a
+    /// sign-in that refreshes, a token that does not expire that soon, and a
+    /// self-hosted Open Live. A caller about to go live warns with it (#65 AC2).
+    pub fn osc_sign_in_ends_within(&self, within: Duration) -> Option<u64> {
+        let Auth::Osc { pat, .. } = &self.auth else {
+            return None;
+        };
+        let end = match pat {
+            OscToken::Keychain(kept) => return kept.ends_within(within),
+            OscToken::Configured(token) => osc::inspect(token)?.expires_at?,
+            OscToken::CliLogin => osc::inspect(&osc::saved_token()?)?.expires_at?,
+        };
+        (end <= osc::now().as_secs() + within.as_secs()).then_some(end)
     }
 
     /// The cloud Strom's hostname and SRT ports, so a venue needs only the Open Live
@@ -323,6 +666,60 @@ impl OpenLiveClient {
         Ok(())
     }
 
+    /// Every production on the instance, whatever its state.
+    pub async fn list_productions(&self) -> Result<Vec<Production>> {
+        let res = self
+            .get("/api/v1/productions")
+            .await?
+            .send()
+            .await
+            .context("GET productions")?;
+        ok(res, "GET productions")?
+            .json()
+            .await
+            .context("decoding productions")
+    }
+
+    /// Puts `source_id` in the slot `mixer_input` (`video_in_<n>`) of a production,
+    /// replacing whatever that slot held. Open Live answers 201 with the assignment.
+    /// A production that is already running reads its slots at activation, so the
+    /// change may only take effect when it is activated again.
+    pub async fn assign_source(
+        &self,
+        production_id: &str,
+        source_id: &str,
+        mixer_input: &str,
+    ) -> Result<ProductionSlot> {
+        let url = self.url_of(&["api", "v1", "productions", production_id, "sources"])?;
+        let body = ProductionSlot {
+            source_id: source_id.to_string(),
+            mixer_input: mixer_input.to_string(),
+        };
+        let res = self
+            .auth(self.http.post(url))
+            .await?
+            .json(&body)
+            .send()
+            .await
+            .context("POST production source")?;
+        ok_or_refused(res, "POST production source")
+            .await?
+            .json()
+            .await
+            .context("decoding the production source")
+    }
+
+    /// The base URL with `segments` appended, each percent-encoded, so an id from
+    /// the server cannot reach another route.
+    fn url_of(&self, segments: &[&str]) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&self.base_url).context("the Open Live URL")?;
+        url.path_segments_mut()
+            .map_err(|()| anyhow::anyhow!("the Open Live URL cannot take a path"))?
+            .pop_if_empty()
+            .extend(segments);
+        Ok(url)
+    }
+
     async fn get(&self, path: &str) -> Result<reqwest::RequestBuilder> {
         self.auth(self.http.get(format!("{}{path}", self.base_url)))
             .await
@@ -358,6 +755,11 @@ pub struct Refused {
     pub status: reqwest::StatusCode,
     /// Open Live's `error` field, when the body carried one.
     pub reason: Option<String>,
+    /// Open Live's machine-readable `code`, for a relay refusal
+    /// `srt-relay-not-configured` or `srt-relay-unknown`.
+    pub code: Option<String>,
+    /// With `code`: the relays Open Live does have (empty when none).
+    pub relays: Vec<String>,
 }
 
 impl std::fmt::Display for Refused {
@@ -373,12 +775,52 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 impl Refused {
+    /// For a relay refusal (`code`), what to do about it in an operator's words:
+    /// which relays Open Live does have. `None` for any other refusal.
+    pub fn relay_advice(&self) -> Option<String> {
+        match self.code.as_deref()? {
+            "srt-relay-not-configured" => Some(
+                "Open Live reports no SRT relay; set uplink.mode = \"caller\" to send to a port on its Strom instead".to_string(),
+            ),
+            "srt-relay-unknown" if !self.relays.is_empty() => Some(format!(
+                "Open Live has the relay(s) {}; set uplink.relay to one of them",
+                self.relays.join(", ")
+            )),
+            _ => None,
+        }
+    }
+
     /// Open Live's own words when it gave any, the status line otherwise.
     pub fn explain(&self) -> String {
         self.reason
             .clone()
             .unwrap_or_else(|| format!("HTTP {}", self.status))
     }
+}
+
+/// The relay refusal of an Open Live error body: its `code` and, with it, the
+/// `relays` it has. Short strings only, so nothing the request carried is echoed.
+fn error_code(body: &[u8]) -> (Option<String>, Vec<String>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (None, Vec::new());
+    };
+    let code = value
+        .get("code")
+        .and_then(|c| c.as_str())
+        .filter(|c| !c.is_empty() && c.len() <= 64)
+        .map(str::to_string);
+    let relays = value
+        .get("relays")
+        .and_then(|r| r.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|r| r.as_str())
+                .filter(|r| config::is_relay_name(r))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    (code, relays)
 }
 
 /// The `error` field of an Open Live error body. Only the short message is taken,
@@ -404,11 +846,15 @@ async fn ok_or_refused(res: reqwest::Response, what: &str) -> Result<reqwest::Re
     if status == reqwest::StatusCode::CONFLICT
         || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY
     {
-        let reason = res.bytes().await.ok().and_then(|b| error_reason(&b));
+        let body = res.bytes().await.ok();
+        let reason = body.as_deref().and_then(error_reason);
+        let (code, relays) = body.as_deref().map(error_code).unwrap_or_default();
         return Err(Refused {
             what: what.to_string(),
             status,
             reason,
+            code,
+            relays,
         }
         .into());
     }
@@ -423,20 +869,33 @@ enum Auth {
     Osc {
         pat: OscToken,
         cache: Mutex<Option<CachedToken>>,
+        /// Where the personal access token is exchanged for service tokens.
+        exchange: String,
     },
 }
 
 /// Where the OSC personal access token comes from. A configured one wins, so a
 /// deployment tool that injects a key is not overridden by whoever logged in on the
-/// box; otherwise the OSC CLI's login is read afresh at each exchange, so logging in
-/// again renews a running gateway.
+/// box; then the OS keychain, when the settings say a sign-in from the app is kept
+/// there; otherwise the OSC CLI's login is read afresh at each exchange, so logging
+/// in again renews a running gateway.
 pub enum OscToken {
     Configured(String),
+    /// A sign-in kept in the OS keychain, refreshed as it nears expiry.
+    Keychain(Box<KeptCredential>),
     CliLogin,
 }
 
 impl OscToken {
-    pub fn resolve(configured: Option<&str>) -> Result<Self> {
+    pub fn resolve(
+        configured: Option<&str>,
+        keychain: Option<Arc<dyn SecretStore>>,
+    ) -> Result<Self> {
+        if let Some(store) =
+            keychain.filter(|_| configured.map(str::trim).is_none_or(str::is_empty))
+        {
+            return Ok(OscToken::Keychain(Box::new(KeptCredential::new(store)?)));
+        }
         Self::resolve_with(configured, osc::saved_token().is_some())
     }
 
@@ -453,9 +912,10 @@ impl OscToken {
         )
     }
 
-    fn read(&self) -> Result<String> {
+    async fn read(&self) -> Result<String> {
         match self {
             OscToken::Configured(key) => Ok(key.clone()),
+            OscToken::Keychain(kept) => kept.access_token().await,
             OscToken::CliLogin => {
                 let token = osc::saved_token().with_context(|| {
                     format!(
@@ -481,6 +941,7 @@ impl OscToken {
     fn rejected_hint(&self) -> String {
         match self {
             OscToken::Configured(_) => "check open_live.api_key".to_string(),
+            OscToken::Keychain(_) => crate::credential::SIGN_IN_AGAIN.to_string(),
             OscToken::CliLogin => format!(
                 "the OSC CLI login has probably expired; run `{}` again",
                 osc::LOGIN_COMMAND
@@ -503,12 +964,17 @@ struct ServiceTokenResponse {
 }
 
 impl Auth {
-    fn new(mode: AuthMode, key: Option<&str>) -> Result<Self> {
+    fn new(
+        mode: AuthMode,
+        key: Option<&str>,
+        keychain: Option<Arc<dyn SecretStore>>,
+    ) -> Result<Self> {
         Ok(match mode {
             AuthMode::Direct => Auth::Direct(key.map(str::to_string)),
             AuthMode::Osc => Auth::Osc {
-                pat: OscToken::resolve(key)?,
+                pat: OscToken::resolve(key, keychain)?,
                 cache: Mutex::new(None),
+                exchange: TOKEN_EXCHANGE_URL.to_string(),
             },
         })
     }
@@ -516,12 +982,16 @@ impl Auth {
     async fn bearer(&self, http: &reqwest::Client) -> Result<Option<String>> {
         match self {
             Auth::Direct(key) => Ok(key.clone()),
-            Auth::Osc { pat, cache } => {
+            Auth::Osc {
+                pat,
+                cache,
+                exchange: url,
+            } => {
                 let mut guard = cache.lock().await;
                 if let Some(cached) = guard.as_ref().filter(|c| !is_expiring(c)) {
                     return Ok(Some(cached.token.clone()));
                 }
-                let fresh = exchange(http, pat).await?;
+                let fresh = exchange(http, url, pat).await?;
                 let token = fresh.token.clone();
                 *guard = Some(fresh);
                 Ok(Some(token))
@@ -540,11 +1010,15 @@ fn is_expiring(cached: &CachedToken) -> bool {
     now() + REFRESH_BUFFER >= cached.expires_at
 }
 
-async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken> {
-    let token = pat.read()?;
-    let res = post_service_token(http, &token).await?;
+async fn exchange(http: &reqwest::Client, url: &str, pat: &OscToken) -> Result<CachedToken> {
+    let token = pat.read().await?;
+    let res = post_service_token_at(http, url, &token).await?;
     let status = res.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        // Refused before it expired, so revoked: the next try refreshes first.
+        if let OscToken::Keychain(kept) = pat {
+            kept.discard_access().await;
+        }
         bail!(
             "OSC token exchange failed with HTTP {status}; {}",
             pat.rejected_hint()
@@ -555,12 +1029,25 @@ async fn exchange(http: &reqwest::Client, pat: &OscToken) -> Result<CachedToken>
 
 /// A one-off service token for Open Live, for setup to list instances with.
 pub async fn service_token(http: &reqwest::Client, pat: &str) -> Result<String> {
-    let res = post_service_token(http, pat).await?;
+    service_token_at(http, TOKEN_EXCHANGE_URL, pat).await
+}
+
+/// [`service_token`], from the exchange at `url`.
+pub(crate) async fn service_token_at(
+    http: &reqwest::Client,
+    url: &str,
+    pat: &str,
+) -> Result<String> {
+    let res = post_service_token_at(http, url, pat).await?;
     Ok(decode_service_token(res).await?.token)
 }
 
-async fn post_service_token(http: &reqwest::Client, pat: &str) -> Result<reqwest::Response> {
-    http.post(TOKEN_EXCHANGE_URL)
+async fn post_service_token_at(
+    http: &reqwest::Client,
+    url: &str,
+    pat: &str,
+) -> Result<reqwest::Response> {
+    http.post(url)
         .header("x-pat-jwt", format!("Bearer {pat}"))
         .header("accept", "application/json")
         .json(&serde_json::json!({ "serviceId": OPEN_LIVE_SERVICE_ID }))
@@ -597,10 +1084,13 @@ mod tests {
     #[test]
     fn direct_mode_sends_the_key_as_is_or_nothing() {
         assert_eq!(
-            bearer_of(&Auth::new(AuthMode::Direct, Some("k")).unwrap()).as_deref(),
+            bearer_of(&Auth::new(AuthMode::Direct, Some("k"), None).unwrap()).as_deref(),
             Some("k")
         );
-        assert_eq!(bearer_of(&Auth::new(AuthMode::Direct, None).unwrap()), None);
+        assert_eq!(
+            bearer_of(&Auth::new(AuthMode::Direct, None, None).unwrap()),
+            None
+        );
     }
 
     /// A key in the settings or the environment is deliberate and wins; the CLI login
@@ -617,7 +1107,156 @@ mod tests {
             Ok(OscToken::CliLogin)
         ));
         assert!(OscToken::resolve_with(None, false).is_err());
-        assert_eq!(OscToken::Configured("pat".into()).read().unwrap(), "pat");
+        let pat = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(OscToken::Configured("pat".into()).read())
+            .unwrap();
+        assert_eq!(pat, "pat");
+    }
+
+    /// The app's credential replaces whatever the settings point at, marker or not,
+    /// and never falls back to the CLI's login; a self-hosted Open Live keeps its key.
+    #[test]
+    fn the_apps_credential_is_used_in_place_of_the_settings() {
+        use crate::keychain::MemoryKeychain;
+
+        let mut settings = config::OpenLive {
+            url: Some("https://venue.osaas.io".into()),
+            auth_mode: AuthMode::Osc,
+            api_key: Some("pat-in-the-file".into()),
+            ..Default::default()
+        };
+        let token = OpenLiveClient::with_osc_credential(&settings, &" app-token ".into()).unwrap();
+        assert!(
+            matches!(&token.auth, Auth::Osc { pat: OscToken::Configured(t), .. } if t == "app-token"),
+            "the app's token wins over the file's"
+        );
+
+        let keychain: Arc<dyn SecretStore> = Arc::new(MemoryKeychain::new());
+        let kept =
+            OpenLiveClient::with_osc_credential(&settings, &OscCredential::Keychain(keychain))
+                .unwrap();
+        assert!(
+            matches!(
+                &kept.auth,
+                Auth::Osc {
+                    pat: OscToken::Keychain(_),
+                    ..
+                }
+            ),
+            "the keychain is used without the marker in the settings"
+        );
+
+        assert!(OpenLiveClient::with_osc_credential(&settings, &"  ".into()).is_err());
+
+        // Against the Open Source Cloud an app's own tests point it at.
+        let endpoints = osc::Endpoints {
+            connect: "http://127.0.0.1:9".into(),
+            catalog: "http://127.0.0.1:9/mysubscriptions".into(),
+            token_exchange: "http://127.0.0.1:9/servicetoken".into(),
+        };
+        let at = OpenLiveClient::with_osc_credential(
+            &settings,
+            &OscCredential::KeychainAt(Arc::new(MemoryKeychain::new()), endpoints),
+        )
+        .unwrap();
+        assert!(
+            matches!(&at.auth, Auth::Osc { pat: OscToken::Keychain(_), exchange, .. } if exchange == "http://127.0.0.1:9/servicetoken"),
+            "the token is exchanged where the app says"
+        );
+        assert!(matches!(&kept.auth, Auth::Osc { exchange, .. } if exchange == TOKEN_EXCHANGE_URL));
+
+        settings.url = Some("http://127.0.0.1:3000".into());
+        settings.auth_mode = AuthMode::Direct;
+        settings.api_key = Some("self-hosted-key".into());
+        let direct = OpenLiveClient::with_osc_credential(&settings, &"app-token".into()).unwrap();
+        assert!(
+            matches!(&direct.auth, Auth::Direct(Some(k)) if k == "self-hosted-key"),
+            "a self-hosted Open Live takes no OSC credential"
+        );
+    }
+
+    /// The keychain is used when the settings point at it and no token in the file
+    /// overrides it, and only a credential that cannot be renewed and ends soon is
+    /// worth warning about before going live (#65 AC2).
+    #[test]
+    fn the_keychain_credential_is_used_when_marked_and_warned_about_only_if_it_ends() {
+        use crate::config::CredentialStore;
+        use crate::credential::{self, StoredCredential, SESSION_HORIZON};
+        use crate::keychain::MemoryKeychain;
+
+        let keychain = Arc::new(MemoryKeychain::new());
+        let mut settings = config::OpenLive {
+            url: Some("https://venue.osaas.io".into()),
+            auth_mode: AuthMode::Osc,
+            credential: Some(CredentialStore::Keychain),
+            ..Default::default()
+        };
+        let client =
+            |s: &config::OpenLive| OpenLiveClient::from_settings_with(s, keychain.clone()).unwrap();
+        let is_keychain = |c: &OpenLiveClient| {
+            matches!(
+                &c.auth,
+                Auth::Osc {
+                    pat: OscToken::Keychain(_),
+                    ..
+                }
+            )
+        };
+
+        credential::keep(
+            keychain.as_ref(),
+            &StoredCredential::SignIn {
+                refresh_token: "r".into(),
+                client_id: "c".into(),
+            },
+        )
+        .unwrap();
+        let signed_in = client(&settings);
+        assert!(is_keychain(&signed_in));
+        assert_eq!(signed_in.osc_sign_in_ends_within(SESSION_HORIZON), None);
+
+        let in_an_hour = osc::now().as_secs() + 3600;
+        credential::keep(
+            keychain.as_ref(),
+            &StoredCredential::Token {
+                token: "t".into(),
+                expires_at: Some(in_an_hour),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            signed_in.osc_sign_in_ends_within(SESSION_HORIZON),
+            Some(in_an_hour)
+        );
+        assert_eq!(
+            signed_in.osc_sign_in_ends_within(Duration::from_secs(60)),
+            None
+        );
+
+        settings.api_key = Some("pat".into());
+        let configured = client(&settings);
+        assert!(!is_keychain(&configured), "a token in the settings wins");
+        assert_eq!(configured.osc_sign_in_ends_within(SESSION_HORIZON), None);
+
+        // {"tenantId":"ludde","exp":1788956652}: long past, so it is reported.
+        settings.api_key = Some(
+            "h.eyJ0ZW5hbnRJZCI6Imx1ZGRlIiwiZXhwIjoxNzg4OTU2NjUyLCJpYXQiOjE3ODg5NTMwNTJ9.s".into(),
+        );
+        assert_eq!(
+            client(&settings).osc_sign_in_ends_within(SESSION_HORIZON),
+            Some(1788956652)
+        );
+
+        let direct = config::OpenLive {
+            url: Some("http://127.0.0.1:3000".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            client(&direct).osc_sign_in_ends_within(SESSION_HORIZON),
+            None
+        );
     }
 
     /// A token inside the refresh buffer must count as expiring, or a request can go
@@ -655,6 +1294,7 @@ mod tests {
                 strom_host: Some("strom.example.com".into()),
                 srt_ports: Some((47110..=47129).collect()),
                 srt_port_state: Some("reserved".into()),
+                srt: None,
             }
         );
         assert!(!current.lease_pending());
@@ -693,6 +1333,7 @@ mod tests {
                 strom_host: Some("strom.example.com".into()),
                 srt_ports: Some([47110, 47111, 47250].into_iter().collect()),
                 srt_port_state: Some("reserved".into()),
+                srt: None,
             }
         );
         assert!(!info.lease_pending());
@@ -1029,6 +1670,358 @@ mod tests {
             patched.connect_warning(),
             Some("srt-port-outside-strom-ports")
         );
+    }
+
+    /// Like `serve_once`, and hands back the request it got: the request line, the
+    /// headers and the body, as text.
+    async fn serve_once_seeing(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (seen_tx, seen) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Headers, then as much body as content-length says.
+            loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length || n == 0 {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let _ = seen_tx.send(String::from_utf8_lossy(&request).to_string());
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// Open Live's list, in the shape its route sends: CouchDB documents with `_id`,
+    /// every state, a production with no sources, and fields the gateway ignores.
+    #[tokio::test]
+    async fn the_production_list_decodes_ids_states_and_slots() {
+        let (base, seen) = serve_once_seeing(
+            "200 OK",
+            r#"[
+              {"_id":"prod-1","_rev":"3-x","type":"production","name":"Morning Show","status":"active",
+               "sources":[{"sourceId":"src-1","mixerInput":"video_in_0","record":"transcode"},
+                          {"sourceId":"src-2","mixerInput":"video_in_1"},
+                          {"sourceId":"src-1","mixerInput":"video_in_3"}],
+               "pipeline":{"stromConfig":null,"status":"running"},"subscriberCount":2},
+              {"_id":"prod-2","name":"Evening News","status":"inactive","sources":[]},
+              {"_id":"prod-3","name":"Rehearsal","status":"activating","sources":[{"sourceId":"src-1","mixerInput":"video_in_2"}]},
+              {"_id":"prod-4","name":"Yesterday","status":"ended"},
+              {"id":"prod-5","name":"Future","status":"paused","sources":[]}
+            ]"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, Some("key")).unwrap();
+        let productions = client.list_productions().await.unwrap();
+
+        let request = seen.await.unwrap();
+        assert!(request.starts_with("GET /api/v1/productions HTTP/1.1"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer key"));
+
+        let ids: Vec<&str> = productions.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["prod-1", "prod-2", "prod-3", "prod-4", "prod-5"]);
+        let states: Vec<ProductionState> = productions.iter().map(|p| p.state).collect();
+        assert_eq!(
+            states,
+            [
+                ProductionState::Active,
+                ProductionState::Inactive,
+                ProductionState::Activating,
+                ProductionState::Ended,
+                ProductionState::Unknown,
+            ]
+        );
+        assert_eq!(productions[0].name, "Morning Show");
+        assert_eq!(
+            productions[0].slots_of("src-1").collect::<Vec<_>>(),
+            ["video_in_0", "video_in_3"]
+        );
+        assert_eq!(productions[0].slots_of("src-9").count(), 0);
+        assert!(productions[3].sources.is_empty());
+    }
+
+    #[test]
+    fn a_production_without_an_id_is_refused() {
+        let err = serde_json::from_value::<Production>(serde_json::json!({
+            "name": "x", "status": "active", "sources": []
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("without an id"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_production_list_is_an_error_with_the_status_only() {
+        let base = serve_once(
+            "503 Service Unavailable",
+            r#"{"error":"Database unavailable"}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client.list_productions().await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "GET productions failed with HTTP 503 Service Unavailable"
+        );
+    }
+
+    /// The body is Open Live's `SourceAssignmentInput`: `sourceId` and `mixerInput`,
+    /// nothing else, so no guest return, preview or recording is switched on. The
+    /// production id is one path segment, encoded.
+    #[tokio::test]
+    async fn assigning_a_source_posts_the_source_and_the_slot() {
+        let (base, seen) = serve_once_seeing(
+            "201 Created",
+            r#"{"sourceId":"src-1","mixerInput":"video_in_2","_rev":"4-y"}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&format!("{base}/"), AuthMode::Direct, None).unwrap();
+        let slot = client
+            .assign_source("prod-1/../x", "src-1", "video_in_2")
+            .await
+            .unwrap();
+        assert_eq!(
+            slot,
+            ProductionSlot {
+                source_id: "src-1".to_string(),
+                mixer_input: "video_in_2".to_string(),
+            }
+        );
+        let request = seen.await.unwrap();
+        assert!(
+            request.starts_with("POST /api/v1/productions/prod-1%2F..%2Fx/sources HTTP/1.1"),
+            "{request}"
+        );
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({"sourceId": "src-1", "mixerInput": "video_in_2"})
+        );
+    }
+
+    #[tokio::test]
+    async fn assigning_to_a_missing_production_is_an_error() {
+        let base = serve_once(
+            "404 Not Found",
+            r#"{"error":"Production not found","statusCode":404}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client
+            .assign_source("prod-9", "src-1", "video_in_0")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "POST production source failed with HTTP 404 Not Found"
+        );
+    }
+
+    /// The `srt` block of an Open Live with relays (open-live `src/routes/status.ts`):
+    /// relays, modes, reachability and Strom's port spans.
+    #[test]
+    fn server_info_decodes_the_srt_block_with_its_relays() {
+        let info = parse_server_info(&serde_json::json!({
+            "stromHost": "strom.example.com",
+            "srtPorts": null,
+            "srtPortState": "unsupported",
+            "srt": {
+                "state": "ok",
+                "modes": { "listener": false, "caller": true, "rendezvous": false },
+                "relays": [
+                    { "name": "default", "public": "relay.example.com:6000" },
+                    { "name": "eu-north", "public": "relay-eu.example.com:6000" }
+                ],
+                "inboundReachable": false,
+                "ports": [{ "first": 47100, "last": 47199 }]
+            }
+        }))
+        .unwrap();
+        assert_eq!(info.srt_ports, None);
+        let srt = info.srt.as_ref().unwrap();
+        assert_eq!(srt.state.as_deref(), Some("ok"));
+        assert_eq!(
+            srt.modes,
+            Some(SrtModes {
+                listener: false,
+                caller: true,
+                rendezvous: false
+            })
+        );
+        assert_eq!(srt.inbound_reachable, Some(false));
+        assert_eq!(
+            srt.ports,
+            Some(vec![PortSpan {
+                first: 47100,
+                last: 47199
+            }])
+        );
+        let names: Vec<&str> = info.relays().iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["default", "eu-north"]);
+        assert_eq!(
+            info.relay("eu-north").map(|r| r.public.as_str()),
+            Some("relay-eu.example.com:6000")
+        );
+        assert_eq!(info.relay("nowhere"), None);
+
+        // Strom not asked yet: every field may be null or empty, and no relay.
+        let unknown = parse_server_info(&serde_json::json!({
+            "srt": { "state": "unknown", "relays": [], "inboundReachable": null, "ports": null }
+        }))
+        .unwrap();
+        assert!(unknown.srt.is_some());
+        assert!(unknown.relays().is_empty());
+
+        assert!(parse_server_info(&serde_json::json!({ "srt": { "relays": "default" } })).is_err());
+    }
+
+    /// v0.8.0, the latest release when relays came: no `srt` at all. Nothing about
+    /// relays is read, and the ports are read as before (AC5).
+    #[test]
+    fn server_info_of_open_live_0_8_0_has_no_relays() {
+        let info = parse_server_info(&serde_json::json!({
+            "stromHost": "strom.example.com",
+            "srtPorts": [47110, 47111],
+            "srtPortState": "reserved"
+        }))
+        .unwrap();
+        assert_eq!(info.srt, None);
+        assert!(info.relays().is_empty());
+        assert_eq!(info.srt_ports, Some([47110, 47111].into_iter().collect()));
+        let null = parse_server_info(&serde_json::json!({ "srt": null })).unwrap();
+        assert_eq!(null.srt, None);
+    }
+
+    /// A relay source's `connect`, as open-live `src/lib/srt-connect.ts` resolves it:
+    /// the address to dial with the stream id, or a reason in words.
+    #[test]
+    fn a_relay_source_gives_its_dial_in_address_or_says_why_not() {
+        let relayed = decode(serde_json::json!({
+            "id": "src-1",
+            "name": "Venue — cam",
+            "address": "srt+relay://AbCdEfGhIjKlMnOpQrStUv?latency=200&passphrase=***",
+            "streamType": "srt",
+            "status": "inactive",
+            "connect": {
+                "uri": "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv",
+                "host": "relay.example.com",
+                "port": 6000,
+                "mode": "caller",
+                "source": "srt-relay",
+                "streamid": "AbCdEfGhIjKlMnOpQrStUv",
+                "relay": "default"
+            }
+        }));
+        assert_eq!(relayed.relay(), Some("default"));
+        assert_eq!(
+            relayed.relay_dial_in(),
+            Ok(RelayDialIn {
+                stream_id: "AbCdEfGhIjKlMnOpQrStUv".into(),
+                uri: "srt://relay.example.com:6000?streamid=AbCdEfGhIjKlMnOpQrStUv".into(),
+                host: "relay.example.com".into(),
+                port: 6000,
+            })
+        );
+
+        let unresolved = |reason: &str| {
+            decode(serde_json::json!({
+                "id": "src-1",
+                "name": "Venue — cam",
+                "address": "srt+relay://AbCdEfGhIjKlMnOpQrStUv@eu?latency=200",
+                "connect": {
+                    "uri": null, "host": null, "port": null, "mode": "caller",
+                    "source": "srt-relay", "streamid": "AbCdEfGhIjKlMnOpQrStUv",
+                    "relay": "eu", "reason": reason
+                }
+            }))
+            .relay_dial_in()
+            .unwrap_err()
+        };
+        assert!(unresolved("srt-relay-not-configured").contains("reports no SRT relay"));
+        assert!(unresolved("srt-relay-unknown").contains(r#"no SRT relay named "eu""#));
+        assert!(unresolved("srt-relay-unreachable").contains("could not ask its Strom"));
+        assert!(unresolved("srt-relay-public-unknown").contains("without a public address"));
+        assert!(unresolved("srt-relay-new").contains("(srt-relay-new)"));
+
+        // An Open Live too old to send `connect` at all.
+        let older = decode(serde_json::json!({
+            "id": "src-1", "name": "Venue — cam", "address": "srt+relay://x"
+        }));
+        assert!(older.relay_dial_in().unwrap_err().contains("too old"));
+    }
+
+    /// The 422 open-live `src/services/listener-ports.ts` sends for a relay it does
+    /// not have: the code and the relays it does have reach the error.
+    #[tokio::test]
+    async fn a_422_relay_refusal_names_the_relays_open_live_has() {
+        let base = serve_once(
+            "422 Unprocessable Entity",
+            r#"{"error":"Strom has no SRT relay named \"eu\"; configured: default, us-east","statusCode":422,"code":"srt-relay-unknown","relays":["default","us-east"]}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let payload = SourcePayload::new(
+            "Venue — cam",
+            "srt+relay://auto@eu?latency=200",
+            false,
+            200,
+            None,
+        );
+        let err = client.create_source(&payload).await.unwrap_err();
+        let refused = err.downcast_ref::<Refused>().expect("a Refused error");
+        assert_eq!(refused.status, reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(refused.code.as_deref(), Some("srt-relay-unknown"));
+        assert_eq!(refused.relays, ["default", "us-east"]);
+        assert_eq!(
+            refused.relay_advice().as_deref(),
+            Some("Open Live has the relay(s) default, us-east; set uplink.relay to one of them")
+        );
+
+        let base = serve_once(
+            "422 Unprocessable Entity",
+            r#"{"error":"Strom reports no SRT relay configured","statusCode":422,"code":"srt-relay-not-configured","relays":[]}"#,
+        )
+        .await;
+        let client = OpenLiveClient::new(&base, AuthMode::Direct, None).unwrap();
+        let err = client.create_source(&payload).await.unwrap_err();
+        let refused = err.downcast_ref::<Refused>().unwrap();
+        assert!(refused.relays.is_empty());
+        assert!(refused
+            .relay_advice()
+            .unwrap()
+            .contains("reports no SRT relay"));
+
+        // Any other refusal carries no code, and no advice about relays.
+        let (code, relays) = error_code(br#"{"error":"port taken","statusCode":409}"#);
+        assert_eq!((code, relays), (None, Vec::new()));
     }
 
     #[test]

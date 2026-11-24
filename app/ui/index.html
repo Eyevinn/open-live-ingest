@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Open Live Ingest</title>
+    <link rel="stylesheet" href="app.css">
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Open Live Ingest</h1>
+    </header>
+    <main>
+      <section id="where" aria-labelledby="where-title">
+        <h2 id="where-title">1. Where to send</h2>
+        <p id="where-summary" hidden>
+          <span id="where-summary-text"></span>
+          <button type="button" id="where-change" class="link">Change</button>
+        </p>
+        <p id="where-problem" class="problem" role="status" hidden></p>
+        <div id="where-choose" hidden>
+          <div class="option">
+            <button type="button" id="osc-sign-in">Sign in with Open Source Cloud</button>
+            <div id="osc-waiting" hidden>
+              <p>Finish signing in in your browser. If no browser opened, open this address:</p>
+              <p><code id="osc-address" class="selectable"></code></p>
+            </div>
+            <div id="osc-workspace" hidden>
+              <p>
+                Workspace <strong id="osc-workspace-name"></strong>
+                <button type="button" id="osc-change-workspace" class="link">Change workspace</button>
+              </p>
+              <fieldset id="osc-instances-box">
+                <legend>Open Live instance</legend>
+                <div id="osc-instances"></div>
+              </fieldset>
+            </div>
+          </div>
+          <details id="self-hosted" class="option">
+            <summary>Use a self-hosted Open Live</summary>
+            <form id="self-hosted-form">
+              <label>Address <input id="self-hosted-url" type="text" required
+                placeholder="open-live.example.com" autocomplete="off" spellcheck="false"></label>
+              <label>API key <input id="self-hosted-key" type="password"
+                placeholder="Leave empty if it needs none" autocomplete="off"></label>
+              <button type="submit">Check and use</button>
+            </form>
+          </details>
+          <details id="paste-token" class="option">
+            <summary>Advanced: paste a personal access token</summary>
+            <form id="paste-token-form">
+              <label>Open Source Cloud personal access token <input id="paste-token-value"
+                type="password" required autocomplete="off"></label>
+              <button type="submit">Use token</button>
+            </form>
+          </details>
+        </div>
+      </section>
+      <section id="what" class="disabled" aria-labelledby="what-title" aria-disabled="true">
+        <h2 id="what-title">2. What to send</h2>
+        <label class="show-all"><input type="checkbox" id="show-all"> Show all</label>
+        <p id="what-notice" class="notice" hidden></p>
+        <table id="inputs">
+          <thead>
+            <tr><th>Send</th><th>Input</th><th>Audio</th><th>Studio name</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+      <section id="go" class="disabled" aria-labelledby="go-title" aria-disabled="true">
+        <h2 id="go-title">3. Go live</h2>
+        <p><button type="button" id="go-button">Go live</button>
+          <span id="go-strom" role="status"></span></p>
+        <p id="go-uplink" class="detail" role="status" hidden></p>
+        <p id="go-passphrase" class="detail" role="status" hidden></p>
+        <div id="go-notices" role="status"></div>
+        <p id="go-problem" class="problem" role="alert" hidden>
+          <span id="go-problem-text"></span>
+          <button type="button" id="go-problem-action" class="link" hidden></button>
+        </p>
+        <ul id="go-rows"></ul>
+      </section>
+      <details id="advanced">
+        <summary>Advanced</summary>
+        <p id="relay-picker" hidden>
+          <label>SRT relay <select id="relay-select"></select></label>
+        </p>
+        <p><button type="button" id="show-strom-log" class="link">Show Strom log</button></p>
+      </details>
+      <p id="problem" class="problem" role="alert" hidden></p>
+    </main>
+    <dialog id="quit-dialog" aria-labelledby="quit-text">
+      <p id="quit-text"></p>
+      <p id="quit-progress" role="status" hidden></p>
+      <p class="quit-buttons">
+        <button type="button" id="quit-anyway" hidden>Quit anyway</button>
+        <button type="button" id="quit-cancel">Cancel</button>
+        <button type="button" id="quit-stop">Stop and quit</button>
+      </p>
+    </dialog>
+    <footer>
+      <span id="version"></span>
+      <button type="button" id="show-logs" class="link" hidden>Show logs</button>
+    </footer>
+  </body>
+</html>

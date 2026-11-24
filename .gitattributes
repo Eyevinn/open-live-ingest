@@ -1,0 +1,4 @@
+# The app embeds its UI with include_bytes! (app/src/protocol.rs), and the
+# protocol tests search that source for LF line endings. Keep these files LF on
+# every checkout so Windows builds and tests use the same bytes as macOS/Linux.
+app/ui/* text eol=lf

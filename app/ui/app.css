@@ -1,0 +1,224 @@
+/* The window's look. Platform fonts and colours, light and dark. */
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.4;
+}
+
+body {
+  margin: 0;
+  padding: 1.5rem 2rem;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+h1 {
+  font-size: 1.4rem;
+  margin: 0 0 1.5rem;
+}
+
+section {
+  border-top: 1px solid color-mix(in srgb, currentColor 20%, transparent);
+  padding: 0.75rem 0 1rem;
+}
+
+h2 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+section.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.show-all {
+  float: right;
+  font-size: 0.9rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.75rem;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+
+th,
+td {
+  padding: 0.3rem 0.4rem 0.3rem 0;
+  vertical-align: middle;
+}
+
+.note {
+  display: block;
+  font-size: 0.8rem;
+  opacity: 0.6;
+}
+
+.studio-name {
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.studio-name input {
+  flex: 1;
+  min-width: 6rem;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.notice {
+  font-size: 0.9rem;
+}
+
+.problem {
+  color: #c62828;
+}
+
+input,
+textarea,
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+code.selectable {
+  word-break: break-all;
+  font-size: 0.8rem;
+}
+
+.option {
+  margin: 0.75rem 0;
+}
+
+form label {
+  display: block;
+  margin: 0.4rem 0;
+}
+
+form input {
+  display: block;
+  width: 100%;
+  max-width: 28rem;
+  box-sizing: border-box;
+  margin-top: 0.2rem;
+}
+
+fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+fieldset label {
+  display: block;
+  margin: 0.25rem 0;
+}
+
+button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: LinkText;
+  text-decoration: underline;
+  cursor: pointer;
+  font: inherit;
+}
+
+button:disabled {
+  opacity: 0.6;
+}
+
+footer {
+  margin-top: 2rem;
+  font-size: 0.85rem;
+  opacity: 0.6;
+}
+
+/* 3. Go live: the rows, the banner, and read-only while live. */
+body.live #where,
+body.live #what,
+body.live #relay-picker {
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+#go-notices .notice {
+  margin: 0.5rem 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  background: color-mix(in srgb, #f9a825 25%, transparent);
+}
+
+#go-rows {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+}
+
+#go-rows li {
+  margin: 0.3rem 0;
+}
+
+#go-rows .state {
+  font-weight: 600;
+  margin-left: 0.5rem;
+}
+
+#go-rows .state-live {
+  color: #2e7d32;
+}
+
+#go-rows .state-failed {
+  color: #c62828;
+}
+
+#go-rows .detail {
+  display: block;
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+
+#go-rows .address {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+#go-rows .status-line {
+  display: block;
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+
+footer button.link {
+  margin-left: 1rem;
+}
+
+/* The quit question while live (spec, section 8). */
+dialog {
+  max-width: 26rem;
+  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+dialog::backdrop {
+  background: color-mix(in srgb, black 30%, transparent);
+}
+
+.quit-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-bottom: 0;
+}

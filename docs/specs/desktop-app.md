@@ -49,6 +49,7 @@ app/Cargo.toml        [package] open-live-ingest-app, publish = false
 app/src/main.rs       window, event loop, menus, IPC dispatcher, quit guard
 app/src/model.rs      UI state: inputs, rows, messages. Pure Rust, unit tested
 app/src/messages.rs   the failure → message table of §10
+app/src/status.rs     the status lines while live (§5.1): productions holding each source, link
 app/src/platform/     macos.rs (applicationShouldTerminate, camera/mic authorisation),
                       windows.rs (WM_QUERYENDSESSION subclass, single-instance mutex)
 app/ui/               index.html, app.css, app.js (static, compiled in with include_bytes!)
@@ -57,7 +58,7 @@ packaging/windows/    open-live-ingest.nsi
 
 - **Lib and CLI stay one package.** `cargo binstall`, the release paths
   (`target/<target>/release/open-live-ingest`), `build.rs`, `tests/pins.rs` and the tag check in
-  `release.yml` (first `^version` line of `Cargo.toml`) all keep working. Splitting them into two
+  `release.yml` all keep working. Splitting them into two
   crates buys nothing the feature below does not.
 - **A `cli` feature (default on)** makes `clap`, `dialoguer` and `console` optional and is
   `required-features` of the bin target. The app depends on
@@ -68,8 +69,9 @@ packaging/windows/    open-live-ingest.nsi
   job and the musl release builds never need webkit2gtk. The app is built with `-p
   open-live-ingest-app` on macOS and Windows only.
 - **One version.** `version` moves to `[workspace.package]` and both packages inherit it, so the
-  app and the CLI in one release always report the same version. The release tag check keeps
-  reading the first `^version` line, which is then the workspace one.
+  app and the CLI in one release always report the same version. The release tag check reads the
+  `open-live-ingest` package's version with `cargo metadata --no-deps` rather than the first
+  `^version` line of `Cargo.toml`.
 - **CI** (`.github/workflows/ci.yml`) gains an `app` job on `macos-latest` and `windows-latest`:
   `cargo clippy -p open-live-ingest-app --all-targets -- -D warnings` and
   `cargo test -p open-live-ingest-app`. The existing job is unchanged. `cargo fmt --all` covers
@@ -102,16 +104,35 @@ packaging/windows/    open-live-ingest.nsi
   `config::pidfile()`), so `open-live-ingest status` reports it and `open-live-ingest down` stops
   it: SIGTERM on macOS, which the app handles as Stop without asking; `taskkill /F` on Windows,
   after which `down` removes what is left, as it does for a CLI `up`. The app executable is named
-  `open-live-ingest-app` so the existing process-name check (`GATEWAY_COMM`, `process_named` in
-  `src/run.rs`) matches it without change.
+  `open-live-ingest-app` so the existing process-name check (`GATEWAY_COMM` in `src/run.rs`, a
+  prefix of the executable's file name) matches it without change.
+- **Stop keeps the Open Live sources (#115).** A production slot references a source by id, so
+  Stop (and quitting while live, §8) removes the flows but leaves each input's source in Open Live,
+  marked inactive (`run::Sources::Keep`, `Event::SourceRetained`). The next Go live adopts it by
+  name with the same id and port (`plan_port`'s `Keep`, which emits `Event::SourceAdopted` and a
+  log line naming the id and port, and `reconcile_sources`), so the slot keeps working without
+  picking the source in Studio again. Sources carrying the prefix that are not
+  this session's inputs (a renamed label, an input not ticked now) are still swept at Stop, and
+  `open-live-ingest down` removes them all. The CLI `up` keeps removing its sources (`DESIGN.md`
+  §6).
 - **One live session per settings file.** Before Go live the app reads `gateway.pid`; if it names
   a running gateway (a CLI `up`, or another app instance) it does not start, and offers "Stop it"
   (the library's `down`). The CLI `up` gains the same refusal (`already running (pid N); run
-  'open-live-ingest down' first`), which today silently runs two loops over the same flows.
-- **A Strom left behind by a crash is reclaimed, not adopted.** If `gateway.pid` is stale and
-  `strom.pid` names a live Strom (process-name checked), Go live first stops it with
-  `local_strom::stop_recorded()`, then starts fresh. Otherwise the next Stop would leave a camera
-  open, because an adopted Strom is never stopped.
+  'open-live-ingest down' first`), which today silently runs two loops over the same flows. `up`
+  writes `gateway.pid` right after this check, before it starts or asks Strom, and removes it
+  however it returns, so a gateway that is still starting counts as running too: a second `up`
+  or Go live started meanwhile refuses it, and `down` stops it (a CLI `up` has no signal handler
+  until its inputs are live, so SIGTERM ends it at once and `down` removes what it left).
+- **A Strom left behind by a crash is reclaimed, not adopted.** If `gateway.pid` names no running
+  gateway (starting or live, see above) and `strom.pid` names a live Strom (checked by the
+  executable's file name, `strom` or `strom.exe`, never by its path), Go live first stops it with
+  `local_strom::reclaim_recorded()`, which, unlike `down`'s `stop_recorded()`, waits until it has
+  exited, then starts fresh. Otherwise the next Stop would leave a camera
+  open, because an adopted Strom is never stopped. Go live checks `gateway.pid` again after the
+  camera check (on macOS that can wait minutes on the prompt), and `reclaim_recorded()` checks it
+  once more itself, after it has read `strom.pid`: since `up` writes `gateway.pid` before it starts
+  Strom, a gateway that starts at any point during the checks is refused, and its Strom is never
+  stopped.
 - **Windows: no console window for Strom.** The app is a GUI-subsystem executable
   (`#![windows_subsystem = "windows"]`). A console child started from a GUI process gets a console
   window of its own, so when the app starts Strom the library adds `CREATE_NO_WINDOW` to the
@@ -126,6 +147,46 @@ packaging/windows/    open-live-ingest.nsi
   moment and a denial becomes the §10 message rather than a Strom error.
 
 ### Go live and Stop
+
+Go live **arms** (#130, OL-63c): the session registers each input's source, or adopts the one an
+earlier Stop kept (same id, #115), and starts no flow. An input's uplink runs only while a
+production holding its source is live, and airing stays the director's call in Studio. The
+session reads `GET /api/v1/productions` every 2 s while armed (`run::GATE_POLL`; every 1 s while a
+production holding one of the sources is `activating`), on a clock of its own apart from the 10 s
+tick, and per input:
+
+- a production holding the source is **`active`** (#128's verdict: a production with no sender
+  reaches `active` on its own within its activation window, so arming does not deadlock it, and a
+  connect into an already active production is clean): the flow is created and started
+  (`ProductionLive`), and the input goes starting → waiting → on air as before, the stall detect
+  and restart of #127 included;
+- none is any more (every one holding it `inactive`, `ended`, `activating` or unknown, or the
+  source taken out of it): the flow is removed and the input is `Armed` again (`NoProductionLive`).
+  The source stays registered, and the next tick marks it inactive.
+
+Both are idempotent: what the productions ask for is compared with whether the flow runs, so
+several productions holding the source start it once and stop it only when none of them is live.
+The productions not being readable changes nothing: a running uplink keeps running, an armed one
+stays armed, and the next look tries again (logged once, not every look). A start that fails
+(Strom refusing the flow) shows the row failed and is retried at every look while the production
+is live. Stop leaves Armed: it removes any running flow and keeps each source, as before. A camera
+that cannot be opened is therefore found when a production goes live, not at Go live.
+
+**A slot added to a live production** gets no receiver until the production is deactivated and
+reactivated (#128). The session tells it from two looks in a row (the production `active` both
+times, the source in it only the second time; never at the first look, when a slot in an active
+production may well have been there at activation) and names those productions
+(`SlotAddedWhileLive`) until they leave `active` or drop the source. The uplink still runs, for
+any other production holding the source; the row says the director has to deactivate and
+reactivate the production (§10).
+
+Without registration with Open Live (`[open_live] register` off) there are no productions to wait
+for, and Go live sends at once, as before (`Session::start_keeping_sources`). Eyevinn/open-live's
+`docs/specs/studio-gateways.md` Phase 2 START/STOP, a command from Studio over the gateway's
+connection, could later replace the polling.
+
+The CLI's `up` keeps sending from the start. `up --wait-for-production` arms as the app does
+(`Session::start_armed` with `Sources::Remove`, so Ctrl-C still removes its sources).
 
 ```mermaid
 sequenceDiagram
@@ -143,20 +204,31 @@ sequenceDiagram
     alt problems
         App-->>UI: error (one line + action, §10)
     else ok
-        App->>Lib: Session::start(settings, inputs)
+        App->>Lib: Session::start_armed(settings, inputs, credential, Sources::Keep)
         Lib->>S: probe strom.url; start headless if unreachable (strom.pid)
         Lib-->>App: Event: Strom starting / ready
-        Lib->>OL: register sources (caller mode: port 0 → assigned port)
-        Lib->>S: create + start one flow per input (derived flow id)
-        Lib-->>App: Event per input: registering → connecting → live
+        Lib->>OL: adopt each input's source by name (same id, same port), or register it (caller mode: port 0 → assigned port)
+        Lib-->>App: Event per input: registering → armed
+        App-->>UI: {"event":"input", state "armed" / "waiting_for_production"}
+        loop every 2 s while armed (1 s while activating)
+            Lib->>OL: GET /api/v1/productions
+            alt a production holding the source is active
+                Lib->>S: create + start the input's flow (derived flow id)
+                Lib-->>App: ProductionLive, then starting → waiting → on air
+            else none holding it is active any more
+                Lib->>S: remove the input's flow (the source stays)
+                Lib-->>App: NoProductionLive, then armed
+            end
+        end
         App-->>UI: {"event":"input", ...} per change, {"event":"stats"} every tick
     end
     P->>UI: Stop (or quit, §8)
     UI->>App: {"cmd":"stop"}
     App->>Lib: SessionHandle::stop()
-    Lib->>OL: heartbeat "stopping", then remove sources
-    Lib->>S: remove flows; stop the Strom we started
-    Lib-->>App: Event: removed … / stopped
+    Lib->>OL: heartbeat "stopping"
+    Lib->>S: remove flows (an armed input has none); stop the Strom we started
+    Lib->>OL: keep each input's source, marked inactive; sweep other sources of the prefix
+    Lib-->>App: Event: removed … / kept … / stopped
     App-->>UI: {"event":"stopped"}
 ```
 
@@ -184,8 +256,9 @@ below an unfinished one is visible but disabled.
      rows' pickers (#64 AC5's rule, enforced again by `validate`).
    - Selection is saved on change (§6).
 3. **Go live / Stop.** One button. While live each ticked row shows a state and a one-line reason
-   when failed, plus bitrate. A banner above the rows carries session-wide notices (Open Live
-   unreachable, Studio cannot see the venue). The rest of the window is read-only while live.
+   when failed, plus bitrate, and under it the status lines of §5.1. A banner above the rows
+   carries session-wide notices (Open Live unreachable, Studio cannot see the venue). The rest of
+   the window is read-only while live.
 
 **Advanced** (collapsed): venue name (`gateway.name`), local Strom (URL, manage, binary, API key,
 "Open Strom"), uplink (mode, host, public host, port range, latency, passphrase), video (codec,
@@ -196,9 +269,61 @@ Defaults are today's `Config::default()` values; nothing here is needed for AC1.
 Cut, Copy, Paste, Select All: needed for Cmd-V into the token and key fields), Window, Help (Show
 logs, Open Live Ingest on GitHub). Windows: no menu bar; "Show logs" is a link in the window footer.
 
-Per-input states shown: `Starting Strom…` (session-wide), `Registering`, `Connecting`, `Live`,
-`Failed: <reason>`, `Stopping`, `Not connected` (a saved device that is not present now; skipped,
-the others go live).
+Per-input states shown: `Starting Strom…` (session-wide), `Registering`, `Armed` (registered,
+sending nothing: no production holds the source, or the productions are not known yet),
+`Waiting for production` (armed, and productions hold the source, none of them live yet),
+`Connecting`, `Live`, `Failed: <reason>`, `Stopping`, `Not connected` (a saved device that is not
+present now; skipped, the others go live). Armed and Waiting for production come from the
+session's `Armed` state and the §5.1 poll's productions; a production going live turns the row to
+Connecting through the session's own states (§4, Go live and Stop). The button stays Go live /
+Stop: Stop also ends an armed session. An armed row is not counted as sending by the quit
+question (§8), which then reads "You are going live".
+
+### 5.1 Status lines while live (#126 AC4, #129)
+
+Open Live only receives an input once a production holding its source is activated, so each row
+says what the uplink depends on. Two lines under each row, refreshed every 4 s (`status::POLL`,
+under the 5 s #126 AC4 asks for) by a poller of their own, apart from the session's 10 s tick:
+
+- **Production.** The productions on the instance (`GET /api/v1/productions`) whose
+  `sources[].sourceId` is the input's source id, each with its name, its state (`inactive`,
+  `activating`, `active`, `ended`; a state the app does not know shows as `unknown`) and the slot
+  (`sources[].mixerInput`, `video_in_<n>`) or slots that hold the source:
+  `Production: Morning Show (active), slot video_in_1`. Several are listed in Open Live's order,
+  separated by `;`. None holding it: `Production: none holds this source`. When Open Live does
+  not answer, refuses, or the source is not registered yet: `Production: unknown`. A failed poll
+  never stops or changes the feed, and is logged at `debug` only.
+  The production routes return CouchDB documents, so a production's id is `_id` (as Studio reads
+  it); the client also takes `id`, which is what the OpenAPI document names.
+- **Link.** From the local Strom's `GET /api/flows/<flow id>/srt-stats` for the input's flow (the
+  sending element's first peer, as the session reads it):
+  - `not sending`: no flow, or no SRT peer;
+  - `connecting`: a peer, but `packets_sent` did not grow since the last poll (the first poll of a
+    peer, too, since there is nothing to compare with);
+  - `connected`: `packets_sent` grew; with the share dropped over that interval,
+    `Δpackets_sent_dropped / Δpackets_sent`, as a percentage;
+  - `unknown`: the local Strom did not answer.
+
+  With the smoothed RTT whenever there is a peer: `Link: connected, 0.2 % dropped, RTT 31 ms`.
+
+The input's flow id and source id come from the session's `stats` (`gateway::InputStats`), so
+nothing is polled before the first tick names them. Stop ends the poller with the session; the
+lines go when the page hears `stopped`. Stop keeps each input's source, marked inactive (§4,
+#115), so the next Go live adopts it with the same id, and the Production line names the same
+productions and slots again from the first tick; the source being inactive in between does not
+change which productions hold it.
+
+**Waiting names what is missing** (#116 item 1). A row whose flow waits for a receiver
+(`InputState::Waiting`) is `Connecting`; when the last poll tells why, its line says so (§10):
+no production holds the source, or every production holding it is `inactive` or `ended`. That
+replaces the 30 s "Nothing has reached the cloud yet" line, which is about the network. With a
+holding production `activating` or `active`, or the productions unknown, the row keeps the
+ordinary wording. Starting and Unreachable (lost contact with Strom) are not waiting for Open
+Live and never get the hint.
+
+The library also has `OpenLiveClient::assign_source` (`POST /api/v1/productions/:id/sources`
+with `{sourceId, mixerInput}`, Open Live's `SourceAssignmentInput`; it replaces whatever that slot
+held). The window does not offer it yet: the slot is chosen in Studio.
 
 ## 6. Settings and data model
 
@@ -230,8 +355,10 @@ label  = "Stage left"            # optional: the source is "<gateway.name> — <
   needs.
 
 **OSC credential.** In the OS keychain, not in the file, with the marker #76 defines (#65 AC3). The
-app never writes `open_live.api_key` for an OSC sign-in. A personal access token pasted under
-Advanced goes to the keychain too.
+app never writes `open_live.api_key` for an OSC sign-in. After a browser sign-in the stored
+credential is OSC's refresh token (30 days, renewed at each refresh; #74,
+[research](../research/OSC_BROWSER_SIGN_IN.md)), and the one-hour access token is refreshed from it
+during a session. A personal access token pasted under Advanced goes to the keychain too.
 
 **Nothing else is stored.** No window size, no "last tab", no recent list. The webview runs
 non-persistent (`with_incognito(true)`); on Windows its user-data folder is
@@ -274,12 +401,13 @@ The rule is the CLI's (`DESIGN.md` §6): a deliberate stop stops, an accident do
 | Logout / restart (macOS) | Quit | Same question; macOS reports that Open Live Ingest cancelled the logout. A venue does not go off air because someone logged out by accident |
 | Logout / shutdown (Windows) | Quit | `WM_QUERYENDSESSION`: `ShutdownBlockReasonCreate("Stopping the live feeds")`, run the bounded teardown (`teardown_within`, the CLI's 4 s deadline), then allow the session to end. Windows does not wait for a dialog here |
 | `open-live-ingest down` from a terminal | — | macOS: SIGTERM → Stop without asking, then exit. Windows: `taskkill /F`, and `down` removes the rest |
-| Crash, Force Quit, Task Manager end task | — | Flows and sources remain; the next Go live or `down` cleans up (§4, Strom reclaim) |
+| Crash, Force Quit, Task Manager end task | — | Flows and sources remain; the next Go live removes the flows and adopts the sources, or `down` removes both (§4, Strom reclaim) |
 
 - **Stop and quit** runs the same teardown as the Stop button (`SessionHandle::stop()`, with
-  progress in the rows), then exits. If it has not finished after 15 s, the dialog adds "Quit
-  anyway"; whatever is left is swept by the next Go live or `down`, which find flows by derived id
-  and sources by name prefix.
+  progress in the rows): the flows are removed and the sources kept (§4), so a relaunch and Go live
+  feeds the same production slots. Then it exits. If it has not finished after 15 s, the dialog
+  adds "Quit anyway"; flows left behind are removed by the next Go live or `down`, which find them
+  by derived id.
 - **macOS implementation.** tao 0.37 implements no `applicationShouldTerminate:` (ADR-001). The app
   adds that method to tao's application delegate class at start with the Objective-C runtime
   (`class_addMethod`, through `objc2`). A unit test on the macOS CI job asserts the method is
@@ -314,20 +442,21 @@ unknown command or bad arguments is an error reply, never a panic.
 | `cmd` | `args` | `ok` | Library call |
 |---|---|---|---|
 | `state` | — | the full view model (where-to-send, rows, live flag, Advanced values) | `load` |
-| `osc_sign_in` | — | `{workspace, instances[]}` | `osc::browser_login` (#75), keychain (#76), `instances` (#77) |
-| `osc_paste_token` | `{token}` | `{workspace, instances[]}` | keychain (#76), `instances` |
-| `osc_workspaces` | — | `workspaces[]` | `workspaces` if #74 finds a list API (#77), else re-sign-in |
+| `osc_sign_in` | — | `{workspace, instances[]}` | `api::osc_sign_in` (#77): `osc::browser_login` (#75), kept in the keychain (#76), then `api::workspace` |
+| `osc_paste_token` | `{token}` | `{workspace, instances[]}` | `api::keep_osc_token` (#76), `api::workspace(OscCredential::Keychain)` (#77) |
+| `osc_workspaces` | — | `{workspace, instances[]}` | No list API exists (#74, [research](../research/OSC_BROWSER_SIGN_IN.md)): `api::osc_sign_in` again, where the workspace is picked on the OSC consent page and the new sign-in replaces the kept one (#77) |
 | `choose_instance` | `{url}` | view model | `save` |
 | `self_hosted` | `{url, api_key}` | view model | `check_self_hosted` (#73), `save` |
 | `devices` | `{show_all}` | `{video[], audio[]}` | `devices` (#73, audio from #69) |
 | `set_inputs` | `{inputs: [{device, audio?, label?}]}` | view model | `validate`, `save` |
-| `set_advanced` | the Advanced values | view model, or `problems[]` | `validate` (#73), `save` |
+| `set_advanced` | the Advanced values | view model, or `problems[]` | `validate` (#73), `save`. So far only `{uplink: {relay}}` is saved (OL-66): the relay picked, `null` for `default`; anything else replies "cannot do that yet" |
+| `relays` | — | `{relays[], chosen, offer}` | `GET /api/v1/server-info` `srt.relays` (OL-65). `offer` is true when Open Live reports more than one relay, or none named `chosen` while it reports others: only then does Advanced show the picker (OL-66) |
 | `go_live` | — | `null` (progress arrives as events) | §4 checks, `Session::start` (#72) |
 | `stop` | — | `null` | `SessionHandle::stop` |
 | `stop_other` | — | `null` | `down` (another gateway named by `gateway.pid`) |
-| `quit` | `{confirmed}` | `null` | quit guard (§8) |
+| `quit` | `{confirmed, anyway?}` | `null` | quit guard (§8): `confirmed: false` asks (the question when live), `true` is Stop and quit, `anyway: true` is Quit anyway once offered |
 | `show_logs` | `{which: "app" \| "strom"}` | `null` | reveal in Finder/Explorer |
-| `open_url` | `{which: "strom" \| "studio" \| "help"}` | `null` | system browser; URLs come from settings, never from the page |
+| `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy" \| "privacy_microphone"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`, `privacy_microphone`: macOS Privacy & Security → Camera or Microphone, for §10's camera/microphone row) |
 
 `open_url` takes a name, not a URL, so the page cannot make the app open an arbitrary address.
 
@@ -336,15 +465,34 @@ unknown command or bad arguments is an error reply, never a panic.
 | `event` | `data` | From library event (#71/#72) |
 |---|---|---|
 | `strom` | `{state: "starting" \| "ready" \| "failed", message?}` | Strom starting / ready / failed |
-| `input` | `{device, state, message?, action?}` | per-input registering / connecting / live / failed / removed |
-| `stats` | `{inputs: [{device, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
+| `input` | `{input, state, message?, action?}` | per-input registering / armed / waiting_for_production / connecting / live / failed / stopping / stopped / not_connected. Keyed by the input's Studio name, which is what the library's events carry |
+| `uplink` | `{via: "relay", relay, public}` | `BringingUpViaRelay` (OL-66): the session sends through Open Live's SRT relay `relay`, at `public` (`host:port`, or `null` when not reported). Not sent without a relay, so a session against an Open Live without one (v0.8.0) hears what it did before |
+| `passphrase` | `{generated: true, kept}` | `PassphraseGenerated`: a passphrase was made for the relay, whose port is public, and saved in the settings file (`kept`), or used for this session only, which is also a `relay_passphrase_not_kept` notice. Never the passphrase itself |
+| `summary` | `{inputs: [{input, port, uplink, registered, relay?}]}` | the start summary: `uplink` is where the gateway sends (in caller mode `srt://<host>:<port>?mode=caller&latency=<ms>`; through the relay the dial-in address `srt://<relay>?streamid=<id>&mode=caller&...`, and `relay` names it), `registered` the address registered with Open Live; passphrases masked. The row reads "Sending via relay `<relay>` to `<uplink>`" |
+| `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
+| `status` | `{inputs: [{input, productions: null \| [{name, state, slots: []}], link: {state: "not_sending" \| "connecting" \| "connected" \| "unknown", dropped_pct, rtt_ms}}]}` | the status lines of §5.1, every 4 s while live; not a library event (the app polls Open Live and the local Strom itself). `productions` is `null` when unknown, `[]` when none holds the source |
 | `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |
 | `stopping` | `{done, total}` | teardown progress |
-| `stopped` | `{left_behind: []}` | teardown finished; anything not removed is named |
+| `stopped` | `{left_behind: [], error}` | teardown finished; anything not removed is named. `error` (`{message, action}`, §10) when the session ended on a failure, else `null` |
 | `quit_requested` | `{inputs_live}` | the quit guard wants the §8 question shown |
+| `quit_anyway` | `{}` | Stop and quit has run for 15 s: the question adds "Quit anyway" (§8) |
+| `osc_sign_in_page` | `{url}` | the sign-in page was opened in the browser; the window shows its address too, for when no browser opens |
+| `where` | step 1's view (as `state`'s `where`) | after `state`, the workspace and instance names looked up with the kept sign-in |
 
 The variant names on the right are #71's; the app maps whatever names #71 merges with. `message`
 is always produced by `app/src/messages.rs` (§10), never passed through from an error chain.
+
+### 9.3a The same API over stdin and stdout (`--ipc-stdio`)
+
+`open-live-ingest-app --ipc-stdio` runs the app core with no window and no webview: each stdin
+line is one page message (§9.1), each stdout line one reply or event, the JSON the page would be
+handed by `window.oli.receive`. It is the same `ipc::Core` the window drives, so a test of the
+release artifact (the DMG's or the installer's executable) exercises the same commands and model
+the page does; OL-59i's end to end (`.github/scripts/e2e-app.py`) uses it. The process ends as the
+window does: a `quit` with nothing live, Stop and quit once the teardown is done, SIGTERM on macOS
+(Stop without asking), or stdin closing (the bounded teardown of §8). It opens no port and gives
+nothing a local process could not do with the CLI as the same user; replies and events carry no
+secret (§9.4), so stdout can be logged.
 
 ### 9.4 Security of the webview
 
@@ -379,6 +527,11 @@ row can be added.
 | API key refused (self-hosted, 401/403) | Open Live refused the API key. Check it under Where to send. | Change |
 | No free SRT port (no range published and none set; Open Live cannot assign one) | Open Live has no free port for `<input>`. Remove an unused source in Studio, or ask the Open Live admin to add ports. | Open Studio |
 | Port held by another gateway's source (`run.rs` clash, not ours) | Port `<n>` is used by the source "`<name>`" in Studio. Remove that source in Studio, then press Go live. | Open Studio |
+| Through the SRT relay (OL-66): Open Live reports no relay any more (`connect.reason` `srt-relay-not-configured`, or a 422 with that `code`, or `srt-relay-unknown` naming no relays) | Open Live has no SRT relay to send through any more. Press Go live again to send to it directly. | Retry |
+| Through the SRT relay: Open Live has no relay of that name (`srt-relay-unknown`, a 422 with `code` and `relays`, or `uplink.relay` not among the relays) | Open Live has no SRT relay named "`<relay>`". Pick one of "`<a>`", "`<b>`" under Advanced. | Advanced |
+| Through the SRT relay: Open Live cannot ask its Strom about the relay (`srt-relay-unreachable`) | Open Live can't reach its SRT relay right now. Wait a moment, then press Go live again. | Retry |
+| Through the SRT relay: the relay has no public address (`srt-relay-public-unknown`) | Open Live's SRT relay has no public address to send to. Ask the Open Live admin to set one, then press Go live again. | Retry |
+| Through the SRT relay: the passphrase generated for it could not be saved in the settings file | Banner: The passphrase made for the SRT relay could not be saved, so it protects this session only. The next Go live makes a new one. | Show file |
 | Port held by our leftover source in an active production (`Refused`) | "`<name>`" from an earlier session is still in an active production. Deactivate that production in Studio, then press Go live. | Open Studio |
 | Camera or microphone access denied (macOS, AVFoundation status) | Open Live Ingest is not allowed to use the camera (microphone). Allow it in System Settings → Privacy & Security, then press Go live. | Open Settings |
 | Camera busy or failed to open (flow does not reach running; Strom error) | `<camera>` could not be opened. Close other apps that use it, then press Go live. | Retry |
@@ -393,6 +546,11 @@ row can be added.
 | Strom's port in use by another program | Port `<port>` is used by another program. Change the local Strom port under Advanced. | Advanced |
 | Another gateway already live (`gateway.pid`) | Open Live Ingest is already live from another window or a terminal. | Stop it |
 | Input connected but nothing delivered for 30 s (bytes not moving, §7 of DESIGN) | Row stays Connecting, with: Nothing has reached the cloud yet. Check that this network allows outgoing UDP. | — |
+| Input waiting for a receiver, and no production holds its source (§5.1) | Row stays Connecting, with: Waiting for Open Live: no production holds this source. Put it in a production in Studio and activate it. | Open Studio |
+| Input waiting for a receiver, and every production holding its source is inactive or ended (§5.1) | Row stays Connecting, with: Waiting for Open Live: production "`<name>`" is inactive. Activate it in Studio. (Several: productions "`<a>`", "`<b>`" are inactive. Activate one in Studio.) | Open Studio |
+| Armed, and no production holds the input's source (or the productions are unknown) (§4, §5) | Row Armed, with: Ready. Nothing is sent until a production that holds this source is activated in Studio. | Open Studio |
+| Armed, and productions hold the source but none is live (§4, §5) | Row Waiting for production, with: Ready. Sending starts when production "`<name>`" is activated in Studio. (Several: when one of productions "`<a>`", "`<b>`" is activated in Studio.) | Open Studio |
+| The source was put in a production while that production was live (`SlotAddedWhileLive`, #128) | Row Connecting, with: Production "`<name>`" got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate the production in Studio; until then it cannot show this input. | Open Studio |
 | Gateway token refused on the heartbeat | Banner: Studio can't see this venue's status (gateway token refused). Your cameras are still sending. | Advanced |
 | Settings file invalid (hand-edited) | The settings file has a problem: `<first problem>`. | Show file |
 | WebView2 missing (Windows, installer) | Installer: Microsoft Edge WebView2 is required. Install it from Microsoft, then run this installer again. | — |
@@ -502,15 +660,15 @@ EFP sequence-validation rule for ingest designs does not apply, as this epic add
 | Crate | Where | Decision |
 |---|---|---|
 | `wry`, `tao`, `muda` | app | **Add.** ADR-001: 43 new crates on macOS, 37 on Windows (measured), no JS toolchain |
-| `objc2`, `objc2-foundation`, `objc2-app-kit` | app, macOS | Direct use of crates already in the tree through tao/wry; no new crate. AVFoundation status call via `msg_send!` on the class by name, no `objc2-av-foundation` |
+| `objc2`, `objc2-foundation`, `objc2-app-kit`, `block2` | app, macOS | Direct use of crates already in the tree through tao/wry; no new crate. AVFoundation status call via `msg_send!` on the class by name, no `objc2-av-foundation`; `block2` for the access request's completion handler |
 | `windows` | app, Windows | Already in the tree through tao/wry; direct use for the subclass, mutex and shutdown block reason. Same version as the lockfile resolves |
 | `serde`, `serde_json`, `tokio`, `tracing`, `tracing-subscriber`, `anyhow` | app | Already used by the gateway |
-| `sha2`, `getrandom` | library | Decided in #75 with its own justification |
-| keychain access | library | Decided in #76 (`keyring` vs own FFI) |
+| `sha2`, `getrandom` | library | **Added** in #75 for PKCE (S256 challenge, random verifier and state): `sha2` 0.11 is the one new crate (its `digest` 0.11 stack is already in the tree through `sha1`); `getrandom` 0.4 was already in the tree |
+| keychain access | library | **Own code** (#76, `src/keychain.rs`): `security-framework` on macOS (+4 crates: it, its `-sys`, `core-foundation`, `core-foundation-sys`), the `windows-sys` already in the tree on Windows (+0). `keyring` 3 would add 5 on each, including a second `windows-sys` |
 | `tauri`, `tauri-build`, `tauri-cli`, any `tauri-plugin-*` | — | **Not added** (ADR-001) |
 | `tracing-appender` | — | Not added: own rotation, §7 |
 | `rfd` (dialogs) | — | Not added: the quit question is in-window HTML |
-| `open` / `opener` | — | Not added: `open` / `explorer` via `std::process::Command`, as #75 does for the browser |
+| `open` / `opener` | — | Not added: `open` / `rundll32 url.dll,FileProtocolHandler` / `xdg-open` via `std::process::Command`, as `osc::open_browser` (#75) does |
 | `winres` / `embed-resource` | — | Not added: §11.2 icons |
 | npm, Node, a bundler, a UI framework | — | Not added: three static files |
 
@@ -533,7 +691,7 @@ i.
 | OL-59f | Logs: file writer with rotation, Show logs / Show Strom log, secret-free log test | a | Rotation and no-secrets tests pass |
 | OL-59g | macOS packaging: `build-macos-app.sh` app binary, Info.plist keys, icon, signing order, `--check`; `release.yml` artifact and DMG check; README/QUICKSTART | a, #67 | `release.yml` PR run passes `Check the DMG`, including the app's `--version` |
 | OL-59h | Windows installer: NSIS script, Strom MSI chaining with digest check, WebView2 check, shortcut, uninstaller; `release.yml` `windows-app` job, checksums, attestation | a | `release.yml` PR run builds the installer and passes the install/uninstall smoke test |
-| OL-59i | Agent-run end to end: on a macOS runner, from the PR's DMG artifact, drive the app core (the same commands the page sends, through the model, no webview) with the test pattern against the `openlivedev` instance: Go live → source in Open Live → Stop → source and flow gone → Go live again with no 409 → quit while live removes them (#62 AC2). Same on Windows once #36 is a go | b–h | Results posted on #62 with run links |
+| OL-59i | Agent-run end to end: on a macOS runner, from the PR's DMG artifact, drive the app core (the same commands the page sends, through the model, no webview) with the test pattern against the `openlivedev` instance: Go live → source in Open Live → Stop → the flow is gone, the source is kept → Go live again with no 409, reusing the source with the same id (#115) → quit while live removes the flow and keeps the source (#115, which supersedes #62 AC2's removal of the sources). The same run on Windows from the installer, with the test pattern, is `release.yml`'s `e2e-windows` (#145); camera capture there waits for #36 | b–h | Results posted on #62 with run links |
 
 What a human does next, for #62's closing comment: on an Apple Silicon Mac, install the notarized
 DMG (needs #25), sign in, pick an instance, tick a camera with its microphone, Go live, and time it
@@ -583,6 +741,13 @@ go (AC1b). Expected: the camera with sound as a source in Studio, no terminal op
     works when WebView2 is present but is not tested.
 14. **Should the app keep running Strom after Stop for a faster next Go live?** No. It stops the
     Strom it started, as `up` does, so no camera stays open with nothing supervising it.
+15. **Does OSC offer a browser sign-in the app can use, and can it be refreshed (#74, #65 AC0)?**
+    Yes. Authorization code + PKCE with a loopback redirect, the CLI's flow, and
+    `/api/connect/token` returns a refresh token and accepts `grant_type=refresh_token`. The app
+    registers its own public client id (dynamic client registration, no secret) so the consent page
+    names Open Live Ingest, with `cli` as the fallback. There is no API listing a user's workspaces:
+    the workspace is picked on the consent page and changing it is a new sign-in. Sources and the
+    optional request to the OSC team: [`docs/research/OSC_BROWSER_SIGN_IN.md`](../research/OSC_BROWSER_SIGN_IN.md).
 
 ## 16. Risks
 

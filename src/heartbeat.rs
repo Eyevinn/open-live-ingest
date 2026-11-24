@@ -13,6 +13,7 @@
 //! header, and errors are built from status codes and close codes.
 
 use crate::config::OpenLive;
+use crate::gateway::{Event, Events};
 use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -145,6 +146,13 @@ pub struct InputStatus {
     pub source_id: Option<String>,
     /// Absent until something receives the feed.
     pub uplink: Option<Uplink>,
+    /// Through an SRT relay only: its name. Left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// Through an SRT relay only: the address the uplink dials
+    /// (`srt://<relay>?streamid=<id>`), never with a passphrase. Left out otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dial_in: Option<String>,
 }
 
 /// Strom's flow state vocabulary, which is what Open Live stores. Strom also has
@@ -184,10 +192,12 @@ pub struct Heartbeat {
 }
 
 impl Heartbeat {
-    pub fn start(target: Target, initial: Snapshot) -> Self {
+    /// Starts pushing. Each failure the loop logs is also told to `events` once, as
+    /// an [`Event::Warning`], so an app can show it (a refused gateway token, say).
+    pub fn start(target: Target, initial: Snapshot, events: Events) -> Self {
         let (snapshot, latest) = watch::channel(initial);
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(run(target, latest, stopped));
+        let task = tokio::spawn(run(target, latest, stopped, events));
         Self {
             snapshot,
             stop: Some(stop),
@@ -233,7 +243,12 @@ pub async fn probe(target: &Target) -> Result<()> {
 /// Connects, pushes, reconnects, until told to stop. Each failure is reported once,
 /// not on every retry, and recovery is reported too, so a log read after the show
 /// says when Studio could and could not see the venue.
-async fn run(target: Target, latest: watch::Receiver<Snapshot>, mut stop: oneshot::Receiver<()>) {
+async fn run(
+    target: Target,
+    latest: watch::Receiver<Snapshot>,
+    mut stop: oneshot::Receiver<()>,
+    events: Events,
+) {
     let mut seq = 0u64;
     let mut failures = 0u32;
     let mut reported: Option<String> = None;
@@ -269,6 +284,9 @@ async fn run(target: Target, latest: watch::Receiver<Snapshot>, mut stop: onesho
         };
         if reported.as_deref() != Some(why.as_str()) {
             warn!("{why}; retrying every {}s", delay.as_secs());
+            events.emit(Event::Warning {
+                message: why.clone(),
+            });
             reported = Some(why);
         }
         tokio::select! {
@@ -711,6 +729,8 @@ mod tests {
                         rtt_ms: 18.0,
                         dropped: 0,
                     }),
+                    relay: None,
+                    dial_in: None,
                 },
                 InputStatus {
                     input_id: "dev-2".into(),
@@ -718,6 +738,8 @@ mod tests {
                     flow_state: FlowState::Idle,
                     source_id: None,
                     uplink: None,
+                    relay: None,
+                    dial_in: None,
                 },
             ],
         }
@@ -747,6 +769,21 @@ mod tests {
         assert_eq!(v["inputs"][1]["flowState"], "idle");
         assert_eq!(v["inputs"][1]["sourceId"], serde_json::Value::Null);
         assert_eq!(v["inputs"][1]["uplink"], serde_json::Value::Null);
+        // Not through a relay: the relay fields are left out, as before relays.
+        assert!(v["inputs"][0].get("relay").is_none());
+        assert!(v["inputs"][0].get("dialIn").is_none());
+
+        // Through a relay: its name and the address dialled, which has no passphrase.
+        let mut relayed = sample();
+        relayed.inputs[0].relay = Some("default".into());
+        relayed.inputs[0].dial_in = Some("srt://relay.example.com:6000?streamid=abc".into());
+        let v: serde_json::Value =
+            serde_json::from_str(&frame(&mut seq, "HEARTBEAT", &relayed).unwrap()).unwrap();
+        assert_eq!(v["inputs"][0]["relay"], "default");
+        assert_eq!(
+            v["inputs"][0]["dialIn"],
+            "srt://relay.example.com:6000?streamid=abc"
+        );
 
         let text = frame(
             &mut seq,
@@ -758,7 +795,7 @@ mod tests {
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["type"], "GATEWAY_OFFLINE");
-        assert_eq!(v["seq"], 2, "the sequence keeps counting across frames");
+        assert_eq!(v["seq"], 3, "the sequence keeps counting across frames");
         assert_eq!(v["reason"], "operator-stop");
     }
 
@@ -924,7 +961,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_socket_pushes_online_heartbeats_and_offline_in_order() {
         let (target, mut received) = fake_open_live("olgw_v1_secret", 1.0).await;
-        let heartbeat = Heartbeat::start(target, sample());
+        let heartbeat = Heartbeat::start(target, sample(), Events::discard());
 
         let online = next_frame(&mut received, "GATEWAY_ONLINE").await;
         assert_eq!(online["type"], "GATEWAY_ONLINE");
@@ -961,6 +998,34 @@ mod tests {
                 .is_err(),
             "nothing follows the offline notice"
         );
+    }
+
+    /// A refused token is told to the session's events once, with the line the log
+    /// gets, so an app can show it while the feeds keep running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_token_is_told_as_a_warning_event() {
+        let (wrong, _received) = fake_open_live("olgw_v1_other", 5.0).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let heartbeat = Heartbeat::start(
+            wrong,
+            sample(),
+            Events::new(move |e| {
+                let _ = tx.send(e);
+            }),
+        );
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a warning within 5s")
+            .unwrap();
+        let Event::Warning { message } = event else {
+            panic!("{event:?}");
+        };
+        assert!(
+            message.starts_with("Open Live refused the token for gateway gw-1"),
+            "{message}"
+        );
+        assert!(!message.contains("olgw_v1_secret"), "{message}");
+        heartbeat.stop().await;
     }
 
     /// Setup uses this to tell a wrong token from a working one.

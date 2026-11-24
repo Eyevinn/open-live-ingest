@@ -1,0 +1,64 @@
+[package]
+name = "open-live-ingest-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Desktop app for Open Live Ingest (macOS and Windows)"
+publish = false
+
+[dependencies]
+# The gateway library without the `cli` feature: no clap, dialoguer or console.
+open-live-ingest = { path = "..", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+# The runtime the core runs what waits on a server, Strom or the browser on, so the
+# window keeps answering meanwhile.
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+
+# SIGTERM from `open-live-ingest down` is Stop without asking on macOS (spec, section 8).
+[target.'cfg(unix)'.dependencies]
+tokio = { version = "1", features = ["signal"] }
+
+# Runs AppKit's event loop, which must own the main thread: no libtest harness.
+[[test]]
+name = "macos_should_terminate"
+harness = false
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }
+toml = "0.8.23"
+
+# The window (tao), the system webview in it (wry) and the macOS menu bar (muda):
+# docs/decisions/ADR-001-desktop-app-toolkit.md. Only on macOS and Windows, so the
+# app's own core (protocol, CSP, navigation filter, IPC) also builds and tests on Linux
+# without webkit2gtk. wry's `devtools` feature stays off, so release builds have none.
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
+tao = "0.37"
+wry = "0.57"
+
+# Windows has no menu bar (docs/specs/desktop-app.md, section 5).
+# objc2 and block2 (both already in the tree through tao and wry) ask AVFoundation for
+# camera and microphone access before Go live (section 4).
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.20"
+objc2 = "0.6"
+block2 = "0.6"
+
+# Quitting while live on Windows (spec, section 8): the window subclass for
+# WM_QUERYENDSESSION, the shutdown block reason and the single-instance mutex. The
+# `windows` crate tao already depends on, at the version the lockfile resolves; the
+# only feature tao does not already turn on is Win32_System_Shutdown (and
+# Win32_Security, which CreateMutexW's signature names). No new crate.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Shutdown",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

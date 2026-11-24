@@ -1,7 +1,7 @@
 # ADR-001: Desktop app toolkit, and a second front end next to the terminal
 
 **Date**: 2026-11-17
-**Status**: Proposed
+**Status**: Accepted
 
 Spec: [`docs/specs/desktop-app.md`](../specs/desktop-app.md). Epic: #62 (OL-59).
 

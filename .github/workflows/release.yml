@@ -1,15 +1,19 @@
 name: Release
 
 # Pushing a tag such as v0.3.0 builds one binary per platform (a tarball each, a
-# zip for Windows) and attaches them to a GitHub release, with SHA256SUMS and
-# build-provenance attestations (`release`). When the Apple secrets (#25) exist and
+# zip for Windows) and the Windows installer (`windows-app`), and attaches them to a
+# GitHub release, with SHA256SUMS and build-provenance attestations (`release`). When the Apple secrets (#25) exist and
 # the macOS DMG was notarized, `release-macos` then adds the DMG to that release,
 # rewrites SHA256SUMS to cover it and attests it; otherwise it is skipped and the
 # release is the archives only. The manual trigger builds the same artifacts and
-# SHA256SUMS without publishing anything, to try the workflow out. A pull request
-# that changes this workflow or the macOS app script runs it too, so the change is
-# proven before it merges; like a manual run from a branch, it publishes nothing
-# (`release` and `release-macos` run only on a tag ref).
+# SHA256SUMS without publishing anything, to try the workflow out. `ios-app` builds the
+# iPhone app on every run: unsigned without the Apple distribution secrets (a notice
+# says the TestFlight upload is skipped), signed with them, and uploaded to TestFlight
+# for internal testers only on a tag ref with the App Store Connect key. A pull request
+# that changes this workflow, the macOS app or Strom MSI script, the desktop app (app/) or the
+# packaging (packaging/) runs it too, so the change is proven before it merges; like
+# a manual run from a branch, it publishes nothing (`release` and `release-macos` run
+# only on a tag ref).
 on:
   push:
     tags: ["v*"]
@@ -18,7 +22,12 @@ on:
     paths:
       - .github/workflows/release.yml
       - .github/scripts/build-macos-app.sh
+      - .github/scripts/e2e-app.py
+      - .github/scripts/test_e2e_app.py
+      - .github/scripts/fetch-strom-msi.sh
       - .github/scripts/open-live-ingest.entitlements
+      - app/**
+      - packaging/**
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +35,9 @@ env:
   DMG: open-live-ingest-macos-aarch64.dmg
   # The artifact name of a notarized DMG on a tag ref; only `release-macos` reads it.
   NOTARIZED_DMG_ARTIFACT: notarized-macos-dmg
+  # The Windows installer `windows-app` builds, and its artifact name; `e2e-windows`
+  # installs it.
+  SETUP: open-live-ingest-x86_64-pc-windows-msvc-setup.exe
 
 jobs:
   build:
@@ -46,19 +58,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The tag must name the version Cargo.toml carries, so a release never ships a
-      # binary that reports a different version than its filename.
-      - name: Check the tag against Cargo.toml
-        if: github.ref_type == 'tag'
-        run: |
-          crate="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          test "$crate" = "${{ github.ref_name }}" \
-            || { echo "tag ${{ github.ref_name }} but Cargo.toml says $crate"; exit 1; }
-
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
+
+      # The tag must name the version Cargo.toml carries, so a release never ships a
+      # binary that reports a different version than its filename. Cargo itself reads
+      # it: the version is the workspace's, inherited by the open-live-ingest package.
+      - name: Check the tag against Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          crate="v$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "open-live-ingest") | .version')"
+          test "$crate" = "${{ github.ref_name }}" \
+            || { echo "tag ${{ github.ref_name }} but Cargo.toml says $crate"; exit 1; }
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -70,6 +84,24 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q musl-tools
 
       - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The desktop app (app/, docs/specs/desktop-app.md) on the two platforms it ships
+      # on. The workspace's default members are the gateway only, so it needs its own
+      # -p. Its artifact name must not start with "$BIN-": `checksums` and `release`
+      # pick the archives up by that prefix, and the app binary is not a release asset
+      # of its own. `macos-app` puts it in the DMG as the bundle's main executable.
+      - name: Build the desktop app
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          cargo build --release --locked -p open-live-ingest-app --target ${{ matrix.target }}
+          case "${{ matrix.target }}" in *-windows-*) exe=.exe ;; *) exe= ;; esac
+          echo "APP_BINARY=target/${{ matrix.target }}/release/open-live-ingest-app$exe" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-pc-windows-msvc'
+        with:
+          name: app-binary-${{ matrix.target }}
+          path: ${{ env.APP_BINARY }}
+          if-no-files-found: error
 
       # No version in the asset name, so releases/latest/download/<asset> is a stable
       # URL. The tag names the version; so does the binary. Windows gets a zip (7-Zip
@@ -94,15 +126,283 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
+  # Open Live Ingest for Windows: an NSIS installer next to the zip
+  # (docs/specs/desktop-app.md, section 11.2), from the x86_64-pc-windows-msvc binaries
+  # of `build` (the CLI from the zip, the desktop app from app-binary-<target>) and the
+  # Strom MSI the strom-types tag in Cargo.toml names, so the workflow never names a
+  # Strom version itself. packaging/windows/open-live-ingest.nsi is the script; its
+  # header says what it installs and where.
+  #
+  # The MSI is checked against the SHA-256 digest GitHub records for it before makensis
+  # runs, as install.ps1 does; no digest, no installer. makensis comes from the runner
+  # image when it has one, otherwise from Chocolatey at NSIS_VERSION.
+  #
+  # Signing depends on the repository secrets (docs/specs/desktop-app.md, section 15 Q9):
+  #   - all six AZURE_* secrets below set: Azure Trusted Signing (now Azure Artifact
+  #     Signing) signs the app and the CLI before they go into the installer, then the
+  #     installer, and the job fails unless all three carry a valid Authenticode
+  #     signature.
+  #   - not set (pull requests, and every run until a human adds them): nothing is
+  #     signed and a notice says so. SmartScreen warns when the installer is run.
+  # Secrets are read only through step inputs, never echoed.
+  #
+  # The smoke test runs on every run, on the installer as it is uploaded: a silent
+  # install into %ProgramFiles%, both executables report the release version, the
+  # Start menu shortcut points at the app, the Strom MSI put strom.exe at
+  # %ProgramFiles%\Strom\bin, the app's window process is still running after 5 s and
+  # WebView2 made its folder under %LOCALAPPDATA%\open-live-ingest\webview, then a silent
+  # uninstall removes the app, the CLI, the shortcut and the Apps & features entry and
+  # leaves Strom.
+  #
+  # The installer is a release asset of its own, published by `release` with the
+  # archives, so it follows the same #36 go/no-go as the Windows zip and has no gate of
+  # its own. Its artifact name starts with "$BIN-" and ends in "-setup.exe", the pattern
+  # `checksums` and `release` pick it up by.
+  windows-app:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      # Chocolatey's nsis package, used only when the image has no makensis.
+      NSIS_VERSION: "3.13.0"
+      # "true" or "false"; secrets cannot be read in `if:` directly.
+      HAS_TRUSTED_SIGNING: ${{ secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_TRUSTED_SIGNING_ENDPOINT != '' && secrets.AZURE_TRUSTED_SIGNING_ACCOUNT != '' && secrets.AZURE_TRUSTED_SIGNING_CERT_PROFILE != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BIN }}-${{ env.TARGET }}.zip
+          path: zip
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-binary-${{ env.TARGET }}
+          path: app-binary
+
+      # stage/ is what the installer carries. The version is the workspace's in
+      # Cargo.toml, which `build` has already checked against the tag on a tag ref.
+      - name: Stage the files
+        run: |
+          set -euo pipefail
+          7z x -ozip "zip/$BIN-$TARGET.zip" > /dev/null
+          mkdir stage
+          cp "zip/$BIN-$TARGET/$BIN.exe" app-binary/open-live-ingest-app.exe LICENSE-MIT LICENSE-APACHE stage/
+          cp app/icons/AppIcon.ico stage/open-live-ingest.ico
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/ s/^version = "\([^"]*\)".*/\1/p' Cargo.toml)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] \
+            || { echo "cannot read the workspace version from Cargo.toml (got '$version')"; exit 1; }
+          if [[ "${{ github.ref_type }}" == tag && "v$version" != "${{ github.ref_name }}" ]]; then
+            echo "tag ${{ github.ref_name }} but Cargo.toml says $version"; exit 1
+          fi
+          {
+            echo "VERSION=$version"
+            echo "VERSION_QUAD=${BASH_REMATCH[0]}.0"
+            echo "STAGE=$(cygpath -w "$PWD/stage")"
+          } >> "$GITHUB_ENV"
+          ls -l stage
+
+      # The script reads the Strom version from the strom-types tag in Cargo.toml, so
+      # this workflow never names one (tests/pins.rs).
+      - name: Download the Strom MSI and check its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          msi="$(.github/scripts/fetch-strom-msi.sh strom)"
+          {
+            echo "STROM_MSI_NAME=$(basename "$msi")"
+            echo "STROM_MSI=$(cygpath -w "$PWD/$msi")"
+          } >> "$GITHUB_ENV"
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $makensis = (Get-Command makensis.exe -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) {
+            choco install nsis --version $env:NSIS_VERSION -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install nsis $env:NSIS_VERSION failed ($LASTEXITCODE)" }
+            $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") |
+              Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (-not $makensis) { throw "makensis.exe not found after installing NSIS $env:NSIS_VERSION" }
+          }
+          Write-Host "makensis: $makensis, $(& $makensis /VERSION)"
+          "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Sign the app and the CLI
+        if: env.HAS_TRUSTED_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          files: |
+            ${{ github.workspace }}\stage\open-live-ingest-app.exe
+            ${{ github.workspace }}\stage\open-live-ingest.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Say the installer is unsigned
+        if: env.HAS_TRUSTED_SIGNING != 'true'
+        run: echo "::notice title=Unsigned::The Azure Trusted Signing secrets are not set, so the installer, the app and the CLI are not signed. SmartScreen warns when the installer is run."
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:MAKENSIS -V3 -WX `
+            "-DVERSION=$env:VERSION" "-DVERSION_QUAD=$env:VERSION_QUAD" "-DSTAGE=$env:STAGE" `
+            "-DSTROM_MSI=$env:STROM_MSI" "-DSTROM_MSI_NAME=$env:STROM_MSI_NAME" `
+            "-DOUTFILE=$env:GITHUB_WORKSPACE\$env:SETUP" `
+            packaging\windows\open-live-ingest.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
+          Get-Item -LiteralPath $env:SETUP | Format-List Name, Length
+
+      - name: Sign the installer
+        if: env.HAS_TRUSTED_SIGNING == 'true'
+        uses: azure/artifact-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_TRUSTED_SIGNING_CERT_PROFILE }}
+          files: ${{ github.workspace }}\${{ env.SETUP }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Check the signatures
+        if: env.HAS_TRUSTED_SIGNING == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in "stage\open-live-ingest-app.exe", "stage\open-live-ingest.exe", $env:SETUP) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            Write-Host "$f : $($sig.Status), $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$f is not validly signed ($($sig.Status): $($sig.StatusMessage))" }
+          }
+
+      - name: Smoke test the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Fail([string]$Message) { Write-Host "::error::$Message"; exit 1 }
+          $dir = Join-Path $env:ProgramFiles 'Open Live Ingest'
+          $app = Join-Path $dir 'open-live-ingest-app.exe'
+          $cli = Join-Path $dir 'open-live-ingest.exe'
+          $uninstaller = Join-Path $dir 'uninstall.exe'
+          $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Open Live Ingest.lnk'
+          $strom = Join-Path $env:ProgramFiles 'Strom\bin\strom.exe'
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OpenLiveIngest'
+          $webview = Join-Path $env:LOCALAPPDATA 'open-live-ingest\webview'
+          $appLog = Join-Path $env:LOCALAPPDATA 'open-live-ingest\logs\app.log'
+
+          # A clean runner, so the installer has to run the Strom MSI itself.
+          if (Test-Path -LiteralPath $dir) { Fail "$dir exists before the install" }
+          if (Test-Path -LiteralPath $strom) { Fail "$strom exists before the install, so the MSI would not be exercised" }
+
+          Write-Host "--- silent install"
+          $p = Start-Process -FilePath (Join-Path $env:GITHUB_WORKSPACE $env:SETUP) -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            $msiLog = Join-Path $env:TEMP 'open-live-ingest-strom-msi.log'
+            if (Test-Path -LiteralPath $msiLog) { Get-Content -LiteralPath $msiLog -Tail 80 }
+            Fail "the silent install exited with $($p.ExitCode)"
+          }
+          foreach ($f in $app, $cli, $uninstaller, 'LICENSE-MIT', 'LICENSE-APACHE', 'open-live-ingest.ico') {
+            $path = if ([IO.Path]::IsPathRooted($f)) { $f } else { Join-Path $dir $f }
+            if (-not (Test-Path -LiteralPath $path)) { Fail "$path is missing after the install" }
+          }
+          Get-ChildItem -LiteralPath $dir | Format-Table Name, Length
+
+          foreach ($exe in @(@($app, 'open-live-ingest-app'), @($cli, 'open-live-ingest'))) {
+            $got = (& $exe[0] --version | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0) { Fail "$($exe[0]) --version exited with $LASTEXITCODE" }
+            Write-Host "installed $($exe[1]): $got"
+            if ($got -ne "$($exe[1]) $env:VERSION") { Fail "expected '$($exe[1]) $env:VERSION' from $($exe[0]) --version, got '$got'" }
+          }
+
+          if (-not (Test-Path -LiteralPath $shortcut)) { Fail "the Start menu shortcut $shortcut is missing" }
+          $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
+          Write-Host "shortcut: $($lnk.TargetPath), icon $($lnk.IconLocation)"
+          if ($lnk.TargetPath -ne $app) { Fail "the shortcut points at '$($lnk.TargetPath)', not $app" }
+
+          if (-not (Test-Path -LiteralPath $strom)) { Fail "strom.exe is not at $strom after the install" }
+          # The MSI adds GStreamer to the machine PATH, which this step's PATH predates.
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          $stromVersion = (& $strom --version 2>&1 | Out-String).Trim()
+          Write-Host "Strom at the MSI path: $stromVersion (exit code $LASTEXITCODE)"
+
+          $entry = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+          if (-not $entry) { Fail "no Apps & features entry at $key" }
+          if ($entry.DisplayVersion -ne $env:VERSION) { Fail "Apps & features says $($entry.DisplayVersion), not $env:VERSION" }
+          # The Strom MSI may change PATH for GStreamer; this installer adds nothing to it.
+          foreach ($scope in 'Machine', 'User') {
+            $entries = [Environment]::GetEnvironmentVariable('Path', $scope) -split ';' | ForEach-Object { $_.TrimEnd('\') }
+            if ($entries -contains $dir) { Fail "the install put $dir on the $scope PATH" }
+          }
+
+          Write-Host "--- the app's window for 5 s"
+          $proc = Start-Process -FilePath $app -PassThru
+          Start-Sleep -Seconds 5
+          if ($proc.HasExited) {
+            if (Test-Path -LiteralPath $appLog) { Get-Content -LiteralPath $appLog -Tail 80 }
+            Fail "the app exited within 5 s (exit code $($proc.ExitCode))"
+          }
+          $proc.Refresh()
+          Write-Host "the app is running (pid $($proc.Id), main window handle $($proc.MainWindowHandle))"
+          $deadline = (Get-Date).AddSeconds(20)
+          while (-not (Test-Path -LiteralPath $webview) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+          $webviewMade = Test-Path -LiteralPath $webview
+          Stop-Process -Id $proc.Id -Force
+          $proc.WaitForExit(15000) | Out-Null
+          if (Test-Path -LiteralPath $appLog) { Write-Host "--- app.log (tail)"; Get-Content -LiteralPath $appLog -Tail 20 }
+          if (-not $webviewMade) { Fail "WebView2 made no user-data folder at $webview" }
+          if (Test-Path -LiteralPath (Join-Path $dir 'open-live-ingest-app.exe.WebView2')) { Fail "WebView2 made its folder next to the app" }
+
+          # The uninstaller copies itself to %TEMP% and runs from there, so wait for the
+          # files to go rather than for the process.
+          Write-Host "--- silent uninstall"
+          $p = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Fail "the silent uninstall exited with $($p.ExitCode)" }
+          $deadline = (Get-Date).AddSeconds(60)
+          while (((Test-Path -LiteralPath $dir) -or (Test-Path -LiteralPath $shortcut)) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 1 }
+          if (Test-Path -LiteralPath $app) { Fail "$app is still there after the uninstall" }
+          if (Test-Path -LiteralPath $cli) { Fail "$cli is still there after the uninstall" }
+          if (Test-Path -LiteralPath $dir) { Fail "$dir is still there after the uninstall" }
+          if (Test-Path -LiteralPath $shortcut) { Fail "the shortcut is still there after the uninstall" }
+          if (Test-Path -LiteralPath $key) { Fail "the Apps & features entry is still there after the uninstall" }
+          if (-not (Test-Path -LiteralPath $strom)) { Fail "the uninstall removed Strom" }
+          if (-not (Test-Path -LiteralPath $webview)) { Fail "the uninstall removed the user's WebView2 folder" }
+          Write-Host "OK: install, both versions, shortcut, Strom, the app's window and uninstall"
+          # GitHub's pwsh wrapper exits with the last native command's code otherwise.
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SETUP }}
+          path: ${{ env.SETUP }}
+          if-no-files-found: error
+
   # Runs on the manual trigger too, so a dry run shows the SHA256SUMS a release
   # would carry. It needs no write permission; publishing stays in `release`.
   checksums:
-    needs: build
+    needs: [build, windows-app]
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      # The archives of `build` only, by name pattern, never a DMG of macos-app.
+      # The archives of `build` and the installer of `windows-app` only, by name
+      # pattern, never a DMG of macos-app.
       - uses: actions/download-artifact@v4
         with:
           pattern: ${{ env.BIN }}-*.tar.gz
@@ -113,8 +413,13 @@ jobs:
           pattern: ${{ env.BIN }}-*.zip
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ env.BIN }}-*-setup.exe
+          path: dist
+          merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum -- *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS
+        run: cd dist && sha256sum -- *.tar.gz *.zip *-setup.exe > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: SHA256SUMS
@@ -123,16 +428,16 @@ jobs:
 
   release:
     if: github.ref_type == 'tag'
-    needs: [build, checksums]
+    needs: [build, windows-app, checksums]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      # Only the archives of `build` and the SHA256SUMS of `checksums`, each by name.
-      # Any other artifact of the run (the DMGs of macos-app) is never downloaded here,
-      # so a re-run of this job cannot publish it.
+      # Only the archives of `build`, the installer of `windows-app` and the SHA256SUMS
+      # of `checksums`, each by name. Any other artifact of the run (the DMGs of
+      # macos-app) is never downloaded here, so a re-run of this job cannot publish it.
       - uses: actions/download-artifact@v4
         with:
           pattern: ${{ env.BIN }}-*.tar.gz
@@ -145,16 +450,23 @@ jobs:
           merge-multiple: true
       - uses: actions/download-artifact@v4
         with:
+          pattern: ${{ env.BIN }}-*-setup.exe
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
           name: SHA256SUMS
           path: dist
       - name: Verify the checksums
         run: cd dist && sha256sum -c SHA256SUMS
-      # Signed build provenance for each archive, checked with `gh attestation verify`.
+      # Signed build provenance for each archive and the installer, checked with
+      # `gh attestation verify`.
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*-setup.exe
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -165,12 +477,16 @@ jobs:
             --generate-notes
 
   # Open Live Ingest.app for Apple silicon in a drag-to-install DMG, built from the
-  # aarch64-apple-darwin binary of `build` by .github/scripts/build-macos-app.sh. The
+  # aarch64-apple-darwin binaries of `build` by .github/scripts/build-macos-app.sh: the
+  # desktop app (artifact app-binary-aarch64-apple-darwin) is the bundle's main
+  # executable, and the gateway CLI from the tarball sits next to it for SSH use. The
   # script bundles the Strom the strom-types tag in Cargo.toml names, so the workflow
   # never names a Strom version itself.
   #
-  # Every Mach-O in the app is signed with the hardened runtime, and strom and
-  # open-live-ingest with the entitlements in .github/scripts/open-live-ingest.entitlements.
+  # Every Mach-O in the app is signed with the hardened runtime, and strom,
+  # open-live-ingest and open-live-ingest-app with the entitlements in
+  # .github/scripts/open-live-ingest.entitlements; strom also with
+  # com.apple.security.cs.allow-jit, for GStreamer's ORC (#113).
   # The identity depends on the repository secrets (#25):
   #   - APPLE_DEVELOPER_ID_P12 set: its Developer ID Application certificate is imported
   #     into a temporary keychain, which the last step deletes on every outcome, and the
@@ -219,6 +535,11 @@ jobs:
           path: tarball
       - name: Unpack the gateway
         run: tar xzf "tarball/$BIN-$TARGET.tar.gz" -C tarball
+      # An artifact does not keep the executable bit; the script installs it 0755.
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-binary-${{ env.TARGET }}
+          path: app-binary
 
       # The GStreamer the bundle carries, plugins included; see the script's header.
       - name: Install GStreamer
@@ -265,13 +586,14 @@ jobs:
 
       # dmg-root becomes the DMG's volume: the app and an /Applications link. The script
       # signs with MACOS_SIGN_IDENTITY when the import step set it, ad hoc otherwise,
-      # and fails unless every Mach-O carries the hardened runtime and the executables
-      # the camera and microphone entitlements.
+      # and fails unless every Mach-O carries the hardened runtime and the three
+      # executables the camera and microphone entitlements.
       - name: Build and sign the app bundle
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          .github/scripts/build-macos-app.sh "tarball/$BIN-$TARGET/$BIN" dmg-root
+          .github/scripts/build-macos-app.sh "tarball/$BIN-$TARGET/$BIN" \
+            app-binary/open-live-ingest-app dmg-root
           ln -s /Applications dmg-root/Applications
 
       # hdiutil on hosted runners sometimes fails with "Resource busy"; retry it.
@@ -333,16 +655,33 @@ jobs:
         run: xcrun stapler staple "$DMG"
 
       # On every run, on the app as the DMG carries it, mounted away from the build path:
-      # - build-macos-app.sh --check: no Mach-O load command or rpath names /opt/homebrew
-      #   or /usr/local, every Mach-O has the hardened runtime, strom and open-live-ingest
-      #   have the camera and microphone entitlements, and the strict deep codesign
-      #   verify passes.
-      # - the signature and entitlements of the main executable, for the log.
+      # - build-macos-app.sh --check: CFBundleExecutable is open-live-ingest-app, with the
+      #   CLI and strom next to it and the icon in Resources; no Mach-O load command or
+      #   rpath names /opt/homebrew or /usr/local, every Mach-O has the hardened runtime,
+      #   strom, open-live-ingest and open-live-ingest-app have the camera and
+      #   microphone entitlements, strom alone has com.apple.security.cs.allow-jit, and
+      #   the strict deep codesign verify passes.
+      # - the signature and entitlements of the main executable, the CLI and strom, for
+      #   the log.
+      # - the app and the CLI start under the hardened runtime from the mounted DMG
+      #   (dyld and library validation load them) and report the bundle's version.
       # - the bundled Strom reports 0.8.1 or later.
       # - the bundled Strom starts under the hardened runtime with the bundle's
-      #   GStreamer, as the gateway starts it: the plugin scanner builds the registry,
-      #   device discovery answers, and nothing in its log says a library or plugin
-      #   failed to load (library validation, a bad signature).
+      #   GStreamer and GLib environment, as the gateway starts it (LocatedStrom::gst_env
+      #   in src/local_strom.rs, mirrored here): the plugin scanner builds the registry
+      #   and device discovery answers.
+      # - two flows run in it at once, and both must still run 5 s after starting:
+      #   a test pattern through videoconvert, videoscale and audioconvert, whose inner
+      #   loops are ORC programs, so ORC JITs them (allow-jit, #113); and the gateway's
+      #   own test-pattern flow (Source::Test, x264 and the SRT uplink).
+      # - with both flows running, the Strom process has no library or module mapped
+      #   from outside the app other than macOS's own (lsof: DYLD_PRINT_LIBRARIES is
+      #   ignored under the hardened runtime), though this runner has Homebrew's
+      #   GStreamer and GLib installed. ORC's JIT buffers (orcexec.* in $HOME or
+      #   $TMPDIR) are flagged with a warning annotation, not failed on.
+      # - nothing in its log says a library, plugin or GIO module failed to load
+      #   (library validation, a bad signature), names a Homebrew path, or says ORC
+      #   could not JIT (`ORC: ERROR`, #113).
       - name: Check the DMG
         run: |
           set -euo pipefail
@@ -356,7 +695,17 @@ jobs:
             || { echo "the DMG has no /Applications link"; exit 1; }
           contents="$mnt/$APP/Contents"
           .github/scripts/build-macos-app.sh --check "$mnt/$APP"
+          codesign -dv --entitlements - "$contents/MacOS/open-live-ingest-app"
           codesign -dv --entitlements - "$contents/MacOS/open-live-ingest"
+          codesign -dv --entitlements - "$contents/MacOS/strom"
+          bundle_version="$(plutil -extract CFBundleShortVersionString raw -o - "$contents/Info.plist")"
+          for exe in open-live-ingest-app open-live-ingest; do
+            got="$("$contents/MacOS/$exe" --version)" \
+              || { echo "$exe --version failed from the DMG"; exit 1; }
+            echo "bundled $exe: $got"
+            test "$got" = "$exe $bundle_version" \
+              || { echo "expected '$exe $bundle_version' from $exe --version"; exit 1; }
+          done
           otool -L "$contents/MacOS/strom"
           out="$("$contents/MacOS/strom" --version)"
           echo "bundled Strom: $out"
@@ -377,6 +726,8 @@ jobs:
           GST_PLUGIN_SCANNER="$contents/Helpers/gst-plugin-scanner" \
           GST_REGISTRY_1_0="$data/gstreamer-registry.bin" \
           GST_REGISTRY="$data/gstreamer-registry.bin" \
+          GIO_MODULE_DIR="$contents/PlugIns/gio" GIO_EXTRA_MODULES="" \
+          XDG_DATA_DIRS="$contents/Resources" \
           GST_DEBUG="*:2" \
             "$contents/MacOS/strom" --headless --port "$port" --data-dir "$data" >"$log" 2>&1 &
           strom_pid=$!
@@ -391,14 +742,152 @@ jobs:
           devices="$(curl -fsS -m 60 "http://127.0.0.1:$port/api/discovery/devices?category=video_source")" \
             || { echo "device discovery failed"; cat "$log"; exit 1; }
           echo "Strom device discovery: $devices"
+
+          # ORC's JIT (#113): a test pattern through videoconvert, videoscale and
+          # audioconvert, whose inner loops are ORC programs, so ORC compiles them; the
+          # flow must start and still run 5 s later (it runs on while the gateway's flow
+          # below starts and the lsof check runs), or the log check below proves nothing.
+          orc_flow_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+          jq -n --arg id "$orc_flow_id" '
+            def el($id; $type; $props; $x; $y):
+              {id: $id, element_type: $type, properties: $props, position: [$x, $y]};
+            def ln($from; $to): {from: $from, to: $to};
+            {
+              id: $id, name: "orc-jit-check",
+              elements: [
+                el("vsrc"; "videotestsrc"; {"is-live": true, pattern: "smpte"}; 0; 0),
+                el("vcaps"; "capsfilter";
+                   {caps: "video/x-raw,format=I420,width=1280,height=720,framerate=30/1"}; 120; 0),
+                el("vconv"; "videoconvert"; {}; 240; 0),
+                el("vscale"; "videoscale"; {}; 360; 0),
+                el("vout"; "capsfilter"; {caps: "video/x-raw,format=BGRA,width=640,height=360"}; 480; 0),
+                el("vsink"; "fakesink"; {}; 600; 0),
+                el("asrc"; "audiotestsrc"; {"is-live": true, wave: "sine"}; 0; 150),
+                el("acaps"; "capsfilter"; {caps: "audio/x-raw,format=S16LE,rate=48000,channels=2"}; 120; 150),
+                el("aconv"; "audioconvert"; {}; 240; 150),
+                el("aout"; "capsfilter"; {caps: "audio/x-raw,format=F32LE"}; 360; 150),
+                el("asink"; "fakesink"; {}; 480; 150)
+              ],
+              links: [
+                ln("vsrc:src"; "vcaps:sink"), ln("vcaps:src"; "vconv:sink"),
+                ln("vconv:src"; "vscale:sink"), ln("vscale:src"; "vout:sink"),
+                ln("vout:src"; "vsink:sink"),
+                ln("asrc:src"; "acaps:sink"), ln("acaps:src"; "aconv:sink"),
+                ln("aconv:src"; "aout:sink"), ln("aout:src"; "asink:sink")
+              ]
+            }' >"$data/orc-flow.json"
+          curl -fsS -m 30 -H 'Content-Type: application/json' --data-binary "@$data/orc-flow.json" \
+            "http://127.0.0.1:$port/api/flows" >/dev/null \
+            || { echo "the bundled Strom did not take the ORC test-pattern flow"; cat "$log"; exit 1; }
+          started="$(curl -fsS -m 60 -X POST "http://127.0.0.1:$port/api/flows/$orc_flow_id/start")" \
+            || { echo "the bundled Strom did not start the ORC test-pattern flow"; cat "$log"; exit 1; }
+          jq -e '.flow.running == true' <<<"$started" >/dev/null \
+            || { echo "the ORC test-pattern flow is not running: $started"; cat "$log"; exit 1; }
+
+          # The flow `up --test` builds (src/flow.rs, Source::Test, default [video]),
+          # with a listener uplink so it needs no peer.
+          test_flow_id=0f3b6a52-6c1e-4e8a-9d0b-114000000001
+          flow_json="$RUNNER_TEMP/test-pattern-flow.json"
+          cat >"$flow_json" <<EOF
+          {
+            "id": "$test_flow_id",
+            "name": "dmg-check test pattern",
+            "elements": [
+              {"id": "testvideo", "element_type": "videotestsrc",
+               "properties": {"is-live": true, "pattern": "smpte"}, "position": [0.0, 0.0]},
+              {"id": "testvideocaps", "element_type": "capsfilter",
+               "properties": {"caps": "video/x-raw,width=1280,height=720,framerate=25/1"}, "position": [120.0, 0.0]},
+              {"id": "testaudio", "element_type": "audiotestsrc",
+               "properties": {"is-live": true, "wave": "sine", "freq": 1000.0}, "position": [0.0, 150.0]},
+              {"id": "testaudiocaps", "element_type": "capsfilter",
+               "properties": {"caps": "audio/x-raw,rate=48000,channels=2"}, "position": [120.0, 150.0]}
+            ],
+            "blocks": [
+              {"id": "encoder", "block_definition_id": "builtin.videoenc", "name": "Encoder",
+               "properties": {"codec": "h264", "encoder_preference": "auto", "bitrate": 6000,
+                              "quality_preset": "ultrafast", "tune": "zerolatency",
+                              "rate_control": "cbr", "keyframe_interval": 25},
+               "position": {"x": 250.0, "y": 0.0}},
+              {"id": "uplink", "block_definition_id": "builtin.mpegtssrt_output", "name": "SRT Uplink",
+               "properties": {"srt_uri": "srt://:18090?mode=listener&latency=200", "latency": 200,
+                              "num_video_tracks": 1, "num_audio_tracks": 1},
+               "position": {"x": 500.0, "y": 0.0}}
+            ],
+            "links": [
+              {"from": "testvideo:src", "to": "testvideocaps:sink"},
+              {"from": "testvideocaps:src", "to": "encoder:video_in"},
+              {"from": "testaudio:src", "to": "testaudiocaps:sink"},
+              {"from": "testaudiocaps:src", "to": "uplink:audio_in_0"},
+              {"from": "encoder:encoded_out", "to": "uplink:video_in"}
+            ]
+          }
+          EOF
+          api="http://127.0.0.1:$port/api/flows"
+          curl -fsS -m 30 -H 'Content-Type: application/json' --data-binary "@$flow_json" "$api" >/dev/null \
+            || { echo "creating the test-pattern flow failed"; cat "$log"; exit 1; }
+          curl -fsS -m 60 -X POST "$api/$test_flow_id/start" >/dev/null \
+            || { echo "starting the test-pattern flow failed"; cat "$log"; exit 1; }
+          running=false
+          for _ in $(seq 1 30); do
+            if [[ "$(curl -fsS -m 5 "$api/$test_flow_id" | jq -r '.flow.running // .running // false')" == true ]]; then
+              running=true; break
+            fi
+            sleep 1
+          done
+          $running || { echo "the test-pattern flow is not running"; cat "$log"; exit 1; }
+          sleep 5
+          flow="$(curl -fsS -m 10 "http://127.0.0.1:$port/api/flows/$orc_flow_id")" \
+            || { echo "cannot read the ORC test-pattern flow back"; cat "$log"; exit 1; }
+          jq -e '.flow.running == true' <<<"$flow" >/dev/null \
+            || { echo "the ORC test-pattern flow stopped running: $flow"; cat "$log"; exit 1; }
+          echo "OK: the bundled Strom ran the ORC test-pattern flow for 5 s"
+
+          # Every file mapped into Strom (lsof's "txt"): the executable, its libraries,
+          # modules it loaded, and the dyld shared cache macOS's own libraries live in.
+          # orcexec.* files are ORC's JIT buffers: on macOS ORC (0.4.44) maps a temp file
+          # in $HOME twice, writable and executable, even with allow-jit (#113), so they
+          # hold code the bundled liborc generated, not code loaded from outside. They
+          # are flagged (a warning annotation) and must sit in $HOME or $TMPDIR, but do
+          # not fail the check; anything else outside the app and macOS still does.
+          app_real="$(cd "$mnt/$APP" && pwd -P)"
+          mapped="$(lsof -n -P -p "$strom_pid" -a -d txt -Fn | sed -n 's/^n//p')" \
+            || { echo "lsof failed on the bundled Strom"; exit 1; }
+          echo "--- files mapped into the bundled Strom ---"; printf '%s\n' "$mapped"
+          grep -qE "^($app_real|$mnt/$APP)/Contents/PlugIns/gstreamer/" <<<"$mapped" \
+            || { echo "lsof shows no bundled plugin mapped into Strom, so this check saw nothing"; exit 1; }
+          outside="$(grep -vE "^($app_real|$mnt/$APP)/|^/usr/lib/|^/System/" <<<"$mapped" \
+            | grep -E '/opt/homebrew|/usr/local|\.(dylib|so)$|\.framework/|/orcexec\.' || true)"
+          orcexec="$(grep -E '/orcexec\.[^/]*$' <<<"$outside" || true)"
+          if [[ -n "$orcexec" ]]; then
+            echo "::warning title=ORC JIT buffers mapped into the bundled Strom::$(tr '\n' ' ' <<<"$orcexec")"
+            echo "flagged: ORC JIT buffers (orcexec.*) mapped into Strom:"; printf '%s\n' "$orcexec"
+            tmp_real="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P || echo /private/tmp)"
+            stray="$(grep -vE "^($HOME|${TMPDIR%/}|$tmp_real)/orcexec\.[^/]*$" <<<"$orcexec" || true)"
+            if [[ -n "$stray" ]]; then
+              echo "orcexec.* mapped from outside \$HOME and \$TMPDIR:"; printf '%s\n' "$stray"; exit 1
+            fi
+            outside="$(grep -vE '/orcexec\.[^/]*$' <<<"$outside" || true)"
+          fi
+          if [[ -n "$outside" ]]; then
+            echo "the bundled Strom loaded these from outside $APP:"; printf '%s\n' "$outside"; exit 1
+          fi
+          curl -fsS -m 30 -X POST "$api/$test_flow_id/stop" >/dev/null || true
+          curl -fsS -m 30 -X POST "$api/$orc_flow_id/stop" >/dev/null || true
           kill "$strom_pid"; wait "$strom_pid" || true; strom_pid=""
           echo "--- strom log (tail) ---"; tail -n 60 "$log"
           test -s "$data/gstreamer-registry.bin" \
             || { echo "the bundled Strom built no GStreamer registry"; exit 1; }
-          if grep -nE 'not valid for use in process|Library Validation|Failed to load plugin|code signature|Code Signature' "$log"; then
-            echo "the bundled Strom could not load bundled code under the hardened runtime"; exit 1
+          if grep -nE 'not valid for use in process|Library Validation|Failed to load plugin|Failed to load module|code signature|Code Signature' "$log"; then
+            echo "the bundled Strom could not load bundled code under the hardened runtime, or tried to load a GIO module"; exit 1
           fi
-          echo "OK: the bundled Strom runs under the hardened runtime and loads the bundle's GStreamer"
+          if grep -nE '/opt/homebrew|/usr/local/(lib|opt|Cellar|share)' "$log"; then
+            echo "the bundled Strom reached for files of a Homebrew install"; exit 1
+          fi
+          if grep -nF 'ORC: ERROR' "$log"; then
+            echo "ORC could not compile in the bundled Strom: is strom signed with com.apple.security.cs.allow-jit? (#113)"; exit 1
+          fi
+          echo "OK: no ORC: ERROR in strom.log, ORC's JIT runs under the hardened runtime"
+          echo "OK: the bundled Strom runs a test-pattern flow under the hardened runtime with only the bundle's GStreamer and GLib"
 
       # The last line is what sets the job output `notarized`: it is reached only when
       # notarizing, stapling and both checks here succeeded.
@@ -437,8 +926,642 @@ jobs:
             echo "No temporary keychain to delete"
           fi
 
+  # The no-secret half of the DMG's end to end (#112): the uplink's SRT stats with a
+  # receiver that comes up late. The app executable the DMG carries, started with
+  # `--ipc-stdio`, is pointed (`self_hosted`) at a stand-in Open Live on loopback and
+  # goes live with the test pattern; a local SRT listener (srt-live-transmit, from
+  # Homebrew's `srt`) starts at least 30 s later. The uplink's srt-stats are sampled
+  # twice, 60 s apart, and the job fails, with the numbers in the log, when
+  # packets_sent_dropped grows by more than 1 % of packets_sent (a warning only while
+  # E2E_UPLINK_DROP_WARN_ONLY is set, #111), the uplink reports connected=false, sends
+  # nothing or reconnects. The check itself is unit tested first
+  # (.github/scripts/test_e2e_app.py). What it does: .github/scripts/e2e-app.py
+  # (E2E_PART late-listener).
+  #
+  # Its own job so that it runs on every pull request that builds the DMG, forks
+  # included: it reads no secret and touches no shared instance, so it has no fork
+  # guard and no `e2e-openlivedev` concurrency group. Never on a tag ref.
+  e2e-macos-late-listener:
+    needs: macos-app
+    if: github.ref_type != 'tag'
+    runs-on: macos-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      APP: Open Live Ingest.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DMG }}
+      - name: Unit tests of the uplink SRT stats check
+        run: python3 -I .github/scripts/test_e2e_app.py
+      - name: Install the local SRT listener (srt-live-transmit)
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install srt
+          command -v srt-live-transmit
+      - name: Go live to a stand-in Open Live, late SRT listener, Stop
+        env:
+          E2E_PART: late-listener
+          # The receiver comes up this long after Go live, and the uplink is sampled
+          # this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
+        run: |
+          set -euo pipefail
+          # As in e2e-macos: drop traffic to the bundled Strom's port (8080) on every
+          # interface but loopback before the app can start it.
+          sudo pfctl -f /etc/pf.conf
+          echo 'block drop in quick on ! lo0 proto { tcp udp } from any to any port 8080' \
+            | sudo pfctl -a com.apple/oli-e2e -f -
+          sudo pfctl -E 2>&1 | grep -v '^Token' || true
+          if ! sudo pfctl -a com.apple/oli-e2e -sr 2>/dev/null | grep -q 'port = 8080'; then
+            echo "::error title=e2e app::the pf rule for Strom's port did not load"
+            exit 1
+          fi
+          if ! sudo pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+            echo "::error title=e2e app::pf is not enabled"
+            exit 1
+          fi
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
+          python3 -I .github/scripts/e2e-app.py "$mnt/$APP/Contents/MacOS/open-live-ingest-app"
+      - name: App log
+        if: always()
+        run: |
+          log="$HOME/Library/Logs/open-live-ingest/app.log"
+          if [[ -f "$log" ]]; then cat "$log"; else echo "no app log at $log"; fi
+          strom_log="$(find "$HOME/Library/Application Support/open-live-ingest" -name strom.log 2>/dev/null | head -n 1)"
+          if [[ -n "$strom_log" ]]; then echo "--- $strom_log (tail) ---"; tail -n 100 "$strom_log"; fi
+          srt_log="$RUNNER_TEMP/oli-app-e2e/srt-listener.log"
+          if [[ -f "$srt_log" ]]; then echo "--- $srt_log (tail) ---"; tail -n 50 "$srt_log"; fi
+
+  # The agent-run end to end (OL-59i, #100; spec section 14), on the DMG `macos-app`
+  # has just built and checked: the app executable the DMG carries, started with
+  # `--ipc-stdio` (the app core with no window and no webview), is fed the same
+  # messages the page sends, with the test pattern, against the Open Live instance
+  # `openlivedev`: Go live, the source in Open Live, Stop, the flow gone and the source
+  # kept, Go live again with no 409 reusing the same source id (#115), quit while live
+  # removes the flow and keeps the source. What it checks and how:
+  # .github/scripts/e2e-app.py.
+  #
+  # The uplink's SRT stats while live (#112): with the secret, the openlivedev
+  # production that takes the source is activated at least 30 s after Go live, and
+  # the uplink's srt-stats are sampled twice, 60 s apart. The job fails, with the
+  # numbers in the log, when packets_sent_dropped grows by more than 1 % of
+  # packets_sent (a warning only while E2E_UPLINK_DROP_WARN_ONLY is set, #111) or the
+  # uplink reports connected=false. The no-secret variant of the same check is the
+  # `e2e-macos-late-listener` job.
+  #
+  # Needs the repository secret OSC_ACCESS_TOKEN, an Open Source Cloud personal access
+  # token for the workspace that owns `openlivedev` (the same secret as the
+  # e2e-audio-device workflow). Without it, a run by hand fails and names the secret;
+  # a pull request run still starts the DMG's app core, lists devices through the
+  # bundled Strom and checks that Go live is refused and quit ends the app, then warns
+  # naming the secret and passes. Fork pull requests get no secrets and skip the job.
+  #
+  # The Windows half, with the same test pattern, is `e2e-windows` (#145). Never on a
+  # tag ref: a release does not wait on a shared test instance. One run at a time per
+  # instance, shared with `e2e-windows` and the e2e-audio-device workflow
+  # (`e2e-openlivedev`): a third queued run cancels the pending one, which is then
+  # re-run by hand.
+  e2e-macos:
+    needs: macos-app
+    if: >-
+      github.ref_type != 'tag' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    concurrency:
+      group: e2e-openlivedev
+      cancel-in-progress: false
+    env:
+      APP: Open Live Ingest.app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.DMG }}
+      - name: Go live, Stop and quit while live from the DMG, against Open Live
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          OPEN_LIVE_INSTANCE: openlivedev
+          # A run by hand needs the secret; a pull request run without it warns and
+          # passes after the checks that need none.
+          E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+          # Everything but the late-listener check, which e2e-macos-late-listener runs.
+          E2E_PART: openlivedev
+          # The SRT stats check (#112): the receiver comes up this long after Go
+          # live, and the uplink is sampled this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
+        run: |
+          set -euo pipefail
+          # The bundled Strom the app starts has an unauthenticated API and listens
+          # on all interfaces: drop traffic to its port (8080, the default [strom]
+          # url) on every interface but loopback before the app can start it, as
+          # #83 does with iptables. The script also keeps OSC_ACCESS_TOKEN and
+          # GH_TOKEN out of the app's environment, and so out of Strom's.
+          sudo pfctl -f /etc/pf.conf
+          echo 'block drop in quick on ! lo0 proto { tcp udp } from any to any port 8080' \
+            | sudo pfctl -a com.apple/oli-e2e -f -
+          sudo pfctl -E 2>&1 | grep -v '^Token' || true
+          if ! sudo pfctl -a com.apple/oli-e2e -sr 2>/dev/null | grep -q 'port = 8080'; then
+            echo "::error title=e2e app::the pf rule for Strom's port did not load"
+            exit 1
+          fi
+          if ! sudo pfctl -s info 2>/dev/null | grep -q '^Status: Enabled'; then
+            echo "::error title=e2e app::pf is not enabled"
+            exit 1
+          fi
+          mnt="$RUNNER_TEMP/dmg"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$DMG"
+          trap 'hdiutil detach "$mnt" || hdiutil detach -force "$mnt"' EXIT
+          python3 -I .github/scripts/e2e-app.py "$mnt/$APP/Contents/MacOS/open-live-ingest-app"
+      - name: App log
+        if: always()
+        run: |
+          log="$HOME/Library/Logs/open-live-ingest/app.log"
+          if [[ -f "$log" ]]; then cat "$log"; else echo "no app log at $log"; fi
+          strom_log="$(find "$HOME/Library/Application Support/open-live-ingest" -name strom.log 2>/dev/null | head -n 1)"
+          if [[ -n "$strom_log" ]]; then echo "--- $strom_log (tail) ---"; tail -n 100 "$strom_log"; fi
+
+  # The Windows half of `e2e-macos` (#145, the open acceptance criteria of #130): the
+  # same .github/scripts/e2e-app.py run (E2E_PART openlivedev), with the test pattern,
+  # on the installer `windows-app` has just built and smoke tested. The installer is
+  # installed silently on a clean runner, as the smoke test does (the app and the CLI
+  # in %ProgramFiles%\Open Live Ingest, the Strom MSI's strom.exe in
+  # %ProgramFiles%\Strom\bin), and the installed open-live-ingest-app.exe is started
+  # with `--ipc-stdio`. Against `openlivedev`: Go live arms with no flow, activating
+  # a production holding the source starts the uplink within 5 s, the uplink's SRT
+  # stats over 60 s, deactivate stops the flow and keeps the source, Go live again
+  # reuses it and reactivating reconnects, quit while live. What it checks and how:
+  # the script's header.
+  #
+  # Camera capture on Windows is not part of it: that is #36. The test pattern goes
+  # through the same uplink flow a camera does.
+  #
+  # Everything else as `e2e-macos`: the same secret (OSC_ACCESS_TOKEN; without it a
+  # run by hand fails naming it, and a pull request run checks devices, the refused
+  # Go live and quit, then warns and passes), the same E2E_UPLINK_DROP_WARN_ONLY while
+  # #111 is open, the same `e2e-openlivedev` concurrency group (so it never runs at
+  # the same time as `e2e-macos` or e2e-audio-device), no fork pull requests and never
+  # on a tag ref. The script names the run's sources `...-win` and the macOS job's
+  # `...-mac`, so the two never share one. Instead of pf, Windows Firewall rules drop
+  # traffic to the Strom port (8080) from every address but loopback, with the
+  # firewall switched on, before the app can start Strom; the step fails if they do
+  # not take.
+  e2e-windows:
+    needs: windows-app
+    if: >-
+      github.ref_type != 'tag' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: windows-latest
+    # e2e-macos's 45 minutes, plus the silent install with the Strom MSI.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    concurrency:
+      group: e2e-openlivedev
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SETUP }}
+      - name: Unit tests of the e2e checks, on Windows
+        shell: pwsh
+        run: |
+          python --version
+          python -I .github/scripts/test_e2e_app.py
+          exit $LASTEXITCODE
+      - name: Install, Go live, Stop and quit while live, against Open Live
+        shell: pwsh
+        env:
+          OSC_ACCESS_TOKEN: ${{ secrets.OSC_ACCESS_TOKEN }}
+          OPEN_LIVE_INSTANCE: openlivedev
+          # A run by hand needs the secret; a pull request run without it warns and
+          # passes after the checks that need none.
+          E2E_REQUIRE_SECRET: ${{ github.event_name == 'workflow_dispatch' }}
+          # Everything but the late-listener check, as e2e-macos.
+          E2E_PART: openlivedev
+          # The SRT stats check (#112): the receiver comes up this long after Go
+          # live, and the uplink is sampled this many times, this far apart.
+          E2E_LATE_SECONDS: "35"
+          E2E_SRT_SAMPLES: "2"
+          E2E_SRT_INTERVAL: "60"
+          # TEMPORARY until #111 (sender drops after a late connect) is fixed: a
+          # dropped share above 1 % only warns, with the numbers. connected=false, no
+          # packets sent and a reconnect still fail. #111's fix PR removes this line.
+          E2E_UPLINK_DROP_WARN_ONLY: "true"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Fail([string]$Message) { Write-Host "::error title=e2e app::$Message"; exit 1 }
+
+          # The Strom the app starts has an unauthenticated API and listens on all
+          # interfaces: block its port (8080, the default [strom] url) from every
+          # remote address but loopback (127.0.0.0/8, ::1), and switch the firewall
+          # on, before the app can start it. As e2e-macos's pf rule.
+          $remote = @('0.0.0.0-126.255.255.255', '128.0.0.0-255.255.255.255', '::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')
+          foreach ($proto in 'TCP', 'UDP') {
+            New-NetFirewallRule -Name "oli-e2e-strom-$proto" -DisplayName "oli-e2e: Strom's port ($proto)" `
+              -Direction Inbound -Action Block -Protocol $proto -LocalPort 8080 -RemoteAddress $remote -Profile Any | Out-Null
+          }
+          Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True
+          $off = @(Get-NetFirewallProfile | Where-Object { "$($_.Enabled)" -ne 'True' })
+          if ($off.Count -gt 0) { Fail "Windows Firewall is not on for the $($off.Name -join ', ') profile(s)" }
+          $rules = @(Get-NetFirewallRule -Name 'oli-e2e-strom-*' |
+            Where-Object { "$($_.Enabled)" -eq 'True' -and "$($_.Action)" -eq 'Block' -and "$($_.Direction)" -eq 'Inbound' })
+          $ports = @($rules | Get-NetFirewallPortFilter | Where-Object { "$($_.LocalPort)" -eq '8080' })
+          if ($rules.Count -ne 2 -or $ports.Count -ne 2) { Fail "the Windows Firewall rules for Strom's port did not load" }
+          Write-Host "Windows Firewall: on, inbound 8080 (TCP, UDP) blocked from every address but loopback"
+
+          # A clean runner, as in windows-app's smoke test.
+          $dir = Join-Path $env:ProgramFiles 'Open Live Ingest'
+          $app = Join-Path $dir 'open-live-ingest-app.exe'
+          $strom = Join-Path $env:ProgramFiles 'Strom\bin\strom.exe'
+          if (Test-Path -LiteralPath $dir) { Fail "$dir exists before the install" }
+          Write-Host "--- silent install of $env:SETUP"
+          $p = Start-Process -FilePath (Join-Path $env:GITHUB_WORKSPACE $env:SETUP) -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            $msiLog = Join-Path $env:TEMP 'open-live-ingest-strom-msi.log'
+            if (Test-Path -LiteralPath $msiLog) { Get-Content -LiteralPath $msiLog -Tail 80 }
+            Fail "the silent install exited with $($p.ExitCode)"
+          }
+          foreach ($f in $app, $strom) {
+            if (-not (Test-Path -LiteralPath $f)) { Fail "$f is missing after the install" }
+          }
+          Write-Host "installed: $((& $app --version | Out-String).Trim())"
+          # What the MSI added to the machine PATH (GStreamer), which this step's PATH
+          # predates, as a new login after the install would see it.
+          $env:Path = $env:Path + ';' + [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+
+          python -I .github/scripts/e2e-app.py $app
+          $code = $LASTEXITCODE
+          # GitHub's pwsh wrapper exits with the last native command's code otherwise.
+          exit $code
+      - name: App log
+        if: always()
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:LOCALAPPDATA 'open-live-ingest\logs\app.log'
+          if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log } else { Write-Host "no app log at $log" }
+          $data = Join-Path $env:APPDATA 'open-live-ingest'
+          $stromLog = Get-ChildItem -LiteralPath $data -Recurse -Filter strom.log -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($stromLog) { Write-Host "--- $($stromLog.FullName) (tail) ---"; Get-Content -LiteralPath $stromLog.FullName -Tail 100 }
+          "- Windows: the test pattern only; camera capture through Strom on Windows 11 is #36." | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          exit 0
+
+  # The iPhone app (docs/specs/ios-app.md, section 12): ios/OpenLiveIngest.xcodeproj
+  # built with SRT.xcframework (ios/Vendor/build-libsrt.sh, cached under the same key
+  # as ci.yml's `ios` job) and the Rust core (mobile/, built by the project's "Build the
+  # Rust core" phase, ios/build-core.sh). Its own job, on macos-latest; it needs `build`
+  # so that on a tag ref the tag has been checked against Cargo.toml first, and reads
+  # none of its artifacts.
+  #
+  # One version (section 3): MARKETING_VERSION, so CFBundleShortVersionString, is the
+  # workspace version from Cargo.toml, read as ios/run-tests.sh reads it (the project
+  # itself says 0.0.0); CURRENT_PROJECT_VERSION, so CFBundleVersion, is
+  # github.run_number, which only grows, as App Store Connect requires of a build
+  # number. "Check the built apps" fails unless both, the bundle id and the
+  # export-compliance answer (ITSAppUsesNonExemptEncryption false: TLS and SRT's AES,
+  # standard algorithms) are what every app this job builds carries.
+  #
+  # The identity depends on the repository secrets (section 14 Q11), guarded like
+  # macos-app's HAS_DEVELOPER_ID:
+  #   - always: an unsigned iOS Simulator .app (CODE_SIGNING_ALLOWED=NO), uploaded as
+  #     the artifact `ios-app-simulator`.
+  #   - APPLE_DISTRIBUTION_P12, APPLE_DISTRIBUTION_P12_PASSWORD and
+  #     APPLE_IOS_PROVISIONING_PROFILE not all set (pull requests, and every run until
+  #     section 14 Q11 is done): the device archive is built with signing disabled and
+  #     uploaded as the artifact `ios-app-device-archive-unsigned`, and a notice says
+  #     the TestFlight upload is skipped.
+  #   - all three set: the Apple Distribution certificate goes into a temporary
+  #     keychain and the App Store profile into the user's profile directories, both
+  #     removed by the last step on every outcome; the archive is signed with them
+  #     (manual signing) and exported with method app-store-connect. On a tag ref with
+  #     the App Store Connect API key (APP_STORE_CONNECT_KEY_ID, _ISSUER_ID, _KEY_P8)
+  #     too, the export's destination is `upload`: the build goes to App Store Connect,
+  #     for internal TestFlight testers only (testFlightInternalTestingOnly, section 14
+  #     Q12). On any other run the destination is `export`, which proves the signing
+  #     and uploads nothing, and a notice says why.
+  # Whether the APPLE_NOTARY_* key has the App Manager role is not checked here: it is
+  # part of #133's closing check, next to the TestFlight upload (section 14 Q11, #143).
+  # Nothing here is a release asset: the artifact names do not start with "$BIN-", so
+  # `checksums`, `release` and `release-macos` never pick them up. Secrets are read
+  # only through step env, never echoed.
+  ios-app:
+    needs: build
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      PROJECT: ios/OpenLiveIngest.xcodeproj
+      SCHEME: OpenLiveIngest
+      BUNDLE_ID: com.eyevinn.open-live-ingest.ios
+      BUILD_NUMBER: ${{ github.run_number }}
+      # "true" or "false"; secrets cannot be read in `if:` directly.
+      HAS_DISTRIBUTION: ${{ secrets.APPLE_DISTRIBUTION_P12 != '' && secrets.APPLE_DISTRIBUTION_P12_PASSWORD != '' && secrets.APPLE_IOS_PROVISIONING_PROFILE != '' }}
+      HAS_ASC_KEY: ${{ secrets.APP_STORE_CONNECT_KEY_ID != '' && secrets.APP_STORE_CONNECT_ISSUER_ID != '' && secrets.APP_STORE_CONNECT_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: aarch64-apple-ios, aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-app
+
+      - name: The version and the build number
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          [[ -n "$version" ]] || { echo "no workspace version in Cargo.toml"; exit 1; }
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "CFBundleShortVersionString $version (Cargo.toml), CFBundleVersion $BUILD_NUMBER (run number)"
+          xcodebuild -version
+          cmake --version | head -n 1
+
+      - uses: actions/cache@v4
+        id: libsrt
+        with:
+          path: ios/Vendor/SRT.xcframework
+          key: libsrt-${{ runner.os }}-${{ hashFiles('ios/Vendor/build-libsrt.sh') }}
+      - name: Build SRT.xcframework (libsrt and mbedTLS from pinned source)
+        if: steps.libsrt.outputs.cache-hit != 'true'
+        run: ios/Vendor/build-libsrt.sh
+
+      - name: Build the simulator app, unsigned
+        run: |
+          set -euo pipefail
+          xcodebuild build -quiet \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS Simulator" -derivedDataPath "$RUNNER_TEMP/ios-sim" \
+            CODE_SIGNING_ALLOWED=NO MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          app="$RUNNER_TEMP/ios-sim/Build/Products/Release-iphonesimulator/$SCHEME.app"
+          [[ -d "$app" ]] || { echo "no $app"; exit 1; }
+          echo "SIM_APP=$app" >> "$GITHUB_ENV"
+
+      - name: Archive for a device, unsigned
+        if: env.HAS_DISTRIBUTION != 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$SCHEME-unsigned.xcarchive"
+          xcodebuild archive -quiet \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS" -derivedDataPath "$RUNNER_TEMP/ios-device" \
+            -archivePath "$archive" \
+            CODE_SIGNING_ALLOWED=NO MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      - name: Say the TestFlight upload is skipped
+        if: env.HAS_DISTRIBUTION != 'true'
+        run: echo "::notice title=TestFlight upload skipped::APPLE_DISTRIBUTION_P12, APPLE_DISTRIBUTION_P12_PASSWORD and APPLE_IOS_PROVISIONING_PROFILE are not all set, so the iOS app is built unsigned (a simulator .app and a device archive, as workflow artifacts) and nothing is uploaded to App Store Connect."
+
+      # A keychain of its own with a random password, first in the search list so
+      # codesign finds the identity, and the profile under its UUID where Xcode looks
+      # for it. KEYCHAIN and PROFILE_FILES are exported before anything that can fail,
+      # so the cleanup step removes them whatever happens next.
+      - name: Import the Apple Distribution certificate and the provisioning profile
+        if: env.HAS_DISTRIBUTION == 'true'
+        env:
+          P12_BASE64: ${{ secrets.APPLE_DISTRIBUTION_P12 }}
+          P12_PASSWORD: ${{ secrets.APPLE_DISTRIBUTION_P12_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.APPLE_IOS_PROVISIONING_PROFILE }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/distribution.keychain-db"
+          kc_pw="$(openssl rand -hex 32)"
+          echo "::add-mask::$kc_pw"
+          echo "KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          security create-keychain -p "$kc_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pw" "$keychain"
+          p12="$RUNNER_TEMP/distribution.p12"
+          trap 'rm -f "$p12"' EXIT
+          base64 --decode <<<"$P12_BASE64" > "$p12"
+          security import "$p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$keychain" >/dev/null
+          existing=()
+          while IFS= read -r k; do existing+=("$k"); done < <(security list-keychains -d user | tr -d '" ')
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+
+          profile="$RUNNER_TEMP/ios-app.mobileprovision"
+          base64 --decode <<<"$PROFILE_BASE64" > "$profile"
+          security cms -D -i "$profile" > "$RUNNER_TEMP/ios-app-profile.plist"
+          pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$RUNNER_TEMP/ios-app-profile.plist"; }
+          uuid="$(pb UUID)"
+          team="$(pb TeamIdentifier:0)"
+          app_id="$(pb Entitlements:application-identifier)"
+          [[ "$app_id" == "$team.$BUNDLE_ID" ]] \
+            || { echo "the profile is for $app_id, not $team.$BUNDLE_ID"; exit 1; }
+          if pb ProvisionedDevices >/dev/null 2>&1; then
+            echo "the profile lists devices: it is not an App Store profile"; exit 1
+          fi
+          files=()
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                     "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            files+=("$dir/$uuid.mobileprovision")
+          done
+          printf 'PROFILE_FILES=%s\n' "$(IFS=:; echo "${files[*]}")" >> "$GITHUB_ENV"
+          for f in "${files[@]}"; do mkdir -p "$(dirname "$f")"; cp "$profile" "$f"; done
+          rm -f "$profile"
+
+          identities="$(security find-identity -v -p codesigning "$keychain")"
+          hash="$(grep -E "\"(Apple|iPhone) Distribution: .*\\($team\\)\"" <<<"$identities" | awk 'NR == 1 { print $2 }')"
+          [[ -n "$hash" ]] || { echo "the certificate holds no valid Apple Distribution identity for team $team"; exit 1; }
+          {
+            echo "IOS_SIGN_IDENTITY=$hash"
+            echo "IOS_TEAM_ID=$team"
+            echo "IOS_PROFILE_UUID=$uuid"
+          } >> "$GITHUB_ENV"
+          echo "Signing with Apple Distribution identity $hash, team $team, profile $uuid ($(pb Name))"
+
+      - name: Archive for a device, signed
+        if: env.HAS_DISTRIBUTION == 'true'
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/$SCHEME.xcarchive"
+          xcodebuild archive -quiet \
+            -project "$PROJECT" -scheme "$SCHEME" -configuration Release \
+            -destination "generic/platform=iOS" -derivedDataPath "$RUNNER_TEMP/ios-device" \
+            -archivePath "$archive" \
+            CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            CODE_SIGN_IDENTITY="$IOS_SIGN_IDENTITY" PROVISIONING_PROFILE_SPECIFIER="$IOS_PROFILE_UUID" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+
+      # What App Store Connect and the phone read: the version is the workspace's, the
+      # build number this run's, the bundle id and the export-compliance answer the
+      # spec's; the simulator app is built for the simulator and the archive for a
+      # device.
+      - name: Check the built apps
+        run: |
+          set -euo pipefail
+          check() {
+            local app="$1" platform="$2" plist="$1/Info.plist" exe got
+            pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$plist"; }
+            echo "== $app"
+            got="$(pb CFBundleShortVersionString)"
+            [[ "$got" == "$VERSION" ]] || { echo "CFBundleShortVersionString is $got, not $VERSION"; exit 1; }
+            got="$(pb CFBundleVersion)"
+            [[ "$got" == "$BUILD_NUMBER" ]] || { echo "CFBundleVersion is $got, not $BUILD_NUMBER"; exit 1; }
+            got="$(pb CFBundleIdentifier)"
+            [[ "$got" == "$BUNDLE_ID" ]] || { echo "CFBundleIdentifier is $got, not $BUNDLE_ID"; exit 1; }
+            got="$(pb ITSAppUsesNonExemptEncryption)"
+            [[ "$got" == false ]] || { echo "ITSAppUsesNonExemptEncryption is $got, not false"; exit 1; }
+            exe="$app/$(pb CFBundleExecutable)"
+            lipo -archs "$exe" | grep -qw arm64 || { echo "$exe is not arm64"; exit 1; }
+            got="$(xcrun vtool -show-build "$exe")"
+            grep -Eq "^[[:space:]]*platform[[:space:]]+$platform\$" <<<"$got" \
+              || { echo "$exe is not built for $platform:"; echo "$got"; exit 1; }
+            echo "OK: $BUNDLE_ID $VERSION ($BUILD_NUMBER), arm64 for $platform, ITSAppUsesNonExemptEncryption false"
+          }
+          check "$SIM_APP" IOSSIMULATOR
+          check "$ARCHIVE/Products/Applications/$SCHEME.app" IOS
+          got="$(/usr/libexec/PlistBuddy -c 'Print :ApplicationProperties:CFBundleShortVersionString' "$ARCHIVE/Info.plist")"
+          [[ "$got" == "$VERSION" ]] || { echo "the archive's version is $got, not $VERSION"; exit 1; }
+          if [[ "$HAS_DISTRIBUTION" == true ]]; then
+            codesign --verify --strict --verbose=2 "$ARCHIVE/Products/Applications/$SCHEME.app"
+          fi
+          {
+            echo "## iOS app"
+            echo
+            echo "- \`$BUNDLE_ID\` $VERSION ($BUILD_NUMBER), ITSAppUsesNonExemptEncryption false"
+            if [[ "$HAS_DISTRIBUTION" == true ]]; then
+              echo "- device archive signed with Apple Distribution (team $IOS_TEAM_ID)"
+            else
+              echo "- simulator .app and device archive unsigned; TestFlight upload skipped (no distribution secrets)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ditto keeps the bundles' symlinks and modes, which upload-artifact would not.
+      - name: Zip the simulator app and the unsigned archive
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent "$SIM_APP" "$RUNNER_TEMP/$SCHEME-simulator.app.zip"
+          if [[ "$HAS_DISTRIBUTION" != true ]]; then
+            ditto -c -k --keepParent "$ARCHIVE" "$RUNNER_TEMP/$SCHEME-unsigned.xcarchive.zip"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-app-simulator
+          path: ${{ runner.temp }}/${{ env.SCHEME }}-simulator.app.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_DISTRIBUTION != 'true'
+        with:
+          name: ios-app-device-archive-unsigned
+          path: ${{ runner.temp }}/${{ env.SCHEME }}-unsigned.xcarchive.zip
+          if-no-files-found: error
+
+      # The .p8 is written to a private directory and removed when the step ends; the
+      # cleanup step removes it too if the runner is cut short.
+      - name: Export the archive (TestFlight upload on a tag)
+        if: env.HAS_DISTRIBUTION == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+          IS_TAG: ${{ github.ref_type == 'tag' }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/app-store-connect"
+          mkdir -p "$dir"
+          chmod 700 "$dir"
+          trap 'rm -rf "$dir"' EXIT
+          auth=()
+          if [[ "$IS_TAG" == true && "$HAS_ASC_KEY" == true ]]; then
+            destination="upload"
+            key="$dir/AuthKey_$ASC_KEY_ID.p8"
+            # The base64 of the .p8, like APPLE_NOTARY_KEY_P8; the PEM text itself works too.
+            if [[ "$ASC_KEY_P8" == -----BEGIN* ]]; then
+              printf '%s\n' "$ASC_KEY_P8" > "$key"
+            else
+              base64 --decode <<<"$ASC_KEY_P8" > "$key"
+            fi
+            auth=(-authenticationKeyPath "$key" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+          else
+            destination="export"
+            if [[ "$IS_TAG" != true ]]; then
+              why="the TestFlight upload runs on a tag ref only"
+            else
+              why="APP_STORE_CONNECT_KEY_ID, APP_STORE_CONNECT_ISSUER_ID and APP_STORE_CONNECT_KEY_P8 are not all set"
+            fi
+            echo "::notice title=TestFlight upload skipped::$why; the signed archive is exported for App Store Connect without uploading it."
+          fi
+          cat > "$dir/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>$destination</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>$IOS_TEAM_ID</string>
+            <key>signingCertificate</key><string>$IOS_SIGN_IDENTITY</string>
+            <key>provisioningProfiles</key>
+            <dict><key>$BUNDLE_ID</key><string>$IOS_PROFILE_UUID</string></dict>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>testFlightInternalTestingOnly</key><true/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$dir/ExportOptions.plist"
+          xcodebuild -exportArchive -archivePath "$ARCHIVE" \
+            -exportOptionsPlist "$dir/ExportOptions.plist" -exportPath "$dir/export" \
+            ${auth[@]+"${auth[@]}"}
+          if [[ "$destination" == upload ]]; then
+            echo "Uploaded $BUNDLE_ID $VERSION ($BUILD_NUMBER) to App Store Connect, internal TestFlight testers only"
+          else
+            ls -l "$dir/export"
+          fi
+
+      - name: Remove the temporary keychain and the profile
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/app-store-connect" "$RUNNER_TEMP/distribution.p12" \
+            "$RUNNER_TEMP/ios-app.mobileprovision" "$RUNNER_TEMP/ios-app-profile.plist"
+          if [[ -n "${PROFILE_FILES:-}" ]]; then
+            IFS=: read -r -a files <<<"$PROFILE_FILES"
+            rm -f "${files[@]}"
+            echo "Removed the provisioning profile"
+          fi
+          if [[ -n "${KEYCHAIN:-}" && -e "$KEYCHAIN" ]]; then
+            security delete-keychain "$KEYCHAIN"
+            echo "Deleted the temporary keychain"
+          else
+            echo "No temporary keychain to delete"
+          fi
+
   # Adds the notarized DMG to the release `release` created: the DMG itself, a
-  # SHA256SUMS that covers the release's tarballs, the Windows zip and the DMG
+  # SHA256SUMS that covers the release's tarballs, the Windows zip and installer, and the DMG
   # (replacing the one `release` uploaded), and a build-provenance attestation for the DMG, checked with
   # `gh attestation verify open-live-ingest-macos-aarch64.dmg --repo Eyevinn/open-live-ingest`.
   # Skipped, not failed, when macos-app did not notarize (no Apple secrets) or failed,
@@ -466,9 +1589,9 @@ jobs:
         run: |
           set -euo pipefail
           test -s "dist/$DMG" || { echo "the notarized artifact holds no $DMG"; exit 1; }
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip' --dir dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.tar.gz' --pattern '*.zip' --pattern '*-setup.exe' --dir dist
           cd dist
-          sha256sum -- *.tar.gz *.zip "$DMG" > SHA256SUMS
+          sha256sum -- *.tar.gz *.zip *-setup.exe "$DMG" > SHA256SUMS
           cat SHA256SUMS
       - uses: actions/attest-build-provenance@v2
         with:

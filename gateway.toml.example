@@ -39,6 +39,8 @@ url = "https://my-instance.eyevinn-open-live.auto.prod-se.osaas.io"
 #         `npx @osaas/cli login` (~/.osc/token, valid for an hour) is used. Set
 #         api_key to a personal access token for a show or a machine with no
 #         browser; it takes precedence. Setup lists the workspace's instances.
+#         After a sign-in from the app, the credential is in the OS keychain and
+#         this section holds only `credential = "keychain"`, no token.
 # direct: api_key is sent as the bearer token as-is, for a self-hosted Open Live
 #         with a static API_KEY, or none at all.
 auth_mode = "osc"
@@ -55,13 +57,20 @@ register = true
 # inside the range it publishes, and a source left by an earlier run keeps its port;
 # in listener mode the lowest free port in port_range, in device-name order.
 [uplink]
-# caller:   this machine dials the cloud. Nothing inbound here; the ports are the
-#           cloud Strom's, and Open Live publishes the range it has leased from it
-#           (GET /api/v1/server-info), so port_range is not needed. Set it only for an
-#           Open Live that publishes no range; it is ignored when one is published.
+# caller:   this machine dials the cloud. Nothing inbound here. Through Open Live's SRT
+#           relay when Open Live reports one (GET /api/v1/server-info, srt.relays):
+#           no ports at all, and a passphrase is generated and saved here if none is
+#           set. Otherwise the ports are the cloud Strom's, and Open Live publishes
+#           the range it has leased from it, so port_range is not needed. Set it only
+#           for an Open Live that publishes no range; it is ignored when one is
+#           published.
+# relay:    always through Open Live's SRT relay; an Open Live without one is an
+#           error rather than a port on its Strom.
 # listener: the cloud dials this machine. Needs public_host and inbound UDP here, and
-#           port_range names this machine's own ports.
+#           port_range names this machine's own ports. Never uses the relay.
 mode = "caller"
+# The relay to send through, by the name Open Live reports; "default" when unset.
+# relay = "default"
 # port_range = "47110-47129"
 # Rule of thumb: 3-4x the measured RTT.
 latency_ms = 200
@@ -95,11 +104,18 @@ keyframe_interval = 25          # frames; one or two seconds' worth
 [log]
 level = "info"
 
-# Send an audio source (a USB microphone, an audio interface) with a camera. Both
-# by Strom device id or name fragment, as `open-live-ingest devices` lists them.
-# One entry per camera, and one audio source goes with one camera. The audio
-# device runs on its own clock; see docs/DESIGN.md. `up --audio "CAMERA=AUDIO"`
-# replaces these for a run.
+# What to send. Without any [[input]], `up` sends every device except the virtual
+# ones. With them, `up` sends exactly these, one entry per input; `--devices`,
+# `--all` and `--test` pick for one run instead. The desktop app writes these.
+#   device: by Strom device id or name fragment, as `open-live-ingest devices` lists
+#           them (an exact id wins), or "test" for the test pattern.
+#   audio:  optional, an audio source (a USB microphone, an audio interface) to send
+#           with the camera. One audio source goes with one camera. It runs on its
+#           own clock; see docs/DESIGN.md. `up --audio "CAMERA=AUDIO"` replaces these
+#           pairings for a run.
+#   label:  optional, the source's name in Studio after "<gateway name> — "; the
+#           device's name when unset.
 # [[input]]
 # device = "FaceTime"
 # audio = "USB Microphone"
+# label = "Stage left"

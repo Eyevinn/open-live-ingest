@@ -12,18 +12,19 @@
 //! `--non-interactive` then runs the same checks without a terminal and refuses on
 //! anything missing. That is how a script or an agent sets a box up.
 
-use crate::config::{
-    format_port_range, format_ports, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE,
-};
-use crate::heartbeat;
-use crate::local_strom;
-use crate::openlive::{OpenLiveClient, ServerInfo};
-use crate::osc;
-use crate::strom::{Reachability, StromClient};
 use anyhow::{bail, Context, Result};
 use console::{style, Emoji, Style};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::{Input, Password, Select};
+use open_live_ingest::api::{self, check_open_live, infer_auth_mode, probe_strom};
+use open_live_ingest::config::{
+    format_port_range, format_ports, AuthMode, Config, UplinkMode, SUGGESTED_PORT_RANGE,
+};
+use open_live_ingest::heartbeat;
+use open_live_ingest::local_strom;
+use open_live_ingest::openlive::ServerInfo;
+use open_live_ingest::osc;
+use open_live_ingest::strom::Reachability;
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -200,10 +201,16 @@ pub struct Answers {
     #[arg(long)]
     pub strom_url: Option<String>,
 
-    /// Which end dials: `caller` (this machine dials the cloud; nothing inbound here)
-    /// or `listener` (the cloud dials this machine).
+    /// Which end dials: `caller` (this machine dials the cloud, through Open Live's
+    /// SRT relay when it has one; nothing inbound here), `relay` (always through the
+    /// relay) or `listener` (the cloud dials this machine).
     #[arg(long)]
     pub uplink_mode: Option<UplinkMode>,
+
+    /// The SRT relay to send through, by the name Open Live reports; `default` when
+    /// unset. Blank clears it.
+    #[arg(long)]
+    pub relay: Option<String>,
 
     /// This machine's address as the cloud sees it. Listener mode only.
     #[arg(long)]
@@ -261,6 +268,9 @@ impl Answers {
         if let Some(mode) = self.uplink_mode {
             cfg.uplink.mode = mode;
         }
+        if let Some(relay) = &self.relay {
+            cfg.uplink.relay = blank_to_none(relay.trim().to_string());
+        }
         if let Some(host) = &self.public_host {
             cfg.uplink.public_host = blank_to_none(host.clone());
         }
@@ -287,26 +297,6 @@ fn auto_to_none(value: &str) -> Option<String> {
     blank_to_none(value.to_string()).filter(|v| !v.eq_ignore_ascii_case("auto"))
 }
 
-/// Which kind of credential an Open Live address implies. An Open Source Cloud
-/// instance sits behind a proxy that rejects a personal access token presented
-/// directly, so it needs the exchange; anything else takes a static key. Inferring it
-/// spares an operator a question nobody can answer from the words "osc" and "direct".
-pub fn infer_auth_mode(url: &str) -> AuthMode {
-    let host = url
-        .split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-    if host == "osaas.io" || host.ends_with(".osaas.io") {
-        AuthMode::Osc
-    } else {
-        AuthMode::Direct
-    }
-}
-
 /// Whether anything still has to be asked for. `osc_login` says whether the OSC CLI
 /// has a saved login, which serves in place of a token in the settings.
 fn needs_setup(cfg: &Config, osc_login: bool) -> bool {
@@ -321,6 +311,7 @@ fn needs_setup(cfg: &Config, osc_login: bool) -> bool {
     cfg.open_live.url.is_none()
         || (cfg.open_live.auth_mode == AuthMode::Osc
             && cfg.open_live.api_key.is_none()
+            && cfg.open_live.credential.is_none()
             && !osc_login)
 }
 
@@ -343,7 +334,7 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     let default_name = Some(cfg.gateway.name.trim())
         .filter(|n| !n.is_empty())
         .map(str::to_string)
-        .or_else(crate::config::hostname)
+        .or_else(open_live_ingest::config::hostname)
         .unwrap_or_else(|| "gateway".to_string());
     cfg.gateway.name = ask("Name for this gateway", Some(&default_name)).await?;
 
@@ -394,7 +385,7 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     }
     // Checked before asking anything else, so a bad address or credential is
     // corrected while the operator is still looking at it.
-    let mut published = None;
+    let mut published = (None, Relays::default());
     match check_open_live(cfg).await {
         Ok(info) => published = report_server_info(cfg, info),
         Err(err) => fail(format!("could not reach Open Live: {err:#}")),
@@ -436,17 +427,22 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
                 "Listener",
                 "the cloud dials this machine; needs a public address and inbound UDP",
             ),
+            choice(
+                "Relay",
+                "always through Open Live's SRT relay, which caller uses whenever Open Live has one",
+            ),
         ],
         match cfg.uplink.mode {
             UplinkMode::Caller => 0,
             UplinkMode::Listener => 1,
+            UplinkMode::Relay => 2,
         },
     )
     .await?;
-    cfg.uplink.mode = if mode == 1 {
-        UplinkMode::Listener
-    } else {
-        UplinkMode::Caller
+    cfg.uplink.mode = match mode {
+        1 => UplinkMode::Listener,
+        2 => UplinkMode::Relay,
+        _ => UplinkMode::Caller,
     };
     if cfg.uplink.mode == UplinkMode::Listener {
         cfg.uplink.public_host = blank_to_none(
@@ -459,8 +455,12 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     }
     // In caller mode the ports are the cloud Strom's, and Open Live publishes the
     // range it leased; only when it publishes none, or in listener mode where the
-    // ports are this machine's own, is there anything to ask.
+    // ports are this machine's own, is there anything to ask. Through the relay
+    // there are no ports at all.
+    let (published, relay) = published;
     match (&published, cfg.uplink.mode) {
+        _ if relay.through(cfg) => good(relay.describe(cfg)),
+        _ if relay.applies(cfg) => warn(relay.describe(cfg)),
         (Some(ports), UplinkMode::Caller) => {
             good(format!(
                 "SRT ports {} come from Open Live",
@@ -508,15 +508,63 @@ pub async fn configure(cfg: &mut Config, force: bool) -> Result<bool> {
     Ok(true)
 }
 
+/// The SRT relays Open Live reports, for setup to say whether the uplink goes
+/// through one.
+#[derive(Debug, Default)]
+struct Relays(Vec<String>);
+
+impl Relays {
+    /// Whether `up` tries a relay with these settings: in caller mode when Open Live
+    /// reports any, in relay mode always.
+    fn applies(&self, cfg: &Config) -> bool {
+        match cfg.uplink.mode {
+            UplinkMode::Listener => false,
+            UplinkMode::Caller => !self.0.is_empty(),
+            UplinkMode::Relay => true,
+        }
+    }
+
+    /// Whether it gets one: Open Live reports the relay the settings name.
+    fn through(&self, cfg: &Config) -> bool {
+        match cfg.uplink.mode {
+            UplinkMode::Listener => false,
+            UplinkMode::Caller | UplinkMode::Relay => {
+                self.0.iter().any(|r| r == cfg.uplink.relay_name())
+            }
+        }
+    }
+
+    fn describe(&self, cfg: &Config) -> String {
+        let name = cfg.uplink.relay_name();
+        if self.through(cfg) {
+            format!("through Open Live's SRT relay {name:?}; no SRT ports needed, and a passphrase is generated if none is set")
+        } else if self.0.is_empty() {
+            "uplink.mode is \"relay\", but Open Live reports no SRT relay; set uplink.mode = \"caller\"".to_string()
+        } else {
+            format!(
+                "Open Live has no SRT relay named {name:?}; it has {}: set uplink.relay to one of them",
+                self.0.join(", ")
+            )
+        }
+    }
+}
+
 /// What Open Live said about its cloud Strom, read back to the operator. Returns the
-/// SRT port range it publishes, which callers use.
-fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<BTreeSet<u16>> {
+/// SRT port range it publishes, which callers use, and the SRT relays it reports.
+fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> (Option<BTreeSet<u16>>, Relays) {
     let Some(info) = info else {
         warn(
             "reached Open Live, but it did not report a Strom host; set uplink.host in the settings file",
         );
-        return None;
+        return (None, Relays::default());
     };
+    let relays = Relays(info.relays().iter().map(|r| r.name.clone()).collect());
+    if !relays.0.is_empty() {
+        good(format!(
+            "it reports the SRT relay(s) {}, which callers send through",
+            relays.0.join(", ")
+        ));
+    }
     match &info.strom_host {
         Some(host) if cfg.uplink.host.is_none() => {
             good(format!("reached Open Live; feeds will go to its Strom at {host}"))
@@ -534,9 +582,10 @@ fn report_server_info(cfg: &Config, info: Option<ServerInfo>) -> Option<BTreeSet
         None if info.lease_pending() => warn(
             "Open Live is still waiting for its SRT ports from Strom; it retries every minute, so run setup again later or set a range here",
         ),
+        None if !relays.0.is_empty() => {}
         None => note("Open Live publishes no SRT ports; a range has to be set here"),
     }
-    info.srt_ports
+    (info.srt_ports, relays)
 }
 
 /// The same checks as the prompts, with nothing asked. Every setting must already be
@@ -552,12 +601,13 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
 
     section("Gateway");
     if cfg.gateway.name.trim().is_empty() {
-        cfg.gateway.name = crate::config::hostname().unwrap_or_else(|| "gateway".to_string());
+        cfg.gateway.name =
+            open_live_ingest::config::hostname().unwrap_or_else(|| "gateway".to_string());
     }
     good(format!("gateway name {}", style(&cfg.gateway.name).bold()));
 
     section("Open Live");
-    let mut published = None;
+    let mut published = (None, Relays::default());
     if !cfg.open_live.register {
         note("registration is off; only streaming to the cloud Strom");
         if cfg
@@ -619,7 +669,11 @@ pub async fn configure_headless(cfg: &mut Config) -> Result<()> {
     }
 
     section("Uplink");
+    let (published, relay) = published;
     match (&published, cfg.uplink.mode) {
+        _ if relay.through(cfg) => good(format!("caller; {}", relay.describe(cfg))),
+        (_, UplinkMode::Relay) => bail!("{}", relay.describe(cfg)),
+        _ if relay.applies(cfg) => bail!("{}", relay.describe(cfg)),
         (Some(ports), UplinkMode::Caller) => {
             good(format!(
                 "caller; SRT ports {} come from Open Live",
@@ -695,20 +749,14 @@ async fn report_heartbeat(cfg: &Config) -> Result<()> {
 /// The Open Source Cloud credential a headless setup can use, in the order the
 /// running gateway would pick them, and where it came from.
 fn headless_osc_token(cfg: &Config) -> Result<(String, &'static str, bool)> {
-    if let Some(token) = cfg.open_live.api_key.clone() {
-        return Ok((token, "the settings (a personal access token)", false));
+    match api::osc_credential(cfg) {
+        Some(credential) => Ok(credential),
+        None => bail!(
+            "an Open Source Cloud instance needs a credential: set {}, run `{}`, or set OLI_OPEN_LIVE_API_KEY to a personal access token",
+            osc::ENV_TOKEN,
+            osc::LOGIN_COMMAND
+        ),
     }
-    if let Some(token) = osc::env_token() {
-        return Ok((token, osc::ENV_TOKEN, false));
-    }
-    if let Some(token) = osc::login_token() {
-        return Ok((token, "the OSC CLI's saved login", true));
-    }
-    bail!(
-        "an Open Source Cloud instance needs a credential: set {}, run `{}`, or set OLI_OPEN_LIVE_API_KEY to a personal access token",
-        osc::ENV_TOKEN,
-        osc::LOGIN_COMMAND
-    )
 }
 
 /// Says where the settings went, in the same voice as the prompts.
@@ -758,6 +806,7 @@ async fn osc_authenticate(cfg: &mut Config) -> Result<String> {
             0 => match osc::env_token() {
                 Some(token) => {
                     cfg.open_live.api_key = None;
+                    cfg.open_live.credential = None;
                     token
                 }
                 None => {
@@ -777,6 +826,7 @@ async fn osc_authenticate(cfg: &mut Config) -> Result<String> {
                 match osc::login_token() {
                     Some(token) => {
                         cfg.open_live.api_key = None;
+                        cfg.open_live.credential = None;
                         if osc::env_token().is_some() {
                             warn(format!(
                                 "{} is also set, and takes precedence over the login when the gateway runs",
@@ -844,7 +894,7 @@ fn describe_token(token: &str, is_login: bool) {
 /// it. A typed address stays available: the list may be empty, the platform may be
 /// unreachable during setup, or the instance may live in another workspace.
 async fn choose_instance(current: Option<&str>, token: &str) -> Result<String> {
-    match osc::open_live_instances(token).await {
+    match api::instances(token).await {
         Ok(instances) if !instances.is_empty() => {
             let mut options: Vec<Choice> =
                 instances.iter().map(|i| choice(&i.name, &i.url)).collect();
@@ -864,51 +914,9 @@ async fn choose_instance(current: Option<&str>, token: &str) -> Result<String> {
     ask("Open Live URL", current.or(Some("https://"))).await
 }
 
-/// Confirms the address and credential work, returning what Open Live says about
-/// its cloud Strom: its host and the SRT ports it has leased.
-async fn check_open_live(cfg: &Config) -> Result<Option<ServerInfo>> {
-    let client = OpenLiveClient::new(
-        cfg.open_live.url.as_deref().unwrap_or_default(),
-        cfg.open_live.auth_mode,
-        cfg.open_live.api_key.as_deref(),
-    )?;
-    // Listing sources exercises the credential; server-info alone might not.
-    client.list_sources().await?;
-    client.server_info().await
-}
-
-async fn probe_strom(cfg: &Config) -> Reachability {
-    match StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref()) {
-        Ok(client) => client.probe().await,
-        Err(err) => Reachability::Unreachable(err.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn an_osaas_address_implies_the_token_exchange_and_lookalikes_do_not() {
-        assert_eq!(
-            infer_auth_mode("https://venue.eyevinn-open-live.auto.prod-se.osaas.io"),
-            AuthMode::Osc
-        );
-        assert_eq!(infer_auth_mode("https://osaas.io/"), AuthMode::Osc);
-        assert_eq!(infer_auth_mode("http://127.0.0.1:3000"), AuthMode::Direct);
-        assert_eq!(
-            infer_auth_mode("https://open-live.example.com"),
-            AuthMode::Direct
-        );
-        assert_eq!(
-            infer_auth_mode("https://osaas.io.example.com"),
-            AuthMode::Direct
-        );
-        assert_eq!(
-            infer_auth_mode("https://myosaas.iohost.net"),
-            AuthMode::Direct
-        );
-    }
 
     fn answers() -> Answers {
         Answers {
@@ -917,6 +925,7 @@ mod tests {
             strom_url: Some("http://127.0.0.1:9090".to_string()),
             uplink_mode: Some(UplinkMode::Listener),
             public_host: Some("198.51.100.7".to_string()),
+            relay: Some(" eu-north ".to_string()),
             port_range: Some("47110-47129".to_string()),
             latency_ms: Some(400),
             resolution: Some("1280x720".to_string()),
@@ -939,6 +948,7 @@ mod tests {
         assert_eq!(cfg.uplink.mode, UplinkMode::Listener);
         assert_eq!(cfg.uplink.public_host.as_deref(), Some("198.51.100.7"));
         assert_eq!(cfg.uplink.port_range.as_deref(), Some("47110-47129"));
+        assert_eq!(cfg.uplink.relay.as_deref(), Some("eu-north"));
         assert_eq!(cfg.uplink.latency_ms, 400);
         assert_eq!(cfg.capture.video_resolution.as_deref(), Some("1280x720"));
         assert_eq!(cfg.capture.video_framerate, None, "auto means unset");

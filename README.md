@@ -33,6 +33,7 @@ open-live-ingest up --audio "FaceTime=USB Microphone"  # send an audio source wi
 open-live-ingest up --all         # include virtual devices, skipped by default
 open-live-ingest up --test        # a test pattern and tone, to commission the link
 open-live-ingest up --reconfigure # ask for every setting again
+open-live-ingest up --wait-for-production  # send each input only while a production holding it is active
 open-live-ingest status           # what is running, from Strom and Open Live directly
 open-live-ingest down             # stop and remove the flows and sources
 open-live-ingest devices          # the cameras and audio sources Strom can see
@@ -41,6 +42,10 @@ open-live-ingest check            # validate the settings file
 ```
 
 `status --json` and `devices --json` print one JSON document instead of a table.
+
+With `[[input]]` entries in the settings (written by the desktop app, or by hand as in
+`gateway.toml.example`), `up` sends exactly those inputs, with their audio and Studio labels;
+`--devices`, `--all` and `--test` pick for one run instead. Without any, it sends every device.
 
 Run it and it asks for what it needs, checks each answer, remembers it, then registers every capture
 device Strom can see and starts streaming. Built for SSH: line-by-line prompts on any terminal, lists
@@ -140,7 +145,29 @@ from the environment variables above, or for Open Source Cloud from `OSC_ACCESS_
 saved login. Given interactively, the same flags become the defaults the prompts show. `setup
 --help` lists them all.
 
-In `caller` mode, the default, the SRT ports belong to the cloud Strom. Open Live reserves ports
+The uplink has three modes (`uplink.mode`):
+
+| Mode | Who dials | Used when |
+|---|---|---|
+| `caller` (default) | this machine | always, unless set otherwise: through Open Live's SRT relay when Open Live reports one, otherwise to a port on the cloud Strom |
+| `relay` | this machine and the cloud Strom, both to the relay | set it to insist on the relay; an Open Live without one is then an error, not a port |
+| `listener` | the cloud Strom dials this machine | set it when the venue has a public address and inbound UDP; it never uses the relay |
+
+Through a relay, Strom and the gateway both dial the relay's one public port and the relay pairs
+them by stream id; nothing listens on the cloud Strom, and no port is leased. The gateway registers
+each input as `srt+relay://auto@<relay>?latency=<ms>&passphrase=...` and dials the address Open Live
+answers with (`connect.uri`, `srt://<relay host>:<port>?streamid=<id>`). `uplink.relay` picks a
+relay by the name Open Live reports (`GET /api/v1/server-info`, `srt.relays`); without it the
+gateway uses `default`, and a name Open Live does not have stops `up` with the names it does have.
+The relay's port is public, so a relay link always has a passphrase: with none in the settings one
+is generated and saved as `uplink.passphrase`, and used from then on. A stop and a new `up` keep the
+source's id and stream id, so a production slot holding it stays valid; a source an older gateway
+registered in caller mode is moved to the relay with its id unchanged. An Open Live without relays
+(v0.8.0 and before) sees exactly what it always did. `up` and `status` (and `status --json`, as
+`uplink.relay` and each source's `relay` and `dial_in`) show the relay and the dial-in address,
+passphrase masked.
+
+Without a relay, in `caller` mode the SRT ports belong to the cloud Strom. Open Live reserves ports
 from that Strom's port pool and publishes them on `GET /api/v1/server-info` together with the Strom
 host, and the gateway registers each input with port 0 and Open Live assigns it a free one, so
 several gateways can feed one Open Live; `uplink.port_range` is only a fallback for an
@@ -179,9 +206,49 @@ curl -fsSL https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/insta
 Binaries land in `/usr/local/bin` when it is writable, else `~/.local/bin`. `INSTALL_DIR`,
 `VERSION`, and `SKIP_STROM=true` override that; the script's header lists every knob.
 
+### Mac: install from the DMG, open the app
+
+On an Apple silicon Mac, no terminal needed: download `open-live-ingest-macos-aarch64.dmg` from
+the [latest release](https://github.com/Eyevinn/open-live-ingest/releases/latest), open it, and
+drag **Open Live Ingest** onto the Applications folder next to it. Then open Open Live Ingest from
+Applications, Launchpad or Spotlight. It opens a window, not a terminal. The app carries its own
+Strom and GStreamer, so nothing else is installed and a Strom or GStreamer already on the Mac is
+left alone. macOS asks once for the camera and the microphone, the first time a feed uses them.
+
+The DMG is on a release only once it is notarized with Apple (#25). Until then a release has the
+archives only, and the DMG a release workflow run builds is signed ad hoc, which Gatekeeper
+refuses once it has been downloaded; use `install.sh` above instead.
+
+The same app holds the command-line gateway, at
+`/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest`. For SSH use, put it on `PATH`
+with a symlink, once:
+
+```bash
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest" /usr/local/bin/open-live-ingest
+open-live-ingest --version   # open-live-ingest X.Y.Z, the same version as the app
+```
+
+Through the symlink, the CLI runs the app's own Strom and GStreamer, and it reads the same
+settings file as the app, so a box set up in the window also answers `open-live-ingest status`
+and `down` over SSH. The symlink replaces an `open-live-ingest` that `install.sh` put in
+`/usr/local/bin`. Updating the app (dragging a newer DMG's app over it) keeps the symlink
+working; deleting the app breaks it, so remove `/usr/local/bin/open-live-ingest` too.
+
 ### Windows
 
-On 64-bit (x86_64) Windows, from PowerShell:
+The desktop app comes as an installer on each release,
+[`open-live-ingest-x86_64-pc-windows-msvc-setup.exe`](https://github.com/Eyevinn/open-live-ingest/releases/latest/download/open-live-ingest-x86_64-pc-windows-msvc-setup.exe).
+It installs for all users into `%ProgramFiles%\Open Live Ingest` (Windows asks once to allow it):
+the app with a Start menu entry "Open Live Ingest", and the command-line gateway next to it,
+`"%ProgramFiles%\Open Live Ingest\open-live-ingest.exe"`, which is not put on PATH. Unless Strom
+is already in `%ProgramFiles%\Strom\bin`, it also installs the pinned Strom MSI it carries. It
+needs the Microsoft Edge WebView2 runtime, which Windows 11 has. `setup.exe /S` installs silently.
+Uninstall it from Apps & features: that removes the app, the gateway and the Start menu entry, and
+keeps Strom and your settings. The installer is not code signed yet, so SmartScreen warns
+("More info", then "Run anyway").
+
+For the command-line gateway alone, on 64-bit (x86_64) Windows, from PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/Eyevinn/open-live-ingest/main/install.ps1 | iex
@@ -207,8 +274,8 @@ code signing. The binary is unsigned, so SmartScreen or Defender may warn before
 Other ways in:
 
 - **By hand.** Each [release](https://github.com/Eyevinn/open-live-ingest/releases) carries a
-  static binary for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), a zip for Windows
-  (x86_64), plus `SHA256SUMS` and a signed build provenance you can check with
+  static binary for Linux (x86_64, aarch64) and macOS (Apple silicon, Intel), a zip and the
+  app's installer for Windows (x86_64), plus `SHA256SUMS` and a signed build provenance you can check with
   `gh attestation verify`. The asset names do not carry a version, so
   `releases/latest/download/open-live-ingest-<target>.tar.gz` (`.zip` on Windows) is stable.
 - **Rust users.** `cargo binstall open-live-ingest` fetches the same tarball. `cargo build
@@ -234,10 +301,11 @@ the venue runs.
 Bump `version` in `Cargo.toml`, commit, then tag and push:
 
 ```bash
-git tag v0.5.0 && git push origin v0.5.0
+git tag v0.6.0 && git push origin v0.6.0
 ```
 
-The release workflow refuses a tag that does not match `Cargo.toml`, builds the five binaries,
+The release workflow refuses a tag that does not match `Cargo.toml`, builds the five binaries
+and the Windows installer (installing and uninstalling it once on the runner first),
 and publishes them with a checksum file, build provenance, and generated notes. When the
 `strom-types` pin moves, move `STROM_VERSION` in `install.sh` and `$StromVersion` in `install.ps1`
 with it; a test checks they agree. Run the workflow by hand from the
@@ -254,17 +322,21 @@ re-enable it from the Actions tab (select `Strom pin`, then "Enable workflow").
 
 ### The macOS app bundle
 
-`.github/scripts/build-macos-app.sh` builds `Open Live Ingest.app` for Apple silicon: the gateway,
-the Strom release the `strom-types` tag pins (checked against the SHA-256 digest GitHub records for
+`.github/scripts/build-macos-app.sh` builds `Open Live Ingest.app` for Apple silicon: the desktop
+app (`open-live-ingest-app`, the bundle's `CFBundleExecutable`), the gateway CLI next to it, the
+Strom release the `strom-types` tag pins (checked against the SHA-256 digest GitHub records for
 the asset), and the Homebrew GStreamer that Strom links against, with every library reference
-rewritten to point inside the bundle. It refuses to finish if any Mach-O in the bundle still names
-`/opt/homebrew` or `/usr/local`. To run it by hand on an Apple silicon Mac with Homebrew, `jq` and
-the Xcode command line tools:
+rewritten to point inside the bundle. The icon is `app/icons/AppIcon.icns`, drawn by
+`app/icons/make-icon.py` (stock Python 3, no packages). It refuses to finish if any Mach-O in the
+bundle still names `/opt/homebrew` or `/usr/local`. To run it by hand on an Apple silicon Mac with
+Homebrew, `jq` and the Xcode command line tools:
 
 ```bash
 brew install gstreamer jq
 cargo build --release --target aarch64-apple-darwin
-.github/scripts/build-macos-app.sh target/aarch64-apple-darwin/release/open-live-ingest dist
+cargo build --release --target aarch64-apple-darwin -p open-live-ingest-app
+.github/scripts/build-macos-app.sh target/aarch64-apple-darwin/release/open-live-ingest \
+  target/aarch64-apple-darwin/release/open-live-ingest-app dist
 .github/scripts/build-macos-app.sh --check "dist/Open Live Ingest.app"   # the check step on its own
 ```
 
@@ -279,10 +351,12 @@ macOS runner. On an Apple silicon Mac with macOS 27, install the DMG from the re
 
 ```bash
 "/Applications/Open Live Ingest.app/Contents/MacOS/strom" --version
+"/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest-app" --version
 "/Applications/Open Live Ingest.app/Contents/MacOS/open-live-ingest" up --test
 ```
 
-Both must start without a `dyld` error, and `up --test` must reach "Strom is up" (then Ctrl-C).
+All three must start without a `dyld` error, and `up --test` must reach "Strom is up" (then Ctrl-C).
+Then open the app from Applications: its window must appear.
 If it stops after "Starting Strom", the error is in the `strom.log` it names.
 
 ## License
