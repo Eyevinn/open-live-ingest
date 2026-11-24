@@ -117,6 +117,7 @@ async function whereCommand(button, cmd, args) {
     const where = result.where || result;
     if (where.ready) {
       changing = false;
+      loadRelays();
     }
     renderWhere(where);
     return true;
@@ -350,6 +351,7 @@ const ACTIONS = {
     run: () => call("open_url", { which: "privacy_microphone" }),
   },
   help: { label: "Help", run: () => call("open_url", { which: "help" }) },
+  advanced: { label: "Advanced", run: () => openAdvanced() },
   show_logs: { label: "Show logs", run: () => call("show_logs", { which: "app" }) },
   show_strom_log: { label: "Show logs", run: () => call("show_logs", { which: "strom" }) },
 };
@@ -447,12 +449,15 @@ function renderRows() {
     if (typeof row.bitrate_kbps === "number" && row.state === "live") {
       item.append(" " + (row.bitrate_kbps / 1000).toFixed(1) + " Mbps");
     }
-    // Where the uplink goes (the caller address), and the address registered with
-    // Open Live as secondary text. Passphrases arrive masked.
+    // Where the uplink goes (the caller address, or through Open Live's SRT relay
+    // the dial-in address), and the address registered with Open Live as secondary
+    // text. Passphrases arrive masked.
     if (row.uplink) {
       const address = document.createElement("span");
       address.className = "detail address selectable";
-      address.textContent = "Sending to " + row.uplink;
+      address.textContent = row.relay
+        ? "Sending via relay " + row.relay + " to " + row.uplink
+        : "Sending to " + row.uplink;
       item.append(address);
       if (row.registered) {
         const registered = document.createElement("span");
@@ -496,6 +501,11 @@ function renderNotices() {
 
 async function goLive() {
   clearGoProblem();
+  for (const id of ["go-uplink", "go-passphrase"]) {
+    const line = byId(id);
+    line.textContent = "";
+    line.hidden = true;
+  }
   rows.clear();
   notices.clear();
   renderRows();
@@ -528,6 +538,25 @@ function wireGoLive() {
     const words = { starting: "Starting Strom…", ready: "", stopped: "" };
     byId("go-strom").textContent = words[event.detail.state] || "";
   });
+  // Through Open Live's SRT relay (OL-66): which one, and the passphrase made for it.
+  // Each has its own line: the library says `passphrase` before `uplink`, so one
+  // shared line would lose the passphrase text when the relay line is written.
+  document.addEventListener("oli:uplink", (event) => {
+    const uplink = byId("go-uplink");
+    uplink.textContent =
+      "Sending via relay " +
+      event.detail.relay +
+      (event.detail.public ? " at " + event.detail.public : "") +
+      ".";
+    uplink.hidden = false;
+  });
+  document.addEventListener("oli:passphrase", (event) => {
+    if (event.detail.kept) {
+      const line = byId("go-passphrase");
+      line.textContent = "A passphrase for the relay was made and saved in the settings.";
+      line.hidden = false;
+    }
+  });
   document.addEventListener("oli:input", (event) => {
     const old = rows.get(event.detail.input) || {};
     rows.set(event.detail.input, { ...old, ...event.detail });
@@ -540,6 +569,7 @@ function wireGoLive() {
         ...old,
         uplink: started.uplink,
         registered: started.registered,
+        relay: started.relay,
       });
     }
     renderRows();
@@ -592,6 +622,67 @@ function wireGoLive() {
         action: "open_studio",
       });
     }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Advanced: the SRT relay (OL-66)
+// ---------------------------------------------------------------------------
+
+// Go live picks the relay by itself. The picker is offered only when Open Live
+// reports more than one, or no longer has the one saved; the core decides.
+// Opening it asks Open Live again (the toggle handler in wireAdvanced): the relays
+// may have changed since the window opened, and a Go live that names an unknown
+// relay offers this button. A stale list would keep the picker hidden, or offer
+// the names that are gone. Already open: no toggle event, so ask here.
+async function openAdvanced() {
+  const advanced = byId("advanced");
+  const wasOpen = advanced.open;
+  advanced.open = true;
+  advanced.scrollIntoView();
+  if (wasOpen) {
+    await loadRelays();
+  }
+}
+
+async function loadRelays() {
+  let relays;
+  try {
+    relays = await call("relays");
+  } catch (error) {
+    // Open Live not reachable now: no picker. Go live says what is wrong.
+    byId("relay-picker").hidden = true;
+    return;
+  }
+  const select = byId("relay-select");
+  select.replaceChildren();
+  const names = relays.relays.includes(relays.chosen)
+    ? relays.relays
+    : [relays.chosen, ...relays.relays];
+  for (const name of names) {
+    const option = document.createElement("option");
+    option.value = name;
+    option.textContent = relays.relays.includes(name) ? name : name + " (not in Open Live)";
+    option.selected = name === relays.chosen;
+    select.append(option);
+  }
+  byId("relay-picker").hidden = !relays.offer;
+}
+
+function wireAdvanced() {
+  byId("advanced").addEventListener("toggle", (event) => {
+    if (event.target.open) {
+      loadRelays();
+    }
+  });
+  byId("relay-select").addEventListener("change", (event) => {
+    if (live) {
+      return;
+    }
+    clearProblem();
+    call("set_advanced", { uplink: { relay: event.target.value } })
+      .then(() => loadRelays())
+      .catch(showProblem);
   });
 }
 
@@ -716,11 +807,15 @@ async function start() {
   wireQuit();
   wireLogs();
   wireUpdate();
+  wireAdvanced();
   const state = await call("state");
   document.getElementById("version").textContent = "Version " + state.version;
   showUpdate(state.update);
   setLive(state.live);
   renderWhere(state.where);
+  if (state.where.ready) {
+    loadRelays();
+  }
   byId("show-all").addEventListener("change", (event) => {
     listDevices(event.target.checked).catch(showProblem);
   });

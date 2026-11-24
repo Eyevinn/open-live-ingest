@@ -226,6 +226,25 @@ class WatchUplink(unittest.TestCase):
         out = self.watch(FakeStrom([self.peer(100, 0), self.peer(20100, 3)]))
         self.assertIn("PASS: step: the uplink stayed connected and dropped 3 of 20000", out)
 
+    def test_it_waits_for_the_first_peer_with_counters(self):
+        # Release run 45466786038: the first poll came before srtsink had peer counters.
+        out = self.watch(FakeStrom([self.peer(None, 0), self.peer(100, 0), self.peer(20100, 3)]))
+        self.assertIn("PASS: step: the uplink stayed connected and dropped 3 of 20000", out)
+
+    def test_a_connected_peer_that_never_reports_counters_fails(self):
+        strom = FakeStrom([])
+        strom.uplink = lambda flow_id: self.peer(None, 0)
+        clock = iter(range(0, 10 ** 6, 2))
+        monotonic, e2e.time.monotonic = e2e.time.monotonic, lambda: next(clock)
+        try:
+            with self.assertRaises(e2e.Failed) as caught:
+                self.watch(strom)
+        finally:
+            e2e.time.monotonic = monotonic
+        message = str(caught.exception)
+        self.assertIn(f"shows no connected peer with SRT counters (packets_sent) within {e2e.CONNECT_TIMEOUT} s", message)
+        self.assertIn("'packets_sent': None", message)
+
     # E2E_UPLINK_DROP_WARN_ONLY (until #111 is fixed): only the dropped share is a warning.
 
     def drops(self):

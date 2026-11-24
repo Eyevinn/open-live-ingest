@@ -147,7 +147,8 @@ footer {
 
 /* 3. Go live: the rows, the banner, and read-only while live. */
 body.live #where,
-body.live #what {
+body.live #what,
+body.live #relay-picker {
   opacity: 0.6;
   pointer-events: none;
 }

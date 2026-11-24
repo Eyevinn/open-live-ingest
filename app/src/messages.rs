@@ -121,6 +121,33 @@ pub enum Failure {
     /// `source`, this gateway's own from an earlier session, is held by an active
     /// production.
     PortHeldByLeftover { source: String },
+    /// Open Live reports no SRT relay (any more), so it gave no address to send
+    /// through one: `connect.reason` `srt-relay-not-configured`, a 422 with that
+    /// `code`, or one with `srt-relay-unknown` and no relays at all.
+    RelayNotConfigured,
+    /// The settings say to send only through an SRT relay (`uplink.mode = "relay"`),
+    /// and Open Live has none (it is older than relays, or reports none): the
+    /// relay choice before registering (`run::choose_relay`). Unlike
+    /// [`Failure::RelayNotConfigured`], Go live again fails the same way until the
+    /// mode is changed.
+    RelayModeWithoutRelay,
+    /// Open Live has no SRT relay named `relay` (the one picked under Advanced, or
+    /// `default`); it has `relays`: `connect.reason` `srt-relay-unknown`, or a 422
+    /// with that `code` and its `relays`. `relay` is `None` when the refusal does
+    /// not name it.
+    RelayUnknown {
+        relay: Option<String>,
+        relays: Vec<String>,
+    },
+    /// Open Live could not ask its Strom about the SRT relay right now
+    /// (`srt-relay-unreachable`).
+    RelayUnreachable,
+    /// Open Live's Strom reports the SRT relay without a public address to send to
+    /// (`srt-relay-public-unknown`).
+    RelayPublicUnknown,
+    /// A passphrase was generated for the relay but could not be saved in the
+    /// settings file: it protects this session only. A banner.
+    RelayPassphraseNotKept,
     /// macOS refuses the app access to the camera or the microphone.
     AccessDenied { media: Media },
     /// `camera` could not be opened, or its flow did not come up.
@@ -224,6 +251,38 @@ impl Failure {
             Failure::PortHeldByLeftover { source } => Message::new(
                 format!("\"{source}\" from an earlier session is still in an active production. Deactivate that production in Studio, then press Go live."),
                 Some(OpenStudio),
+            ),
+            Failure::RelayNotConfigured => Message::new(
+                "Open Live has no SRT relay to send through any more. Press Go live again to send to it directly.",
+                Some(Retry),
+            ),
+            Failure::RelayModeWithoutRelay => Message::new(
+                "The settings file says to send only through an SRT relay (uplink.mode = \"relay\"), but Open Live has none. Set uplink.mode to \"caller\" in the settings file, then press Go live.",
+                Some(ShowFile),
+            ),
+            Failure::RelayUnknown { relay, relays } => {
+                let which = match relay {
+                    Some(relay) => format!("Open Live has no SRT relay named \"{relay}\"."),
+                    None => "Open Live does not have the SRT relay this app sends through."
+                        .to_string(),
+                };
+                let pick = match relays.as_slice() {
+                    [] => "Pick another one under Advanced.".to_string(),
+                    _ => format!("Pick one of {} under Advanced.", quoted_names(relays)),
+                };
+                Message::new(format!("{which} {pick}"), Some(Advanced))
+            }
+            Failure::RelayUnreachable => Message::new(
+                "Open Live can't reach its SRT relay right now. Wait a moment, then press Go live again.",
+                Some(Retry),
+            ),
+            Failure::RelayPublicUnknown => Message::new(
+                "Open Live's SRT relay has no public address to send to. Ask the Open Live admin to set one, then press Go live again.",
+                Some(Retry),
+            ),
+            Failure::RelayPassphraseNotKept => Message::new(
+                "The passphrase made for the SRT relay could not be saved, so it protects this session only. The next Go live makes a new one.",
+                Some(ShowFile),
             ),
             Failure::AccessDenied { media } => Message::new(
                 format!(
@@ -380,12 +439,18 @@ pub fn for_error(reason: &str, ctx: &Context) -> Message {
 /// The message for one input that could not be started or failed while live
 /// (`InputFailed`, or an `Input` event whose state is `Failed`). Its flow did not
 /// reach running, which is the camera being busy or failing to open.
+///
+/// An input Open Live gives no address for through the SRT relay is reported the
+/// same way, with `connect.reason` in its words (`openlive::relay_reason_message`).
 pub fn for_input_failure(input: &str, reason: &str) -> Message {
     tracing::warn!(input, "an input failed: {reason}");
-    Failure::CameraBusy {
-        camera: input.to_string(),
-    }
-    .message()
+    // Open Live registered the source but gave no address to send it through the
+    // relay (`connect.reason`): that, not the camera.
+    relay_failure(reason)
+        .unwrap_or_else(|| Failure::CameraBusy {
+            camera: input.to_string(),
+        })
+        .message()
 }
 
 /// The settings file's first problem, as the window shows it.
@@ -491,6 +556,10 @@ pub fn classify(reason: &str, ctx: &Context) -> Failure {
     {
         return Failure::SignInExpired;
     }
+    // The SRT relay, before the ports: a relay refusal is a 422 too.
+    if let Some(failure) = relay_failure(reason) {
+        return failure;
+    }
     // Ports.
     if has("no SRT port range for the cloud Strom") {
         return Failure::NoFreePort {
@@ -507,7 +576,10 @@ pub fn classify(reason: &str, ctx: &Context) -> Failure {
             return Failure::PortHeldByLeftover { source };
         }
     }
-    if has("registering \"") && (has("HTTP 409") || has("HTTP 422")) {
+    if has("registering \"")
+        && !has("through the SRT relay")
+        && (has("HTTP 409") || has("HTTP 422"))
+    {
         if let Some(input) = quoted(reason, 0) {
             return Failure::NoFreePort { input };
         }
@@ -531,6 +603,69 @@ pub fn classify(reason: &str, ctx: &Context) -> Failure {
         };
     }
     Failure::Unmatched
+}
+
+/// The SRT relay rows, from the library's words for them: `connect.reason` as
+/// `openlive::relay_reason_message` writes it (the code in brackets), a 422 with
+/// `code` and `relays` as `Refused::relay_advice` and the registration's context
+/// write it, and the relay choice before registering (`run::choose_relay`).
+fn relay_failure(text: &str) -> Option<Failure> {
+    let has = |needle: &str| text.contains(needle);
+    if has("(srt-relay-unreachable)") || has("cannot reach its Strom to ask about SRT relays") {
+        return Some(Failure::RelayUnreachable);
+    }
+    if has("(srt-relay-public-unknown)") {
+        return Some(Failure::RelayPublicUnknown);
+    }
+    // `uplink.mode is "relay", but Open Live is older than SRT relays` or `... but
+    // Open Live reports no SRT relay`: only in relay mode, so pressing Go live
+    // again would fail the same way. (The unreachable case is above: it can pass.)
+    if has("uplink.mode is \"relay\"")
+        && (has("Open Live reports no SRT relay") || has("Open Live is older than SRT relays"))
+    {
+        return Some(Failure::RelayModeWithoutRelay);
+    }
+    if has("(srt-relay-not-configured)") || has("Open Live reports no SRT relay") {
+        return Some(Failure::RelayNotConfigured);
+    }
+    // `has no SRT relay named "x"; it has a, b: set uplink.relay ...` (the choice)
+    // or `... named "x" (srt-relay-unknown) ...` (`connect.reason`), and the 422's
+    // `Open Live has the relay(s) a, b; set uplink.relay ...`.
+    let named = text
+        .find("has no SRT relay named ")
+        .and_then(|at| quoted(&text[at..], 0));
+    let listed = list_between(text, "; it has ", ": set uplink.relay")
+        .or_else(|| list_between(text, "Open Live has the relay(s) ", "; set uplink.relay"));
+    if named.is_some() || listed.is_some() || has("(srt-relay-unknown)") {
+        let relays = listed.unwrap_or_default();
+        if relays.is_empty() && named.is_none() {
+            return Some(Failure::RelayNotConfigured);
+        }
+        return Some(Failure::RelayUnknown {
+            relay: named,
+            relays,
+        });
+    }
+    // A relay registration Open Live refused with a 422 and no relays to name: it
+    // has none it can use.
+    if has("through the SRT relay") && has("HTTP 422") {
+        return Some(Failure::RelayNotConfigured);
+    }
+    None
+}
+
+/// The comma-separated names between `start` and `end` in `text`.
+fn list_between(text: &str, start: &str, end: &str) -> Option<Vec<String>> {
+    let from = text.find(start)? + start.len();
+    let to = from + text[from..].find(end)?;
+    Some(
+        text[from..to]
+            .split(',')
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// `audio source "M" is paired with both "A" and "B" in [[input]]; ...`, the
@@ -712,6 +847,152 @@ mod tests {
             ),
             "Open Live has no free port for your inputs. Remove an unused source in Studio, or ask the Open Live admin to add ports.",
             Some(Action::OpenStudio),
+        );
+    }
+
+    /// OL-66 item 3: Open Live registered the source through the SRT relay but gave
+    /// no address for it (`connect.reason`), in the library's own words for each of
+    /// the four reasons Open Live has (open-live `src/lib/srt-connect.ts`).
+    #[test]
+    fn a_relay_address_open_live_could_not_give_is_its_reason() {
+        let cases = [
+            (
+                "srt-relay-not-configured",
+                "Open Live has no SRT relay to send through any more. Press Go live again to send to it directly.",
+                Action::Retry,
+            ),
+            (
+                "srt-relay-unknown",
+                "Open Live has no SRT relay named \"default\". Pick another one under Advanced.",
+                Action::Advanced,
+            ),
+            (
+                "srt-relay-unreachable",
+                "Open Live can't reach its SRT relay right now. Wait a moment, then press Go live again.",
+                Action::Retry,
+            ),
+            (
+                "srt-relay-public-unknown",
+                "Open Live's SRT relay has no public address to send to. Ask the Open Live admin to set one, then press Go live again.",
+                Action::Retry,
+            ),
+        ];
+        for (reason, text, action) in cases {
+            let said = open_live_ingest::openlive::relay_reason_message(Some(reason), "default");
+            assert_message(
+                for_input_failure("Venue — Camera", &said),
+                text,
+                Some(action),
+            );
+        }
+        // Any other reason is still the camera's line, as before relays.
+        let other =
+            open_live_ingest::openlive::relay_reason_message(Some("something-new"), "default");
+        assert_eq!(
+            for_input_failure("Venue — Camera", &other).message,
+            "Venue — Camera could not be opened. Close other apps that use it, then press Go live."
+        );
+    }
+
+    /// OL-66 item 3: a relay registration Open Live refused with a 422 and `code` /
+    /// `relays`, as `run::relay_refusal` words it, and the relay choice before it.
+    #[test]
+    fn a_relay_open_live_refuses_names_the_relays_it_has() {
+        // `relay_refusal`'s words, with `Refused::relay_advice`'s (the app has no
+        // `reqwest` to build a `Refused` with, so they are written out).
+        assert_message(
+            for_error(
+                "Open Live would not register \"Venue — Camera\" through the SRT relay: Strom has no SRT relay named \"eu\"; configured: default, us-east. Open Live has the relay(s) default, us-east; set uplink.relay to one of them",
+                &ctx(),
+            ),
+            "Open Live has no SRT relay named \"eu\". Pick one of \"default\", \"us-east\" under Advanced.",
+            Some(Action::Advanced),
+        );
+        // A refusal in other words still names the relays from the advice.
+        assert_message(
+            for_error(
+                "Open Live would not register \"Venue — Camera\" through the SRT relay: unknown relay. Open Live has the relay(s) eu, us; set uplink.relay to one of them",
+                &ctx(),
+            ),
+            "Open Live does not have the SRT relay this app sends through. Pick one of \"eu\", \"us\" under Advanced.",
+            Some(Action::Advanced),
+        );
+        assert_message(
+            for_error(
+                "Open Live would not register \"Venue — Camera\" through the SRT relay: no SRT relay is configured. Open Live reports no SRT relay; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+                &ctx(),
+            ),
+            "Open Live has no SRT relay to send through any more. Press Go live again to send to it directly.",
+            Some(Action::Retry),
+        );
+        // No advice (`srt-relay-unknown` with no relays): the context and the 422. Not
+        // the port row, which a 422 while registering otherwise is.
+        assert_message(
+            for_error(
+                "registering \"Venue — Camera\" with Open Live through the SRT relay: POST source failed with HTTP 422 Unprocessable Entity: SRT relay \"x\" is not configured",
+                &ctx(),
+            ),
+            "Open Live has no SRT relay to send through any more. Press Go live again to send to it directly.",
+            Some(Action::Retry),
+        );
+        // The relay choice before registering (`run::choose_relay`).
+        assert_message(
+            for_error(
+                "Open Live has no SRT relay named \"default\"; it has eu, us: set uplink.relay to one of them",
+                &ctx(),
+            ),
+            "Open Live has no SRT relay named \"default\". Pick one of \"eu\", \"us\" under Advanced.",
+            Some(Action::Advanced),
+        );
+        assert_eq!(
+            for_error(
+                "uplink.mode is \"relay\", but Open Live cannot reach its Strom to ask about SRT relays; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+                &ctx(),
+            ),
+            Failure::RelayUnreachable.message()
+        );
+    }
+
+    /// `uplink.mode = "relay"` and Open Live has no relay: Go live again fails the
+    /// same way, so the message says to change the mode, not to press Go live.
+    #[test]
+    fn relay_mode_without_a_relay_says_to_change_the_mode() {
+        let expected = "The settings file says to send only through an SRT relay (uplink.mode = \"relay\"), but Open Live has none. Set uplink.mode to \"caller\" in the settings file, then press Go live.";
+        for text in [
+            // `run::choose_relay`
+            "uplink.mode is \"relay\", but Open Live is older than SRT relays; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+            "uplink.mode is \"relay\", but Open Live reports no SRT relay; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+            // `api.rs` and `setup.rs`
+            "uplink.mode is \"relay\", but Open Live reports no SRT relay; set uplink.mode = \"caller\"",
+        ] {
+            assert_message(for_error(text, &ctx()), expected, Some(Action::ShowFile));
+            assert!(!for_error(text, &ctx()).message.contains("Go live again"));
+        }
+        // Not in relay mode: the same "reports no SRT relay" words (the 422's advice,
+        // `connect.reason`) still say Go live again sends directly.
+        assert_eq!(
+            for_error(
+                "Open Live reports no SRT relay, so it cannot give an address for relay \"default\" (srt-relay-not-configured)",
+                &ctx(),
+            ),
+            Failure::RelayNotConfigured.message()
+        );
+        // Relay mode and Strom unreachable can pass on a retry: unchanged.
+        assert_eq!(
+            for_error(
+                "uplink.mode is \"relay\", but Open Live cannot reach its Strom to ask about SRT relays; set uplink.mode = \"caller\" to send to a port on its Strom instead",
+                &ctx(),
+            ),
+            Failure::RelayUnreachable.message()
+        );
+    }
+
+    #[test]
+    fn a_relay_passphrase_that_could_not_be_saved_is_said() {
+        assert_message(
+            Failure::RelayPassphraseNotKept.message(),
+            "The passphrase made for the SRT relay could not be saved, so it protects this session only. The next Go live makes a new one.",
+            Some(Action::ShowFile),
         );
     }
 

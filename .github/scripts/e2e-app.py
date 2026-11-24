@@ -984,19 +984,19 @@ class Strom:
         return uplink_sample(body)
 
     def watch_uplink(self, flow_id, step, still_up=lambda when: None):
-        """The SRT stats check (#112): waits up to CONNECT_TIMEOUT for a connected peer,
-        then takes the rest of the samples E2E_SRT_INTERVAL apart, logs each and judges
+        """The SRT stats check (#112): waits up to CONNECT_TIMEOUT for a connected peer
+        that reports packets_sent (srtsink may report the peer before its counters), then takes the rest of the samples E2E_SRT_INTERVAL apart, logs each and judges
         them. `still_up` checks the receiver is still there before each sample."""
         samples, interval, _ = srt_settings()
         deadline = time.monotonic() + CONNECT_TIMEOUT
         first = None
         while time.monotonic() < deadline:
             first = self.uplink(flow_id)
-            if first is not None and first["connected"]:
+            if first is not None and first["connected"] and first["packets_sent"] is not None:
                 break
             time.sleep(2)
-        if first is None or not first["connected"]:
-            fail(f"{step}: the uplink of flow {flow_id} shows no connected peer {CONNECT_TIMEOUT} s after its receiver came up (last: {first})")
+        if first is None or not first["connected"] or first["packets_sent"] is None:
+            fail(f"{step}: the uplink of flow {flow_id} shows no connected peer with SRT counters (packets_sent) within {CONNECT_TIMEOUT} s after its receiver came up (last: {first})")
         start = time.monotonic()
         first["at"] = 0.0
         taken = [first]

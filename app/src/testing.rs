@@ -330,21 +330,49 @@ pub fn browser(outcome: &'static str) -> crate::where_to_send::Opener {
 // ---------------------------------------------------------------------------
 
 /// A self-hosted Open Live that wants `Bearer <key>`, or nothing when `key` is empty.
+/// Its server info is v0.8.0's ([`server_info_v0_8_0`]): no SRT relay.
 pub fn fake_open_live(key: &'static str) -> String {
+    fake_open_live_with(key, server_info_v0_8_0())
+}
+
+/// [`fake_open_live`] answering `GET /api/v1/server-info` with `server_info`.
+pub fn fake_open_live_with(key: &'static str, server_info: Value) -> String {
     serve(Arc::new(move |req| {
         if !key.is_empty() && req.header("authorization") != Some(&format!("Bearer {key}")) {
             return (401, json!({"error": "unauthorized"}));
         }
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/api/v1/sources") => (200, json!([])),
-            ("GET", "/api/v1/server-info") => (
-                200,
-                json!({"stromHost": "cloud.example.com", "srtPorts": [47110],
-                       "srtPortState": "reserved"}),
-            ),
+            ("GET", "/api/v1/server-info") => (200, server_info.clone()),
             _ => (404, json!({})),
         }
     }))
+}
+
+/// The server info of Open Live v0.8.0, the release before SRT relays: a Strom host
+/// and its reserved ports, and no `srt` block (OL-66 AC3).
+pub fn server_info_v0_8_0() -> Value {
+    json!({"stromHost": "cloud.example.com", "srtPorts": [47110],
+           "srtPortState": "reserved"})
+}
+
+/// The server info of an Open Live with SRT relays (open-live#629): the `srt` block
+/// with `relays` as `(name, public)`, `default` first, and no listener ports to
+/// reach from outside.
+pub fn server_info_with_relays(relays: &[(&str, &str)]) -> Value {
+    json!({
+        "stromHost": "cloud.example.com",
+        "srt": {
+            "state": "ok",
+            "modes": {"listener": false, "caller": true, "rendezvous": false},
+            "relays": relays
+                .iter()
+                .map(|(name, public)| json!({"name": name, "public": public}))
+                .collect::<Vec<Value>>(),
+            "inboundReachable": false,
+            "ports": null,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
