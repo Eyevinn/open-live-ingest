@@ -30,13 +30,16 @@
 #        declares one audio track on the uplink;
 #      - audio buffers reach the uplink's audio input (A0): a Strom buffer probe on
 #        the uplink block counts them;
-#      - what Open Live itself says about the source's audio
-#        (GET /api/v1/sources/{id}/audio-streams). Open Live answers
-#        `discovery: unavailable` until it can probe a source's streams; that is
-#        reported as the missing Open Live capability, not as a failure here.
-#   6. Ctrl-C equivalent (SIGTERM) to `up`, then a check that the source is gone from
-#      Open Live. Whatever happens, the exit trap stops `up`, runs `down`, and deletes
-#      any source still carrying the run's gateway name.
+#      - Open Live itself confirms the audio track: the script creates a production
+#        holding the source (on video_in_0) and activates it, so the cloud Strom dials
+#        the relay and decodes the feed, then polls
+#        GET /api/v1/sources/{id}/audio-streams until it answers `discovery:
+#        available` (open-live#632) and asserts at least one stream. Any other answer
+#        once the production is active (`no-live-flow`, `no-signal`, ...) is a FAIL.
+#   6. The production is deactivated and deleted, then Ctrl-C equivalent (SIGTERM) to
+#      `up`, then a check that the source is gone from Open Live. Whatever happens,
+#      the exit trap deactivates and deletes the run's production, stops `up`, runs
+#      `down`, and deletes any source still carrying the run's gateway name.
 #
 # Needs: sudo (apt-get, modprobe), curl, jq, gh (GH_TOKEN, to read the Strom
 # release), and OSC_ACCESS_TOKEN, an Open Source Cloud personal access token for the
@@ -51,9 +54,13 @@
 # hand); otherwise (a pull request run) it ends with a warning naming the secret and
 # exits 0, so the missing secret does not fail unrelated pull requests.
 #
-# Before step 4 it removes any source left on the instance by an earlier run that
-# was killed before its exit trap ran (names starting `oli-e2e-`). Runs on one
-# instance are serialized by the workflow's concurrency group, so none is live.
+# Before step 4 it removes any production and source left on the instance by an
+# earlier run that was killed before its exit trap ran (names starting `oli-e2e-`).
+# Workflow runs on one instance are serialized by the workflow's concurrency group,
+# so none of those is live. A local run (`oli-e2e-local-<pid>`) is outside that
+# group: a workflow run, or another local run, started while it is going deletes its
+# production and source, and it then fails. Do not run it by hand against an
+# instance while the workflow runs there.
 
 set -euo pipefail
 
@@ -66,11 +73,16 @@ instance="${OPEN_LIVE_INSTANCE:-openlivedev}"
 # The uplink dials Open Live's SRT relay with the stream id Open Live gives the
 # source; with no passphrase in the settings, `up` generates one and keeps it in the
 # run's settings file. The cloud Strom only dials the relay once a production holding
-# the source is active, which this run does not do, so the relay has nothing to pair
-# the uplink with; the audio is checked where it enters the uplink, on the venue
-# Strom. The relay is E2E_RELAY when set, otherwise picked from Open Live's
+# the source is active; step 5 activates one, so Open Live can see the audio track
+# itself. The relay is E2E_RELAY when set, otherwise picked from Open Live's
 # server-info below: `default` when it reports one, else the first.
 relay_name="${E2E_RELAY:-}"
+# How long the production may take to become active, to stop, and how long Open Live
+# may take, once it is active, to report the source's audio streams.
+activate_timeout="${E2E_ACTIVATE_TIMEOUT:-300}"
+deactivate_timeout="${E2E_DEACTIVATE_TIMEOUT:-180}"
+discovery_timeout="${E2E_DISCOVERY_TIMEOUT:-120}"
+mixer_input="video_in_0"
 strom_port="${E2E_STROM_PORT:-18080}"
 strom_url="http://127.0.0.1:$strom_port"
 gateway_name="oli-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-$$}"
@@ -95,10 +107,17 @@ pids=()
 up_pid=""
 open_live_url=""
 sat=""
+production_id=""
 
 cleanup() {
     local status=$?
     set +e
+    # The production first: it holds the source, and while it is active the cloud
+    # Strom keeps dialling the relay.
+    if [[ -n "$production_id" ]]; then
+        say "removing the run's production $production_id"
+        remove_production "$production_id" || say "could not remove production $production_id"
+    fi
     if [[ -n "$up_pid" ]] && kill -0 "$up_pid" 2>/dev/null; then
         kill -TERM "$up_pid"
         for _ in $(seq 60); do kill -0 "$up_pid" 2>/dev/null || break; sleep 1; done
@@ -269,9 +288,44 @@ mask "$open_live_url"
 mask "${open_live_url#https://}"
 
 ol_get() { curl -fsS -H "Authorization: Bearer $sat" "$open_live_url$1"; }
+ol_post() {
+    curl -fsS -X POST -H "Authorization: Bearer $sat" -H 'content-type: application/json' \
+        --max-time "${3:-30}" -d "$2" "$open_live_url$1"
+}
 our_source_ids() {
     ol_get /api/v1/sources | jq -r --arg p "$gateway_name — " '.[] | select(.name | startswith($p)) | .id'
 }
+# The production's status, or nothing when Open Live does not answer with one (gone,
+# or a transient error). Never fails, so a poll under `set -e` keeps polling.
+production_status() {
+    { ol_get "/api/v1/productions/$1" | jq -r '.status // empty'; } 2>/dev/null || true
+}
+# Deactivates (harmless when it is not active), waits until Open Live calls it idle
+# (`inactive`, or `ended` after it was active), then deletes it. True when it is gone.
+remove_production() {
+    local id="$1" state=""
+    ol_post "/api/v1/productions/$id/deactivate" '{}' "$deactivate_timeout" >/dev/null 2>&1 || true
+    for _ in $(seq $((deactivate_timeout / 2))); do
+        state="$(production_status "$id")"
+        [[ "$state" == "inactive" || "$state" == "ended" || -z "$state" ]] && break
+        sleep 2
+    done
+    local code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $sat" \
+        "$open_live_url/api/v1/productions/$id")" || return 1
+    [[ "$code" =~ ^(200|202|204|404)$ ]] || return 1
+    if [[ "$id" == "$production_id" ]]; then production_id=""; fi
+}
+
+# Productions first: they hold the sources.
+stale_productions="$(ol_get /api/v1/productions \
+    | jq -r '.[] | select((.name // "") | startswith("oli-e2e-")) | (._id // .id)')" \
+    || fail "GET /api/v1/productions on '$instance' failed"
+for id in $stale_productions; do
+    say "removing stale production $id from an earlier e2e run"
+    remove_production "$id" || say "could not remove stale production $id"
+done
+[[ -z "$stale_productions" ]] || note "removed $(wc -w <<<"$stale_productions") stale oli-e2e- production(s) left by an earlier run"
 
 stale_ids="$(ol_get /api/v1/sources \
     | jq -r --arg p "$gateway_name — " '.[] | select((.name | startswith("oli-e2e-")) and (.name | startswith($p) | not)) | .id')"
@@ -347,8 +401,10 @@ source_name="$(jq -r .name <<<"$source_json")"
 pass "source '$source_name' ($source_id) registered in Open Live '$instance' (streamType $(jq -r .streamType <<<"$source_json"), status $(jq -r .status <<<"$source_json"))"
 
 # Through the relay: the gateway's own view of the source names the relay and has a
-# dial-in address (srt://<relay>?streamid=<id>, never with the passphrase). Neither
-# is printed; only whether they are there.
+# dial-in address (srt://<relay>?streamid=<id>). This check prints only whether they
+# are there. The up log dumped at the end does print the dial-in address: the relay's
+# public host:port and the stream id, which is no secret (docs/DESIGN.md), with the
+# passphrase masked by the gateway.
 via_relay=""
 for _ in $(seq 30); do
     via_relay="$("$gateway_bin" --config "$work/gateway.toml" status --json 2>/dev/null \
@@ -400,17 +456,53 @@ video_buffers="$(jq '[.probes[] | select(.pad_name | test("^V0$|video"; "i")) | 
 (( audio_buffers > 0 )) || fail "no audio buffers reached the uplink's audio input in 5 s (video: $video_buffers)"
 pass "$audio_buffers audio buffers (and $video_buffers video buffers) reached the uplink in 5 s"
 
-streams="$(ol_get "/api/v1/sources/$source_id/audio-streams" || echo '{}')"
-discovery="$(jq -r '.discovery // "absent"' <<<"$streams")"
-if [[ "$discovery" == "available" ]] || jq -e '(.streams // []) | length > 0' <<<"$streams" >/dev/null; then
-    count="$(jq '(.streams // []) | length' <<<"$streams")"
-    (( count >= 1 )) || fail "Open Live reports no audio stream for the source"
-    pass "Open Live reports $count audio stream(s) for the source"
-else
-    note "Open Live cannot report the source's audio tracks yet: GET /api/v1/sources/{id}/audio-streams answers discovery '$discovery', reason '$(jq -r '.reason // "none"' <<<"$streams")'. The audio track is confirmed on the gateway side above; Open Live's own confirmation needs its source-stream probe."
-fi
+# Open Live's own view of the audio track. It only discovers a source's streams while
+# a production holding it is active (open-live#632): the cloud Strom then dials the
+# relay, decodes the feed, and Open Live reads the audio pads it negotiated.
+production_name="$gateway_name — production"
+made="$(ol_post /api/v1/productions "$(jq -nc --arg n "$production_name" '{name: $n}')")" \
+    || fail "creating production '$production_name' on '$instance' failed"
+production_id="$(jq -r '._id // .id // empty' <<<"$made")"
+[[ -n "$production_id" ]] || fail "Open Live created production '$production_name' but returned no id"
+ol_post "/api/v1/productions/$production_id/sources" \
+    "$(jq -nc --arg s "$source_id" --arg m "$mixer_input" '{sourceId: $s, mixerInput: $m}')" >/dev/null \
+    || fail "assigning the source to production $production_id ($mixer_input) failed"
+say "Activating production $production_id (up to $activate_timeout s)"
+ol_post "/api/v1/productions/$production_id/activate" '{}' "$activate_timeout" >/dev/null \
+    || fail "activating production $production_id failed"
+state="activating"
+for _ in $(seq "$activate_timeout"); do
+    state="$(production_status "$production_id")"
+    [[ "$state" == "active" ]] && break
+    [[ "$state" == "activating" || "$state" == "inactive" || -z "$state" ]] \
+        || fail "production $production_id did not activate: its status went to '$state'"
+    sleep 1
+done
+[[ "$state" == "active" ]] || fail "production $production_id was still '$state' after $activate_timeout s"
+pass "production '$production_name' ($production_id) holding the source on $mixer_input is active"
+
+streams='{}'
+discovery="absent"
+for _ in $(seq $((discovery_timeout / 3))); do
+    streams="$(ol_get "/api/v1/sources/$source_id/audio-streams" 2>/dev/null || echo '{}')"
+    discovery="$(jq -r '.discovery // "absent"' <<<"$streams")"
+    [[ "$discovery" == "available" ]] && break
+    sleep 3
+done
+echo "::group::Open Live audio-streams for the source"
+jq . <<<"$streams"
+echo "::endgroup::"
+[[ "$discovery" == "available" ]] \
+    || fail "Open Live does not confirm the source's audio track: with production $production_id active, GET /api/v1/sources/{id}/audio-streams still answers discovery '$discovery', reason '$(jq -r '.reason // "none"' <<<"$streams")' after $discovery_timeout s"
+count="$(jq '(.streams // []) | length' <<<"$streams")"
+(( count >= 1 )) || fail "Open Live reports discovery 'available' but no audio stream for the source"
+pass "Open Live reports $count audio stream(s) for the source: $(jq -c '[.streams[] | {index, channels}]' <<<"$streams")"
 
 # --- 6. teardown -----------------------------------------------------------------------------
+
+say "Deactivating and deleting production $production_id"
+remove_production "$production_id" || fail "production $production_id could not be deactivated and deleted"
+pass "production deactivated and deleted"
 
 say "Stopping up (SIGTERM, as Ctrl-C)"
 kill -TERM "$up_pid"
