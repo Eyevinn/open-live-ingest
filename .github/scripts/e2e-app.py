@@ -31,7 +31,7 @@ In order, each logged and written to the step summary:
      `activating` Strom runs no flow of the source, and once Open Live says it is
      `active` the flow has to run within 5 s. The uplink's SRT stats are checked
      (below), then the production is deactivated: the flow goes within 15 s and the
-     source is kept. The production stays, inactive, for step 5.
+     source is kept. The production stays, `ended` (or `inactive`), for step 5.
   4. `stop`: the page's `stopped` event, with no error and nothing left behind; the
      flow is gone from Strom, and the source is kept in Open Live with its id (#115),
      the only one of the run's gateway name. When nothing answers at
@@ -479,6 +479,11 @@ class SourceList:
         fail(f"no source named '{name}' appeared in Open Live within {timeout} s")
 
 
+# The statuses of a production that runs nothing: `ended` is one that was active
+# and was deactivated (open-live `ProductionStatus`, docs/specs/production-lifecycle-health.md).
+IDLE_PRODUCTION_STATUSES = ("inactive", "ended")
+
+
 class OpenLive(SourceList):
     def __init__(self, url, pat):
         self.url = url.rstrip("/")
@@ -563,7 +568,10 @@ class OpenLive(SourceList):
         fail(f"production {production_id} was still '{state}' after {timeout} s")
 
     def deactivate(self, production_id, timeout):
-        """Deactivates the production and waits until Open Live says it is inactive."""
+        """Deactivates the production and waits until Open Live says it is idle:
+        `inactive`, or `ended`, which Open Live reports for a production that was
+        active and was then deactivated (#145). Activating it again from `ended` is
+        allowed and goes through `activating` as from `inactive`."""
         status, _ = http("POST", f"{self.url}/api/v1/productions/{production_id}/deactivate", self._bearer(), {}, timeout=180)
         if status not in (200, 202, 204):
             fail(f"deactivating production {production_id} failed with HTTP {status}")
@@ -571,7 +579,7 @@ class OpenLive(SourceList):
         state = None
         while time.monotonic() < deadline:
             state = self.production(production_id).get("status")
-            if state == "inactive":
+            if state in IDLE_PRODUCTION_STATUSES:
                 return
             time.sleep(2)
         fail(f"production {production_id} was still '{state}' {timeout} s after its deactivation")
@@ -1323,7 +1331,7 @@ def run(exe, work):
         # 5. Go live again: no 409, and the kept source reused with its id. The source
         # is there from the start, so go_live() checks the rows before the session has
         # registered anything; they are checked again once the row is armed, which is
-        # after registration. The production still holds the source, inactive: the
+        # after registration. The production still holds the source, idle (ended): the
         # row waits for it, and activating it again starts the flow (#130 AC2).
         again, since = go_live(app, open_live, strom, source_name, "Go live again (no 409)", waits_for=("waiting_for_production",))
         if app.failed_rows(since):

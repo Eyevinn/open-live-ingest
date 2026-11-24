@@ -524,5 +524,56 @@ class Reactivated(unittest.TestCase):
         self.assertEqual(strom.watched, [])
 
 
+class ProductionStatusPolls(unittest.TestCase):
+    """#145: Open Live reports `ended`, not `inactive`, once an active production is
+    deactivated; `deactivate` takes either as done, and activating again from `ended`
+    goes through `activating` to `active`. Open Live's HTTP is scripted, no network."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.saved = (e2e.time.monotonic, e2e.time.sleep, e2e.http)
+        e2e.time.monotonic, e2e.time.sleep = self.clock.monotonic, self.clock.sleep
+        self.calls = []
+        self.statuses = []
+        e2e.http = self.http
+        self.open_live = e2e.OpenLive("https://open-live.example", "pat")
+        self.open_live._bearer = lambda: {}
+
+    def tearDown(self):
+        e2e.time.monotonic, e2e.time.sleep, e2e.http = self.saved
+
+    def http(self, method, url, headers=None, body=None, timeout=30):
+        self.calls.append((method, url.rsplit("/", 1)[-1]))
+        if method == "POST":
+            return 200, {}
+        status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        return 200, {"_id": "p-1", "status": status}
+
+    def test_deactivate_takes_ended_as_done(self):
+        self.statuses = ["active", "ended"]
+        self.open_live.deactivate("p-1", 180)
+        self.assertEqual(self.calls, [("POST", "deactivate"), ("GET", "p-1"), ("GET", "p-1")])
+
+    def test_deactivate_still_takes_inactive_as_done(self):
+        self.statuses = ["inactive"]
+        self.open_live.deactivate("p-1", 180)
+        self.assertEqual(self.calls, [("POST", "deactivate"), ("GET", "p-1")])
+
+    def test_deactivate_that_never_gets_idle_fails_naming_the_status(self):
+        self.statuses = ["active"]
+        with self.assertRaises(e2e.Failed) as caught:
+            self.open_live.deactivate("p-1", 180)
+        self.assertIn("production p-1 was still 'active' 180 s after its deactivation", str(caught.exception))
+
+    def test_activating_again_from_ended_reaches_active(self):
+        self.statuses = ["ended", "active"]
+        self.open_live.deactivate("p-1", 180)
+        self.statuses = ["activating", "active"]
+        looks = []
+        self.open_live.activate("p-1", 300, lambda: looks.append(self.clock.now))
+        self.assertEqual(len(looks), 1)
+        self.assertEqual(self.calls[-3:], [("POST", "activate"), ("GET", "p-1"), ("GET", "p-1")])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
