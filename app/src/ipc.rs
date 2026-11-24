@@ -15,9 +15,10 @@ use crate::go_live::{self, GoLive};
 use crate::logs;
 use crate::messages::Message;
 use crate::quit::{Exit, QuitGuard, QuitHandle};
+use crate::relay;
 use crate::what_to_send::{self, DeviceSource};
 use crate::where_to_send::{Opener, WhereToSend, WhereView};
-use open_live_ingest::api::{self, Devices, SaveError};
+use open_live_ingest::api::{self, Devices, OscCredential, SaveError};
 use open_live_ingest::keychain::OsKeychain;
 use open_live_ingest::{local_strom, osc};
 use serde::{Deserialize, Serialize};
@@ -126,6 +127,8 @@ pub enum Command {
         inputs: Vec<InputArgs>,
     },
     SetAdvanced(AdvancedArgs),
+    /// The SRT relays Open Live reports, for the picker under Advanced (OL-66).
+    Relays,
     GoLive,
     Stop,
     StopOther,
@@ -157,6 +160,7 @@ impl Command {
             Command::Devices { .. } => "devices",
             Command::SetInputs { .. } => "set_inputs",
             Command::SetAdvanced(_) => "set_advanced",
+            Command::Relays => "relays",
             Command::GoLive => "go_live",
             Command::Stop => "stop",
             Command::StopOther => "stop_other",
@@ -594,6 +598,34 @@ impl Core {
                 };
                 Some((reply, Effect::None))
             }
+            Command::Relays => {
+                let settings = match self.settings(id) {
+                    Ok(settings) => settings,
+                    Err(reply) => return Some((reply, Effect::None)),
+                };
+                let credential = settings
+                    .open_live
+                    .uses_keychain()
+                    .then(|| OscCredential::Keychain(model.keychain()));
+                self.later(id, name, Vec::new(), async move {
+                    relay::lookup(&settings, credential)
+                        .await
+                        .map(|relays| to_json(&relays))
+                });
+                None
+            }
+            // Of the Advanced values only the relay is saved yet (OL-66): exactly
+            // `{"uplink": {"relay": <name or null>}}`. Anything else is not yet.
+            Command::SetAdvanced(args) => match relay_choice(&args) {
+                Some(choice) => {
+                    let reply = match relay::choose(&self.settings_file, choice.as_deref()) {
+                        Ok(_) => Reply::ok(id, to_json(&self.view_model())),
+                        Err(message) => Reply::failure(id, &message),
+                    };
+                    Some((reply, Effect::None))
+                }
+                None => Some((Reply::error(id, NOT_YET), Effect::None)),
+            },
             Command::Devices { show_all } => self.devices(id, show_all),
             Command::SetInputs { inputs } => Some((self.set_inputs(id, &inputs), Effect::None)),
             Command::Quit { anyway: true, .. } => Some(if self.quit_handle().quit_anyway() {
@@ -610,7 +642,6 @@ impl Core {
             Command::Quit {
                 confirmed: false, ..
             } => Some((Reply::ok(id, Value::Null), self.request_quit())),
-            _ => Some((Reply::error(id, NOT_YET), Effect::None)),
         }
     }
 
@@ -735,6 +766,21 @@ fn changes_settings(command: &Command) -> bool {
             | Command::SetInputs { .. }
             | Command::SetAdvanced(_)
     )
+}
+
+/// The relay of a `set_advanced` that sets only `uplink.relay`: `Some(None)` clears
+/// it. `None` for any other Advanced value, which cannot be saved yet.
+fn relay_choice(args: &AdvancedArgs) -> Option<Option<String>> {
+    let values = args.values();
+    let uplink = values.get("uplink")?.as_object()?;
+    if values.len() != 1 || uplink.len() != 1 {
+        return None;
+    }
+    match uplink.get("relay")? {
+        Value::Null => Some(None),
+        Value::String(name) => Some(Some(name.clone())),
+        _ => None,
+    }
 }
 
 /// The address `open_url` opens for a name: from the settings, never from the page.
@@ -1069,6 +1115,7 @@ mod tests {
                 json!({"cmd": "set_advanced", "args": {"latency_ms": 200}}),
                 "set_advanced",
             ),
+            (json!({"cmd": "relays"}), "relays"),
             (json!({"cmd": "go_live"}), "go_live"),
             (json!({"cmd": "stop"}), "stop"),
             (json!({"cmd": "stop_other"}), "stop_other"),
@@ -1352,6 +1399,80 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("open_live.url"), "{message}");
+    }
+
+    /// OL-66: the relays Open Live reports, for the picker under Advanced, and
+    /// `set_advanced` saving the one picked as `uplink.relay`.
+    #[test]
+    fn the_relay_picker_lists_open_lives_relays_and_saves_the_choice() {
+        let open_live = testing::fake_open_live_with(
+            "the-key",
+            testing::server_info_with_relays(&[
+                ("default", "relay.example.com:9000"),
+                ("eu", "relay-eu.example.com:9000"),
+            ]),
+        );
+        let dir = testing::Scratch::new("ipc-relays");
+        std::fs::write(
+            dir.settings(),
+            format!("[open_live]\nurl = \"{open_live}\"\napi_key = \"the-key\"\n\n[[input]]\ndevice = \"test\"\n"),
+        )
+        .unwrap();
+        let (mut core, rx) = core_with(dir.settings(), nowhere());
+        assert!(core.dispatch(r#"{"id": 1, "cmd": "relays"}"#).is_none());
+        assert_eq!(
+            next_delivered(&rx),
+            json!({"id": 1, "ok": {"relays": ["default", "eu"], "chosen": "default", "offer": true}})
+        );
+
+        let saved = reply_json(
+            &mut core,
+            r#"{"id": 2, "cmd": "set_advanced", "args": {"uplink": {"relay": "eu"}}}"#,
+        );
+        assert!(saved["ok"]["where"].is_object(), "{saved}");
+        assert_eq!(
+            api::load_from(&dir.settings())
+                .unwrap()
+                .uplink
+                .relay
+                .as_deref(),
+            Some("eu")
+        );
+        assert!(core.dispatch(r#"{"id": 3, "cmd": "relays"}"#).is_none());
+        assert_eq!(next_delivered(&rx)["ok"]["chosen"], "eu");
+
+        let cleared = reply_json(
+            &mut core,
+            r#"{"id": 4, "cmd": "set_advanced", "args": {"uplink": {"relay": null}}}"#,
+        );
+        assert!(cleared.get("ok").is_some(), "{cleared}");
+        assert_eq!(api::load_from(&dir.settings()).unwrap().uplink.relay, None);
+
+        // The relay with anything else is not saved yet.
+        let mixed = reply_json(
+            &mut core,
+            r#"{"id": 5, "cmd": "set_advanced", "args": {"uplink": {"relay": "eu", "latency_ms": 300}}}"#,
+        );
+        assert_eq!(mixed["error"]["message"], NOT_YET);
+        assert_eq!(api::load_from(&dir.settings()).unwrap().uplink.relay, None);
+    }
+
+    /// OL-66 AC3: against Open Live v0.8.0 there is no relay and no picker.
+    #[test]
+    fn an_open_live_without_relays_lists_none() {
+        let open_live = testing::fake_open_live("the-key");
+        let dir = testing::Scratch::new("ipc-relays-v080");
+        std::fs::write(
+            dir.settings(),
+            format!("[open_live]\nurl = \"{open_live}\"\napi_key = \"the-key\"\n\n[[input]]\ndevice = \"test\"\n"),
+        )
+        .unwrap();
+        let (mut core, rx) = core_with(dir.settings(), nowhere());
+        assert!(core.dispatch(r#"{"id": 1, "cmd": "relays"}"#).is_none());
+        assert_eq!(
+            next_delivered(&rx),
+            json!({"id": 1, "ok": {"relays": [], "chosen": "default", "offer": false}})
+        );
     }
 
     #[test]

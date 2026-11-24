@@ -111,6 +111,11 @@ impl WhereToSend {
         }
     }
 
+    /// The keychain the Open Source Cloud sign-in is kept in.
+    pub fn keychain(&self) -> Arc<dyn SecretStore> {
+        self.keychain.clone()
+    }
+
     /// What step 1 shows, from the settings file and what has been listed this run.
     /// Reads the file only; asks no server.
     pub fn view(&self) -> WhereView {

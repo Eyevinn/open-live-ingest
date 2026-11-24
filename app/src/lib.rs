@@ -18,6 +18,7 @@ pub mod messages;
 pub mod navigation;
 pub mod protocol;
 pub mod quit;
+pub mod relay;
 pub mod status;
 pub mod stdio;
 #[cfg(test)]

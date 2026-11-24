@@ -72,6 +72,7 @@
         <h2 id="go-title">3. Go live</h2>
         <p><button type="button" id="go-button">Go live</button>
           <span id="go-strom" role="status"></span></p>
+        <p id="go-uplink" class="detail" role="status" hidden></p>
         <div id="go-notices" role="status"></div>
         <p id="go-problem" class="problem" role="alert" hidden>
           <span id="go-problem-text"></span>
@@ -81,6 +82,9 @@
       </section>
       <details id="advanced">
         <summary>Advanced</summary>
+        <p id="relay-picker" hidden>
+          <label>SRT relay <select id="relay-select"></select></label>
+        </p>
         <p><button type="button" id="show-strom-log" class="link">Show Strom log</button></p>
       </details>
       <p id="problem" class="problem" role="alert" hidden></p>

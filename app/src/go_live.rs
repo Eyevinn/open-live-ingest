@@ -99,6 +99,7 @@ impl Row {
 const OPEN_LIVE_UNREACHABLE: &str = "open_live_unreachable";
 const HEARTBEAT_REFUSED: &str = "heartbeat_refused";
 const SIGN_IN_ENDS: &str = "sign_in_ends";
+const RELAY_PASSPHRASE_NOT_KEPT: &str = "relay_passphrase_not_kept";
 
 fn notice(kind: &str, message: &Message) -> Event {
     Event::new(
@@ -123,6 +124,9 @@ pub struct Rows {
     unreachable_this_tick: bool,
     stopping: Option<(usize, usize)>,
     left_behind: Vec<String>,
+    /// The SRT relay this session sends through (OL-66), from `BringingUpViaRelay`;
+    /// `None` when it sends to a port on the cloud Strom, as before relays.
+    relay: Option<String>,
 }
 
 impl Rows {
@@ -137,6 +141,7 @@ impl Rows {
             unreachable_this_tick: false,
             stopping: None,
             left_behind: Vec::new(),
+            relay: None,
         }
     }
 
@@ -210,6 +215,31 @@ impl Rows {
             }
             E::StromReady { .. } => out.push(Event::new("strom", json!({ "state": "ready" }))),
             E::StromStopped => out.push(Event::new("strom", json!({ "state": "stopped" }))),
+            // Through Open Live's SRT relay (OL-66): which relay, and its public
+            // address when Open Live reports one. Without a relay nothing is said,
+            // as before relays.
+            E::BringingUpViaRelay { relay, public, .. } => {
+                self.relay = Some(relay.clone());
+                out.push(Event::new(
+                    "uplink",
+                    json!({ "via": "relay", "relay": relay, "public": public }),
+                ));
+            }
+            // The relay's port is public, so a passphrase was made for it. Never the
+            // passphrase itself, nor where it is kept; one that could not be kept is
+            // a banner, since it protects this session only.
+            E::PassphraseGenerated { kept_in } => {
+                out.push(Event::new(
+                    "passphrase",
+                    json!({ "generated": true, "kept": kept_in.is_some() }),
+                ));
+                if kept_in.is_none() {
+                    out.extend(self.add_notice(
+                        RELAY_PASSPHRASE_NOT_KEPT,
+                        &Failure::RelayPassphraseNotKept.message(),
+                    ));
+                }
+            }
             E::Registering { input } => {
                 out.extend(self.set(input, RowState::Registering, None, now))
             }
@@ -230,16 +260,24 @@ impl Rows {
                     out.extend(self.set(&started.name, RowState::Connecting, None, now));
                 }
                 // Where each input's uplink goes, and the address registered with Open
-                // Live, passphrases already masked by the library.
+                // Live, passphrases already masked by the library. Through the relay
+                // the uplink is the dial-in address, and the row names the relay.
+                let relay = self.relay.clone();
                 out.push(Event::new(
                     "summary",
                     json!({
-                        "inputs": inputs.iter().map(|r| json!({
-                            "input": r.name,
-                            "port": r.port,
-                            "uplink": r.uplink,
-                            "registered": r.address,
-                        })).collect::<Vec<Value>>()
+                        "inputs": inputs.iter().map(|r| {
+                            let mut row = json!({
+                                "input": r.name,
+                                "port": r.port,
+                                "uplink": r.uplink,
+                                "registered": r.address,
+                            });
+                            if let Some(relay) = &relay {
+                                row["relay"] = json!(relay);
+                            }
+                            row
+                        }).collect::<Vec<Value>>()
                     }),
                 ));
             }
@@ -1024,6 +1062,137 @@ mod tests {
             row["registered"],
             "srt://:47110?mode=listener&passphrase=***"
         );
+    }
+
+    /// OL-66 item 2: through Open Live's SRT relay the page is told which relay and
+    /// its public address, and each summary row names the relay, with the dial-in
+    /// address as the uplink, passphrase masked.
+    #[test]
+    fn through_the_relay_the_page_is_told_the_relay_and_the_dial_in_address() {
+        let mut rows = rows();
+        let t = Instant::now();
+        let mut seen = Vec::new();
+        for event in [
+            E::PassphraseGenerated {
+                kept_in: Some("/home/venue/.config/open-live-ingest/gateway.toml".into()),
+            },
+            E::BringingUpViaRelay {
+                inputs: 1,
+                relay: "default".to_string(),
+                public: Some("relay.example.com:9000".to_string()),
+                total_mbps: 6.0,
+            },
+            E::Summary {
+                inputs: vec![SummaryRow {
+                    name: CAM.to_string(),
+                    port: 9000,
+                    address: "srt+relay://ab12cd@default?latency=200&passphrase=***".to_string(),
+                    uplink: "srt://relay.example.com:9000?streamid=ab12cd&mode=caller&latency=200&passphrase=***".to_string(),
+                }],
+            },
+        ] {
+            seen.extend(rows.on_event(&event, t));
+        }
+        let seen = json_of(&seen);
+        assert_eq!(
+            seen[0],
+            json!({"event": "passphrase", "data": {"generated": true, "kept": true}})
+        );
+        assert_eq!(
+            seen[1],
+            json!({"event": "uplink", "data": {"via": "relay", "relay": "default", "public": "relay.example.com:9000"}})
+        );
+        let summary = seen.iter().find(|e| e["event"] == "summary").unwrap();
+        assert_eq!(
+            summary["data"]["inputs"][0],
+            json!({
+                "input": CAM,
+                "port": 9000,
+                "uplink": "srt://relay.example.com:9000?streamid=ab12cd&mode=caller&latency=200&passphrase=***",
+                "registered": "srt+relay://ab12cd@default?latency=200&passphrase=***",
+                "relay": "default",
+            })
+        );
+        // Neither the settings file nor a passphrase reaches the page.
+        let text = serde_json::to_string(&seen).unwrap();
+        assert!(!text.contains("gateway.toml"), "{text}");
+        assert!(
+            text.split("passphrase=")
+                .skip(1)
+                .all(|rest| rest.starts_with("***")),
+            "{text}"
+        );
+    }
+
+    /// A passphrase made for the relay that could not be saved is a banner: it
+    /// protects this session only.
+    #[test]
+    fn a_relay_passphrase_not_kept_is_a_banner() {
+        let mut rows = rows();
+        let out =
+            json_of(&rows.on_event(&E::PassphraseGenerated { kept_in: None }, Instant::now()));
+        assert_eq!(
+            out[0],
+            json!({"event": "passphrase", "data": {"generated": true, "kept": false}})
+        );
+        assert_eq!(out[1]["event"], "notice");
+        assert_eq!(out[1]["data"]["kind"], "relay_passphrase_not_kept");
+        assert_eq!(out[1]["data"]["action"], "show_file");
+    }
+
+    /// OL-66 AC3: against an Open Live without a relay (v0.8.0) the session says
+    /// `BringingUp`, and the page hears exactly what it heard before relays: no
+    /// `uplink` event, and summary rows without a relay.
+    #[test]
+    fn without_a_relay_the_page_hears_what_it_did_before() {
+        let mut rows = rows();
+        let t = Instant::now();
+        let bringing_up = rows.on_event(
+            &E::BringingUp {
+                inputs: 1,
+                host: "strom.example.com".to_string(),
+                ports: "47110-47129".to_string(),
+                port_source: "Open Live".to_string(),
+                total_mbps: 6.0,
+            },
+            t,
+        );
+        assert!(bringing_up.is_empty());
+        let out = json_of(&rows.on_event(&summary(&[CAM]), t));
+        let summary = out.iter().find(|e| e["event"] == "summary").unwrap();
+        assert_eq!(
+            summary["data"]["inputs"][0],
+            json!({
+                "input": CAM,
+                "port": 47110,
+                "uplink": "srt://strom.example.com:47110?mode=caller&latency=200&passphrase=***",
+                "registered": "srt://:47110?mode=listener&passphrase=***",
+            })
+        );
+    }
+
+    /// An input Open Live gives no relay address for fails with `connect.reason` in
+    /// the row, not the camera line.
+    #[test]
+    fn an_input_without_a_relay_address_says_why() {
+        let mut rows = rows();
+        let reason = open_live_ingest::openlive::relay_reason_message(
+            Some("srt-relay-unreachable"),
+            "default",
+        );
+        let out = json_of(&rows.on_event(
+            &E::InputFailed {
+                input: CAM.to_string(),
+                reason,
+            },
+            Instant::now(),
+        ));
+        assert_eq!(out[0]["data"]["state"], "failed");
+        assert_eq!(
+            out[0]["data"]["message"],
+            "Open Live can't reach its SRT relay right now. Wait a moment, then press Go live again."
+        );
+        assert_eq!(out[0]["data"]["action"], "retry");
     }
 
     #[test]
