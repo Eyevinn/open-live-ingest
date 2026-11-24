@@ -24,7 +24,14 @@
 //!   buffer's PTS. Strom has no per-sink frame counter: a base sink's `stats` is a
 //!   GstStructure, which its element property read skips, and a probe's
 //!   `sample_count` is reset at every broadcast. So the media check is "the receiver
-//!   got packets, and both sinks got buffers", and the PTS shows how far each got.
+//!   got packets, and both sinks got buffers". The PTS is gated too, anchored to the
+//!   connect like the drop counters: both sinks must have had a buffer by the first
+//!   sample (+10 s), and each sink's last PTS, read there and again at the end of the
+//!   window, must have advanced by the wall time between those two reads, less 5 s.
+//!   A receiver that freezes without making the sender drop (its sinks stop getting
+//!   buffers while SRT still acknowledges) fails on that, instead of passing on a
+//!   buffer it got early on; so does one that only starts decoding later in the
+//!   window, instead of passing on a short stretch of wall time at the end.
 //!
 //! It reads the uplink's `/api/flows/<id>/srt-stats` the moment the peer appears and
 //! then every 10 s to the end of the window. The caller's SRT counters start at 0 for
@@ -32,7 +39,8 @@
 //! growth since the first sample: the backlog burst at connect is already in that
 //! first sample, and a drop burst there must count. It fails (exit status 1) when
 //! `packets_sent_dropped` is 1 % or more of `packets_sent` in any sample, or when the
-//! receiver got no video or no audio. Every sample counts, not only +10 s and the
+//! receiver got no video or no audio (with the Strom receiver, also when a sink's PTS
+//! stopped short of the end of the window, see above). Every sample counts, not only +10 s and the
 //! end: a stalled Strom receiver drops nothing at +10 s, and the caller reconnects at
 //! about +50 s with its counters back at 0, so a check on those two samples alone
 //! would pass it. A sample with no peer, or with `packets_sent` lower than the one
@@ -108,6 +116,16 @@ const MAX_DROP_RATIO: f64 = 0.01;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// Time between two samples of the uplink's counters.
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+/// How far a Strom receiver sink's PTS may fall behind the wall time between its first
+/// and its last read (the queue, the SRT latency and the read itself), before the run
+/// counts the receiver as frozen.
+const PTS_SLACK: Duration = Duration::from_secs(5);
+/// How long after connect the Strom receiver's first PTS reading may be taken: the
+/// first sample (+10 s), plus `PTS_SLACK` for the reads before it. A receiver whose
+/// sinks have no buffer yet by then started late, and the PTS gate fails it, rather
+/// than measuring from whenever its first buffers arrived (from the +60 s sample, the
+/// wall time to cover would be about 0).
+const FIRST_PTS_WITHIN: Duration = SAMPLE_INTERVAL.saturating_add(PTS_SLACK);
 
 /// The Strom receiver's flow: the SRT input block and the two sinks behind it.
 const RX_INPUT: &str = "receiver";
@@ -299,6 +317,10 @@ async fn main() -> Result<ExitCode> {
         let mut reconnects = 0;
         let mut previous_sent = totals(&first).0;
         let mut next = SAMPLE_INTERVAL;
+        // The Strom receiver's first PTS reading, taken at the first sample at which
+        // both sinks have had a buffer; `pts_reached_end` fails it unless that is the
+        // +10 s sample.
+        let mut first_pts: Option<PtsReading> = None;
         while next <= o.window {
             tokio::time::sleep(next.saturating_sub(connected.elapsed())).await;
             let label = format!("+{} s", next.as_secs());
@@ -311,12 +333,22 @@ async fn main() -> Result<ExitCode> {
                         println!("{label:>10}: packets_sent went down: the caller reconnected");
                     }
                     previous_sent = sent;
-                    samples.push((label, (sent, dropped)));
+                    samples.push((label.clone(), (sent, dropped)));
                 }
                 _ => {
                     reconnects += 1;
                     previous_sent = 0;
                     println!("{label:>10}: no peer: the caller is reconnecting");
+                }
+            }
+            if let (None, Some((client, rx_id))) = (&first_pts, &rx_strom) {
+                first_pts = pts_reading(client, rx_id).await?;
+                if let Some(first) = &first_pts {
+                    println!(
+                        "{label:>10}: receiver PTS video {} audio {}",
+                        show_pts(first.video),
+                        show_pts(first.audio)
+                    );
                 }
             }
             next += SAMPLE_INTERVAL;
@@ -326,7 +358,7 @@ async fn main() -> Result<ExitCode> {
             Some((client, rx_id)) => Some(strom_receiver_media(client, rx_id).await?),
             None => None,
         };
-        Ok((samples, reconnects, strom_media))
+        Ok((samples, reconnects, strom_media, first_pts, connected))
     }
     .await;
 
@@ -342,7 +374,7 @@ async fn main() -> Result<ExitCode> {
             let _ = client.delete_flow(rx_id).await;
         }
     }
-    let (samples, reconnects, strom_media) = outcome?;
+    let (samples, reconnects, strom_media, first_pts, connected) = outcome?;
 
     let mut drops_ok = true;
     for (label, (sent, dropped)) in &samples {
@@ -350,7 +382,12 @@ async fn main() -> Result<ExitCode> {
             "since connect, at {label}: {dropped} of {sent} sent dropped ({})",
             percent(*dropped, *sent)
         );
-        drops_ok &= under_ratio(*sent, *dropped);
+        drops_ok &= sample_ok(*sent, *dropped);
+    }
+    // Something was sent at some point: a run whose samples all read 0 sent fails.
+    if !samples.iter().any(|(_, (sent, _))| *sent > 0) {
+        println!("the uplink sent nothing during the window");
+        drops_ok = false;
     }
     if reconnects > 0 {
         println!("the caller reconnected {reconnects} time(s) during the window");
@@ -364,7 +401,10 @@ async fn main() -> Result<ExitCode> {
                 media.video_pts.as_deref().unwrap_or("none"),
                 media.audio_pts.as_deref().unwrap_or("none"),
             );
-            media.packets_received > 0 && media.video_pts.is_some() && media.audio_pts.is_some()
+            let got_media = media.packets_received > 0
+                && media.video_pts.is_some()
+                && media.audio_pts.is_some();
+            got_media && pts_reached_end(connected, first_pts.as_ref(), &media)
         }
         None => {
             let (video_frames, audio_frames) = count_frames(&o.out)?;
@@ -386,7 +426,9 @@ async fn main() -> Result<ExitCode> {
             );
         }
         if !media_ok {
-            println!("FAIL: the receiver did not get both video and audio");
+            println!(
+                "FAIL: the receiver did not get both video and audio up to the end of the window"
+            );
         }
         Ok(ExitCode::FAILURE)
     }
@@ -503,6 +545,108 @@ struct StromMedia {
     /// The PTS of the last buffer each sink got, from its `last-message`.
     video_pts: Option<String>,
     audio_pts: Option<String>,
+    /// When the sinks were read.
+    read_at: Instant,
+}
+
+/// Both Strom receiver sinks' last PTS, and when they were read.
+struct PtsReading {
+    video: Duration,
+    audio: Duration,
+    read_at: Instant,
+}
+
+/// Both sinks' last PTS, when both have had a buffer with a readable PTS.
+async fn pts_reading(client: &StromClient, rx_id: &FlowId) -> Result<Option<PtsReading>> {
+    let read_at = Instant::now();
+    let video = last_pts(client, rx_id, RX_VIDEO_SINK).await?;
+    let audio = last_pts(client, rx_id, RX_AUDIO_SINK).await?;
+    Ok(
+        match (
+            video.as_deref().and_then(parse_pts),
+            audio.as_deref().and_then(parse_pts),
+        ) {
+            (Some(video), Some(audio)) => Some(PtsReading {
+                video,
+                audio,
+                read_at,
+            }),
+            _ => None,
+        },
+    )
+}
+
+/// The first reading was taken within `FIRST_PTS_WITHIN` of `connected` (the receiver
+/// decoded from the start, not only late in the window), and each sink's PTS advanced,
+/// from that reading to the end of the window, by the wall time between the two reads
+/// less `PTS_SLACK`: the receiver kept getting media to the end, rather than freezing
+/// after its first buffers.
+fn pts_reached_end(connected: Instant, first: Option<&PtsReading>, media: &StromMedia) -> bool {
+    let Some(first) = first else {
+        println!("receiver PTS: never read from both sinks during the window");
+        return false;
+    };
+    let first_at = first.read_at.saturating_duration_since(connected);
+    let started_on_time = first_at <= FIRST_PTS_WITHIN;
+    println!(
+        "receiver PTS: first read from both sinks {:.1} s after connect ({})",
+        first_at.as_secs_f64(),
+        if started_on_time {
+            "at the first sample"
+        } else {
+            "too late: no buffer on both sinks by the first sample"
+        },
+    );
+    let wall = media.read_at.saturating_duration_since(first.read_at);
+    let mut ok = true;
+    for (kind, from, to) in [
+        ("video", first.video, media.video_pts.as_deref()),
+        ("audio", first.audio, media.audio_pts.as_deref()),
+    ] {
+        let to = to.and_then(parse_pts);
+        let advanced = to.map(|to| to.saturating_sub(from));
+        let reached = advanced.is_some_and(|a| a + PTS_SLACK >= wall);
+        println!(
+            "receiver {kind} PTS: {} to {}, advanced {} in {:.1} s of wall time ({})",
+            show_pts(from),
+            to.map_or_else(|| "none".to_string(), show_pts),
+            advanced.map_or_else(|| "-".to_string(), |a| format!("{:.1} s", a.as_secs_f64())),
+            wall.as_secs_f64(),
+            if reached {
+                "reached the end of the window"
+            } else {
+                "stopped short of the end of the window"
+            },
+        );
+        ok &= reached;
+    }
+    started_on_time && ok
+}
+
+/// A GStreamer clock time as printed in `last-message`, `H:MM:SS.NNNNNNNNN`; `None`
+/// for anything else, including `99:99:99.999999999` (no time).
+fn parse_pts(pts: &str) -> Option<Duration> {
+    let mut parts = pts.trim().splitn(3, ':');
+    let hours: u64 = parts.next()?.parse().ok()?;
+    let minutes: u64 = parts.next()?.parse().ok()?;
+    let (seconds, fraction) = parts.next()?.split_once('.')?;
+    let seconds: u64 = seconds.parse().ok()?;
+    if minutes >= 60 || seconds >= 60 || fraction.len() != 9 {
+        return None;
+    }
+    let nanos: u32 = fraction.parse().ok()?;
+    Some(Duration::new(hours * 3600 + minutes * 60 + seconds, nanos))
+}
+
+fn show_pts(pts: Duration) -> String {
+    let s = pts.as_secs();
+    format!(
+        "{}:{:02}:{:02}.{:09}",
+        s / 3600,
+        s / 60 % 60,
+        s % 60,
+        pts.subsec_nanos()
+    )
 }
 
 async fn strom_receiver_media(client: &StromClient, rx_id: &FlowId) -> Result<StromMedia> {
@@ -519,10 +663,12 @@ async fn strom_receiver_media(client: &StromClient, rx_id: &FlowId) -> Result<St
                 .sum()
         })
         .unwrap_or(0);
+    let read_at = Instant::now();
     Ok(StromMedia {
         packets_received,
         video_pts: last_pts(client, rx_id, RX_VIDEO_SINK).await?,
         audio_pts: last_pts(client, rx_id, RX_AUDIO_SINK).await?,
+        read_at,
     })
 }
 
@@ -594,6 +740,14 @@ fn under_ratio(sent: u64, dropped: u64) -> bool {
     sent > 0 && (dropped as f64) < MAX_DROP_RATIO * sent as f64
 }
 
+/// One sample passes when under `MAX_DROP_RATIO` was dropped, or when nothing was sent
+/// or dropped yet: with the listener up first, the peer appears before the first packet,
+/// so the `connected` sample reads 0 of 0. That the uplink sent anything at all is
+/// checked over the whole run.
+fn sample_ok(sent: u64, dropped: u64) -> bool {
+    (sent == 0 && dropped == 0) || under_ratio(sent, dropped)
+}
+
 fn percent(part: u64, whole: u64) -> String {
     if whole == 0 {
         return "nothing sent".to_string();
@@ -630,4 +784,114 @@ fn count_frames(path: &Path) -> Result<(u64, u64)> {
         }
     }
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sample_before_the_first_packet_passes() {
+        assert!(sample_ok(0, 0));
+        assert!(sample_ok(6148, 0));
+        assert!(!sample_ok(14087, 4590));
+        assert!(!sample_ok(0, 1));
+    }
+
+    #[test]
+    fn parses_gstreamer_clock_times() {
+        assert_eq!(
+            parse_pts("0:00:12.345678900"),
+            Some(Duration::new(12, 345_678_900))
+        );
+        assert_eq!(parse_pts("1:02:03.000000001"), Some(Duration::new(3723, 1)));
+        assert_eq!(parse_pts("99:99:99.999999999"), None);
+        assert_eq!(parse_pts("unknown"), None);
+        assert_eq!(parse_pts("0:00:12"), None);
+        assert_eq!(show_pts(Duration::new(3723, 1)), "1:02:03.000000001");
+    }
+
+    fn media(video: &str, audio: &str, read_at: Instant) -> StromMedia {
+        StromMedia {
+            packets_received: 1,
+            video_pts: Some(video.to_string()),
+            audio_pts: Some(audio.to_string()),
+            read_at,
+        }
+    }
+
+    #[test]
+    fn pts_gate_catches_a_frozen_receiver() {
+        let connected = Instant::now();
+        // The first reading at the +10 s sample, as in the `first` and `nosync` runs.
+        let start = connected + SAMPLE_INTERVAL;
+        let first = PtsReading {
+            video: Duration::from_secs(10),
+            audio: Duration::from_secs(10),
+            read_at: start,
+        };
+        let end = start + Duration::from_secs(50);
+        // Kept up: 49 s of media in 50 s of wall time.
+        assert!(pts_reached_end(
+            connected,
+            Some(&first),
+            &media("0:00:59.000000000", "0:00:59.500000000", end)
+        ));
+        // Video froze 20 s into the 50 s.
+        assert!(!pts_reached_end(
+            connected,
+            Some(&first),
+            &media("0:00:30.000000000", "0:00:59.500000000", end)
+        ));
+        // The PTS went backwards (a reset), or was never read.
+        assert!(!pts_reached_end(
+            connected,
+            Some(&first),
+            &media("0:00:01.000000000", "0:00:59.500000000", end)
+        ));
+        assert!(!pts_reached_end(
+            connected,
+            None,
+            &media("0:00:59.000000000", "0:00:59.000000000", end)
+        ));
+    }
+
+    #[test]
+    fn pts_gate_fails_a_receiver_that_starts_late() {
+        let connected = Instant::now();
+        let end = connected + Duration::from_secs(60);
+        let reading = |at: u64, pts: u64| PtsReading {
+            video: Duration::from_secs(pts),
+            audio: Duration::from_secs(pts),
+            read_at: connected + Duration::from_secs(at),
+        };
+        // First buffers by the +60 s sample: the wall time to cover is about 0, and the
+        // gate must not pass on that.
+        assert!(!pts_reached_end(
+            connected,
+            Some(&reading(60, 70)),
+            &media("0:01:10.000000000", "0:01:10.000000000", end)
+        ));
+        // The `late` run: first reading at +40 s, then 20 s of media in 20 s.
+        assert!(!pts_reached_end(
+            connected,
+            Some(&reading(40, 42)),
+            &media("0:01:02.000000000", "0:01:02.000000000", end)
+        ));
+        // The +20 s sample is already too late.
+        assert!(!pts_reached_end(
+            connected,
+            Some(&reading(20, 22)),
+            &media("0:01:02.000000000", "0:01:02.000000000", end)
+        ));
+        // The `nosync` run: first reading at +10 s (a non-zero PTS base), 50 s of media
+        // in 50 s; a slow first read still counts as the first sample.
+        let mut on_time = reading(10, 47);
+        on_time.read_at += Duration::from_millis(300);
+        assert!(pts_reached_end(
+            connected,
+            Some(&on_time),
+            &media("0:01:37.000000000", "0:01:37.000000000", end)
+        ));
+    }
 }
