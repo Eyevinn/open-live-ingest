@@ -373,7 +373,12 @@ async fn main() -> Result<ExitCode> {
             "since connect, at {label}: {dropped} of {sent} sent dropped ({})",
             percent(*dropped, *sent)
         );
-        drops_ok &= under_ratio(*sent, *dropped);
+        drops_ok &= sample_ok(*sent, *dropped);
+    }
+    // Something was sent at some point: a run whose samples all read 0 sent fails.
+    if !samples.iter().any(|(_, (sent, _))| *sent > 0) {
+        println!("the uplink sent nothing during the window");
+        drops_ok = false;
     }
     if reconnects > 0 {
         println!("the caller reconnected {reconnects} time(s) during the window");
@@ -713,6 +718,14 @@ fn under_ratio(sent: u64, dropped: u64) -> bool {
     sent > 0 && (dropped as f64) < MAX_DROP_RATIO * sent as f64
 }
 
+/// One sample passes when under `MAX_DROP_RATIO` was dropped, or when nothing was sent
+/// or dropped yet: with the listener up first, the peer appears before the first packet,
+/// so the `connected` sample reads 0 of 0. That the uplink sent anything at all is
+/// checked over the whole run.
+fn sample_ok(sent: u64, dropped: u64) -> bool {
+    (sent == 0 && dropped == 0) || under_ratio(sent, dropped)
+}
+
 fn percent(part: u64, whole: u64) -> String {
     if whole == 0 {
         return "nothing sent".to_string();
@@ -754,6 +767,14 @@ fn count_frames(path: &Path) -> Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sample_before_the_first_packet_passes() {
+        assert!(sample_ok(0, 0));
+        assert!(sample_ok(6148, 0));
+        assert!(!sample_ok(14087, 4590));
+        assert!(!sample_ok(0, 1));
+    }
 
     #[test]
     fn parses_gstreamer_clock_times() {
