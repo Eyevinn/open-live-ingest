@@ -4,54 +4,121 @@
 //! live before a production is active.
 //!
 //! The flow is `flow::build`'s own, with the settings of the report: test pattern,
-//! 1280x720 at 30/1, H.264 software, 6000 kbit/s CBR, caller, latency 200 ms. The
-//! receiver is `srt-live-transmit` writing the stream to a file, and `ffprobe` counts
-//! the video and audio frames in it afterwards.
+//! 1280x720 at 30/1, H.264 software, 6000 kbit/s CBR, caller, latency 200 ms.
 //!
-//! It reads the uplink's `/api/flows/<id>/srt-stats` the moment the peer appears, 10 s
-//! later, and at the end of the window. The caller's SRT counters start at 0 for each
-//! connection, so the check uses their absolute values (a baseline of 0), not growth
-//! since the first sample: the backlog burst at connect is already in that first
-//! sample, and a drop burst there must count. It fails (exit status 1) when
-//! `packets_sent_dropped` is 1 % or more of `packets_sent` at +10 s or at the end of
-//! the window, or when the receiver got no video or no audio frames.
-//! `snd_buf_level_ms` is printed with every sample: a send buffer that holds more
-//! than the SRT latency is the backlog the issue suspects.
+//! Two receivers, picked with `--receiver`:
+//!
+//! - `srt-live-transmit` (the default) writes the stream to a file, and `ffprobe`
+//!   counts the video and audio frames in it afterwards. It always reads, so it never
+//!   stalls: it shows the backlog burst at connect, not the #111 drop.
+//! - `strom` is the receiver of Eyevinn/strom#1277 and of Open Live: a flow built
+//!   through a Strom's API (`--receiver-strom`, by default the sending Strom) with a
+//!   `builtin.mpegtssrt_input` listener (`srt://:<port>?mode=listener`, latency 125,
+//!   the two properties Open Live sets) whose `video_out` and `audio_out_0` each go
+//!   through a `queue` into a `fakesink` (`async: false`, `sync: true`, or `false`
+//!   with `--receiver-sync false`). The queues keep GStreamer from reporting an
+//!   invalid construction; strom#1277 stalls with and without them. What the
+//!   receiver got is read from that Strom before the flow is stopped: its `srtsrc`'s
+//!   `packets_received` from `/api/flows/<id>/srt-stats`, and each sink's
+//!   `last-message` (the sinks run with `silent: false`), which names the last
+//!   buffer's PTS. Strom has no per-sink frame counter: a base sink's `stats` is a
+//!   GstStructure, which its element property read skips, and a probe's
+//!   `sample_count` is reset at every broadcast. So the media check is "the receiver
+//!   got packets, and both sinks got buffers", and the PTS shows how far each got.
+//!
+//! It reads the uplink's `/api/flows/<id>/srt-stats` the moment the peer appears and
+//! then every 10 s to the end of the window. The caller's SRT counters start at 0 for
+//! each connection, so the check uses their absolute values (a baseline of 0), not
+//! growth since the first sample: the backlog burst at connect is already in that
+//! first sample, and a drop burst there must count. It fails (exit status 1) when
+//! `packets_sent_dropped` is 1 % or more of `packets_sent` in any sample, or when the
+//! receiver got no video or no audio. Every sample counts, not only +10 s and the
+//! end: a stalled Strom receiver drops nothing at +10 s, and the caller reconnects at
+//! about +50 s with its counters back at 0, so a check on those two samples alone
+//! would pass it. A sample with no peer, or with `packets_sent` lower than the one
+//! before, is reported as a reconnect. `snd_buf_level_ms` is printed with every
+//! sample: a send buffer that holds more than the SRT latency is the backlog the
+//! issue first suspected.
 //!
 //! Needs a running Strom (the pinned release, with GStreamer's `srt`, `x264` and
-//! `avenc_aac`), `srt-live-transmit` and `ffprobe` on the PATH. Nothing else: no
-//! Open Live, no device.
+//! `avenc_aac`). The default receiver needs `srt-live-transmit` and `ffprobe` on the
+//! PATH; the Strom receiver needs nothing else (and decodes, so its Strom needs
+//! `avdec_h264` and `avdec_aac` or equivalents). No Open Live, no device.
 //!
 //! ```text
 //! # the late connect: the listener starts 35 s after the flow
 //! cargo run --example late_connect -- --listener-delay 35
 //! # the control: the listener is up before the flow starts
 //! cargo run --example late_connect -- --listener-delay 0
+//!
+//! # AC1 of #111 (strom#1277): Strom's mpegtssrt_input with clock-synced sinks, late
+//! cargo run --example late_connect -- --receiver strom --listener-delay 35
+//! # its controls: the receiver first, or sinks that do not sync to the clock
+//! cargo run --example late_connect -- --receiver strom --listener-delay 0
+//! cargo run --example late_connect -- --receiver strom --listener-delay 35 --receiver-sync false
+//! # the receiver on a second Strom, as in strom#1277
+//! cargo run --example late_connect -- --receiver strom --receiver-strom http://127.0.0.1:8092
 //! ```
+//!
+//! Expected with the Strom receiver, from svensson00's runs on strom#1277 (Strom
+//! 0.8.1 on both ends, localhost) and until a Strom release fixes it:
+//!
+//! | run | expected |
+//! |---|---|
+//! | `--listener-delay 35`, `sync: true` | FAIL: 0 dropped at connect and +10 s, then about 6,055 sent and 6,055 dropped per 10 s from before +20 s (about 25 % dropped at +20 s, rising), the RTT unchanged across those samples, and a reconnect by about +50 s after which the counters restart clean |
+//! | `--listener-delay 0`, `sync: true` | PASS: 0 dropped |
+//! | `--listener-delay 35 --receiver-sync false` | PASS: 0 dropped |
+//!
+//! With the default `srt-live-transmit` receiver both the late run and the control
+//! pass (0 dropped, #120 and the Mac run on #111). With a Strom carrying the
+//! strom#1277 fix, the first row must PASS: that is the after-fix half of AC1, run
+//! after the pin bump (`.github/scripts/bump-strom-pin.sh`).
 //!
 //! Options: `--strom <url>` (default `http://127.0.0.1:8080`, or `OLI_STROM_URL`),
 //! `--port <n>` (default 47199), `--receiver-port <n>` (default `--port`; set it
 //! to put a relay or a link emulator between the two), `--listener-delay <s>` (default 35),
-//! `--window <s>` (default 60), `--out <file>` (default a file in the temp dir),
-//! `--keep` to leave the flow in Strom afterwards. `OLI_STROM_API_KEY` is sent when
-//! set.
+//! `--window <s>` (default 60), `--receiver <srt-live-transmit|strom>` (default
+//! `srt-live-transmit`), `--receiver-strom <url>` (default `--strom`, or
+//! `OLI_RECEIVER_STROM_URL`), `--receiver-sync <true|false>` (default true),
+//! `--out <file>` (default a file in the temp dir; `srt-live-transmit` only),
+//! `--keep` to leave the flows in Strom afterwards. `OLI_STROM_API_KEY` is sent when
+//! set, to the receiving Strom too unless `OLI_RECEIVER_STROM_API_KEY` is set.
 
 use anyhow::{bail, Context, Result};
 use open_live_ingest::config::{Uplink, Video};
 use open_live_ingest::flow::{self, Input, Source, TEST_INPUT_ID};
 use open_live_ingest::strom::{StromClient, PINNED_VERSION};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
-use strom_types::api::SrtCallerStats;
+use strom_types::api::{SrtCallerStats, SrtRole};
+use strom_types::block::Position;
+use strom_types::flow::FlowProperties;
+use strom_types::{BlockInstance, Element, Flow, FlowId, Link, PropertyValue};
 
 const GATEWAY_ID: &str = "repro-late-connect";
 const LATENCY_MS: u32 = 200;
+/// The latency Open Live sets on its `mpegtssrt_input` sources.
+const RECEIVER_LATENCY_MS: u64 = 125;
 /// The share of `packets_sent` that `packets_sent_dropped` may reach, counted from 0 at
 /// connect.
 const MAX_DROP_RATIO: f64 = 0.01;
 /// How long to wait for the uplink to report a peer once the listener is up.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Time between two samples of the uplink's counters.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The Strom receiver's flow: the SRT input block and the two sinks behind it.
+const RX_INPUT: &str = "receiver";
+const RX_VIDEO_SINK: &str = "videosink";
+const RX_AUDIO_SINK: &str = "audiosink";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReceiverKind {
+    SrtLiveTransmit,
+    Strom,
+}
 
 struct Options {
     strom: String,
@@ -61,6 +128,15 @@ struct Options {
     window: Duration,
     out: PathBuf,
     keep: bool,
+    receiver: ReceiverKind,
+    receiver_strom: Option<String>,
+    receiver_sync: bool,
+}
+
+impl Options {
+    fn listen_port(&self) -> u16 {
+        self.receiver_port.unwrap_or(self.port)
+    }
 }
 
 fn options() -> Result<Options> {
@@ -72,7 +148,12 @@ fn options() -> Result<Options> {
         window: Duration::from_secs(60),
         out: std::env::temp_dir().join("oli-late-connect.ts"),
         keep: false,
+        receiver: ReceiverKind::SrtLiveTransmit,
+        receiver_strom: std::env::var("OLI_RECEIVER_STROM_URL").ok(),
+        receiver_sync: true,
     };
+    // --receiver-strom and --receiver-sync given without --receiver strom.
+    let mut strom_receiver_option = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().with_context(|| format!("{arg} needs a value"));
@@ -89,11 +170,31 @@ fn options() -> Result<Options> {
             "--window" => o.window = Duration::from_secs(value()?.parse().context("--window")?),
             "--out" => o.out = value()?.into(),
             "--keep" => o.keep = true,
+            "--receiver" => {
+                o.receiver = match value()?.as_str() {
+                    "srt-live-transmit" => ReceiverKind::SrtLiveTransmit,
+                    "strom" => ReceiverKind::Strom,
+                    other => bail!("--receiver is srt-live-transmit or strom, not {other}"),
+                }
+            }
+            "--receiver-strom" => {
+                o.receiver_strom = Some(value()?);
+                strom_receiver_option = true;
+            }
+            "--receiver-sync" => {
+                o.receiver_sync = value()?
+                    .parse()
+                    .context("--receiver-sync is true or false")?;
+                strom_receiver_option = true;
+            }
             other => bail!("unknown argument {other}; see the header of examples/late_connect.rs"),
         }
     }
-    if o.window < Duration::from_secs(10) {
+    if o.window < SAMPLE_INTERVAL {
         bail!("--window must be at least 10 s");
+    }
+    if o.receiver != ReceiverKind::Strom && strom_receiver_option {
+        bail!("--receiver-strom and --receiver-sync need --receiver strom");
     }
     Ok(o)
 }
@@ -101,7 +202,8 @@ fn options() -> Result<Options> {
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
     let o = options()?;
-    let strom = StromClient::new(&o.strom, std::env::var("OLI_STROM_API_KEY").ok().as_deref())?;
+    let api_key = std::env::var("OLI_STROM_API_KEY").ok();
+    let strom = StromClient::new(&o.strom, api_key.as_deref())?;
     let version = strom.version().await.context("reaching Strom")?;
     println!(
         "Strom {version} at {} (gateway pinned to {PINNED_VERSION})",
@@ -131,6 +233,38 @@ async fn main() -> Result<ExitCode> {
     let id = flow.id;
     println!("uplink: {}", input.endpoint.venue_uri());
 
+    // The Strom receiver's flow is created up front, so a Strom that rejects it fails
+    // the run before the uplink starts; only starting it is timed.
+    let rx_strom = match o.receiver {
+        ReceiverKind::SrtLiveTransmit => None,
+        ReceiverKind::Strom => {
+            let url = o.receiver_strom.as_deref().unwrap_or(&o.strom);
+            let key = std::env::var("OLI_RECEIVER_STROM_API_KEY")
+                .ok()
+                .or_else(|| api_key.clone());
+            let client = StromClient::new(url, key.as_deref())?;
+            let version = client
+                .version()
+                .await
+                .context("reaching the receiving Strom")?;
+            let rx_flow = receiver_flow(o.listen_port(), o.receiver_sync);
+            println!(
+                "receiver: Strom {version} at {url}, mpegtssrt_input on srt://:{}?mode=listener, latency {RECEIVER_LATENCY_MS} ms, sinks sync {}",
+                o.listen_port(),
+                o.receiver_sync
+            );
+            client
+                .delete_flow(&rx_flow.id)
+                .await
+                .context("removing an earlier run's receiver flow")?;
+            client
+                .create_flow(&rx_flow)
+                .await
+                .context("creating the receiver flow")?;
+            Some((client, rx_flow.id))
+        }
+    };
+
     strom
         .delete_flow(&id)
         .await
@@ -138,7 +272,7 @@ async fn main() -> Result<ExitCode> {
     let mut receiver = None;
     let outcome = async {
         if o.listener_delay.is_zero() {
-            receiver = Some(spawn_receiver(o.receiver_port.unwrap_or(o.port), &o.out)?);
+            receiver = Some(start_receiver(&o, rx_strom.as_ref()).await?);
             println!("control: listener up before the flow");
         }
         strom.create_flow(&flow).await?;
@@ -151,7 +285,7 @@ async fn main() -> Result<ExitCode> {
         if receiver.is_none() {
             println!("listener starts in {} s", o.listener_delay.as_secs());
             tokio::time::sleep(o.listener_delay).await;
-            receiver = Some(spawn_receiver(o.receiver_port.unwrap_or(o.port), &o.out)?);
+            receiver = Some(start_receiver(&o, rx_strom.as_ref()).await?);
             println!(
                 "listener up {} s after the flow",
                 started.elapsed().as_secs()
@@ -161,45 +295,89 @@ async fn main() -> Result<ExitCode> {
         let first = wait_for_peer(&strom, &id).await?;
         let connected = Instant::now();
         sample("connected", &first);
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let ten = peer(&strom, &id).await?;
-        sample("+10 s", &ten);
-        tokio::time::sleep(o.window.saturating_sub(connected.elapsed())).await;
-        let last = peer(&strom, &id).await?;
-        sample(&format!("+{} s", connected.elapsed().as_secs()), &last);
-
-        Ok((totals(&ten), totals(&last)))
+        let mut samples = vec![("connected".to_string(), totals(&first))];
+        let mut reconnects = 0;
+        let mut previous_sent = totals(&first).0;
+        let mut next = SAMPLE_INTERVAL;
+        while next <= o.window {
+            tokio::time::sleep(next.saturating_sub(connected.elapsed())).await;
+            let label = format!("+{} s", next.as_secs());
+            match strom.srt_uplink(&id).await? {
+                Some(stats) if stats.packets_sent.is_some() => {
+                    sample(&label, &stats);
+                    let (sent, dropped) = totals(&stats);
+                    if sent < previous_sent {
+                        reconnects += 1;
+                        println!("{label:>10}: packets_sent went down: the caller reconnected");
+                    }
+                    previous_sent = sent;
+                    samples.push((label, (sent, dropped)));
+                }
+                _ => {
+                    reconnects += 1;
+                    previous_sent = 0;
+                    println!("{label:>10}: no peer: the caller is reconnecting");
+                }
+            }
+            next += SAMPLE_INTERVAL;
+        }
+        // The Strom receiver is read while its flow still runs.
+        let strom_media = match &rx_strom {
+            Some((client, rx_id)) => Some(strom_receiver_media(client, rx_id).await?),
+            None => None,
+        };
+        Ok((samples, reconnects, strom_media))
     }
     .await;
 
-    if let Some(mut child) = receiver {
+    if let Some(mut child) = receiver.flatten() {
         let _ = child.kill();
         let _ = child.wait();
     }
     if !o.keep {
         let _ = strom.stop_flow(&id).await;
         let _ = strom.delete_flow(&id).await;
+        if let Some((client, rx_id)) = &rx_strom {
+            let _ = client.stop_flow(rx_id).await;
+            let _ = client.delete_flow(rx_id).await;
+        }
     }
-    let ((sent10, dropped10), (sent, dropped)) = outcome?;
+    let (samples, reconnects, strom_media) = outcome?;
 
-    println!(
-        "since connect, at +10 s: {dropped10} of {sent10} sent dropped ({})",
-        percent(dropped10, sent10)
-    );
-    println!(
-        "since connect, at end:   {dropped} of {sent} sent dropped ({})",
-        percent(dropped, sent)
-    );
-    let (video_frames, audio_frames) = count_frames(&o.out)?;
-    println!(
-        "receiver: {video_frames} video and {audio_frames} audio frames in {}",
-        o.out.display()
-    );
+    let mut drops_ok = true;
+    for (label, (sent, dropped)) in &samples {
+        println!(
+            "since connect, at {label}: {dropped} of {sent} sent dropped ({})",
+            percent(*dropped, *sent)
+        );
+        drops_ok &= under_ratio(*sent, *dropped);
+    }
+    if reconnects > 0 {
+        println!("the caller reconnected {reconnects} time(s) during the window");
+    }
 
-    let drops_ok = under_ratio(sent10, dropped10) && under_ratio(sent, dropped);
-    let media_ok = video_frames > 0 && audio_frames > 0;
+    let media_ok = match strom_media {
+        Some(media) => {
+            println!(
+                "receiver: {} SRT packets received; last video buffer {}, last audio buffer {}",
+                media.packets_received,
+                media.video_pts.as_deref().unwrap_or("none"),
+                media.audio_pts.as_deref().unwrap_or("none"),
+            );
+            media.packets_received > 0 && media.video_pts.is_some() && media.audio_pts.is_some()
+        }
+        None => {
+            let (video_frames, audio_frames) = count_frames(&o.out)?;
+            println!(
+                "receiver: {video_frames} video and {audio_frames} audio frames in {}",
+                o.out.display()
+            );
+            video_frames > 0 && audio_frames > 0
+        }
+    };
+
     if drops_ok && media_ok {
-        println!("PASS: under 1 % dropped, and the receiver decodes video and audio");
+        println!("PASS: under 1 % dropped, and the receiver got video and audio");
         Ok(ExitCode::SUCCESS)
     } else {
         if !drops_ok {
@@ -208,9 +386,26 @@ async fn main() -> Result<ExitCode> {
             );
         }
         if !media_ok {
-            println!("FAIL: the receiver did not get both video and audio frames");
+            println!("FAIL: the receiver did not get both video and audio");
         }
         Ok(ExitCode::FAILURE)
+    }
+}
+
+/// Starts the listener: `srt-live-transmit` as a child process (returned), or the
+/// Strom receiver's flow, created beforehand (nothing to return; it is stopped by id).
+async fn start_receiver(
+    o: &Options,
+    rx_strom: Option<&(StromClient, FlowId)>,
+) -> Result<Option<Child>> {
+    match rx_strom {
+        None => spawn_receiver(o.listen_port(), &o.out).map(Some),
+        Some((client, rx_id)) => {
+            if !client.start_flow(rx_id).await? {
+                bail!("the receiving Strom did not start the receiver flow");
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -226,7 +421,131 @@ fn spawn_receiver(port: u16, out: &Path) -> Result<Child> {
         .context("starting srt-live-transmit (is it on the PATH?)")
 }
 
-async fn wait_for_peer(strom: &StromClient, id: &strom_types::FlowId) -> Result<SrtCallerStats> {
+/// The receiver of strom#1277: Open Live's SRT input, `builtin.mpegtssrt_input` as a
+/// listener with the two properties Open Live always sets, its video and audio each
+/// through a queue into a fakesink. `sync` is the sinks' clock sync, the variable
+/// strom#1277 found the stall to need. The sinks are not silent, so their
+/// `last-message` names the last buffer they got.
+fn receiver_flow(port: u16, sync: bool) -> Flow {
+    let sink = || {
+        props([
+            ("sync", PropertyValue::Bool(sync)),
+            ("async", PropertyValue::Bool(false)),
+            ("silent", PropertyValue::Bool(false)),
+        ])
+    };
+    Flow {
+        id: flow::flow_id(GATEWAY_ID, "receiver"),
+        name: "late-connect reproduction receiver (#111)".to_string(),
+        elements: vec![
+            element("videoqueue", "queue", HashMap::new(), (250.0, 0.0)),
+            element(RX_VIDEO_SINK, "fakesink", sink(), (400.0, 0.0)),
+            element("audioqueue", "queue", HashMap::new(), (250.0, 150.0)),
+            element(RX_AUDIO_SINK, "fakesink", sink(), (400.0, 150.0)),
+        ],
+        blocks: vec![BlockInstance {
+            id: RX_INPUT.to_string(),
+            block_definition_id: "builtin.mpegtssrt_input".to_string(),
+            name: Some("SRT Input".to_string()),
+            properties: props([
+                (
+                    "srt_uri",
+                    PropertyValue::String(format!("srt://:{port}?mode=listener")),
+                ),
+                ("latency", PropertyValue::UInt(RECEIVER_LATENCY_MS)),
+            ]),
+            position: Position { x: 0.0, y: 0.0 },
+            runtime_data: None,
+            computed_external_pads: None,
+        }],
+        links: vec![
+            link(RX_INPUT, "video_out", "videoqueue", "sink"),
+            link("videoqueue", "src", RX_VIDEO_SINK, "sink"),
+            link(RX_INPUT, "audio_out_0", "audioqueue", "sink"),
+            link("audioqueue", "src", RX_AUDIO_SINK, "sink"),
+        ],
+        running: false,
+        gst_state: None,
+        properties: FlowProperties::default(),
+    }
+}
+
+fn props<const N: usize>(pairs: [(&str, PropertyValue); N]) -> HashMap<String, PropertyValue> {
+    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+}
+
+fn element(
+    id: &str,
+    element_type: &str,
+    properties: HashMap<String, PropertyValue>,
+    position: (f32, f32),
+) -> Element {
+    Element {
+        id: id.to_string(),
+        element_type: element_type.to_string(),
+        properties,
+        pad_properties: HashMap::new(),
+        position,
+    }
+}
+
+fn link(from_id: &str, from_pad: &str, to_id: &str, to_pad: &str) -> Link {
+    Link {
+        from: format!("{from_id}:{from_pad}"),
+        to: format!("{to_id}:{to_pad}"),
+    }
+}
+
+/// What the Strom receiver got, read from that Strom's API.
+struct StromMedia {
+    /// `packets_received` summed over the receiving `srtsrc`'s peers.
+    packets_received: u64,
+    /// The PTS of the last buffer each sink got, from its `last-message`.
+    video_pts: Option<String>,
+    audio_pts: Option<String>,
+}
+
+async fn strom_receiver_media(client: &StromClient, rx_id: &FlowId) -> Result<StromMedia> {
+    let packets_received = client
+        .srt_stats(rx_id)
+        .await?
+        .map(|stats| {
+            stats
+                .connections
+                .values()
+                .filter(|c| c.role == SrtRole::Source)
+                .flat_map(|c| &c.callers)
+                .filter_map(|c| c.packets_received)
+                .sum()
+        })
+        .unwrap_or(0);
+    Ok(StromMedia {
+        packets_received,
+        video_pts: last_pts(client, rx_id, RX_VIDEO_SINK).await?,
+        audio_pts: last_pts(client, rx_id, RX_AUDIO_SINK).await?,
+    })
+}
+
+/// The PTS in a fakesink's `last-message`, when it has had a buffer: the message reads
+/// `chain   ******* (videosink:sink) (… bytes, dts: …, pts: 0:00:12.345678900, …`.
+async fn last_pts(client: &StromClient, rx_id: &FlowId, sink: &str) -> Result<Option<String>> {
+    let Some(properties) = client.element_properties(rx_id, sink).await? else {
+        return Ok(None);
+    };
+    let Some(PropertyValue::String(message)) = properties.get("last-message") else {
+        return Ok(None);
+    };
+    if !message.starts_with("chain") {
+        return Ok(None);
+    }
+    let pts = message
+        .split_once("pts: ")
+        .and_then(|(_, rest)| rest.split([',', ')']).next())
+        .unwrap_or("unknown");
+    Ok(Some(pts.trim().to_string()))
+}
+
+async fn wait_for_peer(strom: &StromClient, id: &FlowId) -> Result<SrtCallerStats> {
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         // The caller entry appears before its counters do.
@@ -243,13 +562,6 @@ async fn wait_for_peer(strom: &StromClient, id: &strom_types::FlowId) -> Result<
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-}
-
-async fn peer(strom: &StromClient, id: &strom_types::FlowId) -> Result<SrtCallerStats> {
-    strom
-        .srt_uplink(id)
-        .await?
-        .context("the uplink lost its peer during the window")
 }
 
 fn sample(label: &str, s: &SrtCallerStats) {

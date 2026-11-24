@@ -5,12 +5,14 @@
 //! carry the SRT passphrase.
 
 use anyhow::{bail, Context, Result};
+use std::collections::HashMap;
 use std::time::Duration;
 use strom_types::api::{
-    FlowListResponse, FlowResponse, SrtRole, SrtStats, SrtStatsResponse, SystemInfo,
+    ElementPropertiesResponse, FlowListResponse, FlowResponse, SrtRole, SrtStats, SrtStatsResponse,
+    SystemInfo,
 };
 use strom_types::discovery::DeviceResponse;
-use strom_types::Flow;
+use strom_types::{Flow, PropertyValue};
 
 /// Strom's types a caller of this client handles without depending on `strom-types`
 /// itself: a flow's id, and the uplink peer [`StromClient::srt_uplink`] answers with.
@@ -186,6 +188,12 @@ impl StromClient {
 
     /// The uplink's SRT peer statistics. None when the flow reports no peer yet.
     pub async fn srt_uplink(&self, id: &FlowId) -> Result<Option<SrtCallerStats>> {
+        Ok(self.srt_stats(id).await?.as_ref().and_then(uplink_peer))
+    }
+
+    /// Every SRT element's statistics in a flow, sending and receiving. None when the
+    /// flow is not running.
+    pub async fn srt_stats(&self, id: &FlowId) -> Result<Option<SrtStats>> {
         let res = self
             .get(&format!("/api/flows/{id}/srt-stats"))
             .send()
@@ -198,7 +206,30 @@ impl StromClient {
             .json()
             .await
             .context("decoding srt-stats")?;
-        Ok(uplink_peer(&body.stats))
+        Ok(Some(body.stats))
+    }
+
+    /// The current values of a running element's readable properties, by the
+    /// element's id in the flow. None when the flow is not running or has no such
+    /// element.
+    pub async fn element_properties(
+        &self,
+        id: &FlowId,
+        element_id: &str,
+    ) -> Result<Option<HashMap<String, PropertyValue>>> {
+        let res = self
+            .get(&format!("/api/flows/{id}/elements/{element_id}/properties"))
+            .send()
+            .await
+            .context("GET element properties")?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body: ElementPropertiesResponse = ok(res, "GET element properties")?
+            .json()
+            .await
+            .context("decoding element properties")?;
+        Ok(Some(body.properties))
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -327,6 +358,26 @@ mod tests {
         }}));
         assert!(uplink_peer(&s).is_none());
         assert!(uplink_peer(&SrtStats::default()).is_none());
+    }
+
+    /// A running element's properties, in the shape `GET
+    /// /api/flows/<id>/elements/<element>/properties` answers with.
+    #[test]
+    fn element_properties_in_stroms_shape_decode() {
+        let body: ElementPropertiesResponse = serde_json::from_value(json!({
+            "element_id": "videosink",
+            "properties": { "sync": true, "silent": false, "max-lateness": -1,
+                            "last-message": "chain   ******* (videosink:sink) (3110400 bytes, pts: 0:00:12.300000000)" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            body.properties.get("sync"),
+            Some(PropertyValue::Bool(true))
+        ));
+        assert!(matches!(
+            body.properties.get("last-message"),
+            Some(PropertyValue::String(m)) if m.starts_with("chain")
+        ));
     }
 
     /// The device list is what `GET /api/discovery/devices` returns today, verbatim.
