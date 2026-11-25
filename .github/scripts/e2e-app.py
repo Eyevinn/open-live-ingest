@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Agent-run end to end of the desktop app against an Open Live instance (OL-59i, #100;
-docs/specs/desktop-app.md section 14, #62 AC2).
+docs/specs/desktop-app.md section 14, #62 AC2), with the preview and Strom's CPU
+(OL-70e, #179; section 14.1).
 
 Drives the app executable a release artifact carries (the DMG's
 Contents/MacOS/open-live-ingest-app, or the open-live-ingest-app.exe the Windows
@@ -20,18 +21,23 @@ In order, each logged and written to the step summary:
   2. Where to send, as the page does it with a pasted token: `osc_paste_token` with
      OSC_ACCESS_TOKEN, then `choose_instance` with the instance named
      OPEN_LIVE_INSTANCE (default openlivedev) from the workspace the reply lists.
-     Then What to send: `set_inputs` with the test pattern ticked.
+     Then What to send: `set_inputs` with the test pattern ticked, and `preview {on}`,
+     as step 2 on screen asks: its preview flow `<source name> (preview)` runs.
   3. `go_live`: the source `<gateway name> — Test pattern` appears in Open Live, and
      the session arms (#130): its row is Armed and Strom runs no flow of that name,
-     because no production holding the source is live. Then the late receiver
+     and no preview flow either (Go live removes it before the uplink starts,
+     OL-70e). Then the late receiver
      (#112): a production named `<gateway name> — production` is created with the
      source on `video_in_0`; the row waits for it and still nothing is sent. At least
      E2E_LATE_SECONDS (default 35, never under 30) after Go live it is activated, so
      the cloud Strom's listener comes up only now, as in #110; while it is
      `activating` Strom runs no flow of the source, and once Open Live says it is
-     `active` the flow has to run within 5 s. The uplink's SRT stats are checked
-     (below), then the production is deactivated: the flow goes within 15 s and the
-     source is kept. The production stays, `ended` (or `inactive`), for step 5.
+     `active` the flow has to run within 5 s, with no preview flow next to it. The
+     row's `preview` (a JPEG) and `level` (above -60 dBFS) then come from the uplink
+     flow's taps within 30 s (OL-70e, #172 AC2). The uplink's SRT stats are checked
+     (below), then Strom's CPU with the taps polled and not (below), then the
+     production is deactivated: the flow goes within 15 s and the source is kept.
+     The production stays, `ended` (or `inactive`), for step 5.
   4. `stop`: the page's `stopped` event, with no error and nothing left behind; the
      flow is gone from Strom, and the source is kept in Open Live with its id (#115),
      the only one of the run's gateway name. When nothing answers at
@@ -56,7 +62,14 @@ to the login keychain (macOS) or the Credential Manager (Windows) of the user th
 runner runs as.
 
 Before step 2, with or without OSC_ACCESS_TOKEN, a `go_live` has to be refused (no
-Open Live address yet), and then the late-listener check runs with no secret (#112):
+Open Live address yet). Then, also with no secret, the preview in step 2 (OL-70e,
+docs/specs/desktop-app.md section 14.1; not in the late-listener part): with the test
+pattern ticked, `preview {on}` has to be answered with the preview available, then a
+`preview` event with a JPEG `image` has to come within 3 s of the reply and a `level`
+above -60 dBFS within 5 s (the test pattern carries a 1 kHz tone), and Strom has to
+run the preview flow; Strom's CPU is measured with it running; `preview {on: false}`
+has to remove the flow from Strom's `GET /api/flows` within 15 s, and Strom's CPU is
+measured again with no flow. Then the late-listener check runs with no secret (#112):
   - `self_hosted` points the app at a stand-in Open Live on loopback (LocalOpenLive:
     the four source routes, server-info publishing Strom host 127.0.0.1 and one free
     SRT port, and `GET /api/v1/productions` listing the productions the run puts
@@ -96,6 +109,25 @@ too. While E2E_UPLINK_DROP_WARN_ONLY is `true`, a dropped share above 1 % is a
 after a late connect) is fixed; `connected` false, nothing sent and a reconnect still
 fail. #111's fix removes the switch.
 
+Strom's CPU (OL-70e) is read from the pid the app records in `strom.pid` next to the
+settings file, over windows of E2E_CPU_SECONDS (default 60, never under 60): on macOS
+`ps -o time= -o %cpu=` (CPU seconds at both ends of the window, the figure, and the
+mean of `%cpu` every 5 s alongside), on Windows the CPU seconds PowerShell's
+`Get-Process` gives at both ends. Figures are in % of one core. While live, two
+windows on the uplink: the taps polled (the app running; with no window, it counts
+as visible) and the taps not polled (the app process suspended, SIGSTOP or
+NtSuspendProcess, so it asks Strom for no picture; resumed after, and its row has to
+be connecting or live again). Their difference per input (one, the test pattern) has
+a budget of 5 % of one core (spec section 5.2); over it is a `::warning::` with the
+numbers, not a failure, since question 27 makes it the cue for a follow-up and a
+hosted runner is noisy. Every figure is logged as measured, and all of them again at
+the end of the run in one block labelled as GitHub-hosted runner figures, for #172,
+and in the step summary.
+
+The app's `preview` lines are logged with the `image` replaced by its length (no
+picture in the log, spec section 5.2), and its `level` lines (four a second) once
+every 10 s.
+
 Without OSC_ACCESS_TOKEN, a `quit` with nothing live then has to end the process. The
 run fails naming the secret when E2E_REQUIRE_SECRET is `true` (a run by hand);
 otherwise (a pull request run) it ends with a warning naming the secret and exits 0.
@@ -131,11 +163,14 @@ that can carry a secret is printed. Replies and events cannot carry a secret (th
 core never serialises one), so the app's lines are logged.
 """
 
+import base64
+import contextlib
 import json
 import os
 import queue
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -183,6 +218,28 @@ ARMED_HOLD = 7
 ROW_TIMEOUT = 20
 # The row states of an armed input (app/src/go_live.rs, RowState).
 ARMED = ("armed", "waiting_for_production")
+# The preview (OL-70e, spec section 14.1): after `preview {on}` is answered, a JPEG
+# `image` within PICTURE_WITHIN seconds and a `level` above SOUND_ABOVE_DB (dBFS,
+# app/src/preview.rs SILENT_BELOW_DB) within LEVEL_WITHIN.
+PICTURE_WITHIN = 3
+LEVEL_WITHIN = 5
+SOUND_ABOVE_DB = -60.0
+# While live, the picture and the level from the uplink flow within this many seconds
+# of the flow running.
+LIVE_PREVIEW_WITHIN = 30
+# The start of every JPEG.
+JPEG_MARKER = b"\xff\xd8\xff"
+# Strom's CPU is measured over windows of E2E_CPU_SECONDS (default and floor 60, the
+# spec's "60 s each"). The taps' budget: Strom's CPU with the taps polled minus
+# without, in % of one core per input while live (docs/specs/desktop-app.md 5.2).
+MIN_CPU_SECONDS = 60
+TAPS_CPU_BUDGET = 5.0
+# How often the CPU is read inside a window where reading it is cheap (`ps`).
+CPU_SAMPLE_EVERY = 5
+# The inputs the run sends: the test pattern only.
+INPUTS = 1
+# An app `level` line is logged at most this often (it says one every 250 ms).
+LEVEL_LOG_EVERY = 10
 
 SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY") or os.devnull
 ON_ACTIONS = bool(os.environ.get("GITHUB_ACTIONS"))
@@ -282,6 +339,7 @@ class App:
         self.lines = queue.Queue()
         self.seen = []
         self.next_id = 1
+        self.level_logged_at = None
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -308,8 +366,30 @@ class App:
             self.seen.append(message)
             # Before anything prints it: the instance address is not for the log.
             mask_urls(message)
-            print(f"    app: {json.dumps(message, ensure_ascii=False)}", flush=True)
+            if self._logs(message):
+                print(f"    app: {json.dumps(printable(message), ensure_ascii=False)}", flush=True)
         return message
+
+    def _logs(self, message):
+        """Whether an app line is printed: every one but most `level` lines, which
+        come four a second; one every LEVEL_LOG_EVERY seconds is."""
+        if message.get("event") != "level":
+            return True
+        now = time.monotonic()
+        if self.level_logged_at is not None and now - self.level_logged_at < LEVEL_LOG_EVERY:
+            return False
+        self.level_logged_at = now
+        return True
+
+    @contextlib.contextmanager
+    def paused(self):
+        """The app process suspended for the block, and resumed after it whatever
+        happens: it asks Strom for no picture meanwhile (the taps not polled)."""
+        suspend(self.proc.pid, True)
+        try:
+            yield
+        finally:
+            suspend(self.proc.pid, False)
 
     def send(self, cmd, args=None):
         message_id = self.next_id
@@ -942,16 +1022,23 @@ class Strom:
             time.sleep(min(every, max(0.0, deadline - time.monotonic())))
         fail(f"{step + ': ' if step else ''}Strom at {self.url} runs no flow named '{name}' after {timeout} s")
 
-    def no_flow(self, name, seconds, step):
+    def no_flow(self, name, seconds, step, preview=None):
         """For `seconds`, Strom runs no flow named `name` (an armed session sends
-        nothing, #130). Fails when one shows up, or when nothing answers at Strom's
-        address the whole time, which would prove nothing."""
+        nothing, #130), nor, when given, the preview flow named `preview` (Go live
+        removes every preview flow before the session starts, OL-70e). Fails when one
+        shows up, or when nothing answers at Strom's address the whole time, which
+        would prove nothing."""
         deadline = time.monotonic() + seconds
         answered = False
         while True:
-            flow = self.flow_named(name)
+            flows = self.flows()
+            flow = "unreachable" if flows is None else next((f for f in flows if f.get("name") == name), None)
             if isinstance(flow, dict):
                 fail(f"{step}: Strom runs flow {flow.get('id')} for '{name}' while no production holding the source is live")
+            if preview is not None and flows is not None:
+                left = next((f for f in flows if f.get("name") == preview), None)
+                if left is not None:
+                    fail(f"{step}: Strom still runs the preview flow {left.get('id')} ('{preview}') after Go live; none may remain before the uplink starts")
             answered |= flow is None
             if time.monotonic() >= deadline:
                 break
@@ -959,7 +1046,7 @@ class Strom:
         if not answered:
             fail(f"{step}: nothing answered at {self.url} for {seconds} s, so the absence of a flow proves nothing")
 
-    def wait_flow_gone(self, name, timeout, step):
+    def wait_flow_gone(self, name, timeout, step, after="no production holding the source is live"):
         """Waits until Strom, still answering, runs no flow named `name`."""
         deadline = time.monotonic() + timeout
         while True:
@@ -968,7 +1055,7 @@ class Strom:
             if time.monotonic() >= deadline:
                 break
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-        fail(f"{step}: Strom at {self.url} still runs a flow named '{name}' {timeout} s after no production holding the source is live")
+        fail(f"{step}: Strom at {self.url} still runs a flow named '{name}' {timeout} s after {after}")
 
     def uplink(self, flow_id):
         """The uplink's state (`uplink_sample`), or None when the flow reports no peer
@@ -1043,6 +1130,328 @@ class Strom:
         passed(f"{step}: Strom at {self.url} no longer has flow {flow_id}")
 
 
+# --- the preview (OL-70e) -------------------------------------------------------------
+
+
+def preview_name(source_name):
+    """The name of an input's preview flow in Strom (src/flow.rs, `preview`)."""
+    return f"{source_name} (preview)"
+
+
+def jpeg_bytes(image):
+    """The picture of a `preview` event's `image` (`data:image/jpeg;base64,...`, as
+    app/src/preview.rs sends it) when it is a JPEG; None otherwise."""
+    prefix = "data:image/jpeg;base64,"
+    if not isinstance(image, str) or not image.startswith(prefix):
+        return None
+    try:
+        raw = base64.b64decode(image[len(prefix):], validate=True)
+    except ValueError:
+        return None
+    return raw if raw.startswith(JPEG_MARKER) else None
+
+
+def shows_picture(device):
+    """A `where` for a `preview` event of `device` that shows a JPEG."""
+    return lambda data: data.get("device") == device and data.get("state") == "showing" and jpeg_bytes(data.get("image")) is not None
+
+
+def loudest(data, device):
+    """The highest channel peak (dBFS) a `level` event gives `device`; None without
+    one. `levels` is `[{device, peak_db: [per channel], rms_db: [...]}]`."""
+    peaks = [
+        p
+        for entry in data.get("levels") or []
+        if isinstance(entry, dict) and entry.get("device") == device
+        for p in entry.get("peak_db") or []
+        if isinstance(p, (int, float))
+    ]
+    return max(peaks) if peaks else None
+
+
+def has_sound(device):
+    """A `where` for a `level` event that gives `device` a peak above SOUND_ABOVE_DB."""
+
+    def where(data):
+        peak = loudest(data, device)
+        return peak is not None and peak > SOUND_ABOVE_DB
+
+    return where
+
+
+def printable(message):
+    """An app line as it is logged: a `preview` event's picture is replaced by its
+    length, so no image reaches the log (spec section 5.2, "Never logged")."""
+    data = message.get("data")
+    if message.get("event") == "preview" and isinstance(data, dict) and data.get("image"):
+        return dict(message, data=dict(data, image=f"<{len(str(data['image']))} characters>"))
+    return message
+
+
+def preview_check(app, strom, source_name, cpu):
+    """Step 2's preview with the test pattern ticked, with or without the secret:
+    `preview {on}` runs the preview flow, a JPEG `image` within PICTURE_WITHIN s of
+    the reply and a `level` above SOUND_ABOVE_DB within LEVEL_WITHIN; Strom's CPU with
+    it running; `preview {on: false}` removes it (`GET /api/flows`); Strom's CPU with
+    no flow."""
+    step = "Preview (step 2)"
+    name = preview_name(source_name)
+    tick_the_test_pattern(app)
+    mark = len(app.seen)
+    asked_at = time.monotonic()
+    reply = app.ok("preview", {"on": True}, timeout=120)
+    answered_at = time.monotonic()
+    if not (reply or {}).get("available"):
+        fail(f"{step}: `preview {{on}}` says the preview is not available: {reply}")
+    picture = app.event_since("preview", mark, max(0.1, answered_at + PICTURE_WITHIN - time.monotonic()), shows_picture(TEST_PATTERN))
+    picture_at = time.monotonic()
+    level = app.event_since("level", mark, max(0.1, answered_at + LEVEL_WITHIN - time.monotonic()), has_sound(TEST_PATTERN))
+    level_at = time.monotonic()
+    flow = strom.wait_for_flow(name, 5, step)
+    passed(
+        f"{step}: `preview {{on}}` answered in {answered_at - asked_at:.1f} s; a JPEG of {len(jpeg_bytes(picture['image']))} bytes "
+        f"{picture_at - answered_at:.1f} s later (at most {PICTURE_WITHIN} s) and a level of {loudest(level, TEST_PATTERN):.1f} dBFS "
+        f"{level_at - answered_at:.1f} s later (above {SOUND_ABOVE_DB:g} dBFS, at most {LEVEL_WITHIN} s), from preview flow {flow.get('id')}"
+    )
+    cpu.measure("Step 2, preview flow running (the taps polled)")
+    app.ok("preview", {"on": False})
+    off_at = time.monotonic()
+    strom.wait_flow_gone(name, FLOW_GONE_TIMEOUT, f"{step}: preview off", after="`preview {on: false}`")
+    passed(f"{step}: `preview {{on: false}}`: the preview flow is gone from Strom's GET /api/flows {time.monotonic() - off_at:.1f} s later")
+    cpu.measure("Step 2, preview off (held Strom, no flow)")
+
+
+def preview_before_go_live(app, strom, source_name):
+    """The page shows step 2 when Go live is pressed: the preview flow runs, so that
+    Go live has one to remove before the uplink starts."""
+    step = "Preview before Go live"
+    reply = app.ok("preview", {"on": True}, timeout=120)
+    if not (reply or {}).get("available"):
+        fail(f"{step}: `preview {{on}}` says the preview is not available: {reply}")
+    flow = strom.wait_for_flow(preview_name(source_name), 60, step)
+    passed(f"{step}: preview flow {flow.get('id')} runs when Go live is pressed")
+
+
+def live_preview_check(app, strom, source_name, since, step):
+    """While live (#172 AC2): the row's `preview` (a JPEG) and `level` (above
+    SOUND_ABOVE_DB) come from the uplink flow: Strom runs no preview flow for it."""
+    started = time.monotonic()
+    picture = app.event_since("preview", since, LIVE_PREVIEW_WITHIN, shows_picture(TEST_PATTERN))
+    level = app.event_since("level", since, max(0.1, started + LIVE_PREVIEW_WITHIN - time.monotonic()), has_sound(TEST_PATTERN))
+    left = strom.flow_named(preview_name(source_name))
+    if isinstance(left, dict):
+        fail(f"{step}: Strom runs the preview flow {left.get('id')} while live, so the picture does not prove the uplink's taps")
+    passed(
+        f"{step}: the row shows a JPEG of {len(jpeg_bytes(picture['image']))} bytes and a level of "
+        f"{loudest(level, TEST_PATTERN):.1f} dBFS from the uplink flow (no preview flow runs)"
+    )
+
+
+# --- Strom's CPU (OL-70e) --------------------------------------------------------------
+
+
+def cpu_seconds(text):
+    """Seconds from a `ps -o time=` value: `[[dd-]hh:]mm:ss[.ss]` (macOS gives
+    `0:01.23`, procps `00:00:01`)."""
+    text = text.strip()
+    days = 0
+    if "-" in text:
+        head, text = text.split("-", 1)
+        days = int(head)
+    seconds = 0.0
+    for part in text.split(":"):
+        seconds = seconds * 60 + float(part)
+    return days * 86400 + seconds
+
+
+def share(first, last):
+    """% of one core between two samples `(wall seconds, CPU seconds)`."""
+    wall = last[0] - first[0]
+    if wall <= 0:
+        fail(f"a CPU window of {wall:.1f} s measures nothing")
+    return 100.0 * (last[1] - first[1]) / wall
+
+
+def taps_verdict(polled, not_polled, inputs=INPUTS, budget=TAPS_CPU_BUDGET):
+    """(the taps' cost in % of one core per input, None or what is over budget)."""
+    per_input = (polled - not_polled) / inputs
+    if per_input > budget:
+        return per_input, (
+            f"the taps cost {per_input:.2f} % of one core per input while live ({polled:.2f} % polled minus "
+            f"{not_polled:.2f} % not polled, {inputs} input(s)), over the {budget:g} % budget"
+        )
+    return per_input, None
+
+
+def ps_sample(pid):
+    """(CPU seconds, %cpu) of `pid`, from `ps -o time= -o %cpu=` (macOS, Linux)."""
+    done = subprocess.run(["ps", "-o", "time=", "-o", "%cpu=", "-p", str(pid)], capture_output=True, text=True, timeout=30)
+    fields = done.stdout.split()
+    if done.returncode != 0 or len(fields) != 2:
+        fail(f"`ps -o time= -o %cpu= -p {pid}` found no Strom process (exit {done.returncode}: {done.stdout.strip()} {done.stderr.strip()})")
+    return cpu_seconds(fields[0]), float(fields[1])
+
+
+def powershell_sample(pid):
+    """(CPU seconds, None) of `pid`, from PowerShell's Get-Process (Windows)."""
+    script = (
+        f"$p = Get-Process -Id {int(pid)} -ErrorAction Stop; "
+        "$p.TotalProcessorTime.TotalSeconds.ToString([Globalization.CultureInfo]::InvariantCulture)"
+    )
+    done = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=60
+    )
+    try:
+        return float(done.stdout.strip()), None
+    except ValueError:
+        fail(f"Get-Process found no Strom process {pid} (exit {done.returncode}: {done.stdout.strip()} {done.stderr.strip()})")
+
+
+def suspend(pid, stop):
+    """Suspends (`stop`) or resumes the process `pid`: SIGSTOP / SIGCONT, or on
+    Windows NtSuspendProcess / NtResumeProcess (ctypes, standard library)."""
+    if sys.platform != "win32":
+        os.kill(pid, signal.SIGSTOP if stop else signal.SIGCONT)
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll")
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    call = ntdll.NtSuspendProcess if stop else ntdll.NtResumeProcess
+    call.argtypes = (ctypes.c_void_p,)
+    call.restype = ctypes.c_long
+    handle = kernel32.OpenProcess(0x0800, 0, pid)  # PROCESS_SUSPEND_RESUME
+    if not handle:
+        fail(f"could not open the app process {pid} to {'suspend' if stop else 'resume'} it (error {ctypes.get_last_error()})")
+    try:
+        status = call(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+    if status != 0:
+        fail(f"{'suspending' if stop else 'resuming'} the app process {pid} failed (NTSTATUS {status & 0xFFFFFFFF:#x})")
+
+
+class Cpu:
+    """Strom's CPU over windows of E2E_CPU_SECONDS, read from the pid the app records
+    in strom.pid next to the settings file (src/config.rs, `strom_pidfile`). Every
+    figure is logged and kept; `report` prints them all, labelled as GitHub-hosted
+    runner figures, for #172."""
+
+    def __init__(self, pidfile):
+        self.pidfile = pidfile
+        self.figures = []
+        # The taps' cost while live, per input, once `taps_cpu_check` has it.
+        self.taps = None
+        self.seconds = env_int("E2E_CPU_SECONDS", MIN_CPU_SECONDS, MIN_CPU_SECONDS)
+        self.sample = powershell_sample if sys.platform == "win32" else ps_sample
+        # `ps` is cheap, so its %cpu is read along the way too; PowerShell is not.
+        self.read_along = sys.platform != "win32"
+
+    def pid(self):
+        try:
+            with open(self.pidfile, encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError) as err:
+            fail(f"no Strom pid to measure the CPU of: {self.pidfile}: {err}")
+
+    def _take(self, pid):
+        before = time.monotonic()
+        cpu, percent = self.sample(pid)
+        return (before + time.monotonic()) / 2, cpu, percent
+
+    def measure(self, what):
+        """Strom's CPU over one window, in % of one core; logged and kept."""
+        pid = self.pid()
+        first = self._take(pid)
+        end = first[0] + self.seconds
+        taken = [first]
+        if self.read_along:
+            while time.monotonic() + CPU_SAMPLE_EVERY < end:
+                time.sleep(CPU_SAMPLE_EVERY)
+                taken.append(self._take(pid))
+        wait_until(end)
+        taken.append(self._take(pid))
+        if self.pid() != pid:
+            fail(f"CPU of Strom, {what}: Strom's pid changed from {pid} during the window")
+        last = taken[-1]
+        figure = {
+            "what": what,
+            "pid": pid,
+            "wall": last[0] - first[0],
+            "cpu": last[1] - first[1],
+            "percent": share(first[:2], last[:2]),
+            "ps_percent": None,
+        }
+        readings = [t[2] for t in taken if t[2] is not None]
+        if readings:
+            figure["ps_percent"] = sum(readings) / len(readings)
+        self.figures.append(figure)
+        say(f"CPU (hosted runner): {self.line(figure)}")
+        return figure["percent"]
+
+    @staticmethod
+    def line(figure):
+        text = (
+            f"{figure['what']}: {figure['percent']:.2f} % of one core "
+            f"({figure['cpu']:.2f} CPU-s over {figure['wall']:.1f} s, Strom pid {figure['pid']})"
+        )
+        if figure["ps_percent"] is not None:
+            text += f"; mean of `ps -o %cpu` {figure['ps_percent']:.2f} %"
+        return text
+
+    def report(self):
+        """Prints every figure in one block, labelled for #172, and writes them to the
+        step summary."""
+        if not self.figures:
+            return
+        runner = " ".join(
+            v for v in (os.environ.get("ImageOS"), os.environ.get("ImageVersion"), os.environ.get("RUNNER_ARCH")) if v
+        ) or "not on Actions"
+        head = (
+            f"Strom CPU figures for #172 (GitHub-hosted runner figures, not real hardware): {sys.platform}, "
+            f"runner image {runner}, {os.cpu_count()} logical CPUs, test pattern, {INPUTS} input, {self.seconds} s windows"
+        )
+        print(f"==> {head}", flush=True)
+        record(f"#### {head}")
+        record("")
+        record("| Window | % of one core | CPU-s | Wall s |")
+        record("|---|---|---|---|")
+        for figure in self.figures:
+            print(f"==>   {self.line(figure)}", flush=True)
+            record(f"| {figure['what']} | {figure['percent']:.2f} | {figure['cpu']:.2f} | {figure['wall']:.1f} |")
+        if self.taps is not None:
+            text = f"Taps while live (polled minus not polled), per input: {self.taps:.2f} % of one core (budget {TAPS_CPU_BUDGET:g} %)"
+            print(f"==>   {text}", flush=True)
+            record("")
+            record(f"- {text}")
+
+
+def taps_cpu_check(app, cpu, source_name, since, step):
+    """Strom's CPU while live, with the taps polled (the app running, its window
+    counted visible) and without (the app suspended, so it asks for no picture and
+    reads no level), each over one window; their difference per input against the
+    budget. Over budget is a warning with the numbers, not a failure: the spec
+    (question 27) makes it a follow-up's cue, and hosted runners are noisy. The row
+    has to be connecting or live again once the app runs again. Returns the cost."""
+    polled = cpu.measure("Live, uplink with the taps polled")
+    with app.paused():
+        not_polled = cpu.measure("Live, uplink with the taps not polled (app suspended)")
+    app.wait_row(source_name, ("connecting", "live"), since, f"{step}: after the app was suspended")
+    per_input, over = taps_verdict(polled, not_polled)
+    cpu.taps = per_input
+    if over:
+        warn(f"{step}: {over}. Hosted-runner figures; spec question 27 decides a follow-up")
+    else:
+        passed(
+            f"{step}: the taps cost {per_input:.2f} % of one core per input while live ({polled:.2f} % polled minus "
+            f"{not_polled:.2f} % not polled; budget {TAPS_CPU_BUDGET:g} %, hosted-runner figures)"
+        )
+    return per_input
+
+
 # --- settings --------------------------------------------------------------------------
 
 
@@ -1102,18 +1511,21 @@ def go_live(app, open_live, strom, source_name, step, waits_for=ARMED):
         fail(f"{step}: an input failed: {app.failed_rows(since)}")
     passed(f"{step}: source '{source_name}' ({source.get('id')}) is in Open Live (streamType {source.get('streamType')}, status {source.get('status')})")
     state = app.wait_row(source_name, waits_for, since, step)
-    strom.no_flow(source_name, ARMED_HOLD, step)
-    passed(f"{step}: the session is armed: the row is '{state}' and Strom runs no flow for it over {ARMED_HOLD} s")
+    strom.no_flow(source_name, ARMED_HOLD, step, preview=preview_name(source_name))
+    passed(f"{step}: the session is armed: the row is '{state}' and Strom runs no flow for it, and no preview flow, over {ARMED_HOLD} s")
     return source, since
 
 
 def sends_once_live(strom, source_name, step, live_at):
     """Once a production holding the source is `active` (at `live_at`), Strom runs
-    the source's flow within FLOW_START_TIMEOUT (#130 AC1). The flow, and when it was
-    seen."""
+    the source's flow within FLOW_START_TIMEOUT (#130 AC1), with no preview flow left
+    next to it (OL-70e). The flow, and when it was seen."""
     flow = strom.wait_for_flow(source_name, FLOW_START_TIMEOUT, step, every=0.25)
     seen_at = time.monotonic()
-    passed(f"{step}: Strom runs flow {flow.get('id')} {seen_at - live_at:.1f} s after the production is active (at most {FLOW_START_TIMEOUT} s)")
+    left = strom.flow_named(preview_name(source_name))
+    if isinstance(left, dict):
+        fail(f"{step}: Strom runs the preview flow {left.get('id')} next to the uplink {flow.get('id')}")
+    passed(f"{step}: Strom runs flow {flow.get('id')} {seen_at - live_at:.1f} s after the production is active (at most {FLOW_START_TIMEOUT} s), and no preview flow")
     return flow, seen_at
 
 
@@ -1198,13 +1610,15 @@ def late_listener_check(app, strom, gateway_name, source_name, work):
         local.close()
 
 
-def late_receiver_check(app, open_live, strom, source, source_name, live_at, gateway_name):
+def late_receiver_check(app, open_live, strom, source, source_name, live_at, gateway_name, cpu):
     """The openlivedev late-receiver check (#112, #130): the production that takes the
     source is activated at least E2E_LATE_SECONDS after Go live, so the cloud Strom's
     listener comes up late; the session sends nothing while it activates and starts
     the flow once it is active; the uplink's SRT stats are checked; the production is
-    deactivated, the flow goes and the source is kept. Returns the production id (it
-    stays, inactive, for Go live again) and the flow."""
+    deactivated, the flow goes and the source is kept. While it is live (OL-70e): the
+    row's picture and level from the uplink flow, and Strom's CPU with the taps
+    polled and not (`taps_cpu_check`). Returns the production id (it stays, inactive,
+    for Go live again) and the flow."""
     step = "Late receiver (openlivedev)"
     _, _, late = srt_settings()
     since = len(app.seen)
@@ -1219,7 +1633,9 @@ def late_receiver_check(app, open_live, strom, source, source_name, live_at, gat
     passed(f"{step}: production {production_id} is active, {active_at - live_at:.0f} s after Go live (activation took {active_at - activated_at:.0f} s, no flow while it activated)")
     flow, _ = sends_once_live(strom, source_name, step, active_at)
     app.wait_row(source_name, ("connecting", "live"), since, step)
+    live_preview_check(app, strom, source_name, since, step)
     strom.watch_uplink(flow.get("id"), step)
+    taps_cpu_check(app, cpu, source_name, since, step)
     open_live.deactivate(production_id, 180)
     stops_once_not_live(strom, open_live, gateway_name, source, source_name, f"{step}: production deactivated")
     return production_id, flow
@@ -1260,6 +1676,7 @@ def run(exe, work):
     against = "a stand-in Open Live on loopback (late-listener part)" if which == "late-listener" else f"`{instance}`"
     record(f"### App end to end against {against}: {sys.platform}, `{os.path.basename(exe)} --ipc-stdio`")
 
+    cpu = Cpu(os.path.join(os.path.dirname(settings), "strom.pid"))
     stderr_log = open(os.path.join(work, "app-stderr.log"), "w", encoding="utf-8")
     app = App(exe, stderr_log)
     open_live = None
@@ -1272,6 +1689,11 @@ def run(exe, work):
         if "error" not in reply:
             fail("`go_live` with no Open Live address was not refused")
         passed(f"`go_live` with no Open Live address is refused: {reply['error'].get('message')}")
+
+        # The preview in step 2 needs no secret (OL-70e); the late-listener job
+        # leaves it to the jobs that run it.
+        if which != "late-listener":
+            preview_check(app, strom, source_name, cpu)
 
         # With or without the secret: the late-listener check needs none (#112).
         if which != "openlivedev":
@@ -1324,9 +1746,12 @@ def run(exe, work):
 
         # 3. Go live, armed: no production holds the source yet. Then the late
         # receiver: the production is created and activated only now.
+        # Step 2 is on screen when Go live is pressed: its preview flow runs, and Go
+        # live removes it before the uplink starts (OL-70e).
+        preview_before_go_live(app, strom, source_name)
         live_at = time.monotonic()
         source, since = go_live(app, open_live, strom, source_name, "Go live", waits_for=("armed",))
-        production_id, flow = late_receiver_check(app, open_live, strom, source, source_name, live_at, gateway_name)
+        production_id, flow = late_receiver_check(app, open_live, strom, source, source_name, live_at, gateway_name, cpu)
 
         # 4. Stop: the flow goes, the source stays (#115).
         mark = len(app.seen)
@@ -1379,6 +1804,7 @@ def run(exe, work):
     finally:
         app.close()
         stderr_log.close()
+        cpu.report()
         if open_live is not None:
             for production_id in list(open_live.productions):
                 try:

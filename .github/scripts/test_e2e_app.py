@@ -2,11 +2,15 @@
 """Unit tests of the uplink SRT stats check in e2e-app.py (#112), of the stand-in
 Open Live the no-secret late-listener check sends to, and of the armed-session checks
 (#130: no flow until a production holding the source is active, the flow within 5 s
-once it is, the row states, the SRT stats check after reactivation). No app and no network beyond loopback:
+once it is, the row states, the SRT stats check after reactivation), and of the
+preview and CPU checks (OL-70e: the picture and level events, the preview flow gone
+after `preview {on: false}` and after Go live, Strom's CPU windows and the taps'
+budget). No app and no network beyond loopback:
 
     python3 -I .github/scripts/test_e2e_app.py
 """
 
+import base64
 import contextlib
 import importlib.util
 import io
@@ -637,6 +641,397 @@ class ProductionStatusPolls(unittest.TestCase):
         self.open_live.activate("p-1", 300, lambda: looks.append(self.clock.now))
         self.assertEqual(len(looks), 1)
         self.assertEqual(self.calls[-3:], [("POST", "activate"), ("GET", "p-1"), ("GET", "p-1")])
+
+
+# --- the preview (OL-70e) ---------------------------------------------------------------
+
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 60
+
+
+def image(raw=JPEG):
+    return "data:image/jpeg;base64," + base64.b64encode(raw).decode()
+
+
+def picture(state="showing", raw=JPEG, device="test"):
+    return {"event": "preview", "data": {"device": device, "state": state,
+                                         "image": image(raw) if state == "showing" else None,
+                                         "message": None, "action": None}}
+
+
+def level(peaks, device="test"):
+    return {"event": "level", "data": {"levels": [{"device": device, "peak_db": peaks, "rms_db": peaks}]}}
+
+
+class PreviewEvents(unittest.TestCase):
+    def test_a_jpeg_data_url_is_a_picture(self):
+        self.assertEqual(e2e.jpeg_bytes(image()), JPEG)
+
+    def test_anything_else_is_not(self):
+        self.assertIsNone(e2e.jpeg_bytes(image(b"\x89PNG\r\n")))
+        self.assertIsNone(e2e.jpeg_bytes("data:image/png;base64," + base64.b64encode(JPEG).decode()))
+        self.assertIsNone(e2e.jpeg_bytes("data:image/jpeg;base64,!!not base64!!"))
+        self.assertIsNone(e2e.jpeg_bytes(None))
+
+    def test_a_showing_jpeg_of_the_device_is_what_the_check_waits_for(self):
+        where = e2e.shows_picture("test")
+        self.assertTrue(where(picture()["data"]))
+        self.assertFalse(where(picture(state="starting")["data"]))
+        self.assertFalse(where(picture(device="cam")["data"]))
+        self.assertFalse(where(picture(raw=b"GIF89a")["data"]))
+
+    def test_the_loudest_channel_of_the_device_counts(self):
+        data = {"levels": [{"device": "cam", "peak_db": [-1.0]}, {"device": "test", "peak_db": [-70.0, -2.5, None]}]}
+        self.assertEqual(e2e.loudest(data, "test"), -2.5)
+        self.assertIsNone(e2e.loudest({"levels": []}, "test"))
+        self.assertTrue(e2e.has_sound("test")(data))
+
+    def test_silence_at_or_below_minus_60_is_no_sound(self):
+        self.assertFalse(e2e.has_sound("test")(level([-60.0, -80.0])["data"]))
+        self.assertTrue(e2e.has_sound("test")(level([-59.9])["data"]))
+        self.assertFalse(e2e.has_sound("test")(level([-3.0], device="cam")["data"]))
+
+    def test_no_picture_is_logged(self):
+        shown = e2e.printable(picture())
+        self.assertNotIn("base64", json.dumps(shown))
+        self.assertEqual(shown["data"]["image"], f"<{len(image())} characters>")
+        self.assertEqual(picture()["data"]["image"], image(), "the line itself is kept as it came")
+        self.assertEqual(e2e.printable(level([-3.0])), level([-3.0]))
+
+    def test_level_lines_are_logged_once_every_ten_seconds(self):
+        clock = Clock()
+        saved = e2e.time.monotonic
+        e2e.time.monotonic = clock.monotonic
+        try:
+            app = object.__new__(e2e.App)
+            app.level_logged_at = None
+            logged = []
+            for _ in range(50):
+                logged.append(app._logs(level([-3.0])))
+                clock.now += 0.25
+            self.assertEqual(logged.count(True), 2)
+            self.assertTrue(app._logs({"event": "input"}))
+        finally:
+            e2e.time.monotonic = saved
+
+
+class ScriptedApp(FakeApp):
+    """A FakeApp that answers each command with the next canned reply, the events
+    listed before it first, and records what was sent."""
+
+    def __init__(self, answers):
+        super().__init__([])
+        self.answers = list(answers)
+        self.sent = []
+        self.next_id = 1
+
+    def send(self, cmd, args=None):
+        message_id = self.next_id
+        self.next_id += 1
+        self.sent.append((cmd, args))
+        events, ok = self.answers.pop(0)
+        for line in events + [{"id": message_id, "ok": ok}]:
+            self.lines.put(line)
+        return message_id
+
+
+class FakeCpu:
+    def __init__(self, figures=()):
+        self.figures = list(figures)
+        self.measured = []
+        self.taps = None
+
+    def measure(self, what):
+        self.measured.append(what)
+        return self.figures.pop(0) if self.figures else 1.0
+
+
+PREVIEW = {"id": "p-1", "name": "gw — Test pattern (preview)"}
+UPLINK = {"id": "f-1", "name": "gw — Test pattern"}
+TICKED = {"video": [{"name": "Test pattern", "ticked": True}], "name_prefix": "gw — "}
+
+
+class PreviewCheck(unittest.TestCase):
+    """Step 2: `preview {on}` gives a JPEG and a level, the preview flow runs; off
+    removes it; the CPU is measured with and without it."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.saved = (e2e.time.monotonic, e2e.time.sleep)
+        e2e.time.monotonic, e2e.time.sleep = self.clock.monotonic, self.clock.sleep
+
+    def tearDown(self):
+        e2e.time.monotonic, e2e.time.sleep = self.saved
+
+    def check(self, on_events, flows):
+        app = ScriptedApp([([], TICKED), (on_events, {"available": True}), ([picture("stopped")], {"available": True})])
+        cpu = FakeCpu()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            e2e.preview_check(app, ScriptedStrom(flows), "gw — Test pattern", cpu)
+        return app, cpu, out.getvalue()
+
+    def test_picture_level_flow_then_gone(self):
+        app, cpu, out = self.check([picture("starting"), level([-3.0]), picture()], [[PREVIEW], [PREVIEW], []])
+        self.assertEqual([c for c, _ in app.sent], ["set_inputs", "preview", "preview"])
+        self.assertEqual([a for _, a in app.sent][1:], [{"on": True}, {"on": False}])
+        self.assertEqual(cpu.measured, ["Step 2, preview flow running (the taps polled)", "Step 2, preview off (held Strom, no flow)"])
+        self.assertIn(f"a JPEG of {len(JPEG)} bytes", out)
+        self.assertIn("a level of -3.0 dBFS", out)
+        self.assertIn("the preview flow is gone from Strom's GET /api/flows", out)
+        self.assertNotIn("base64", out)
+
+    def test_no_picture_fails(self):
+        with self.assertRaises(e2e.Failed) as caught:
+            self.check([level([-3.0]), picture("starting")], [[PREVIEW], []])
+        self.assertIn("no `preview` event from the app within", str(caught.exception))
+
+    def test_a_silent_level_fails(self):
+        with self.assertRaises(e2e.Failed) as caught:
+            self.check([picture(), level([-80.0])], [[PREVIEW], []])
+        self.assertIn("no `level` event from the app within", str(caught.exception))
+
+    def test_a_preview_flow_left_after_off_fails(self):
+        with self.assertRaises(e2e.Failed) as caught:
+            self.check([picture(), level([-3.0])], [[PREVIEW]])
+        self.assertIn("Preview (step 2): preview off: Strom at http://127.0.0.1:9 still runs a flow named "
+                      "'gw — Test pattern (preview)' 15 s after `preview {on: false}`", str(caught.exception))
+
+    def test_the_preview_not_available_fails(self):
+        app = ScriptedApp([([], TICKED), ([], {"available": False})])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(e2e.Failed) as caught:
+            e2e.preview_check(app, ScriptedStrom([[]]), "gw — Test pattern", FakeCpu())
+        self.assertIn("the preview is not available", str(caught.exception))
+
+
+class PreviewAtGoLive(unittest.TestCase):
+    """Go live removes the preview flow before the uplink starts, and the picture and
+    level while live come from the uplink flow."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.saved = (e2e.time.monotonic, e2e.time.sleep)
+        e2e.time.monotonic, e2e.time.sleep = self.clock.monotonic, self.clock.sleep
+
+    def tearDown(self):
+        e2e.time.monotonic, e2e.time.sleep = self.saved
+
+    def test_armed_with_no_preview_flow_passes(self):
+        ScriptedStrom([[], [{"id": "x", "name": "other (preview)"}]]).no_flow(
+            "gw — Test pattern", 7, "Go live", preview="gw — Test pattern (preview)")
+
+    def test_a_preview_flow_left_after_go_live_fails(self):
+        with self.assertRaises(e2e.Failed) as caught:
+            ScriptedStrom([[], [PREVIEW]]).no_flow("gw — Test pattern", 7, "Go live", preview="gw — Test pattern (preview)")
+        self.assertIn("Go live: Strom still runs the preview flow p-1", str(caught.exception))
+
+    def test_a_preview_flow_next_to_the_uplink_fails(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            flow, _ = e2e.sends_once_live(ScriptedStrom([[UPLINK]]), "gw — Test pattern", "active", 0.0)
+        self.assertEqual(flow, UPLINK)
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(e2e.Failed) as caught:
+            e2e.sends_once_live(ScriptedStrom([[UPLINK, PREVIEW]]), "gw — Test pattern", "active", 0.0)
+        self.assertIn("active: Strom runs the preview flow p-1 next to the uplink f-1", str(caught.exception))
+
+    def test_picture_and_level_from_the_uplink(self):
+        app = FakeApp([picture("camera_off"), row("connecting"), picture("starting"), picture(), level([-2.0])])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            e2e.live_preview_check(app, ScriptedStrom([[UPLINK]]), "gw — Test pattern", 0, "Late receiver")
+        self.assertIn("a level of -2.0 dBFS from the uplink flow", out.getvalue())
+
+    def test_no_picture_while_live_fails(self):
+        app = FakeApp([picture("starting"), level([-2.0])])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(e2e.Failed):
+            e2e.live_preview_check(app, ScriptedStrom([[UPLINK]]), "gw — Test pattern", 0, "Late receiver")
+
+    def test_a_preview_flow_while_live_fails(self):
+        app = FakeApp([picture(), level([-2.0])])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(e2e.Failed) as caught:
+            e2e.live_preview_check(app, ScriptedStrom([[UPLINK, PREVIEW]]), "gw — Test pattern", 0, "Late receiver")
+        self.assertIn("Strom runs the preview flow p-1 while live", str(caught.exception))
+
+
+# --- Strom's CPU (OL-70e) ---------------------------------------------------------------
+
+
+class CpuFigures(unittest.TestCase):
+    def test_ps_time_values(self):
+        self.assertAlmostEqual(e2e.cpu_seconds("0:01.23"), 1.23)
+        self.assertAlmostEqual(e2e.cpu_seconds(" 12:03.50\n"), 723.5)
+        self.assertAlmostEqual(e2e.cpu_seconds("1:00:00.00"), 3600.0)
+        self.assertAlmostEqual(e2e.cpu_seconds("00:00:07"), 7.0)
+        self.assertAlmostEqual(e2e.cpu_seconds("2-00:00:01"), 172801.0)
+
+    def test_share_is_percent_of_one_core(self):
+        self.assertAlmostEqual(e2e.share((10.0, 5.0), (70.0, 8.0)), 5.0)
+        self.assertAlmostEqual(e2e.share((0.0, 0.0), (60.0, 90.0)), 150.0)
+        with self.assertRaises(e2e.Failed):
+            e2e.share((5.0, 1.0), (5.0, 2.0))
+
+    def test_the_taps_budget_is_per_input(self):
+        self.assertEqual(e2e.taps_verdict(12.0, 9.0), (3.0, None))
+        self.assertEqual(e2e.taps_verdict(14.0, 9.0)[1], None, "exactly 5 % passes")
+        cost, over = e2e.taps_verdict(16.0, 9.0)
+        self.assertEqual(cost, 7.0)
+        for text in ("7.00 % of one core per input", "16.00 % polled minus 9.00 % not polled", "over the 5 % budget"):
+            self.assertIn(text, over)
+        self.assertEqual(e2e.taps_verdict(16.0, 9.0, inputs=2), (3.5, None))
+
+
+class CpuWindows(unittest.TestCase):
+    """Cpu.measure over a scripted sampler and clock: the figure is the CPU seconds
+    between both ends over the wall time, the pid is read from strom.pid."""
+
+    def setUp(self):
+        self.clock = Clock()
+        self.saved = (e2e.time.monotonic, e2e.time.sleep, e2e.wait_until, e2e.SUMMARY)
+        e2e.time.monotonic, e2e.time.sleep = self.clock.monotonic, self.clock.sleep
+        e2e.wait_until = lambda moment: setattr(self.clock, "now", max(self.clock.now, moment))
+        self.env = os.environ.pop("E2E_CPU_SECONDS", None)
+        self.dir = __import__("tempfile").mkdtemp()
+        self.pidfile = os.path.join(self.dir, "strom.pid")
+        with open(self.pidfile, "w", encoding="utf-8") as f:
+            f.write("4242\n")
+
+    def tearDown(self):
+        e2e.time.monotonic, e2e.time.sleep, e2e.wait_until, e2e.SUMMARY = self.saved
+        if self.env is not None:
+            os.environ["E2E_CPU_SECONDS"] = self.env
+        __import__("shutil").rmtree(self.dir)
+
+    def cpu(self, sample, read_along=False):
+        cpu = e2e.Cpu(self.pidfile)
+        cpu.sample = sample
+        cpu.read_along = read_along
+        return cpu
+
+    def test_a_window_of_60_s_with_the_cpu_seconds_at_both_ends(self):
+        pids = []
+
+        def sample(pid):
+            pids.append(pid)
+            return self.clock.now * 0.03, None  # 3 % of one core
+
+        cpu = self.cpu(sample)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            percent = cpu.measure("Live, uplink with the taps polled")
+        self.assertAlmostEqual(percent, 3.0)
+        self.assertEqual(set(pids), {4242})
+        self.assertEqual(len(pids), 2, "without reading along, only at both ends (PowerShell)")
+        self.assertGreaterEqual(cpu.figures[0]["wall"], 60)
+        self.assertIn("CPU (hosted runner): Live, uplink with the taps polled: 3.00 % of one core", out.getvalue())
+
+    def test_ps_is_read_along_the_way_and_its_mean_logged(self):
+        calls = []
+
+        def sample(pid):
+            calls.append(pid)
+            return self.clock.now * 0.05, 4.0
+
+        cpu = self.cpu(sample, read_along=True)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            percent = cpu.measure("Step 2, preview flow running (the taps polled)")
+        self.assertAlmostEqual(percent, 5.0)
+        self.assertGreater(len(calls), 10)
+        self.assertIn("mean of `ps -o %cpu` 4.00 %", out.getvalue())
+
+    def test_the_window_is_never_under_60_s(self):
+        os.environ["E2E_CPU_SECONDS"] = "5"
+        try:
+            self.assertEqual(self.cpu(None).seconds, 60)
+            os.environ["E2E_CPU_SECONDS"] = "90"
+            self.assertEqual(self.cpu(None).seconds, 90)
+        finally:
+            del os.environ["E2E_CPU_SECONDS"]
+
+    def test_no_strom_pid_fails(self):
+        os.remove(self.pidfile)
+        with self.assertRaises(e2e.Failed) as caught:
+            self.cpu(lambda pid: (0.0, None)).measure("Live")
+        self.assertIn("no Strom pid to measure the CPU of", str(caught.exception))
+
+    def test_a_strom_that_changed_during_the_window_fails(self):
+        def sample(pid):
+            with open(self.pidfile, "w", encoding="utf-8") as f:
+                f.write("5151")
+            return self.clock.now, None
+
+        with self.assertRaises(e2e.Failed) as caught:
+            self.cpu(sample).measure("Live")
+        self.assertIn("Strom's pid changed from 4242", str(caught.exception))
+
+    def test_the_report_is_labelled_as_hosted_runner_figures(self):
+        cpu = self.cpu(lambda pid: (self.clock.now * 0.02, None))
+        summary = os.path.join(self.dir, "summary.md")
+        e2e.SUMMARY = summary
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cpu.measure("Live, uplink with the taps polled")
+            cpu.taps = 0.5
+            cpu.report()
+        text = out.getvalue()
+        self.assertIn("Strom CPU figures for #172 (GitHub-hosted runner figures, not real hardware)", text)
+        self.assertIn("Taps while live (polled minus not polled), per input: 0.50 % of one core (budget 5 %)", text)
+        with open(summary, encoding="utf-8") as f:
+            self.assertIn("| Live, uplink with the taps polled | 2.00 |", f.read())
+
+    def test_no_figures_no_report(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.cpu(None).report()
+        self.assertEqual(out.getvalue(), "")
+
+
+class PausableApp(FakeApp):
+    def __init__(self, lines):
+        super().__init__(lines)
+        self.states = []
+
+    @contextlib.contextmanager
+    def paused(self):
+        self.states.append("suspended")
+        try:
+            yield
+        finally:
+            self.states.append("resumed")
+
+
+class TapsCpu(unittest.TestCase):
+    def check(self, polled, not_polled):
+        app = PausableApp([row("live")])
+        cpu = FakeCpu([polled, not_polled])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cost = e2e.taps_cpu_check(app, cpu, "gw — Test pattern", 0, "Late receiver")
+        return app, cpu, cost, out.getvalue()
+
+    def test_within_budget_passes_and_the_app_is_suspended_only_for_the_second_window(self):
+        app, cpu, cost, out = self.check(6.0, 4.5)
+        self.assertEqual(cpu.measured, ["Live, uplink with the taps polled", "Live, uplink with the taps not polled (app suspended)"])
+        self.assertEqual(app.states, ["suspended", "resumed"])
+        self.assertEqual(cost, 1.5)
+        self.assertEqual(cpu.taps, 1.5)
+        self.assertIn("PASS: Late receiver: the taps cost 1.50 % of one core per input", out)
+
+    def test_over_budget_only_warns_with_the_numbers(self):
+        _, cpu, cost, out = self.check(20.0, 4.0)
+        self.assertEqual(cost, 16.0)
+        self.assertIn("::warning title=e2e app::Late receiver: the taps cost 16.00 % of one core per input", out)
+
+    def test_a_failure_while_suspended_still_resumes_the_app(self):
+        app = PausableApp([])
+
+        class Broken(FakeCpu):
+            def measure(self, what):
+                if "suspended" in what:
+                    e2e.fail("no Strom")
+                return 3.0
+
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(e2e.Failed):
+            e2e.taps_cpu_check(app, Broken(), "gw — Test pattern", 0, "Late receiver")
+        self.assertEqual(app.states, ["suspended", "resumed"])
 
 
 if __name__ == "__main__":
