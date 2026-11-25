@@ -4,7 +4,10 @@
 **Status**: Proposed
 **Date**: 2026-11-17
 **Decision record**: [ADR-001](../decisions/ADR-001-desktop-app-toolkit.md) (toolkit, and a second
-front end next to the terminal)
+front end next to the terminal); [ADR-003](../decisions/ADR-003-desktop-preview-through-strom.md)
+(preview of picture and sound through Strom, #172)
+**Amended**: 2026-11-25, #172 (OL-70): picture and sound preview in steps 2 and 3 (§4.1, §5.2,
+§9, §10, §12–§16)
 
 ## 1. Problem
 
@@ -18,8 +21,15 @@ and a log, and read "Starting Strom on port 8080" as the cause of a failure it d
 (Apple Silicon) and Windows (x86_64), running the same gateway code, settings file and Strom as
 the CLI. The CLI does not change for SSH and headless boxes.
 
-Out of scope (from #62): a live video preview, destinations other than Open Live, Linux desktop,
-running as a background service, auto-update.
+Out of scope (from #62): destinations other than Open Live, Linux desktop, running as a background
+service, auto-update.
+
+#62 also left out a live video preview. #172 (OL-70) brings in a **still preview**: for each ticked
+row in step 2, and for each input while its uplink runs in step 3, about one picture a second and a
+level bar for its microphone, plus a warning when a microphone gives no sound (§4.1, §5.2,
+[ADR-003](../decisions/ADR-003-desktop-preview-through-strom.md)). It is for checking that the
+right camera and microphone are picked and still delivering, not for watching: smooth video in the
+window stays out of scope. The same for the iPhone app is OL-71, not this amendment.
 
 ## 2. Decisions at a glance
 
@@ -35,6 +45,8 @@ running as a background service, auto-update.
 | Errors | One table, failure → one line + action, unit tested | §10 |
 | macOS | App becomes `CFBundleExecutable`; CLI stays in `Contents/MacOS` for PATH/SSH; same signing and notarization | §11.1 |
 | Windows | NSIS installer (per machine), chains the pinned Strom MSI, Start menu entry; next to the zip | §11.2 |
+| Preview (#172) | Strom's `builtin.thumbnail` and `builtin.meter`: one preview flow per ticked row while step 2 is on screen, the same two blocks as taps inside the uplink flow (app only) while live; pictures as `data:` JPEGs and levels over the existing IPC | ADR-003, §5.2, §12 |
+| Strom from step 2 | Held by the app core from the first device list, handed to the session at Go live; the camera is never opened by two flows | §4.1 |
 
 ## 3. Workspace layout
 
@@ -43,6 +55,7 @@ Cargo.toml            [package] open-live-ingest (lib + CLI bin)  +  [workspace]
 Cargo.lock            one lockfile for both
 src/lib.rs            the library (#71): config, devices, flow, heartbeat, local_strom,
                       openlive, osc, run (session), strom, events
+src/strom_events.rs   Strom's WebSocket /api/ws, read for MeterData only (#172, §5.2)
 src/main.rs           the CLI: clap, tracing init, signals, the event reporter, exit codes
 src/setup.rs          CLI-only prompts (dialoguer), behind the `cli` feature (#73)
 app/Cargo.toml        [package] open-live-ingest-app, publish = false
@@ -50,6 +63,8 @@ app/src/main.rs       window, event loop, menus, IPC dispatcher, quit guard
 app/src/model.rs      UI state: inputs, rows, messages. Pure Rust, unit tested
 app/src/messages.rs   the failure → message table of §10
 app/src/status.rs     the status lines while live (§5.1): productions holding each source, link
+app/src/preview.rs    the preview controller (§5.2): Strom hold, preview flows, pictures, levels,
+                      silence and wrong-camera checks. Pure state machine + I/O shell, unit tested
 app/src/platform/     macos.rs (applicationShouldTerminate, camera/mic authorisation),
                       windows.rs (WM_QUERYENDSESSION subclass, single-instance mutex)
 app/ui/               index.html, app.css, app.js (static, compiled in with include_bytes!)
@@ -132,7 +147,8 @@ packaging/windows/    open-live-ingest.nsi
   camera check (on macOS that can wait minutes on the prompt), and `reclaim_recorded()` checks it
   once more itself, after it has read `strom.pid`: since `up` writes `gateway.pid` before it starts
   Strom, a gateway that starts at any point during the checks is refused, and its Strom is never
-  stopped.
+  stopped. With the preview (#172) the same checks and reclaim run when the app first takes its
+  Strom hold in step 2, and Go live skips them while it holds one (§4.1).
 - **Windows: no console window for Strom.** The app is a GUI-subsystem executable
   (`#![windows_subsystem = "windows"]`). A console child started from a GUI process gets a console
   window of its own, so when the app starts Strom the library adds `CREATE_NO_WINDOW` to the
@@ -144,7 +160,9 @@ packaging/windows/    open-live-ingest.nsi
   asks AVFoundation for the authorisation status of video and audio
   (`AVCaptureDevice authorizationStatusForMediaType:`, through `objc2`, already in the tree) and
   requests access when it is not determined, so the prompt comes from the app at a predictable
-  moment and a denial becomes the §10 message rather than a Strom error.
+  moment and a denial becomes the §10 message rather than a Strom error. With the preview (#172)
+  the same check runs before the first preview flow for a camera (or microphone) is created, so the
+  prompt comes when the first row is ticked in step 2, and Go live finds the answer already given.
 
 ### Go live and Stop
 
@@ -232,6 +250,123 @@ sequenceDiagram
     App-->>UI: {"event":"stopped"}
 ```
 
+### 4.1 Strom from step 2 to Go live (#172)
+
+Before #172, the `devices` command started a managed Strom only to list the devices and stopped it
+again before replying (`api::devices` → `run::devices`, whose `LocalStrom` is dropped on return).
+The preview needs Strom running while step 2 is on screen, and a camera must never be opened by two
+flows at once: Media Foundation gives a camera to one user at a time, and on macOS strom#1278 shows
+that even a stop and start of one flow can open the wrong device. So the app core holds the Strom
+from step 2 and hands that same Strom to the session at Go live.
+
+- **The hold.** The library gains `api::StromHold`: a `LocalStrom` (Managed or Adopted), its
+  `StromClient`, its version, and whether it has the two preview blocks (§5.2, "Older Strom"). It
+  is taken by `api::hold_strom(settings, events)`, used by `api::devices_with(&hold)`, and given up
+  by `StromHold::release(self)`. The first `devices` command takes it; later ones reuse it. It lives
+  until Go live (handed over), quit (released), or a change of `strom.url`, `strom.api_key` or
+  `strom.manage` (released; the next `devices` takes a new one). A Strom with no flows opens no
+  camera (device discovery does not open the devices), so holding it costs an idle process, never a
+  camera light. `api::devices` (start, list, stop) stays for the CLI.
+- **The reclaim moves to the hold.** Taking the hold runs §4's checks first: `gateway.pid` names no
+  running gateway and `strom.pid` names a live Strom → `local_strom::reclaim_recorded()`, which
+  checks `gateway.pid` once more itself. A Go live while the app holds a Strom skips the reclaim:
+  the Strom `strom.pid` names is then the app's own (Managed), or the hold is Adopted from a Strom
+  that was running and was not left behind by a crash. Without this, Go live's reclaim would kill
+  the app's own Strom. A Go live with no hold (`--ipc-stdio` without a `devices` first, or a hold
+  released by a settings change) reclaims as before.
+- **Go live hands the hold over, in this order** (diagram below):
+  1. The preview controller removes every preview flow (`DELETE /api/flows/{id}`) and polls
+     `GET /api/flows/{id}` every 100 ms until it answers 404, at most 5 s per flow, all flows in
+     parallel. Each row's picture goes to `camera_off`. A flow still present after 5 s is logged
+     and left to the session's `prepare`, which removes every flow holding one of its cameras, and
+     (new) every preview flow of this gateway (§5.2), before any uplink is created.
+  2. §4's checks (`gateway.pid`, camera and microphone authorisation), then the session is started
+     with the hold: `Session::start_armed` and `Session::start_keeping_sources` gain siblings that
+     take a `Launch { strom: Option<StromHold>, taps: Taps }` (names final in OL-70b).
+     `StromMedia::start` writes `gateway.pid` as today and then uses the held Strom instead of
+     calling `connect_strom`. From here the session owns it: when the session ends, its drop stops a
+     Managed Strom after the teardown, exactly as for a Strom it started itself (§15 Q14).
+  3. When a production holding a source goes `active`, the uplink flow is created with the taps
+     inline (`Taps::On`, §12), and step 3 reads its picture and level. While armed no flow runs, so
+     the row has no picture and its camera is off (#130).
+- **The meter WebSocket carries on.** It belongs to the app core, not to a flow (§5.2). The Strom
+  process is the same before and after the handover, so the connection stays open; only the flow
+  ids it listens for change.
+- **Stop does not hand the Strom back.** The session stops it after the teardown, as today (§15
+  Q14). Back on step 2 with rows ticked, the next `devices` or `preview` takes a fresh hold, which
+  costs a Strom start (a few seconds). Question 19.
+- **Quit while not live** removes the preview flows and releases the hold within the CLI's 4 s
+  bound (§8). `StromHold::release` stops a Managed Strom only when Strom runs no flow but this app's
+  preview flows and `gateway.pid` names no other gateway. Otherwise (a CLI `up` adopted the app's
+  Strom meanwhile) it leaves Strom running, keeps `strom.pid`, and logs it; `down` stops it as it
+  stops any recorded Strom. An Adopted Strom is never stopped, as before.
+- **Another gateway goes live while the app holds Strom.** A CLI `up` adopts the running Strom, and
+  its `prepare` removes any flow holding one of its cameras, the app's preview flows included. The
+  preview controller reads `run::running_gateway()` at every reconcile (2 s); while it names another
+  process the app removes its own preview flows, creates none, and shows the
+  `preview_off_other_gateway` notice (§10). Go live's refusal (§4) is unchanged.
+
+```mermaid
+sequenceDiagram
+    actor P as Person
+    participant UI as Webview (app.js)
+    participant App as App core (preview controller)
+    participant Lib as Gateway library
+    participant S as Strom (child)
+    participant OL as Open Live
+
+    Note over UI,S: Step 2: what to send
+    UI->>App: {"cmd":"devices","args":{"show_all":false}}
+    App->>Lib: §4 reclaim checks, then api::hold_strom(settings)
+    Lib->>S: probe strom.url; start headless if unreachable (strom.pid)
+    Lib->>S: GET /api/blocks (builtin.thumbnail and builtin.meter present?)
+    App->>Lib: api::devices_with(&hold)
+    App-->>UI: ok {video[], audio[]}
+    App->>S: WebSocket /api/ws (Authorization: Bearer, when a key is set), kept open
+    UI->>App: {"cmd":"preview","args":{"on":true}}
+    App->>App: macOS: camera/mic authorised? (ask if not determined)
+    loop each ticked row
+        App->>S: POST /api/flows (preview flow, id from {gateway}/preview/{input}), start
+        App->>S: GET /api/flows/{id}/elements/capture:videosrc/properties (strom#1278 check)
+    end
+    loop per row: every 250 ms until the first picture, then every 1 s
+        App->>S: GET /api/flows/{id}/blocks/picture/thumbnail
+        S-->>App: 200 image/jpeg, or 504 (no fresh frame yet), or 404 (flow gone)
+        App-->>UI: {"event":"preview","data":{"device","state","image":"data:image/jpeg;base64,…"}}
+    end
+    S--)App: MeterData {flow_id, element_id "sound", rms[], peak[]} every 100 ms
+    App-->>UI: {"event":"level"} at 4 Hz; notice no_sound after 5 s below -60 dBFS
+
+    Note over P,OL: Go live: the handover
+    P->>UI: Go live
+    UI->>App: {"cmd":"go_live"}
+    par each preview flow
+        App->>S: DELETE /api/flows/{preview id}
+        App->>S: GET /api/flows/{preview id} every 100 ms until 404 (at most 5 s)
+    end
+    App-->>UI: {"event":"preview"} camera_off per row
+    App->>App: gateway.pid live? authorisation; no reclaim (hold present)
+    App->>Lib: start armed with Launch {strom: hold, taps: On}, Sources::Keep
+    Lib->>Lib: write gateway.pid; StromMedia over the held Strom (owned by the session now)
+    Lib->>OL: adopt or register each input's source
+    Lib-->>App: Armed per input (no flow, camera off)
+
+    Note over P,OL: A production holding the source goes active
+    loop every 2 s while armed (1 s while activating)
+        Lib->>OL: GET /api/v1/productions
+    end
+    Lib->>S: prepare (removes any flow holding the camera, and our preview flows)
+    Lib->>S: create + start the uplink flow with the picture and sound taps
+    Lib-->>App: ProductionLive, starting → waiting → on air; stats name the flow id
+    App->>S: GET /api/flows/{uplink id}/elements/capture:videosrc/properties (strom#1278 check)
+    loop every 1 s per running uplink, while the window is visible
+        App->>S: GET /api/flows/{uplink id}/blocks/picture/thumbnail
+        App-->>UI: {"event":"preview"} in step 3
+    end
+    S--)App: MeterData for the uplink flow, same WebSocket
+    App-->>UI: {"event":"level"} at 4 Hz
+```
+
 ## 5. The window
 
 One window, about 720×640, resizable, no other windows. Three sections top to bottom; a section
@@ -255,10 +390,13 @@ below an unfinished one is visible but disabled.
    - An audio source already paired with another ticked camera is shown disabled in the other
      rows' pickers (#64 AC5's rule, enforced again by `validate`).
    - Selection is saved on change (§6).
+   - Per ticked row, a small picture of the camera (or the test pattern) and a level bar for its
+     microphone, with a warning when the microphone gives no sound (§5.2, #172).
 3. **Go live / Stop.** One button. While live each ticked row shows a state and a one-line reason
    when failed, plus bitrate, and under it the status lines of §5.1. A banner above the rows
    carries session-wide notices (Open Live unreachable, Studio cannot see the venue). The rest of
-   the window is read-only while live.
+   the window is read-only while live. While an input's uplink runs, its row shows the same
+   picture and level as in step 2, taken from the uplink flow itself (§5.2).
 
 **Advanced** (collapsed): venue name (`gateway.name`), local Strom (URL, manage, binary, API key,
 "Open Strom"), uplink (mode, host, public host, port range, latency, passphrase), video (codec,
@@ -325,6 +463,128 @@ The library also has `OpenLiveClient::assign_source` (`POST /api/v1/productions/
 with `{sourceId, mixerInput}`, Open Live's `SourceAssignmentInput`; it replaces whatever that slot
 held). The window does not offer it yet: the slot is chosen in Studio.
 
+### 5.2 Preview: picture and sound (#172, OL-70)
+
+**What the row shows.**
+
+- **Step 2**, each ticked row: a 160×90 picture (the 320×180 JPEG Strom makes, so it is sharp on a
+  Retina display), replaced about once a second, and one horizontal level bar per microphone
+  channel from -60 to 0 dBFS (peak, with the RMS as a darker inner bar). A row with audio "None"
+  shows "No microphone" instead of a bar. The test pattern row shows the bars and the 1 kHz tone.
+- **Step 3**, each input whose uplink runs (Connecting, Live): the same, from the uplink flow. An
+  input that is Armed or Waiting for production has no flow and its camera is off (#130): the
+  picture area says "Camera off until a production goes live" and there is no bar.
+- **No picture**: no fresh frame for 5 s while the flow runs → the last picture dimmed, with "No
+  picture from `<camera>`".
+- **No sound**: §10's `no_sound` line on the row ("No sound from `<microphone>`.").
+- **Wrong camera** (strom#1278): §10's `wrong_camera` line on the row.
+
+**When it runs.** The preview controller (`app/src/preview.rs`) runs preview flows for exactly the
+ticked rows of the saved `[[input]]` selection (§6) while all of these hold: the page asked for it
+(`preview {on: true}`, sent while step 2 is shown and enabled), the window is not minimised or fully
+occluded (tao's `WindowEvent::Occluded` / minimised state; the page's `visibilitychange` sends
+`preview {on: false}` as well), the app is not live, it holds a Strom (§4.1), that Strom has the
+blocks ("Older Strom" below), and `gateway.pid` names no other gateway. Otherwise it runs none, so
+no camera light stays on with nothing shown. It reconciles on every command that changes one of
+these (`preview`, `set_inputs`, `go_live`, `stop`) and every 2 s:
+
+| Change | Preview flow |
+|---|---|
+| Row ticked | created and started |
+| Row unticked, or preview off | removed; the row is `stopped` when Strom answers 404 (camera off) |
+| Audio pick changed, or capture resolution / frame rate changed | removed, then created |
+| Label changed | nothing (the flow id does not depend on it) |
+| Flow gone (404) while the controller thinks it runs | `failed`, created again at the next reconcile unless another gateway runs |
+
+While live, the controller polls the taps of every running uplink flow (flow id from the session's
+`stats`, `gateway::InputStats`, as §5.1 does) while the window is visible, regardless of the page's
+preview flag. When the window is minimised it stops polling pictures, so the tap detaches after
+Strom's 10 s idle timeout and costs nothing; the meter and the silence detector keep running so a
+warning is there when the window comes back.
+
+**Preview flow.** One Strom flow per ticked row, shape in §12. Its id is
+`flow::preview_flow_id(gateway_id, input_id)`, the v5 UUID of `"{gateway_id}/preview/{input_id}"` in
+the same namespace as `flow::flow_id`, so it never equals an uplink flow id, and nothing is stored to
+find it again. Its name is `<gateway.name> — <label> (preview)`, so Strom's UI says what it is.
+`flow::is_preview_of_ours(flow, gateway_id)` recognises it; the session's `prepare` and `down`
+remove preview flows of this gateway along with their own (`prepare` already removes any flow
+holding one of its cameras; the test pattern's preview holds none, hence the explicit rule). The
+capture block has the same properties as the uplink's (device, audio device, resolution, frame
+rate), so the camera is opened in the mode it will be sent in, and what the row shows is what goes
+out.
+
+**Pictures.** `StromClient::thumbnail(flow_id, "picture")` →
+`GET /api/flows/{id}/blocks/picture/thumbnail` (Strom v0.8.4 `get_block_thumbnail`):
+
+| Strom answers | Meaning | Row |
+|---|---|---|
+| 200 `image/jpeg` | the latest frame, 320×180, quality 75 (`ThumbnailTapConfig` defaults: one new frame per 1 s, served from cache, stale after 3 s) | `showing`; the event carries the image if its bytes changed |
+| 504 | no fresh frame: the branch was just attached, or the source sends nothing | `starting` until the first picture; `no_picture` after 5 s of 504s once a picture was shown, or 5 s after start without one |
+| 404 | the flow does not run, or has no such block | `failed` (preview), or nothing (uplink: the session's own states say why) |
+| no answer | Strom is gone | nothing per row: the `strom` event and §10 handle it |
+
+The first request attaches the tap's branch; it is polled every 250 ms until the first picture
+(#172 AC1 asks for one within 3 s of ticking), then every 1 s. Polling stops when the row stops or
+the window is hidden; the tap detaches itself after 10 s without requests. The core checks the body
+starts with the JPEG marker `FF D8 FF` and is at most 256 KiB, else drops it (logged once at
+`debug`), and hands it to the page as `data:image/jpeg;base64,…`, which the CSP already allows
+(`img-src 'self' data:`, §9.4). The page never fetches anything.
+
+**Levels.** `strom_events::meter_readings(strom_url, api_key)`: one WebSocket to the local Strom's
+`/api/ws` for as long as the app holds or runs a Strom and the preview or a live input wants levels,
+with `Authorization: Bearer <strom.api_key>` on the upgrade when a key is set (Strom accepts the
+bearer header on every route; the `?auth_token=` form is not used, so the key never sits in a URL).
+Strom sends every event to every subscriber (flows, system stats once a second, and so on); the
+reader decodes only text frames whose `type` is `MeterData` (`StromEvent` is
+`#[serde(tag = "type", content = "data")]`), into its own struct
+`MeterReading { flow_id, element_id, rms_db: Vec<Option<f64>>, peak_db: Vec<Option<f64>> }`. It does
+not decode `strom_types::StromEvent` as a whole, so a variant another Strom version adds never breaks
+the stream. `serde_json` writes the `-inf` of digital silence as `null`, hence `Option`; `None` counts
+as -inf. Readings for other flows or other elements than `sound` are dropped. Lost connection:
+retried after 1 s, 2 s, then every 5 s; Strom pings every 15 s and tungstenite answers.
+
+The meter block reports every 100 ms (`interval` `"100"`, its default and one of its listed values).
+The core keeps, per row and channel, the highest peak and RMS of each 250 ms window and sends them
+at 4 Hz, clamped to -90…0 dBFS, all rows in one `level` event.
+
+**Silence.** `SilenceDetector`, per row with a microphone, a pure function of readings and a clock:
+silent when every reading's highest channel peak is below -60 dBFS for 5 s, or when no reading at all
+arrives for 5 s while the flow runs (a microphone that delivers nothing); it then raises the
+`no_sound` notice for the row. It clears at the first 250 ms window whose peak reaches -54 dBFS (6 dB
+of hysteresis, so a signal hovering at the threshold does not flicker). The clock starts when the
+flow runs. #172 AC3 (warning within 10 s of a muted microphone) is 5 s plus the flow start. The
+test pattern never warns.
+
+**Wrong camera (strom#1278).** After each start of a preview or uplink flow for a camera, once it
+runs, the app core reads `GET /api/flows/{id}/elements/capture:videosrc/properties`
+(`StromClient::element_properties`, already in the library; one retry after 1 s on 404) and compares
+`device-name` (both `avfvideosrc` and `mfvideosrc` have it) with the device's name in Strom's device
+list. A mismatch is logged at `warn` naming both and raises the row's `wrong_camera` notice, with no
+automatic action (question 22). A missing property is logged at `debug` and ignored. For the uplink
+the app does the check after the session reports the flow starting; the CLI is unchanged.
+
+**Older Strom.** Taking the hold reads `GET /api/blocks` once (`StromClient::block_ids`). Both
+`builtin.thumbnail` and `builtin.meter` must be listed (Strom v0.8.4, the pin, has both). If either
+is missing, or the list cannot be read (logged), the app runs no preview flows, sends `preview` →
+`{available: false}`, shows the `preview_unavailable` notice once, and the session builds uplink
+flows without taps (`Taps::Off`), so going live never depends on the preview.
+
+**Cost** (#172 Q3). While live, the taps are a tee that passes buffers through (`allow-not-linked`,
+no work until asked); when polled, one frame a second is scaled to 320×180 and JPEG-encoded, and
+`level` reads 48 kHz audio: expected well under 1 % of a core each. The budget OL-70e measures: at
+most 5 % of one core per input while live (Strom's CPU with taps polled minus without, 60 s each, test
+pattern), with AC5's drop figures unchanged. In step 2 the preview costs the capture itself, up to
+about 10 % of a core for a USB camera sending MJPEG at 1080p30, only while step 2 is on screen;
+OL-70e records it, with no gate. The WebSocket's other events are a few KB/s, discarded.
+
+**Same on macOS and Windows.** No OS-specific code beyond §4's authorisation check, which runs
+before the first preview flow too. Windows cameras cannot be shared, and none is: the handover in
+§4.1 never has two flows on one camera. #172 AC4 with a real Windows camera waits for #36; the test
+pattern runs there now.
+
+**Never logged.** Images and levels are IPC payloads, which §7 keeps out of the log; the controller
+logs state changes only (`preview <device>: showing`).
+
 ## 6. Settings and data model
 
 **Same file, same code.** The app reads and writes `config::default_path()` through the library's
@@ -367,6 +627,30 @@ executable, under `Program Files`, which is not writable). The repo invariant "n
 the settings file and two pidfiles" gains exactly the keychain entry (#76), the log file (§7) and
 the webview's cache folder on Windows; `DESIGN.md` §6 records this when it is amended.
 
+**The preview stores nothing (#172).** No settings key, no file, no migration: what is previewed
+follows the saved `[[input]]` selection, and the preview's state lives in the app core's memory
+(`app/src/preview.rs`):
+
+```rust
+struct Preview {
+    wanted: bool,                    // the page's `preview {on}`
+    visible: bool,                   // window not minimised or occluded
+    hold: Option<StromHold>,         // §4.1; None while live (the session owns the Strom)
+    capable: Option<bool>,           // builtin.thumbnail and builtin.meter present; None: not asked yet
+    other_gateway: Option<u32>,      // pid from `run::running_gateway()`
+    rows: BTreeMap<DeviceKey, Row>,  // Strom device id of the camera, or "test"
+}
+struct Row {
+    flow: FlowId,                    // preview flow id, or the uplink's from `stats` while live
+    kind: FlowKind,                  // Preview | Uplink
+    microphone: Option<String>,      // the paired audio device's name, for the no-sound line
+    picture: Picture,                // Starting{since} | Showing{hash, at} | NoPicture{since} | CameraOff | Failed{reason}
+    levels: LevelWindow,             // per channel max peak / RMS of the current 250 ms window
+    silence: SilenceDetector,        // §5.2
+    camera: CameraCheck,             // Pending | Same | Other{opened}
+}
+```
+
 **Version skew.** `Config` is `deny_unknown_fields`, so an older CLI fails on a file a newer app
 wrote. The DMG and the installer ship the CLI of the same version next to the app; the error a
 stray older CLI prints names the unknown key, which is enough to see the cause.
@@ -403,6 +687,10 @@ The rule is the CLI's (`DESIGN.md` §6): a deliberate stop stops, an accident do
 | `open-live-ingest down` from a terminal | — | macOS: SIGTERM → Stop without asking, then exit. Windows: `taskkill /F`, and `down` removes the rest |
 | Crash, Force Quit, Task Manager end task | — | Flows and sources remain; the next Go live removes the flows and adopts the sources, or `down` removes both (§4, Strom reclaim) |
 
+- **Not live, preview on (#172).** Quit removes the preview flows and releases the Strom hold
+  (§4.1) within the CLI's 4 s bound; no question is asked, since nothing is sent. A crash leaves
+  the preview flows in a Strom recorded in `strom.pid`: the next hold reclaims that Strom (§4.1),
+  and `down` removes this gateway's preview flows with its uplink flows (§5.2).
 - **Stop and quit** runs the same teardown as the Stop button (`SessionHandle::stop()`, with
   progress in the rows): the flows are removed and the sources kept (§4), so a relaunch and Go live
   feeds the same production slots. Then it exits. If it has not finished after 15 s, the dialog
@@ -447,14 +735,15 @@ unknown command or bad arguments is an error reply, never a panic.
 | `osc_workspaces` | — | `{workspace, instances[]}` | No list API exists (#74, [research](../research/OSC_BROWSER_SIGN_IN.md)): `api::osc_sign_in` again, where the workspace is picked on the OSC consent page and the new sign-in replaces the kept one (#77) |
 | `choose_instance` | `{url}` | view model | `save` |
 | `self_hosted` | `{url, api_key}` | view model | `check_self_hosted` (#73), `save` |
-| `devices` | `{show_all}` | `{video[], audio[]}` | `devices` (#73, audio from #69) |
-| `set_inputs` | `{inputs: [{device, audio?, label?}]}` | view model | `validate`, `save` |
+| `devices` | `{show_all}` | `{video[], audio[]}` | `api::hold_strom` the first time (§4.1, #172), then `api::devices_with(&hold)` (#73, audio from #69). The Strom keeps running for the preview and Go live |
+| `set_inputs` | `{inputs: [{device, audio?, label?}]}` | view model | `validate`, `save`; the preview reconciles to the new selection (§5.2) |
+| `preview` | `{on: bool}` | `{available: bool}` | Not a library call: the preview controller (§5.2). `on: true` takes the hold if there is none, runs §4's authorisation check, and starts preview flows for the ticked rows; `on: false` removes them. `available` is false when the Strom lacks the blocks, another gateway runs, or the app is live (step 3's taps need no command); the reason arrives as a `notice`. Idempotent. Error reply only for bad arguments, or when no Strom can be held (the §10 Strom rows: not found, did not start, wants a key, port in use). A camera that fails is a `preview` event on its row, never an error reply |
 | `set_advanced` | the Advanced values | view model, or `problems[]` | `validate` (#73), `save`. So far only `{uplink: {relay}}` is saved (OL-66): the relay picked, `null` for `default`; anything else replies "cannot do that yet" |
 | `relays` | — | `{relays[], chosen, offer}` | `GET /api/v1/server-info` `srt.relays` (OL-65). `offer` is true when Open Live reports more than one relay, or none named `chosen` while it reports others: only then does Advanced show the picker (OL-66) |
-| `go_live` | — | `null` (progress arrives as events) | §4 checks, `Session::start` (#72) |
+| `go_live` | — | `null` (progress arrives as events) | §4.1 handover (remove the preview flows, wait for 404), §4 checks, the session started with the hold and `Taps::On` (#72, #172) |
 | `stop` | — | `null` | `SessionHandle::stop` |
 | `stop_other` | — | `null` | `down` (another gateway named by `gateway.pid`) |
-| `quit` | `{confirmed, anyway?}` | `null` | quit guard (§8): `confirmed: false` asks (the question when live), `true` is Stop and quit, `anyway: true` is Quit anyway once offered |
+| `quit` | `{confirmed, anyway?}` | `null` | quit guard (§8): `confirmed: false` asks (the question when live), `true` is Stop and quit, `anyway: true` is Quit anyway once offered. Not live: removes the preview flows and releases the hold (§4.1) |
 | `show_logs` | `{which: "app" \| "strom"}` | `null` | reveal in Finder/Explorer |
 | `open_url` | `{which: "strom" \| "studio" \| "help" \| "privacy" \| "privacy_microphone" \| "release"}` | `null` | system browser; URLs come from settings, never from the page (`privacy`, `privacy_microphone`: macOS Privacy & Security → Camera or Microphone, for §10's camera/microphone row; `release`: the GitHub page of the newer release the update check found, built by the core from its version number) |
 
@@ -471,7 +760,9 @@ unknown command or bad arguments is an error reply, never a panic.
 | `summary` | `{inputs: [{input, port, uplink, registered, relay?}]}` | the start summary: `uplink` is where the gateway sends (in caller mode `srt://<host>:<port>?mode=caller&latency=<ms>`; through the relay the dial-in address `srt://<relay>?streamid=<id>&mode=caller&...`, and `relay` names it), `registered` the address registered with Open Live; passphrases masked. The row reads "Sending via relay `<relay>` to `<uplink>`" |
 | `stats` | `{inputs: [{input, bitrate_kbps, rtt_ms, dropped}]}` | periodic stats (the heartbeat snapshot data) |
 | `status` | `{inputs: [{input, productions: null \| [{name, state, slots: []}], link: {state: "not_sending" \| "connecting" \| "connected" \| "unknown", dropped_pct, rtt_ms}}]}` | the status lines of §5.1, every 4 s while live; not a library event (the app polls Open Live and the local Strom itself). `productions` is `null` when unknown, `[]` when none holds the source |
-| `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?}` / `{clear: kind}` | warnings |
+| `notice` | `{kind: "open_live_unreachable" \| "heartbeat_refused" \| ..., message, action?, device?}` / `{clear: kind, device?}` | warnings. #172 adds the row notices `no_sound`, `wrong_camera` (with `device`) and the window notices `preview_unavailable`, `preview_off_other_gateway` (§10) |
+| `preview` | `{device, state: "starting" \| "showing" \| "no_picture" \| "camera_off" \| "failed" \| "stopped", image: "data:image/jpeg;base64,…" \| null, message?, action?}` | not a library event: the preview controller (§5.2). `device` is the camera's Strom device id, or `"test"`, as in `set_inputs`. Sent at every state change, and while `showing` at most once a second per row, only when the picture changed; `image` is `null` when it did not (the page keeps the last one). Typically 10–20 KB per image as base64 |
+| `level` | `{levels: [{device, peak_db: [f64], rms_db: [f64]}]}` | not a library event: Strom's `MeterData` for the `sound` block (§5.2). 4 Hz, one event for all rows (so the number of `evaluate_script` calls does not grow with the inputs), one value per channel, -90…0 dBFS. Only rows with a microphone or the test pattern; none while the window is hidden |
 | `stopping` | `{done, total}` | teardown progress |
 | `stopped` | `{left_behind: [], error}` | teardown finished; anything not removed is named. `error` (`{message, action}`, §10) when the session ended on a failure, else `null` |
 | `quit_requested` | `{inputs_live}` | the quit guard wants the §8 question shown |
@@ -482,6 +773,10 @@ unknown command or bad arguments is an error reply, never a panic.
 
 The variant names on the right are #71's; the app maps whatever names #71 merges with. `message`
 is always produced by `app/src/messages.rs` (§10), never passed through from an error chain.
+
+Rates while the preview runs, per row: one `preview` event a second at most, four `level` events a
+second in total. `--ipc-stdio` (§9.3a) carries them unchanged, so OL-70e's end to end can assert a
+picture (`image` decodes as a JPEG) and a level.
 
 ### 9.3a The same API over stdin and stdout (`--ipc-stdio`)
 
@@ -554,6 +849,13 @@ row can be added.
 | The source was put in a production while that production was live (`SlotAddedWhileLive`, #128) | Row Connecting, with: Production "`<name>`" got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate the production in Studio; until then it cannot show this input. | Open Studio |
 | Gateway token refused on the heartbeat | Banner: Studio can't see this venue's status (gateway token refused). Your cameras are still sending. | Advanced |
 | Settings file invalid (hand-edited) | The settings file has a problem: `<first problem>`. | Show file |
+| Preview: the camera could not be opened (preview flow does not reach running, #172) | Row picture: `<camera>` could not be opened. Close other apps that use it, then untick and tick it again. | Retry |
+| Preview: no fresh frame for 5 s while the flow runs (§5.2) | Row picture, dimmed: No picture from `<camera>`. | — |
+| Preview or live: the microphone gives no sound for 5 s (`no_sound`, §5.2) | Row: No sound from `<microphone>`. Check that it is on and not muted. | — (clears itself) |
+| Preview or live: Strom opened another camera than the one picked (`wrong_camera`, strom#1278) | Row: Strom opened "`<opened>`" instead of "`<camera>`". Untick and tick it again (while live: Stop, then Go live). | Show logs |
+| Preview: the local Strom has no thumbnail or meter block (`preview_unavailable`) | Banner, once: This video engine has no preview. Pictures and sound levels need Strom 0.8.4 or later; going live is not affected. | — |
+| Preview: another gateway is live on this computer (`preview_off_other_gateway`) | Banner: The preview is off while another gateway is live on this computer. | Stop it |
+| Preview: camera or microphone access denied (macOS, before the first preview flow) | Open Live Ingest is not allowed to use the camera (microphone). Allow it in System Settings → Privacy & Security, then tick the camera again. | Open Settings |
 | WebView2 missing (Windows, installer) | Installer: Microsoft Edge WebView2 is required. Install it from Microsoft, then run this installer again. | — |
 
 ## 11. Packaging
@@ -652,9 +954,70 @@ NuGet supply chain and the Burn bundle; MSIX cannot install unsigned.
 
 No new environment variables. The app honours the existing `OLI_*` overrides (they are applied in
 `config::load_or_default`) and `RUST_LOG` through the same `EnvFilter`. Advanced exposes the
-existing settings only. No Strom pipeline change: the flow shape is the library's (§4 of
-`DESIGN.md`, plus #69's audio pairing). Contribution stays MPEG-TS over SRT (`DESIGN.md` §9); the
-EFP sequence-validation rule for ingest designs does not apply, as this epic adds no EFP path.
+existing settings only. Contribution stays MPEG-TS over SRT (`DESIGN.md` §9); the EFP
+sequence-validation rule for ingest designs does not apply, as this epic adds no EFP path.
+
+**Strom flows (#172).** The flow shape is the library's (§4 of `DESIGN.md`, plus #69's audio
+pairing), with two changes for the app only. No setting turns them on or off; the CLI's `up`, the
+iPhone app's `ExternalMedia` and every other caller build exactly today's flow (`Taps::Off`).
+
+The **preview flow** (§5.2), for a camera with a microphone, as `strom_types::Flow` JSON. Without a
+microphone, `stream_mode` is `"video"`, `audio_device` is absent, and the `sound` block, its sink
+and their links are left out. For the test pattern, the capture block is replaced by today's
+`testvideo`/`testvideocaps`/`testaudio`/`testaudiocaps` elements, linked `testvideocaps:src →
+picture:video_in` and `testaudiocaps:src → sound:audio_in`.
+
+```json
+{
+  "id": "<v5 UUID of \"{gateway_id}/preview/{input_id}\">",
+  "name": "<gateway.name> — <label> (preview)",
+  "blocks": [
+    { "id": "capture", "block_definition_id": "builtin.local_input",
+      "properties": { "stream_mode": "audio_video", "video_device": "<camera id>",
+                      "audio_device": "<microphone id>",
+                      "video_resolution": "<capture.resolution, when set>",
+                      "video_framerate": "<capture.framerate, when set>" } },
+    { "id": "picture", "block_definition_id": "builtin.thumbnail", "properties": {} },
+    { "id": "sound", "block_definition_id": "builtin.meter",
+      "properties": { "interval": "100" } }
+  ],
+  "elements": [
+    { "id": "picture_sink", "element_type": "fakesink",
+      "properties": { "sync": false, "async": false } },
+    { "id": "sound_sink", "element_type": "fakesink",
+      "properties": { "sync": false, "async": false } }
+  ],
+  "links": [
+    { "from": "capture:video_out", "to": "picture:video_in" },
+    { "from": "picture:video_out", "to": "picture_sink:sink" },
+    { "from": "capture:audio_out", "to": "sound:audio_in" },
+    { "from": "sound:audio_out", "to": "sound_sink:sink" }
+  ]
+}
+```
+
+The `fakesink`s end each branch, so the pipeline has a sink to reach PLAYING with; `sync: false`
+keeps them from holding buffers to the clock. Block and element ids are the flow's own (Strom names
+the elements `picture:tee` and `sound:level`); the thumbnail route takes the block id `picture`, and
+`MeterData` carries the block id `sound` as `element_id`.
+
+The **uplink flow with taps** (`Taps::On`, the app's sessions only) is today's flow
+(`src/flow.rs`) with the same two blocks inserted, and nothing else changed:
+
+```text
+  capture:video_out ──> picture:video_in   picture:video_out ──> encoder:video_in
+  capture:audio_out ──> sound:audio_in     sound:audio_out   ──> uplink:audio_in_0
+  (test pattern: testvideocaps:src ──> picture:video_in, testaudiocaps:src ──> sound:audio_in)
+```
+
+`picture` is a `tee` with `allow-not-linked` and one linked branch, the encoder; the thumbnail
+branch Strom attaches on request starts with a leaky one-buffer queue, so it can never hold the
+uplink back. `sound` is `level` in line, passing audio through unchanged. An input without a
+microphone gets no `sound` block, as it gets no audio track today. `flow::is_ours`,
+`capture_device_of` and the derived flow id are unchanged by the taps.
+
+`flow::build` gains a `taps: Taps` argument (`Taps::Off` everywhere today), and `flow::preview`
+builds the preview flow. Both are unit tested on their JSON, as `flow::build` is today.
 
 ## 13. Dependencies
 
@@ -671,6 +1034,10 @@ EFP sequence-validation rule for ingest designs does not apply, as this epic add
 | `rfd` (dialogs) | — | Not added: the quit question is in-window HTML |
 | `open` / `opener` | — | Not added: `open` / `rundll32 url.dll,FileProtocolHandler` / `xdg-open` via `std::process::Command`, as `osc::open_browser` (#75) does |
 | `winres` / `embed-resource` | — | Not added: §11.2 icons |
+| `tokio-tungstenite`, `futures-util` | library | **Already direct** (the heartbeat, `src/heartbeat.rs`). #172's `src/strom_events.rs` also opens a plain `ws://` connection to the local Strom with them: no new crate and no new feature (`connect` covers plain TCP) |
+| `base64` | app | **Made direct, +0 crates** (#172): 0.22.1 is already in the lockfile through `reqwest`, `hyper-util` and `strom-types`; the app uses its standard engine's `encode` for the `data:` pictures. Own code would be about 25 lines; using the copy already built and shipped adds no new code to the supply chain. Pinned to `0.22`, the version the tree resolves. Not sensitive: it encodes bytes we pass on, it parses nothing |
+| JPEG decoding or an image crate | — | Not added (#172): the core only checks the JPEG marker and the size; the webview decodes the picture |
+| A WebSocket client in the page | — | Not added (#172): `connect-src 'none'` stays; levels come over the IPC |
 | npm, Node, a bundler, a UI framework | — | Not added: three static files |
 
 Existing dependencies touched: `clap`, `dialoguer` and `console` become optional behind `cli` (§3),
@@ -698,6 +1065,25 @@ What a human does next, for #62's closing comment: on an Apple Silicon Mac, inst
 DMG (needs #25), sign in, pick an instance, tick a camera with its microphone, Go live, and time it
 (#62 AC1, target under 5 minutes). The same on Windows 11 x86_64 with the installer once #36 is a
 go (AC1b). Expected: the camera with sound as a source in Studio, no terminal opened.
+
+### 14.1 Preview (#172, OL-70)
+
+Cut after this amendment merges; each is machine-completable. Order: a and b in parallel → c → d →
+e.
+
+| # | Title | Depends on | Done when (checkable) |
+|---|---|---|---|
+| OL-70a | Library: `flow::preview` and `Taps` on `flow::build` (§12), `preview_flow_id`, `is_preview_of_ours`, `prepare` and `down` remove preview flows; `StromClient::thumbnail` (200/504/404) and `block_ids` (`GET /api/blocks`); `strom_events::meter_readings` (WS `/api/ws`, `MeterData` only, bearer header, reconnect) | — | Unit tests: flow JSON for camera, camera + mic and test pattern, with and without taps; uplink without taps byte-identical to today's; thumbnail statuses against a fake Strom; meter reader against a fake WS server sending `MeterData` (with `null` values), other event types and an unknown variant; `down` removes a preview flow; CLI golden output unchanged |
+| OL-70b | Library: Strom ownership handover. `StromHold`, `hold_strom`, `devices_with`, `release` (stops a Managed Strom only with no foreign flows and no other gateway), session starts taking `Launch {strom, taps}`, `StromMedia` over a held Strom; app: reclaim at hold time, skipped at Go live with a hold (§4.1) | — | Unit tests: a hold handed to a session is stopped by the session's drop and not by the app; `release` leaves a Strom with a foreign flow running and keeps `strom.pid`; Go live with a hold does not reclaim, without one does; existing session and reclaim tests pass |
+| OL-70c | App core: preview controller (§5.2, §6 state), `preview` command, `preview` / `level` events, `devices` keeps the hold, Go live handover order, silence detector, wrong-camera check, older-Strom fallback, other-gateway pause, new §10 rows in `messages.rs` | a, b | Model tests with a fake Strom and fake clock: tick → flow created; untick → removed; Go live removes every preview flow and waits for 404 before the session starts; silence at 5 s below -60 dBFS, cleared at -54; `wrong_camera` on a mismatched `device-name`; no blocks → no preview flow and `Taps::Off`; every new §10 row has a test; no event or log line carries an image |
+| OL-70d | UI: picture and level bars in step 2 and step 3 rows, "No microphone", "Camera off until a production goes live", notices; `preview {on}` on step 2 shown/hidden and on `visibilitychange` | c | There is no JavaScript test harness (no npm, §13), so: CI app job green; the protocol/CSP tests pass unchanged; a test in the app crate asserts `app/ui/app.js` contains no `fetch`, `WebSocket` or `XMLHttpRequest` (the page still talks only through the IPC); a core test asserts the view model's rows carry what the page renders (picture state, microphone name or none, the armed wording) |
+| OL-70e | Agent-run end to end on macOS and Windows runners from the PR's DMG / installer, over `--ipc-stdio`, with the test pattern against `openlivedev`: `preview {on}` → a JPEG `image` within 3 s and a `level` above -60 dBFS; `preview {on: false}` → the preview flow is gone (`GET /api/flows` on the local Strom); Go live → no preview flow remains before the uplink starts; production active → `preview` and `level` from the uplink flow; drop figures as in the existing e2e; Strom CPU with and without taps recorded per input | c (d for nothing: no webview) | Run links and the CPU figures posted on #172; ≤ 5 % of one core per input while live, AC5 drop figures within the existing e2e thresholds |
+
+What a human does next, for #172's closing comment: on a Mac with a camera and a microphone, tick
+the camera in step 2 and check the picture appears within 3 s and the level moves when speaking;
+mute the microphone and see "No sound from …" within 10 s; untick and check the camera light goes
+off; Go live with a production active in Studio and see the same picture and level in step 3
+(AC1, AC2, AC3). AC4 with a real Windows camera once #36 is a go.
 
 ## 15. Open questions (resolved, with the decision)
 
@@ -750,6 +1136,60 @@ go (AC1b). Expected: the camera with sound as a source in Studio, no terminal op
     the workspace is picked on the consent page and changing it is a new sign-in. Sources and the
     optional request to the OSC team: [`docs/research/OSC_BROWSER_SIGN_IN.md`](../research/OSC_BROWSER_SIGN_IN.md).
 
+### Preview (#172, OL-70): resolved, with the decision
+
+16. **Does the preview need its own short-lived Strom flow, and does it hand over cleanly at Go
+    live on macOS and Windows?** Yes: one preview flow per ticked row, only while step 2 is shown.
+    Go live removes them all and waits for 404 before the session starts; the uplink flow opens the
+    camera only when a production goes active. No camera is ever open in two flows, which Windows
+    would refuse (§4.1).
+17. **One preview flow for all rows, or one per row?** One per row: a camera that fails does not
+    stop the others' pictures, unticking removes exactly one flow and turns off exactly one camera
+    light, and it mirrors the uplink's one flow per input.
+18. **Who owns Strom between step 2 and Go live?** The app core, through `StromHold`, from the
+    first `devices` until Go live (handed to the session), quit, or a change of the local-Strom
+    settings. An idle Strom opens no camera. The §4 reclaim runs when the hold is taken, not at Go
+    live (§4.1).
+19. **Does Stop hand the Strom back to the preview?** No. The session stops it after the teardown
+    as today (question 14), and the preview takes a fresh hold. The cost is a Strom start (a few
+    seconds) after Stop; the gain is one ownership path through the session's teardown instead of
+    two.
+20. **Preview while armed (Go live pressed, no production live)?** No picture and no level: the
+    camera stays off until a production holding the source goes live (#130). The row says so.
+    Opening the camera for hours while armed would contradict #172 item 3 and keep the light on
+    with nothing sent.
+21. **What if the window is minimised, or another gateway goes live meanwhile?** Minimised or
+    occluded: the preview flows are removed and live pictures are not polled. Another gateway
+    (`gateway.pid` names another process): the app removes its preview flows and creates none until
+    that gateway is gone, and quitting leaves a Strom that runs flows not ours running (§4.1).
+22. **What does the app do when Strom opened another camera (strom#1278)?** It logs both names at
+    `warn` and shows the row notice; it does not stop or restart the flow. Stopping an uplink is the
+    director's call in Studio, and a restart can hit the same bug; the person sees the wrong picture
+    in the row anyway and can Stop. Revisit when strom#1278's AC2 (Strom fails the flow itself)
+    ships.
+23. **Pictures over the IPC as `data:` URLs, or a dynamic route on the app's `oli` protocol?**
+    `data:` over the IPC. The CSP already allows it, the protocol handler stays three compiled-in
+    files (§9.4), and the overhead (one 10–20 KB string a second per row) is negligible.
+24. **Which level rate, and what reaches the page?** The meter at 100 ms (its default, one of its
+    listed values), the core sending the per-window maximum at 4 Hz for all rows in one event.
+    Taking the maximum keeps short peaks visible that a 250 ms sample would miss.
+25. **Silence threshold?** Highest channel peak below -60 dBFS for 5 s, or no readings for 5 s,
+    cleared at -54 dBFS. -60 dBFS is below any working microphone's room noise and above the
+    digital silence of a muted one; 5 s does not warn on a pause in speech and meets AC3's 10 s.
+26. **Taps in the CLI's `up` too?** No: the CLI has no screen to show them, and Studio shows the
+    received picture. `Taps::Off` keeps the CLI's flow exactly as today. A later `status` view could
+    turn them on.
+27. **A setting to turn the preview off (low-power laptops)?** Not in this version: it runs only
+    while step 2 is shown or while live with the window visible, and the live taps are within the
+    5 % budget. OL-70e's CPU figures decide; if over budget, a follow-up adds `[app] preview`.
+28. **An adopted Strom older than the pin, without the blocks?** `GET /api/blocks` at hold time;
+    without both blocks there is no preview, the uplink is built without taps, and one notice says
+    why (§5.2). Going live never depends on the preview.
+29. **Preview capture mode: the uplink's resolution and frame rate, or a cheap low mode?** The
+    uplink's. The camera is then opened in step 2 in the mode it will be sent in, so a mode the
+    camera refuses shows up before Go live, and the picture is what goes out. The cost is step 2
+    only, and bounded (§5.2, "Cost").
+
 ## 16. Risks
 
 - **#69's settings shape lands differently.** §6 says the app follows #69; OL-59c checks.
@@ -766,3 +1206,27 @@ go (AC1b). Expected: the camera with sound as a source in Studio, no terminal op
 - **A GUI app on Windows does not get console control events.** All stop paths are the ones in §8;
   `DESIGN.md` §6's console-close handling stays the CLI's.
 - **Audio drift (#64 AC3).** The audio picker ships after #64's measurement, as #64 requires.
+- **strom#1278: the wrong camera on a stop and start (#172).** The preview adds a stop and start of
+  a camera (preview flow, then uplink flow) to every Go live. Mitigation: the `capture:videosrc`
+  check after every start (§5.2), a warning on the row and in the log. Detection: OL-70e on a
+  two-camera runner is not available, so the log line is what a field report carries.
+- **Camera not released in time at the handover.** AVFoundation or Media Foundation may release a
+  device shortly after Strom reports the flow gone. With registration on the uplink starts only
+  when a production goes active, normally seconds later; with registration off (Go live sends at
+  once) a "camera busy" start is the existing §10 row, retried at every look while live (§4).
+  Detection: OL-70e checks no preview flow remains before the uplink starts.
+- **A tee in the uplink's encode path.** `picture` puts a tee between capture and encoder. With
+  one linked branch it passes buffers through, but a tee answers allocation queries differently
+  from a direct link, which could change zero-copy into a hardware encoder. Detection: OL-70e's
+  drop figures and CPU with and without taps (AC5); fallback is `Taps::Off` for video only.
+- **The thumbnail tap refuses some memory.** Strom's tap refuses GPU memory it cannot download
+  before attaching anything; the row then shows no picture while the uplink is unaffected.
+  `local_input` delivers system memory today.
+- **Strom's WebSocket is not a versioned API.** `MeterData`'s shape may change in a later Strom.
+  The reader decodes only that variant into its own struct and ignores what it cannot read (no
+  levels, a `debug` log), and the pin moves on purpose (`Cargo.toml`), with OL-70a's fixture taken
+  from the pinned `strom-types`.
+- **An adopted Strom older than v0.8.4.** No blocks → no preview and no taps (§5.2); covered by a
+  unit test with a fake `GET /api/blocks`.
+- **A CLI `up` adopting the app's Strom.** Covered by §4.1: the app pauses the preview and never
+  stops a Strom that runs flows not its own.
