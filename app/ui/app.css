@@ -204,6 +204,14 @@ footer button.link {
   margin-left: 1rem;
 }
 
+footer #update {
+  margin-left: 1rem;
+}
+
+footer #update button.link {
+  margin-left: 0.25rem;
+}
+
 /* The quit question while live (spec, section 8). */
 dialog {
   max-width: 26rem;

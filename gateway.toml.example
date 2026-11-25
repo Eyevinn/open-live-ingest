@@ -104,6 +104,14 @@ keyframe_interval = 25          # frames; one or two seconds' worth
 [log]
 level = "info"
 
+# The desktop app only. It asks GitHub for the latest release
+# (https://api.github.com/repos/Eyevinn/open-live-ingest/releases/latest) when it
+# starts and once a day, and shows a line in the window when a newer one is out.
+# Nothing is downloaded. On by default; false makes no request at all. Release
+# 0.6.0 and older do not know [app] and refuse a file that has it.
+# [app]
+# check_for_updates = false
+
 # What to send. Without any [[input]], `up` sends every device except the virtual
 # ones. With them, `up` sends exactly these, one entry per input; `--devices`,
 # `--all` and `--test` pick for one run instead. The desktop app writes these.

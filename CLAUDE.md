@@ -28,6 +28,8 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
   to a live production. Pure.
 - `src/setup.rs`: interactive setup. Binary only: it prompts on the terminal.
 - `src/local_strom.rs`: adopt a running Strom, or start and later stop a headless one.
+- `src/update.rs`: whether a newer release is out (GitHub's latest release against this
+  version), for the desktop app's update check (`[app] check_for_updates`).
 - `app/`: the desktop app. `app/src/main.rs` and `window.rs` are the window (tao), the system
   webview (wry) and the macOS menu bar (muda); `app/src/lib.rs` is its window-free core: the `oli`
   custom protocol and its CSP, the navigation filter, the IPC dispatcher, and the model of each
