@@ -70,6 +70,7 @@ final class MediaMonitor {
         lock.lock()
         running = true
         generation += 1
+        let generation = self.generation
         rendering = false
         nextPicture = 0
         lock.unlock()
@@ -83,7 +84,9 @@ final class MediaMonitor {
             ticker.setEventHandler { [weak self] in self?.closeWindow(at: MediaMonitor.now()) }
             timer = ticker
             ticker.resume()
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                // Not if stopped (or started again) since: a `stop` on main may have cleared first.
+                guard let self, self.isCurrent(generation) else { return }
                 display.running = true
                 display.level = nil
                 display.silent = false
@@ -93,23 +96,30 @@ final class MediaMonitor {
         }
     }
 
-    /// Stops and clears the display.
+    /// Stops and clears the display: at once when called on main, else in main's next turn, not
+    /// behind a picture still being scaled on the monitor's queue. A level or picture already on
+    /// its way to main is dropped there (`isCurrent`).
     func stop() {
         lock.lock()
         running = false
         generation += 1
         lock.unlock()
-        let display = self.display
         queue.async { [self] in
             timer?.cancel()
             timer = nil
             pending = nil
-            DispatchQueue.main.async {
-                display.running = false
-                display.level = nil
-                display.silent = false
-                display.picture = nil
-            }
+        }
+        let display = self.display
+        let clear = {
+            display.running = false
+            display.level = nil
+            display.silent = false
+            display.picture = nil
+        }
+        if Thread.isMainThread {
+            clear()
+        } else {
+            DispatchQueue.main.async(execute: clear)
         }
     }
 
@@ -117,6 +127,13 @@ final class MediaMonitor {
         lock.lock()
         defer { lock.unlock() }
         return running
+    }
+
+    /// Whether the run that `generation` was read in still goes on (no `stop` or `start` since).
+    private func isCurrent(_ generation: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return running && self.generation == generation
     }
 
     /// A PCM buffer as it goes to the encoder (or the preview's): measured on the monitor's queue.
@@ -151,7 +168,11 @@ final class MediaMonitor {
             self.lock.unlock()
             guard current, let image else { return }
             let display = self.display
-            DispatchQueue.main.async { display.picture = image }
+            DispatchQueue.main.async { [weak self] in
+                // Not after a `stop` that cleared the display while this was on its way.
+                guard let self, display.running, self.isCurrent(generation) else { return }
+                display.picture = image
+            }
         }
     }
 
@@ -160,9 +181,12 @@ final class MediaMonitor {
         let level = pending
         pending = nil
         let silent = detector.update(peak: level?.peak, at: time)
+        lock.lock()
+        let generation = self.generation
+        lock.unlock()
         let display = self.display
-        DispatchQueue.main.async {
-            guard display.running else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, display.running, self.isCurrent(generation) else { return }
             display.level = level
             if display.silent != silent { display.silent = silent }
         }

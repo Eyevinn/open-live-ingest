@@ -182,8 +182,15 @@ final class LevelMeterTests: XCTestCase {
         XCTAssertNotNil(display.picture, "no picture reached the display")
         XCTAssertEqual(Double(display.picture?.width ?? 0), Double(MediaMonitor.pictureWidth), accuracy: 1)
 
+        // Stopped: the display clears (at once on main; waited for up to 2 s so a slow
+        // simulator render cannot fail it), and no level or picture already on its way lands
+        // after the clear (another picture interval and more).
         monitor.stop()
-        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        let cleared = Date().addingTimeInterval(2)
+        while Date() < cleared, display.running || display.level != nil || display.picture != nil {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        RunLoop.main.run(until: Date().addingTimeInterval(MediaMonitor.pictureInterval + 0.25))
         XCTAssertFalse(display.running)
         XCTAssertNil(display.level)
         XCTAssertNil(display.picture)

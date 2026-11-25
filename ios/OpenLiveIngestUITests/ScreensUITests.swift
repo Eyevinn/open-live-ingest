@@ -137,6 +137,11 @@ final class ScreensUITests: XCTestCase {
         wait(state, "label == %@", "Live", within: 60)
         wait(app.staticTexts["linkLine"], "label BEGINSWITH %@", "Link: connected", within: 60)
         shot("7 live again after the background")
+        // The picture being sent and the level come back with the uplink (#173): the monitor
+        // stopped with it in the background and starts again with it.
+        let resumed = liveMonitorProblem(app)
+        shot("7b live picture and level after the background")
+        XCTAssertNil(resumed, resumed.map { "after the background: \($0)" } ?? "")
         let go = app.buttons["goLive"]
         XCTAssertEqual(go.label, "Stop", "the session ended")
         let after = try control.call("GET", "/state")
