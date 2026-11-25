@@ -775,7 +775,7 @@ class PreviewCheck(unittest.TestCase):
         app, cpu, out = self.check([picture("starting"), level([-3.0]), picture()], [[PREVIEW], [PREVIEW], []])
         self.assertEqual([c for c, _ in app.sent], ["set_inputs", "preview", "preview"])
         self.assertEqual([a for _, a in app.sent][1:], [{"on": True}, {"on": False}])
-        self.assertEqual(cpu.measured, ["Step 2, preview flow running (the taps polled)", "Step 2, preview off (held Strom, no flow)"])
+        self.assertEqual(cpu.measured, ["Step 2, preview flow running (picture polled)", "Step 2, preview off (held Strom, no flow)"])
         self.assertIn(f"a JPEG of {len(JPEG)} bytes", out)
         self.assertIn("a level of -3.0 dBFS", out)
         self.assertIn("the preview flow is gone from Strom's GET /api/flows", out)
@@ -916,12 +916,12 @@ class CpuWindows(unittest.TestCase):
         cpu = self.cpu(sample)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            percent = cpu.measure("Live, uplink with the taps polled")
+            percent = cpu.measure("Live, uplink with the picture polled")
         self.assertAlmostEqual(percent, 3.0)
         self.assertEqual(set(pids), {4242})
         self.assertEqual(len(pids), 2, "without reading along, only at both ends (PowerShell)")
         self.assertGreaterEqual(cpu.figures[0]["wall"], 60)
-        self.assertIn("CPU (hosted runner): Live, uplink with the taps polled: 3.00 % of one core", out.getvalue())
+        self.assertIn("CPU (hosted runner): Live, uplink with the picture polled: 3.00 % of one core", out.getvalue())
 
     def test_ps_is_read_along_the_way_and_its_mean_logged(self):
         calls = []
@@ -932,7 +932,7 @@ class CpuWindows(unittest.TestCase):
 
         cpu = self.cpu(sample, read_along=True)
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            percent = cpu.measure("Step 2, preview flow running (the taps polled)")
+            percent = cpu.measure("Step 2, preview flow running (picture polled)")
         self.assertAlmostEqual(percent, 5.0)
         self.assertGreater(len(calls), 10)
         self.assertIn("mean of `ps -o %cpu` 4.00 %", out.getvalue())
@@ -968,14 +968,14 @@ class CpuWindows(unittest.TestCase):
         e2e.SUMMARY = summary
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            cpu.measure("Live, uplink with the taps polled")
+            cpu.measure("Live, uplink with the picture polled")
             cpu.taps = 0.5
             cpu.report()
         text = out.getvalue()
         self.assertIn("Strom CPU figures for #172 (GitHub-hosted runner figures, not real hardware)", text)
-        self.assertIn("Taps while live (polled minus not polled), per input: 0.50 % of one core (budget 5 %)", text)
+        self.assertIn("Polling the picture while live (polled minus not polled), per input: 0.50 % of one core (budget 5 %)", text)
         with open(summary, encoding="utf-8") as f:
-            self.assertIn("| Live, uplink with the taps polled | 2.00 |", f.read())
+            self.assertIn("| Live, uplink with the picture polled | 2.00 |", f.read())
 
     def test_no_figures_no_report(self):
         out = io.StringIO()
@@ -984,9 +984,16 @@ class CpuWindows(unittest.TestCase):
         self.assertEqual(out.getvalue(), "")
 
 
-class PausableApp(FakeApp):
-    def __init__(self, lines):
-        super().__init__(lines)
+class PausableApp(ScriptedApp):
+    """A ScriptedApp that can be suspended: `before` is what the app said before the
+    suspension (already on the reader's queue), `after` what it says once resumed;
+    `state` answers the `state` command."""
+
+    def __init__(self, before, after=(), state=None):
+        super().__init__([([], {"live": True} if state is None else state)])
+        for line in before:
+            self.lines.put(line)
+        self.after = list(after)
         self.states = []
 
     @contextlib.contextmanager
@@ -996,12 +1003,31 @@ class PausableApp(FakeApp):
             yield
         finally:
             self.states.append("resumed")
+            for line in self.after:
+                self.lines.put(line)
+
+
+SUSPENDED = "Live, uplink with the picture not polled (app suspended, 15 s after; meter still on)"
 
 
 class TapsCpu(unittest.TestCase):
-    def check(self, polled, not_polled):
-        app = PausableApp([row("live")])
-        cpu = FakeCpu([polled, not_polled])
+    def setUp(self):
+        self.clock = Clock()
+        self.saved = (e2e.time.monotonic, e2e.time.sleep)
+        e2e.time.monotonic, e2e.time.sleep = self.clock.monotonic, self.clock.sleep
+
+    def tearDown(self):
+        e2e.time.monotonic, e2e.time.sleep = self.saved
+
+    def check(self, polled, not_polled, before=(row("live"), level([-3.0])), after=(level([-4.0]),), state=None):
+        app = PausableApp(list(before), list(after), state)
+
+        class Timed(FakeCpu):
+            def measure(inner, what):
+                inner.at = getattr(inner, "at", []) + [self.clock.now]
+                return FakeCpu.measure(inner, what)
+
+        cpu = Timed([polled, not_polled])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             cost = e2e.taps_cpu_check(app, cpu, "gw — Test pattern", 0, "Late receiver")
@@ -1009,16 +1035,43 @@ class TapsCpu(unittest.TestCase):
 
     def test_within_budget_passes_and_the_app_is_suspended_only_for_the_second_window(self):
         app, cpu, cost, out = self.check(6.0, 4.5)
-        self.assertEqual(cpu.measured, ["Live, uplink with the taps polled", "Live, uplink with the taps not polled (app suspended)"])
+        self.assertEqual(cpu.measured, ["Live, uplink with the picture polled", SUSPENDED])
         self.assertEqual(app.states, ["suspended", "resumed"])
         self.assertEqual(cost, 1.5)
         self.assertEqual(cpu.taps, 1.5)
-        self.assertIn("PASS: Late receiver: the taps cost 1.50 % of one core per input", out)
+        self.assertIn("PASS: Late receiver: polling the picture costs 1.50 % of one core per input", out)
+        self.assertIn("PASS: Late receiver: after the app was suspended: the app runs again: a new level of -4.0 dBFS", out)
+        self.assertEqual(app.sent, [("state", None)])
+
+    def test_the_not_polled_window_starts_past_the_idle_timeout(self):
+        _, cpu, _, _ = self.check(6.0, 4.5)
+        self.assertGreaterEqual(e2e.TAP_IDLE_SETTLE, 10 + 5)
+        self.assertGreaterEqual(cpu.at[1] - cpu.at[0], e2e.TAP_IDLE_SETTLE)
 
     def test_over_budget_only_warns_with_the_numbers(self):
         _, cpu, cost, out = self.check(20.0, 4.0)
         self.assertEqual(cost, 16.0)
-        self.assertIn("::warning title=e2e app::Late receiver: the taps cost 16.00 % of one core per input", out)
+        self.assertIn("::warning title=e2e app::Late receiver: polling the picture costs 16.00 % of one core per input", out)
+
+    def test_only_what_was_said_before_the_suspension_fails(self):
+        # The `live` row and a loud level from before the suspension, nothing after.
+        with self.assertRaises(e2e.Failed) as caught:
+            self.check(6.0, 4.5, before=(row("live"), level([-3.0])), after=())
+        self.assertIn("after the app was suspended: no new level above -60 dBFS within 10 s of the resume", str(caught.exception))
+
+    def test_a_failed_row_after_the_resume_fails(self):
+        with self.assertRaises(e2e.Failed) as caught:
+            self.check(6.0, 4.5, after=(level([-4.0]), row("failed")))
+        self.assertIn("an input failed after the resume", str(caught.exception))
+
+    def test_a_failed_row_from_before_the_suspension_does_not_count(self):
+        _, _, cost, _ = self.check(6.0, 4.5, before=(row("failed"), row("live")), after=(level([-4.0]),))
+        self.assertEqual(cost, 1.5)
+
+    def test_not_live_after_the_resume_fails(self):
+        with self.assertRaises(e2e.Failed) as caught:
+            self.check(6.0, 4.5, state={"live": False})
+        self.assertIn("`state` after the resume says the app is not live", str(caught.exception))
 
     def test_a_failure_while_suspended_still_resumes_the_app(self):
         app = PausableApp([])
@@ -1032,6 +1085,44 @@ class TapsCpu(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(e2e.Failed):
             e2e.taps_cpu_check(app, Broken(), "gw — Test pattern", 0, "Late receiver")
         self.assertEqual(app.states, ["suspended", "resumed"])
+
+
+class RealPaused(unittest.TestCase):
+    """The real `App.paused`, with `suspend` faked: it suspends, then resumes whatever
+    happens in the block."""
+
+    def setUp(self):
+        self.calls = []
+        self.saved = e2e.suspend
+        e2e.suspend = lambda pid, stop: self.calls.append((pid, stop))
+        self.app = FakeApp([])
+        self.app.proc = type("Proc", (), {"pid": 4242})()
+
+    def tearDown(self):
+        e2e.suspend = self.saved
+
+    def test_it_suspends_then_resumes(self):
+        with self.app.paused():
+            self.assertEqual(self.calls, [(4242, True)])
+        self.assertEqual(self.calls, [(4242, True), (4242, False)])
+
+    def test_it_resumes_after_an_exception(self):
+        with self.assertRaises(e2e.Failed):
+            with self.app.paused():
+                e2e.fail("no Strom")
+        self.assertEqual(self.calls, [(4242, True), (4242, False)])
+
+    def test_a_suspend_that_fails_resumes_nothing(self):
+        def refuse(pid, stop):
+            self.calls.append((pid, stop))
+            if stop:
+                e2e.fail("could not open the app process")
+
+        e2e.suspend = refuse
+        with self.assertRaises(e2e.Failed):
+            with self.app.paused():
+                self.fail("the block ran with the app not suspended")
+        self.assertEqual(self.calls, [(4242, True)])
 
 
 if __name__ == "__main__":

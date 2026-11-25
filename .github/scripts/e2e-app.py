@@ -35,7 +35,7 @@ In order, each logged and written to the step summary:
      `active` the flow has to run within 5 s, with no preview flow next to it. The
      row's `preview` (a JPEG) and `level` (above -60 dBFS) then come from the uplink
      flow's taps within 30 s (OL-70e, #172 AC2). The uplink's SRT stats are checked
-     (below), then Strom's CPU with the taps polled and not (below), then the
+     (below), then Strom's CPU with the picture polled and not (below), then the
      production is deactivated: the flow goes within 15 s and the source is kept.
      The production stays, `ended` (or `inactive`), for step 5.
   4. `stop`: the page's `stopped` event, with no error and nothing left behind; the
@@ -62,14 +62,16 @@ to the login keychain (macOS) or the Credential Manager (Windows) of the user th
 runner runs as.
 
 Before step 2, with or without OSC_ACCESS_TOKEN, a `go_live` has to be refused (no
-Open Live address yet). Then, also with no secret, the preview in step 2 (OL-70e,
-docs/specs/desktop-app.md section 14.1; not in the late-listener part): with the test
-pattern ticked, `preview {on}` has to be answered with the preview available, then a
-`preview` event with a JPEG `image` has to come within 3 s of the reply and a `level`
-above -60 dBFS within 5 s (the test pattern carries a 1 kHz tone), and Strom has to
-run the preview flow; Strom's CPU is measured with it running; `preview {on: false}`
-has to remove the flow from Strom's `GET /api/flows` within 15 s, and Strom's CPU is
-measured again with no flow. Then the late-listener check runs with no secret (#112):
+Open Live address yet). The preview in step 2 (OL-70e, docs/specs/desktop-app.md
+section 14.1) runs once Where to send is done, as on screen (until then the app
+cannot save the test pattern's tick: `set_inputs` is refused), so with the secret and
+not in the late-listener part: with the test pattern ticked, `preview {on}` has to be
+answered with the preview available, then a `preview` event with a JPEG `image` has
+to come within 3 s of the reply and a `level` above -60 dBFS within 5 s (the test
+pattern carries a 1 kHz tone), and Strom has to run the preview flow; Strom's CPU is
+measured with it running; `preview {on: false}` has to remove the flow from Strom's
+`GET /api/flows` within 15 s, and Strom's CPU is measured again with no flow. With or
+without the secret, the late-listener check runs with no secret (#112):
   - `self_hosted` points the app at a stand-in Open Live on loopback (LocalOpenLive:
     the four source routes, server-info publishing Strom host 127.0.0.1 and one free
     SRT port, and `GET /api/v1/productions` listing the productions the run puts
@@ -114,10 +116,16 @@ settings file, over windows of E2E_CPU_SECONDS (default 60, never under 60): on 
 `ps -o time= -o %cpu=` (CPU seconds at both ends of the window, the figure, and the
 mean of `%cpu` every 5 s alongside), on Windows the CPU seconds PowerShell's
 `Get-Process` gives at both ends. Figures are in % of one core. While live, two
-windows on the uplink: the taps polled (the app running; with no window, it counts
-as visible) and the taps not polled (the app process suspended, SIGSTOP or
-NtSuspendProcess, so it asks Strom for no picture; resumed after, and its row has to
-be connecting or live again). Their difference per input (one, the test pattern) has
+windows on the uplink: the picture polled (the app running; with no window, it
+counts as visible) and not polled (the app process suspended, SIGSTOP or
+NtSuspendProcess, so it asks Strom for no picture, as with its window minimised).
+The not-polled window starts only TAP_IDLE_SETTLE (15) s into the suspension, past
+Strom's 10 s idle timeout after which the thumbnail tap detaches (spec section 5.2).
+The meter and the pass-through tee still run and Strom still pushes MeterData over
+`/api/ws` while not polled, so the difference is the cost of polling the picture,
+not taps against `Taps::Off`. Once resumed, the app has to say something new: a
+`level` above -60 dBFS within 10 s, no failed row, and a `state` round-trip that
+says it is live. The difference per input (one, the test pattern) has
 a budget of 5 % of one core (spec section 5.2); over it is a `::warning::` with the
 numbers, not a failure, since question 27 makes it the cue for a follow-up and a
 hosted runner is noisy. Every figure is logged as measured, and all of them again at
@@ -230,10 +238,17 @@ LIVE_PREVIEW_WITHIN = 30
 # The start of every JPEG.
 JPEG_MARKER = b"\xff\xd8\xff"
 # Strom's CPU is measured over windows of E2E_CPU_SECONDS (default and floor 60, the
-# spec's "60 s each"). The taps' budget: Strom's CPU with the taps polled minus
+# spec's "60 s each"). The polling budget: Strom's CPU with the picture polled minus
 # without, in % of one core per input while live (docs/specs/desktop-app.md 5.2).
 MIN_CPU_SECONDS = 60
 TAPS_CPU_BUDGET = 5.0
+# The not-polled window starts this many seconds into the suspension: the thumbnail
+# tap detaches only after Strom's 10 s idle timeout (spec section 5.2), so a window
+# started at once would still pay for it.
+TAP_IDLE_SETTLE = 15
+# Once resumed, the app has to report a level above SOUND_ABOVE_DB within this many
+# seconds: new output proves it runs and reads the meter again.
+RESUMED_WITHIN = 10
 # How often the CPU is read inside a window where reading it is cheap (`ps`).
 CPU_SAMPLE_EVERY = 5
 # The inputs the run sends: the test pattern only.
@@ -384,7 +399,7 @@ class App:
     @contextlib.contextmanager
     def paused(self):
         """The app process suspended for the block, and resumed after it whatever
-        happens: it asks Strom for no picture meanwhile (the taps not polled)."""
+        happens: it asks Strom for no picture meanwhile (the picture not polled)."""
         suspend(self.proc.pid, True)
         try:
             yield
@@ -1213,7 +1228,7 @@ def preview_check(app, strom, source_name, cpu):
         f"{picture_at - answered_at:.1f} s later (at most {PICTURE_WITHIN} s) and a level of {loudest(level, TEST_PATTERN):.1f} dBFS "
         f"{level_at - answered_at:.1f} s later (above {SOUND_ABOVE_DB:g} dBFS, at most {LEVEL_WITHIN} s), from preview flow {flow.get('id')}"
     )
-    cpu.measure("Step 2, preview flow running (the taps polled)")
+    cpu.measure("Step 2, preview flow running (picture polled)")
     app.ok("preview", {"on": False})
     off_at = time.monotonic()
     strom.wait_flow_gone(name, FLOW_GONE_TIMEOUT, f"{step}: preview off", after="`preview {on: false}`")
@@ -1273,11 +1288,12 @@ def share(first, last):
 
 
 def taps_verdict(polled, not_polled, inputs=INPUTS, budget=TAPS_CPU_BUDGET):
-    """(the taps' cost in % of one core per input, None or what is over budget)."""
+    """(the cost of polling the picture in % of one core per input, None or what is
+    over budget)."""
     per_input = (polled - not_polled) / inputs
     if per_input > budget:
         return per_input, (
-            f"the taps cost {per_input:.2f} % of one core per input while live ({polled:.2f} % polled minus "
+            f"polling the picture costs {per_input:.2f} % of one core per input while live ({polled:.2f} % polled minus "
             f"{not_polled:.2f} % not polled, {inputs} input(s)), over the {budget:g} % budget"
         )
     return per_input, None
@@ -1423,33 +1439,70 @@ class Cpu:
             print(f"==>   {self.line(figure)}", flush=True)
             record(f"| {figure['what']} | {figure['percent']:.2f} | {figure['cpu']:.2f} | {figure['wall']:.1f} |")
         if self.taps is not None:
-            text = f"Taps while live (polled minus not polled), per input: {self.taps:.2f} % of one core (budget {TAPS_CPU_BUDGET:g} %)"
+            text = (
+                f"Polling the picture while live (polled minus not polled), per input: {self.taps:.2f} % of one core "
+                f"(budget {TAPS_CPU_BUDGET:g} %). Not polled is the minimised-window state: the meter and the "
+                "pass-through tee still run and Strom still pushes MeterData, so this is the polling cost, "
+                "not taps against Taps::Off"
+            )
             print(f"==>   {text}", flush=True)
             record("")
             record(f"- {text}")
 
 
 def taps_cpu_check(app, cpu, source_name, since, step):
-    """Strom's CPU while live, with the taps polled (the app running, its window
-    counted visible) and without (the app suspended, so it asks for no picture and
-    reads no level), each over one window; their difference per input against the
-    budget. Over budget is a warning with the numbers, not a failure: the spec
-    (question 27) makes it a follow-up's cue, and hosted runners are noisy. The row
-    has to be connecting or live again once the app runs again. Returns the cost."""
-    polled = cpu.measure("Live, uplink with the taps polled")
+    """Strom's CPU while live, with the picture polled (the app running, its window
+    counted visible) and not (the app suspended, as with its window minimised: it
+    asks for no picture), each over one window; their difference per input against
+    the budget. The not-polled window starts TAP_IDLE_SETTLE s into the suspension,
+    once Strom's idle timeout has detached the thumbnail tap. The meter and the
+    pass-through tee run in both windows, so the difference is the polling cost, not
+    taps against `Taps::Off`. Over budget is a warning with the numbers, not a
+    failure: the spec (question 27) makes it a follow-up's cue, and hosted runners are
+    noisy. Once resumed, the app has to say something new (`resumed_check`). Returns
+    the cost."""
+    polled = cpu.measure("Live, uplink with the picture polled")
     with app.paused():
-        not_polled = cpu.measure("Live, uplink with the taps not polled (app suspended)")
-    app.wait_row(source_name, ("connecting", "live"), since, f"{step}: after the app was suspended")
+        time.sleep(TAP_IDLE_SETTLE)
+        not_polled = cpu.measure(
+            f"Live, uplink with the picture not polled (app suspended, {TAP_IDLE_SETTLE} s after; meter still on)"
+        )
+        # Everything the app said before it was stopped has reached the reader by
+        # now: read it, so that what comes after the mark was said after the resume.
+        app.drain()
+        mark = len(app.seen)
+    resumed_check(app, source_name, mark, f"{step}: after the app was suspended")
     per_input, over = taps_verdict(polled, not_polled)
     cpu.taps = per_input
     if over:
         warn(f"{step}: {over}. Hosted-runner figures; spec question 27 decides a follow-up")
     else:
         passed(
-            f"{step}: the taps cost {per_input:.2f} % of one core per input while live ({polled:.2f} % polled minus "
-            f"{not_polled:.2f} % not polled; budget {TAPS_CPU_BUDGET:g} %, hosted-runner figures)"
+            f"{step}: polling the picture costs {per_input:.2f} % of one core per input while live ({polled:.2f} % polled "
+            f"minus {not_polled:.2f} % not polled, meter on in both; budget {TAPS_CPU_BUDGET:g} %, hosted-runner figures)"
         )
     return per_input
+
+
+def resumed_check(app, source_name, mark, step):
+    """After the suspension, from what the app says since line `mark` only (nothing
+    from before it counts): a `level` above SOUND_ABOVE_DB within RESUMED_WITHIN s,
+    so it runs and reads the meter again; no failed row; and a `state` round-trip
+    that says it is still live."""
+    try:
+        level = app.event_since("level", mark, RESUMED_WITHIN, has_sound(TEST_PATTERN))
+    except Failed as err:
+        fail(f"{step}: no new level above {SOUND_ABOVE_DB:g} dBFS within {RESUMED_WITHIN} s of the resume ({err})")
+    failed = app.failed_rows(mark)
+    if failed:
+        fail(f"{step}: an input failed after the resume: {failed}")
+    state = app.ok("state")
+    if not (state or {}).get("live"):
+        fail(f"{step}: `state` after the resume says the app is not live: {state}")
+    passed(
+        f"{step}: the app runs again: a new level of {loudest(level, TEST_PATTERN):.1f} dBFS for '{source_name}', "
+        "no failed row, and `state` says it is live"
+    )
 
 
 # --- settings --------------------------------------------------------------------------
@@ -1616,7 +1669,7 @@ def late_receiver_check(app, open_live, strom, source, source_name, live_at, gat
     listener comes up late; the session sends nothing while it activates and starts
     the flow once it is active; the uplink's SRT stats are checked; the production is
     deactivated, the flow goes and the source is kept. While it is live (OL-70e): the
-    row's picture and level from the uplink flow, and Strom's CPU with the taps
+    row's picture and level from the uplink flow, and Strom's CPU with the picture
     polled and not (`taps_cpu_check`). Returns the production id (it stays, inactive,
     for Go live again) and the flow."""
     step = "Late receiver (openlivedev)"
@@ -1690,11 +1743,6 @@ def run(exe, work):
             fail("`go_live` with no Open Live address was not refused")
         passed(f"`go_live` with no Open Live address is refused: {reply['error'].get('message')}")
 
-        # The preview in step 2 needs no secret (OL-70e); the late-listener job
-        # leaves it to the jobs that run it.
-        if which != "late-listener":
-            preview_check(app, strom, source_name, cpu)
-
         # With or without the secret: the late-listener check needs none (#112).
         if which != "openlivedev":
             late_listener_check(app, strom, gateway_name, source_name, work)
@@ -1730,7 +1778,10 @@ def run(exe, work):
         if not where.get("where", {}).get("ready"):
             fail(f"Where to send is not done after `choose_instance`: {where.get('where', {}).get('problem')}")
         passed(f"Where to send: token pasted, instance '{instance}' chosen ({where['where'].get('summary')})")
-        tick_the_test_pattern(app)
+        # Step 2 comes after Where to send, as on screen: until it is done the app
+        # cannot save the settings, so `set_inputs` is refused ("open_live.register
+        # is on but open_live.url is unset"). preview_check ticks the test pattern.
+        preview_check(app, strom, source_name, cpu)
 
         open_live = OpenLive(url, pat)
         for production in open_live.all_productions():
