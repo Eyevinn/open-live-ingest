@@ -1,40 +1,107 @@
 import AVFoundation
 import SwiftUI
 
-/// The picked lens's live picture behind step 2's controls (docs/specs/ios-app.md, section 5): an
-/// `AVCaptureVideoPreviewLayer` over a capture session of its own, which runs only while step 2
-/// is on screen. The picture is always shown as it is sent, 16:9 landscape: full screen with the
-/// phone turned, and in portrait the landscape crop in a 16:9 box with a "Turn the phone" hint.
-final class PreviewSession {
+/// The picked lens's live picture behind step 2's controls, and the picked microphone's level
+/// (docs/specs/ios-app.md, section 5): an `AVCaptureVideoPreviewLayer` over a capture session of
+/// its own, with the microphone's PCM into a `MediaMonitor` for the level bar and the no-sound
+/// warning. It runs only while step 2 is on screen and the app is in the foreground. The picture
+/// is always shown as it is sent, 16:9 landscape: full screen with the phone turned, and in
+/// portrait the landscape crop in a 16:9 box with a "Turn the phone" hint.
+final class PreviewSession: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
+    /// The level bar's and the warning's.
+    let display: MonitorDisplay
+    private let monitor: MediaMonitor
+    private let audioOutput = AVCaptureAudioDataOutput()
     private let queue = DispatchQueue(label: "com.eyevinn.open-live-ingest.preview")
-    private var lensID: String?
+    private let audioQueue = DispatchQueue(label: "com.eyevinn.open-live-ingest.preview.audio")
+    /// What is shown: the lens, the microphone and whether with sound.
+    private var shown: String?
 
-    /// Shows `lens`; nothing for the test pattern or a lens that is not there.
-    func show(_ lens: Lens?) {
-        guard lens?.id != lensID else { return }
-        lensID = lens?.id
-        let session = self.session
+    override init() {
+        let display = MonitorDisplay()
+        self.display = display
+        monitor = MediaMonitor(display: display, pictures: false)
+        super.init()
+        audioOutput.setSampleBufferDelegate(self, queue: audioQueue)
+    }
+
+    /// Shows `lens`, with the level of `microphoneUID` (the default route when nil) when `sound`;
+    /// nothing for the test pattern or a lens that is not there.
+    func show(_ lens: Lens?, microphone microphoneUID: String?, sound: Bool) {
+        let key = lens.map { "\($0.id)|\(microphoneUID ?? "")|\(sound)" }
+        guard key != shown else { return }
+        shown = key
         let device = lens.flatMap { AVCaptureDevice(uniqueID: $0.id) }
+        let withSound: Bool
+        if device != nil, sound {
+            do {
+                try Capture.routeMicrophone(microphoneUID)
+                withSound = true
+            } catch {
+                AppLog.warning("preview: the microphone could not be routed, no level shown")
+                withSound = false
+            }
+        } else {
+            withSound = false
+        }
+        let session = self.session
+        let audioOutput = self.audioOutput
         queue.async {
             session.beginConfiguration()
+            // The app's audio session (Capture.routeMicrophone) decides the input.
+            session.automaticallyConfiguresApplicationAudioSession = false
             for input in session.inputs { session.removeInput(input) }
             if let device, let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
                 session.addInput(input)
+            }
+            let hasOutput = session.outputs.contains { $0 === audioOutput }
+            if withSound, let microphone = AVCaptureDevice.default(for: .audio),
+                let input = try? AVCaptureDeviceInput(device: microphone), session.canAddInput(input)
+            {
+                session.addInput(input)
+                if !hasOutput, session.canAddOutput(audioOutput) { session.addOutput(audioOutput) }
+            } else if hasOutput {
+                session.removeOutput(audioOutput)
             }
             session.commitConfiguration()
             if device != nil, !session.isRunning { session.startRunning() }
             if device == nil, session.isRunning { session.stopRunning() }
         }
+        if withSound {
+            monitor.start(microphone: Capture.microphoneName())
+        } else {
+            monitor.stop()
+        }
+    }
+
+    /// `body` on the main thread with whether the microphone may be used, asking first if it was
+    /// never asked. Without it step 2 shows the picture and no level bar.
+    static func microphoneAllowed(_ body: @escaping (Bool) -> Void) {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            body(true)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { granted in
+                DispatchQueue.main.async { body(granted) }
+            }
+        default:
+            body(false)
+        }
     }
 
     func stop() {
-        lensID = nil
+        shown = nil
+        monitor.stop()
         let session = self.session
         queue.async {
             if session.isRunning { session.stopRunning() }
             for input in session.inputs { session.removeInput(input) }
         }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if let pcm = Capture.pcmBuffer(sampleBuffer) { monitor.audio(pcm) }
     }
 }
 

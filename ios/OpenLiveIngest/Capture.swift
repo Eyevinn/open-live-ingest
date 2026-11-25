@@ -60,7 +60,7 @@ final class Capture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVC
         self.onVideo = onVideo
         self.onAudio = onAudio
         let camera = try pickCamera()
-        try routeMicrophone()
+        try Self.routeMicrophone(microphoneUID)
         try configure(camera)
         let session = self.session
         sessionQueue.async { session.startRunning() }
@@ -139,7 +139,10 @@ final class Capture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVC
         return device
     }
 
-    private func routeMicrophone() throws {
+    /// The app's audio session set up for recording, its input the microphone with
+    /// `AVAudioSessionPortDescription.uid` `microphoneUID` (the default route when nil or not
+    /// there). Capture and step 2's preview (`PreviewSession`) both take the picked microphone so.
+    static func routeMicrophone(_ microphoneUID: String?) throws {
         let audioSession = AVAudioSession.sharedInstance()
         do {
             try audioSession.setCategory(.playAndRecord, mode: .videoRecording, options: [.allowBluetoothHFP, .mixWithOthers])
@@ -153,6 +156,12 @@ final class Capture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVC
         } catch {
             throw CaptureError.audioSession(error.localizedDescription)
         }
+    }
+
+    /// The name of the microphone the audio session records from now (its port name), for the
+    /// no-sound warning.
+    static func microphoneName() -> String {
+        AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? "the microphone"
     }
 
     /// The camera's frame rate, when its active format offers it.
@@ -210,7 +219,8 @@ final class Capture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate, AVC
         }
     }
 
-    private static func pcmBuffer(_ sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
+    /// The PCM of a capture sample buffer, copied out of it.
+    static func pcmBuffer(_ sampleBuffer: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let description = CMSampleBufferGetFormatDescription(sampleBuffer) else { return nil }
         let format = AVAudioFormat(cmAudioFormatDescription: description)
         let frames = CMSampleBufferGetNumSamples(sampleBuffer)

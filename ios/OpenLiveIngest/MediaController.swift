@@ -56,10 +56,16 @@ final class MediaController {
     private var timer: Timer?
 
     /// `report` sends a `media_report`; `factory` makes an input's media (a `MediaSession` unless a
-    /// test says otherwise).
-    init(report: @escaping (MediaReport) -> Void, factory: Factory? = nil) {
+    /// test says otherwise), whose pictures and sound go to `monitor` too (step 3's picture and
+    /// level bar, section 5).
+    init(report: @escaping (MediaReport) -> Void, factory: Factory? = nil, monitor: MediaMonitor? = nil) {
+        let session: Factory = { start in
+            let media = try MediaSession(start)
+            media.monitor = monitor
+            return media
+        }
         self.report = report
-        self.factory = factory ?? { try MediaSession($0) }
+        self.factory = factory ?? session
     }
 
     /// The inputs whose media runs.

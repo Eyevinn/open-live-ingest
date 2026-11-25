@@ -45,6 +45,9 @@
 		0C000000000000000000012E /* FakeControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022E /* FakeControl.swift */; };
 		0C000000000000000000012F /* FakeControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C000000000000000000022E /* FakeControl.swift */; };
 		0C0000000000000000000130 /* OpenLiveDevE2EUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000230 /* OpenLiveDevE2EUITests.swift */; };
+		0C0000000000000000000131 /* LevelMeter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000231 /* LevelMeter.swift */; };
+		0C0000000000000000000132 /* MediaMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000232 /* MediaMonitor.swift */; };
+		0C0000000000000000000133 /* LevelMeterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C0000000000000000000233 /* LevelMeterTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -105,6 +108,9 @@
 		0C000000000000000000022D /* PhoneTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneTests.swift; sourceTree = "<group>"; };
 		0C000000000000000000022E /* FakeControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FakeControl.swift; sourceTree = "<group>"; };
 		0C0000000000000000000230 /* OpenLiveDevE2EUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenLiveDevE2EUITests.swift; sourceTree = "<group>"; };
+		0C0000000000000000000231 /* LevelMeter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LevelMeter.swift; sourceTree = "<group>"; };
+		0C0000000000000000000232 /* MediaMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaMonitor.swift; sourceTree = "<group>"; };
+		0C0000000000000000000233 /* LevelMeterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LevelMeterTests.swift; sourceTree = "<group>"; };
 		0C000000000000000000022A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -172,6 +178,8 @@
 				0C0000000000000000000224 /* SignInSheet.swift */,
 				0C000000000000000000022B /* Phone.swift */,
 				0C000000000000000000022C /* PhoneObserver.swift */,
+				0C0000000000000000000231 /* LevelMeter.swift */,
+				0C0000000000000000000232 /* MediaMonitor.swift */,
 				0C000000000000000000022A /* Info.plist */,
 			);
 			path = OpenLiveIngest;
@@ -188,6 +196,7 @@
 				0C0000000000000000000227 /* AppInfoTests.swift */,
 				0C0000000000000000000228 /* StatusTextTests.swift */,
 				0C000000000000000000022D /* PhoneTests.swift */,
+				0C0000000000000000000233 /* LevelMeterTests.swift */,
 			);
 			path = OpenLiveIngestTests;
 			sourceTree = "<group>";
@@ -370,6 +379,8 @@
 				0C0000000000000000000124 /* SignInSheet.swift in Sources */,
 				0C000000000000000000012B /* Phone.swift in Sources */,
 				0C000000000000000000012C /* PhoneObserver.swift in Sources */,
+				0C0000000000000000000131 /* LevelMeter.swift in Sources */,
+				0C0000000000000000000132 /* MediaMonitor.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -386,6 +397,7 @@
 				0C0000000000000000000128 /* StatusTextTests.swift in Sources */,
 				0C000000000000000000012D /* PhoneTests.swift in Sources */,
 				0C000000000000000000012F /* FakeControl.swift in Sources */,
+				0C0000000000000000000133 /* LevelMeterTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -3,6 +3,8 @@
 **Epic**: #133 (OL-64)
 **Status**: Accepted
 **Date**: 2026-11-22
+**Amended**: 2026-11-25, #173 (OL-71): the sound level in steps 2 and 3, the picture being sent in
+step 3, and the no-sound warning (§5, "Level and picture")
 **Decision record**: [ADR-002](../decisions/ADR-002-ios-app-toolkit.md) (the library on iOS, the
 Swift binding, and the media and SRT stack on the phone)
 **Model**: [`desktop-app.md`](desktop-app.md) (#62) and
@@ -198,12 +200,45 @@ room for all three at once.
    `AVCaptureDevice.DiscoverySession` reports on this phone) and the microphone (built-in, wired
    or Bluetooth headset, USB-C: `AVAudioSession.availableInputs`), and the label. The Studio name
    is `<gateway.name> — <label>`, only the label editable (§6.1). A live camera preview
-   (`AVCaptureVideoPreviewLayer`, part of the OS) fills the screen behind the controls.
+   (`AVCaptureVideoPreviewLayer`, part of the OS) fills the screen behind the controls, and a level
+   bar for the picked microphone sits under its picker ("Level and picture" below).
 3. **Go live / Stop.** One button. The state line as the desktop's per-input states (`Armed`,
    `Waiting for production`, `Connecting`, `Live`, `Failed: <reason>`, `Stopping`), and under it
    the desktop §5.1 status lines: `Production: Morning Show (active), slot video_in_1` and
    `Link: connected, 0.2 % dropped, RTT 31 ms`, plus the network (`Wi-Fi` / `Cellular`) and the
-   bitrate. A banner carries session-wide notices (Open Live unreachable, sign-in ending).
+   bitrate. While the uplink runs, the picture being sent (192×108 pt) and its level bar sit under
+   the status lines; Armed or Waiting for production shows neither (the camera is off). A banner
+   carries session-wide notices (Open Live unreachable, sign-in ending).
+
+**Level and picture (#173, OL-71).** The numbers are the desktop app's (desktop-app.md §5.2):
+
+- **Level.** `AudioLevel` (`LevelMeter.swift`): per 250 ms window, the highest channel's sample
+  peak and RMS in dBFS, clamped to -90…0 (digital silence is -90), shown at 4 Hz as a bar from -60
+  to 0 dBFS (the peak, with the RMS as a darker inner bar). Its accessibility value is the level
+  (`-20.0 dBFS peak, -23.0 dBFS RMS`), id `levelBar`. The test pattern's 1 kHz tone at -20 dBFS
+  reads -20 peak and -23 RMS.
+- **No sound.** `SilenceDetector`, a pure function of the windows and a clock: silent when every
+  window's peak is below -60 dBFS, or no sound arrived at all, for 5 s; cleared at the first window
+  whose peak reaches -54 dBFS (6 dB of hysteresis). The clock starts when the source runs. Silent
+  shows "No sound from `<microphone>`." under the bar (id `noSoundWarning`), the microphone named by
+  the audio route's port name (`AVAudioSession.currentRoute`). A muted microphone warns within
+  5.25 s, inside #173 AC3's 10 s.
+- **Step 2.** `PreviewSession` routes the audio session to the picked microphone as capture does
+  (`Capture.routeMicrophone`, shared) and adds the microphone and an `AVCaptureAudioDataOutput` to
+  its own capture session; its PCM feeds a `MediaMonitor` for the bar. It asks for the microphone
+  permission the first time; without it the picture shows and the bar does not. Nothing for the
+  test pattern (the simulator): step 2's level is checked on a real phone.
+- **Step 3.** iOS allows one ordinary capture session on the camera, so the picture comes from the
+  capture that feeds the encoder: `MediaSession.run()` hands the same pixel and PCM buffers it gives
+  `MediaPipeline` (camera or test pattern), after it, to `MediaMonitor`. The tap never blocks or
+  copies in the encode path: it checks a flag under a lock and hands the retained buffer to the
+  monitor's own queue, which measures the level and scales a picture to 320 px wide (Core Image)
+  about twice a second, skipping one while the last is still being made. The picture (id
+  `livePreview`, value `showing` once a frame arrived) is what goes out; the sent stream is
+  unchanged.
+- **Background.** Both run only while their source does: step 2's preview stops when the screen
+  goes and when the app goes to the background (and comes back with it if step 2 is still shown);
+  step 3's monitor starts and stops with `MediaSession`, which the background pause (§9) stops.
 
 **Advanced** (collapsed): venue name (`gateway.name`), uplink latency, passphrase and key length,
 video bitrate, resolution and frame rate, log level. The values are the library's `Config` fields;

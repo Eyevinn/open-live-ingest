@@ -2,7 +2,9 @@ import SwiftUI
 
 /// Step 3, "Go live / Stop" (docs/specs/ios-app.md, section 5): one button; the state line; the
 /// status lines (the production holding the source and its slot, the link, through an SRT relay
-/// the relay and its dial-in address, the network and the bitrate); a banner for session-wide notices; and Advanced, collapsed.
+/// the relay and its dial-in address, the network and the bitrate); while the uplink runs, the
+/// picture being sent and its level bar, with the no-sound warning; a banner for session-wide
+/// notices; and Advanced, collapsed.
 struct GoLiveView: View {
     @ObservedObject var model: AppModel
     @State private var showAdvanced = false
@@ -56,6 +58,8 @@ struct GoLiveView: View {
                             .accessibilityIdentifier("networkLine")
                     }
                     .font(.callout.monospacedDigit())
+                    // What goes out, once the uplink runs: nothing while armed (the camera is off).
+                    LiveMonitorView(display: model.liveMonitor)
                 }
                 if let stopping = model.stopping {
                     Text("Stopping: \(stopping.done) of \(stopping.total)")

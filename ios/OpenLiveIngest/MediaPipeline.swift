@@ -106,9 +106,14 @@ final class MediaPipeline {
 /// microphone (or the test pattern), encode and mux, and the SRT caller (docs/specs/ios-app.md,
 /// section 8.2; ADR-002 section 3). `stop()` ends all of it. Chunks are sent off the muxer's lock
 /// on a queue of their own; while the caller is not connected they are dropped.
+///
+/// `monitor`, when set, is handed the same pixel and PCM buffers as the encoders, after them, so
+/// step 3 shows the picture and the level of what goes out (section 5); it starts and stops with
+/// the session.
 final class MediaSession {
     let start: MediaStart
     let sender: SRTSender
+    var monitor: MediaMonitor?
     private let pipeline: MediaPipeline
     private let sendQueue: DispatchQueue
     private let mediaQueue = DispatchQueue(label: "com.eyevinn.open-live-ingest.media")
@@ -131,16 +136,25 @@ final class MediaSession {
     func run() throws {
         sender.start()
         let pipeline = self.pipeline
+        let monitor = self.monitor
+        let video: (CVPixelBuffer, CMTime) -> Void = { buffer, time in
+            pipeline.appendVideo(buffer, time: time)
+            monitor?.video(buffer)
+        }
+        let audio: (AVAudioPCMBuffer, CMTime) -> Void = { buffer, time in
+            pipeline.appendAudio(buffer, time: time)
+            monitor?.audio(buffer)
+        }
         if start.usesTestPattern || !Capture.hasCamera {
             let pattern = try TestPatternSource(video: start.video, audio: start.audio)
-            pattern.start(
-                queue: mediaQueue, video: { pipeline.appendVideo($0, time: $1) },
-                audio: { pipeline.appendAudio($0, time: $1) })
+            monitor?.start(microphone: Devices.testPattern.name)
+            pattern.start(queue: mediaQueue, video: video, audio: audio)
             self.pattern = pattern
         } else {
             let capture = Capture(cameraID: start.device, microphoneUID: start.microphone, video: start.video)
-            try capture.start(video: { pipeline.appendVideo($0, time: $1) }, audio: { pipeline.appendAudio($0, time: $1) })
+            try capture.start(video: video, audio: audio)
             self.capture = capture
+            monitor?.start(microphone: Capture.microphoneName())
         }
     }
 
@@ -149,6 +163,7 @@ final class MediaSession {
         pattern = nil
         capture?.stop()
         capture = nil
+        monitor?.stop()
         sender.stop()
     }
 }
