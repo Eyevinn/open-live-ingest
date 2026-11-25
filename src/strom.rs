@@ -13,12 +13,13 @@ use strom_types::api::{
     SystemInfo,
 };
 use strom_types::discovery::DeviceResponse;
-use strom_types::{Flow, PropertyValue};
 
 /// Strom's types a caller of this client handles without depending on `strom-types`
-/// itself: a flow's id, and the uplink peer [`StromClient::srt_uplink`] answers with.
+/// itself: a flow and its id, an element property's value
+/// ([`StromClient::element_properties`]), and the uplink peer
+/// [`StromClient::srt_uplink`] answers with.
 pub use strom_types::api::SrtCallerStats;
-pub use strom_types::FlowId;
+pub use strom_types::{Flow, FlowId, PropertyValue};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 

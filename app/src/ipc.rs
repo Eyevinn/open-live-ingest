@@ -13,13 +13,14 @@
 
 use crate::go_live::{self, GoLive};
 use crate::logs;
-use crate::messages::Message;
+use crate::messages::{self, Context, Message};
 use crate::quit::{Exit, QuitGuard, QuitHandle};
 use crate::relay;
 use crate::what_to_send::{self, DeviceSource};
 use crate::where_to_send::{Opener, WhereToSend, WhereView};
 use open_live_ingest::api::{self, Devices, OscCredential, SaveError};
 use open_live_ingest::keychain::OsKeychain;
+use open_live_ingest::strom::StromClient;
 use open_live_ingest::update::{self, Version};
 use open_live_ingest::{local_strom, osc};
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,11 @@ pub enum Command {
     SetInputs {
         inputs: Vec<InputArgs>,
     },
+    /// The page shows step 2 (`on: true`) or stops showing it: the preview runs only
+    /// while it does (section 5.2).
+    Preview {
+        on: bool,
+    },
     SetAdvanced(AdvancedArgs),
     /// The SRT relays Open Live reports, for the picker under Advanced (OL-66).
     Relays,
@@ -164,6 +170,7 @@ impl Command {
             Command::SetInputs { .. } => "set_inputs",
             Command::SetAdvanced(_) => "set_advanced",
             Command::Relays => "relays",
+            Command::Preview { .. } => "preview",
             Command::GoLive => "go_live",
             Command::Stop => "stop",
             Command::StopOther => "stop_other",
@@ -300,6 +307,8 @@ const NO_SETTINGS: &str = "The settings file could not be read, so the Strom log
 const NO_DEVICE_LIST: &str =
     "Could not get the list of cameras from the video engine. Show logs for details.";
 const NOT_SAVED: &str = "Could not save the settings. Show logs for details.";
+const NO_SETTINGS_FOR_PREVIEW: &str =
+    "The settings file could not be read, so there is no preview. Show logs for details.";
 const STILL_STOPPING: &str =
     "Still stopping the live inputs. Quit anyway is offered if it takes long.";
 
@@ -339,7 +348,9 @@ pub struct Core {
     runtime: tokio::runtime::Runtime,
     app_log: Option<PathBuf>,
     reveal: Reveal,
-    device_source: Arc<dyn DeviceSource>,
+    /// Where the device list comes from: a fake in tests; otherwise the Strom the
+    /// preview holds, which keeps running for the preview and Go live (section 4.1).
+    device_source: Option<Arc<dyn DeviceSource>>,
     /// The last device list Strom gave, for the rows and the names in messages.
     listed: Arc<Mutex<Option<Devices>>>,
     /// Whether the What to send step lists virtual devices.
@@ -395,6 +406,10 @@ impl Core {
             Arc::new(OsKeychain::default()),
             Arc::new(go_live::System),
         );
+        let listed: Arc<Mutex<Option<Devices>>> = Arc::default();
+        go_live
+            .preview()
+            .attach(deliver.clone(), runtime.handle(), listed.clone());
         Core {
             settings_file,
             where_to_send: Arc::new(where_to_send),
@@ -403,8 +418,8 @@ impl Core {
             runtime,
             app_log: logs::default_path(),
             reveal: Arc::new(logs::reveal),
-            device_source: Arc::new(what_to_send::Strom),
-            listed: Arc::default(),
+            device_source: None,
+            listed,
             show_all: false,
             quit: Arc::default(),
             exit: Arc::new(|| tracing::warn!("asked to quit with no window to close")),
@@ -446,8 +461,19 @@ impl Core {
 
     /// The core with step 3 of the caller's: fakes, in tests.
     pub fn with_go_live(mut self, go_live: GoLive) -> Self {
+        go_live.preview().attach(
+            self.deliver.clone(),
+            self.runtime.handle(),
+            self.listed.clone(),
+        );
         self.go_live = Arc::new(go_live);
         self
+    }
+
+    /// The window was minimised (`false`) or shown again: no preview flow runs and no
+    /// picture is asked for while it is hidden (section 5.2).
+    pub fn set_window_visible(&self, visible: bool) {
+        self.go_live.preview().set_visible(visible);
     }
 
     /// Going live, live or stopping.
@@ -486,7 +512,7 @@ impl Core {
 
     /// Lists devices from `source` instead of the local Strom.
     pub fn with_device_source(mut self, source: Arc<dyn DeviceSource>) -> Self {
-        self.device_source = source;
+        self.device_source = Some(source);
         self
     }
 
@@ -676,6 +702,10 @@ impl Core {
                 None => Some((Reply::error(id, NOT_YET), Effect::None)),
             },
             Command::Devices { show_all } => self.devices(id, show_all),
+            Command::Preview { on } => {
+                self.preview(id, on);
+                None
+            }
             Command::SetInputs { inputs } => Some((self.set_inputs(id, &inputs), Effect::None)),
             Command::Quit { anyway: true, .. } => Some(if self.quit_handle().quit_anyway() {
                 (Reply::ok(id, Value::Null), Effect::Quit)
@@ -720,9 +750,27 @@ impl Core {
             Err(reply) => return Some((reply, Effect::None)),
         };
         let source = self.device_source.clone();
+        let preview = self.go_live.preview();
         let listed = self.listed.clone();
+        let live = self.live();
         self.reply_later(async move {
-            match source.devices(&settings).await {
+            let devices = match source {
+                Some(source) => source.devices(&settings).await,
+                // While live the session owns the Strom: asked as it is, never held
+                // (taking a hold would reclaim it).
+                None if live => {
+                    match StromClient::new(&settings.strom.url, settings.strom.api_key.as_deref()) {
+                        Ok(strom) => api::devices_on(&strom).await,
+                        Err(err) => Err(err),
+                    }
+                }
+                // The first `devices` takes the hold; later ones reuse it.
+                None => match preview.hold(&settings).await {
+                    Ok(strom) => api::devices_on(&strom).await,
+                    Err(err) => Err(err),
+                },
+            };
+            match devices {
                 Ok(devices) => {
                     let model = what_to_send::model(Some(&devices), &settings, show_all);
                     *listed.lock().unwrap_or_else(|e| e.into_inner()) = Some(devices);
@@ -735,6 +783,40 @@ impl Core {
             }
         });
         None
+    }
+
+    /// `preview`: the preview controller runs the ticked rows' preview flows while
+    /// `on` (section 5.2). `on: true` takes the hold first, if there is none; only
+    /// that failing is an error reply. `available` is false when the Strom lacks the
+    /// blocks, another gateway is live, or this app is; the reason arrives as a
+    /// `notice`.
+    fn preview(&self, id: u32, on: bool) {
+        let preview = self.go_live.preview();
+        let settings_file = self.settings_file.clone();
+        let live = self.live();
+        self.reply_later(async move {
+            if !on || live {
+                preview.set_wanted(false);
+                return Reply::ok(id, json!({ "available": !live && preview.available() }));
+            }
+            let settings = match api::load_from(&settings_file) {
+                Ok(settings) => settings,
+                Err(err) => {
+                    let problem = format!("{err:#}");
+                    let first = problem.lines().next().unwrap_or_default();
+                    tracing::warn!("reading the settings: {first}");
+                    return Reply::error(id, NO_SETTINGS_FOR_PREVIEW);
+                }
+            };
+            if let Err(err) = preview.hold(&settings).await {
+                tracing::warn!("holding the local Strom for the preview: {err:#}");
+                let message = messages::for_error(&format!("{err:#}"), &Context::of(&settings));
+                return Reply::failure(id, &message);
+            }
+            preview.look_for_other_gateway().await;
+            preview.set_wanted(true);
+            Reply::ok(id, json!({ "available": preview.available() }))
+        });
     }
 
     /// `set_inputs`: the ticked rows, checked and saved as `[[input]]`.
@@ -756,6 +838,8 @@ impl Core {
         settings.inputs = entries;
         match api::save_to(&self.settings_file, &settings) {
             Ok(()) => {
+                // The preview follows the selection (section 5.2).
+                self.go_live.preview().wake();
                 let model = what_to_send::model(listed.as_ref(), &settings, self.show_all);
                 Reply::ok(id, to_json(&model))
             }
@@ -1207,6 +1291,7 @@ mod tests {
                 ]}}),
                 "set_inputs",
             ),
+            (json!({"cmd": "preview", "args": {"on": true}}), "preview"),
             (
                 json!({"cmd": "set_advanced", "args": {"latency_ms": 200}}),
                 "set_advanced",
@@ -1276,6 +1361,8 @@ mod tests {
             r#"{"id": 4, "cmd": "state", "extra": 1}"#,
             r#"{"id": 4, "cmd": "set_inputs", "args": {"inputs": [{"device": "a", "x": 1}]}}"#,
             r#"{"id": 4, "cmd": "set_advanced", "args": [1, 2]}"#,
+            r#"{"id": 4, "cmd": "preview"}"#,
+            r#"{"id": 4, "cmd": "preview", "args": {"on": "yes"}}"#,
         ] {
             let (reply, effect) = core.dispatch(raw).expect("a reply");
             assert_eq!(effect, Effect::None, "{raw}");
@@ -1399,6 +1486,86 @@ mod tests {
 
     /// A Strom that cannot be asked is one line for the person; the details go to the
     /// log only.
+    /// A machine with no other gateway, nothing to reclaim and access granted.
+    struct QuietHost;
+
+    impl go_live::Host for QuietHost {
+        fn other_gateway(&self) -> Option<u32> {
+            None
+        }
+        fn reclaim_strom(&self) {}
+        fn media_access(
+            &self,
+            _needs: crate::media_access::Needs,
+        ) -> Result<(), crate::messages::Media> {
+            Ok(())
+        }
+    }
+
+    /// The next message delivered later with `id`, skipping events.
+    fn reply_to(rx: &Receiver<String>, id: u32) -> Value {
+        loop {
+            let message = next_delivered(rx);
+            if message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    /// Section 4.1: the first `devices` takes the Strom hold and keeps it for the
+    /// preview and Go live; `preview {on}` runs the ticked rows' preview flows on it,
+    /// `preview {on: false}` removes them.
+    #[test]
+    fn devices_keeps_the_hold_and_preview_runs_the_ticked_rows() {
+        let strom = testing::FakeStrom::start(true, 0, "Cam");
+        let scratch = testing::Scratch::new("ipc-preview");
+        std::fs::write(
+            scratch.settings(),
+            format!(
+                "[gateway]\nid = \"gw-app\"\nname = \"Venue\"\n\n[strom]\nurl = \"{}\"\nmanage = false\n\n[open_live]\nregister = false\n\n[[input]]\ndevice = \"dev-cam\"\n",
+                strom.url
+            ),
+        )
+        .unwrap();
+        let (core, rx) = core_with(scratch.settings(), nowhere());
+        let go = GoLive::new(
+            scratch.settings(),
+            Arc::new(MemoryKeychain::new()),
+            Arc::new(QuietHost),
+        );
+        let mut core = core.with_go_live(go);
+
+        let reply = list(&mut core, &rx, 1, false);
+        assert_eq!(reply["ok"]["video"][1]["device"], "dev-cam", "{reply}");
+        assert!(
+            core.go_live.held().is_held(),
+            "devices did not keep the hold"
+        );
+        list(&mut core, &rx, 2, false);
+        assert!(core.go_live.held().is_held());
+
+        assert!(core
+            .dispatch(r#"{"id": 3, "cmd": "preview", "args": {"on": true}}"#)
+            .is_none());
+        assert_eq!(
+            reply_to(&rx, 3),
+            json!({"id": 3, "ok": {"available": true}})
+        );
+        let id = open_live_ingest::flow::preview_flow_id("gw-app", "dev-cam");
+        strom.wait_for("the preview flow started", |calls| {
+            calls.contains(&format!("POST /api/flows/{id}/start"))
+        });
+
+        assert!(core
+            .dispatch(r#"{"id": 4, "cmd": "preview", "args": {"on": false}}"#)
+            .is_none());
+        reply_to(&rx, 4);
+        strom.wait_for("the preview flow removed", |calls| {
+            calls.contains(&format!("DELETE /api/flows/{id}"))
+        });
+        assert!(strom.flow_ids().is_empty());
+    }
+
     #[test]
     fn devices_that_cannot_be_listed_say_so_in_one_line() {
         let file = SettingsFile::new("no-strom");

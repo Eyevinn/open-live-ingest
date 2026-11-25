@@ -121,6 +121,8 @@ pub struct StromMedia {
     strom: StromClient,
     gateway_id: String,
     version: Option<String>,
+    /// Whether the uplink flows carry the desktop app's preview taps.
+    taps: flow::Taps,
     // Dropped in this order: the Strom first, the pidfile after it.
     _local: LocalStrom,
     _pidfile: Pidfile,
@@ -187,6 +189,7 @@ impl StromMedia {
             strom,
             gateway_id: cfg.gateway.resolved_id(),
             version,
+            taps: flow::Taps::Off,
             _local: local,
             _pidfile: pidfile,
         })
@@ -200,9 +203,17 @@ impl StromMedia {
             strom: strom.clone(),
             gateway_id: gateway_id.to_string(),
             version: None,
+            taps: flow::Taps::Off,
             _local: LocalStrom::Adopted,
             _pidfile: Pidfile::none(),
         }
+    }
+
+    /// This, building its uplink flows with `taps`: [`flow::Taps::On`] only for the
+    /// desktop app over a Strom that has the preview blocks.
+    pub fn with_taps(mut self, taps: flow::Taps) -> Self {
+        self.taps = taps;
+        self
     }
 
     fn flow_id(&self, input: &Input) -> FlowId {
@@ -331,7 +342,7 @@ impl Media for StromMedia {
     /// removed again.
     async fn start(&self, input: &Input, video: &Video) -> Result<()> {
         let flow_id = self.flow_id(input);
-        let desired = flow::build(&self.gateway_id, input, video, flow::Taps::Off);
+        let desired = flow::build(&self.gateway_id, input, video, self.taps);
         self.strom.create_flow(&desired).await?;
         match self.strom.start_flow(&flow_id).await {
             Ok(true) => Ok(()),

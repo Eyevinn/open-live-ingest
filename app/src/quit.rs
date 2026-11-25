@@ -17,6 +17,7 @@
 
 use crate::go_live::GoLive;
 use crate::ipc::{Deliver, Effect, Event};
+use crate::preview::SHUT_DOWN_WITHIN;
 use open_live_ingest::run::ENDING_TEARDOWN;
 use serde_json::json;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -290,6 +291,9 @@ impl QuitHandle {
     /// the core's runtime. Does nothing when nothing is live or a quit was already
     /// decided (Quit anyway means now).
     pub fn end_session(&self) {
+        if !self.is_live() {
+            self.shut_down_preview();
+        }
         if self.may_terminate() {
             return;
         }
@@ -310,6 +314,24 @@ impl QuitHandle {
             );
         }
         self.guard().ended();
+    }
+
+    /// Quitting while not live (section 4.1): the preview flows are removed and the
+    /// Strom hold released, within [`SHUT_DOWN_WITHIN`]. Blocks, like
+    /// [`end_session`](Self::end_session).
+    fn shut_down_preview(&self) {
+        let preview = self.go_live.preview();
+        let done = self.runtime.block_on(async move {
+            tokio::time::timeout(SHUT_DOWN_WITHIN, preview.shut_down())
+                .await
+                .is_ok()
+        });
+        if !done {
+            tracing::warn!(
+                "the preview flows and the Strom hold were not given up within {}s",
+                SHUT_DOWN_WITHIN.as_secs()
+            );
+        }
     }
 }
 

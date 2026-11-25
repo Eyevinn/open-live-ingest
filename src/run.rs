@@ -13,7 +13,6 @@
 //! [`Event`]s, reports come back as values, and `up` is told when to stop by a future
 //! its caller resolves: the CLI on Ctrl-C or SIGTERM, an app on its Stop button.
 
-use crate::api::StromHold;
 use crate::config::{self, format_ports, mask_passphrase, Config, UplinkMode, Video};
 use crate::credential::OscCredential;
 use crate::devices;
@@ -26,7 +25,7 @@ use crate::media::{Media, ResolvedInputs, StromMedia};
 use crate::openlive::{
     drifted, listener_port, OpenLiveClient, Refused, ServerInfo, Source, SourcePayload,
 };
-use crate::session::Inputs;
+use crate::session::{Inputs, Launch};
 use crate::strom::StromClient;
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -666,12 +665,13 @@ fn relay_passphrase(cfg: &Config, events: &Events) -> Result<String> {
 /// [`up`] with the media done by the local Strom ([`StromMedia`]), as the CLI and the
 /// desktop app run it. The arguments are checked first, so a rejected one never
 /// starts Strom; then a second live gateway is refused ([`AlreadyRunning`]) and this
-/// one recorded in the pidfile, and Strom is adopted or started, or `held` is used:
-/// the Strom the app took in step 2, owned by this run from here on. Only a Strom
-/// started here, or a Managed one handed over in `held`, is stopped on the way out,
-/// then the pidfile is removed.
+/// one recorded in the pidfile, and Strom is adopted or started, or `launch.strom` is
+/// used: the Strom the app took in step 2, owned by this run from here on. Only a
+/// Strom started here, or a Managed one handed over, is stopped on the way out, then
+/// the pidfile is removed. `launch.taps` says whether the uplinks carry the preview
+/// taps.
 pub async fn up_on_strom(
-    held: Option<StromHold>,
+    launch: Launch,
     cfg: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
@@ -679,6 +679,7 @@ pub async fn up_on_strom(
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
+    let Launch { strom: held, taps } = launch;
     if let Err(err) = check_arguments(&cfg, &inputs, sending) {
         // Released, not dropped: nothing started on it.
         if let Some(held) = held {
@@ -686,7 +687,9 @@ pub async fn up_on_strom(
         }
         return Err(err);
     }
-    let media = StromMedia::start_on(&cfg, held, events).await?;
+    let media = StromMedia::start_on(&cfg, held, events)
+        .await?
+        .with_taps(taps.into());
     let outcome = up(
         &media,
         cfg,

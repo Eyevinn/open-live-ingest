@@ -66,6 +66,12 @@ pub async fn devices_with(hold: &StromHold) -> Result<Devices> {
     Ok(split(run::devices_on(&hold.client).await?))
 }
 
+/// [`devices_with`], through a client of the held Strom ([`StromHold::client`]): for
+/// a caller that keeps the hold behind a lock it cannot keep across the requests.
+pub async fn devices_on(strom: &StromClient) -> Result<Devices> {
+    Ok(split(run::devices_on(strom).await?))
+}
+
 fn split(devices: Vec<DeviceReport>) -> Devices {
     let (video, audio) = devices
         .into_iter()

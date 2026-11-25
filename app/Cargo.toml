@@ -18,6 +18,9 @@ anyhow = "1.0"
 # The runtime the core runs what waits on a server, Strom or the browser on, so the
 # window keeps answering meanwhile.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+# The preview's pictures reach the page as `data:image/jpeg;base64,...` URLs (ADR-003).
+# Already in the lockfile through reqwest and strom-types: no new crate.
+base64 = "0.22"
 
 # SIGTERM from `open-live-ingest down` is Stop without asking on macOS (spec, section 8).
 [target.'cfg(unix)'.dependencies]

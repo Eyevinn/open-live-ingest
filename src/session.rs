@@ -64,6 +64,7 @@ use crate::api::StromHold;
 use crate::config::{self, Config};
 use crate::credential::OscCredential;
 use crate::devices::AudioPairing;
+use crate::flow;
 use crate::gateway::{Event, Events};
 use crate::media::{Media, StromMedia};
 use crate::run::{self, Sending, Sources, Stop};
@@ -122,13 +123,25 @@ pub struct Launch {
 }
 
 /// Whether a session's uplink flows carry the picture and sound taps the desktop app
-/// reads while live (docs/specs/desktop-app.md, section 12). Only `Off` for now, the
-/// flow every caller builds today; `On` comes with the taps in the flow builder.
+/// reads while live (docs/specs/desktop-app.md, section 12).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Taps {
-    /// Today's flow, byte for byte.
+    /// Today's flow, byte for byte: every caller but the desktop app's sessions.
     #[default]
     Off,
+    /// A `builtin.thumbnail` between the capture and the encoder and a
+    /// `builtin.meter` on the audio ([`flow::Taps::On`]), for the app's live preview.
+    /// Only for a Strom that has both blocks.
+    On,
+}
+
+impl From<Taps> for flow::Taps {
+    fn from(taps: Taps) -> Self {
+        match taps {
+            Taps::Off => flow::Taps::Off,
+            Taps::On => flow::Taps::On,
+        }
+    }
 }
 
 /// Starts sessions. See the module documentation.
@@ -150,7 +163,7 @@ impl Session {
     pub fn start(settings: Config, inputs: Inputs) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
             None,
-            None,
+            Launch::default(),
             settings,
             None,
             inputs,
@@ -170,7 +183,7 @@ impl Session {
     ) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
             None,
-            None,
+            Launch::default(),
             settings,
             Some(credential),
             inputs,
@@ -191,7 +204,7 @@ impl Session {
     ) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
             None,
-            None,
+            Launch::default(),
             settings,
             credential,
             inputs,
@@ -218,7 +231,7 @@ impl Session {
     ) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
             None,
-            None,
+            Launch::default(),
             settings,
             credential,
             inputs,
@@ -241,7 +254,7 @@ impl Session {
     ) -> (SessionHandle, Receiver) {
         Self::start_inner(
             Some(media),
-            None,
+            Launch::default(),
             settings,
             credential,
             inputs,
@@ -259,13 +272,9 @@ impl Session {
         credential: Option<OscCredential>,
         sources: Sources,
     ) -> (SessionHandle, Receiver) {
-        let Launch {
-            strom,
-            taps: Taps::Off,
-        } = launch;
         Self::start_inner::<StromMedia>(
             None,
-            strom,
+            launch,
             settings,
             credential,
             inputs,
@@ -281,13 +290,9 @@ impl Session {
         inputs: Inputs,
         credential: Option<OscCredential>,
     ) -> (SessionHandle, Receiver) {
-        let Launch {
-            strom,
-            taps: Taps::Off,
-        } = launch;
         Self::start_inner::<StromMedia>(
             None,
-            strom,
+            launch,
             settings,
             credential,
             inputs,
@@ -296,11 +301,11 @@ impl Session {
     }
 
     /// Runs the session on a task of its own: through `media` when one is given,
-    /// otherwise through a [`StromMedia`] built inside the task, over `held` when
-    /// given.
+    /// otherwise through a [`StromMedia`] built inside the task, launched as `launch`
+    /// says.
     fn start_inner<M: Media + 'static>(
         media: Option<M>,
-        held: Option<StromHold>,
+        launch: Launch,
         settings: Config,
         credential: Option<OscCredential>,
         inputs: Inputs,
@@ -318,7 +323,7 @@ impl Session {
             // with flows and sources nobody can remove.
             let stop = async move { stop_rx.await.unwrap_or(Stop::Interrupt) };
             let outcome = run(
-                media, held, settings, credential, inputs, sources, &events, stop,
+                media, launch, settings, credential, inputs, sources, &events, stop,
             )
             .await;
             events.emit(match &outcome {
@@ -356,7 +361,7 @@ impl Session {
 #[allow(clippy::too_many_arguments)]
 async fn run<M: Media>(
     media: Option<M>,
-    held: Option<StromHold>,
+    launch: Launch,
     settings: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
@@ -371,14 +376,14 @@ async fn run<M: Media>(
     };
     if let Err(err) = valid {
         // Released, not dropped: the session never started on it.
-        if let Some(held) = held {
+        if let Some(held) = launch.strom {
             held.release().await;
         }
         return Err(err);
     }
     match media {
         Some(media) => run::up(&media, settings, credential, inputs, sources, events, stop).await,
-        None => run::up_on_strom(held, settings, credential, inputs, sources, events, stop).await,
+        None => run::up_on_strom(launch, settings, credential, inputs, sources, events, stop).await,
     }
 }
 
@@ -434,6 +439,14 @@ impl SessionHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every launch but the app's builds today's flow; `On` is the flow builder's taps.
+    #[test]
+    fn launches_carry_no_taps_unless_asked() {
+        assert_eq!(Launch::default().taps, Taps::Off);
+        assert_eq!(flow::Taps::from(Taps::Off), flow::Taps::Off);
+        assert_eq!(flow::Taps::from(Taps::On), flow::Taps::On);
+    }
 
     /// Settings that fail validation end the session at once, with the reason the
     /// CLI would print, as the last event.

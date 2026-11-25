@@ -167,6 +167,13 @@ pub fn run() -> ExitCode {
                 event: WindowEvent::CloseRequested,
                 ..
             } => apply(core.request_quit(), control_flow),
+            // Minimised or restored (Windows resizes, macOS changes focus): no
+            // preview flow runs and no picture is asked for while the window is
+            // minimised (section 5.2). Occlusion is the page's `visibilitychange`.
+            Event::WindowEvent {
+                event: WindowEvent::Resized(_) | WindowEvent::Focused(_),
+                ..
+            } => core.set_window_visible(!window.is_minimized()),
             Event::UserEvent(UserEvent::Ipc(raw)) => {
                 if let Some((reply, effect)) = core.dispatch(&raw) {
                     if let Err(e) = webview.evaluate_script(&reply.script()) {
