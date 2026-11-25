@@ -35,7 +35,7 @@ final class MediaMonitor {
 
     private let display: MonitorDisplay
     private let pictures: Bool
-    private let queue = DispatchQueue(label: "com.eyevinn.open-live-ingest.monitor")
+    private let queue = DispatchQueue(label: "com.eyevinn.open-live-ingest.monitor", qos: .utility)
     private lazy var context = CIContext(options: [.cacheIntermediates: false])
 
     // Under `lock`: what the taps look at.
