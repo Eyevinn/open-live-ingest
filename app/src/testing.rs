@@ -524,3 +524,158 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
         self.clone()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Strom
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct StromState {
+    /// Flows by id, as posted.
+    flows: std::collections::BTreeMap<String, Value>,
+    /// Removed flows Strom still answers for, with the number of `GET`s left.
+    lingering: std::collections::BTreeMap<String, usize>,
+    /// Every request, as `METHOD /path`.
+    calls: Vec<String>,
+}
+
+/// A fake local Strom: a camera (`dev-cam`, "Cam") and a microphone (`dev-mic`,
+/// "Mic") in its device list, the preview blocks when `blocks` says so, and the flow
+/// routes, keeping what is posted. A removed flow is still answered for `linger`
+/// more `GET`s before Strom says 404, as a flow takes a moment to go. Pictures are
+/// 504: no fresh frame. The capture's `device-name` is `opened`.
+pub struct FakeStrom {
+    pub url: String,
+    state: Arc<Mutex<StromState>>,
+}
+
+impl FakeStrom {
+    pub fn start(blocks: bool, linger: usize, opened: &'static str) -> Self {
+        let state: Arc<Mutex<StromState>> = Arc::default();
+        let shared = state.clone();
+        let url = serve(Arc::new(move |req: &Request| {
+            let mut state = shared.lock().unwrap();
+            state.calls.push(format!("{} {}", req.method, req.path));
+            let path = req.path.split('?').next().unwrap_or_default();
+            let flow = path.strip_prefix("/api/flows/").map(|rest| {
+                let mut parts = rest.splitn(2, '/');
+                (
+                    parts.next().unwrap_or_default().to_string(),
+                    parts.next().unwrap_or_default().to_string(),
+                )
+            });
+            match (req.method.as_str(), path, flow) {
+                ("GET", "/api/discovery/devices", _) => {
+                    let device = |id: &str, name: &str, category: &str| {
+                        json!({
+                            "id": id, "name": name, "category": category,
+                            "device_class": "Source", "provider": "test", "properties": {},
+                            "first_seen_secs_ago": 1, "last_seen_secs_ago": 0
+                        })
+                    };
+                    if req.path.ends_with("audio_source") {
+                        (200, json!([device("dev-mic", "Mic", "audiosource")]))
+                    } else {
+                        (200, json!([device("dev-cam", "Cam", "videosource")]))
+                    }
+                }
+                ("GET", "/api/blocks", _) if blocks => (
+                    200,
+                    json!({ "blocks": [
+                        { "id": "builtin.local_input" },
+                        { "id": "builtin.thumbnail" },
+                        { "id": "builtin.meter" }
+                    ]}),
+                ),
+                ("GET", "/api/blocks", _) => {
+                    (200, json!({ "blocks": [{ "id": "builtin.local_input" }] }))
+                }
+                ("GET", "/api/flows", _) => (
+                    200,
+                    json!({ "flows": state.flows.values().collect::<Vec<_>>() }),
+                ),
+                ("POST", "/api/flows", _) => {
+                    let flow: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                    let id = flow["id"].as_str().unwrap_or_default().to_string();
+                    state.lingering.remove(&id);
+                    state.flows.insert(id, flow.clone());
+                    (200, json!({ "flow": flow }))
+                }
+                ("POST", _, Some((id, action))) if action == "start" => {
+                    match state.flows.get_mut(&id) {
+                        Some(flow) => {
+                            flow["running"] = json!(true);
+                            (200, json!({ "flow": flow }))
+                        }
+                        None => (404, Value::Null),
+                    }
+                }
+                ("DELETE", _, Some((id, _))) => {
+                    if state.flows.remove(&id).is_some() && linger > 0 {
+                        state.lingering.insert(id, linger);
+                    }
+                    (204, Value::Null)
+                }
+                ("GET", _, Some((id, rest))) if rest.is_empty() => {
+                    if let Some(flow) = state.flows.get(&id) {
+                        return (200, json!({ "flow": flow }));
+                    }
+                    match state.lingering.get_mut(&id) {
+                        Some(left) if *left > 0 => {
+                            *left -= 1;
+                            (200, json!({ "flow": { "id": id, "name": "going" } }))
+                        }
+                        _ => (404, Value::Null),
+                    }
+                }
+                ("GET", _, Some((id, rest))) if rest == "blocks/picture/thumbnail" => {
+                    if state.flows.contains_key(&id) {
+                        (504, Value::Null)
+                    } else {
+                        (404, Value::Null)
+                    }
+                }
+                ("GET", _, Some((id, rest))) if rest == "elements/capture:videosrc/properties" => {
+                    if state.flows.contains_key(&id) {
+                        (
+                            200,
+                            json!({ "element_id": "capture:videosrc", "properties": { "device-name": opened } }),
+                        )
+                    } else {
+                        (404, Value::Null)
+                    }
+                }
+                _ => (404, Value::Null),
+            }
+        }));
+        FakeStrom { url, state }
+    }
+
+    /// Every request so far, as `METHOD /path`.
+    pub fn calls(&self) -> Vec<String> {
+        self.state.lock().unwrap().calls.clone()
+    }
+
+    /// The flow it has with `id`, as posted.
+    pub fn flow(&self, id: &str) -> Option<Value> {
+        self.state.lock().unwrap().flows.get(id).cloned()
+    }
+
+    /// The ids of the flows it has now.
+    pub fn flow_ids(&self) -> Vec<String> {
+        self.state.lock().unwrap().flows.keys().cloned().collect()
+    }
+
+    /// Waits up to 10 s for `done` to hold for the requests so far.
+    pub fn wait_for(&self, what: &str, done: impl Fn(&[String]) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done(&self.calls()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Strom never saw {what}: {:?}",
+                self.calls()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}

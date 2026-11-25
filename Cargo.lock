@@ -1947,6 +1947,7 @@ name = "open-live-ingest-app"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "block2",
  "muda",
  "objc2",

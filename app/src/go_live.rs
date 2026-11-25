@@ -19,6 +19,7 @@
 use crate::ipc::{Deliver, Event, Reply};
 use crate::media_access::{self, Needs};
 use crate::messages::{self, Context, Failure, Media, Message, WarningKind};
+use crate::preview::PreviewController;
 use crate::status::{self, Poller, Target};
 use open_live_ingest::api::{self, OscCredential, Released, StromHold};
 use open_live_ingest::config::{self, Config};
@@ -26,7 +27,7 @@ use open_live_ingest::gateway::{self, Events, InputState};
 use open_live_ingest::keychain::SecretStore;
 use open_live_ingest::local_strom;
 use open_live_ingest::run::{self, Sources, Stop};
-use open_live_ingest::session::{Inputs, Launch, Session, SessionHandle};
+use open_live_ingest::session::{Inputs, Launch, Session, SessionHandle, Taps};
 use open_live_ingest::strom::StromClient;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -561,11 +562,12 @@ impl HeldStrom {
     /// `strom.pid` is stopped (the reclaim checks `gateway.pid` once more itself), so
     /// the Strom held is one the app starts and stops, never a leftover it would
     /// adopt. Go live then skips the reclaim. Blocks while a Strom starts or stops.
-    pub async fn ensure(&self, settings: &Config, host: Arc<dyn Host>) -> anyhow::Result<()> {
+    /// True when a hold was taken now, false when the one held already serves.
+    pub async fn ensure(&self, settings: &Config, host: Arc<dyn Host>) -> anyhow::Result<bool> {
         let stale = {
             let mut held = lock(&self.0);
             if held.as_ref().is_some_and(|h| h.serves(settings)) {
-                return Ok(());
+                return Ok(false);
             }
             held.take()
         };
@@ -585,12 +587,17 @@ impl HeldStrom {
         if let Some(extra) = extra {
             log_release(extra.release().await);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Whether a Strom is held.
     pub fn is_held(&self) -> bool {
         lock(&self.0).is_some()
+    }
+
+    /// A client of the Strom held, if one is.
+    pub fn client(&self) -> Option<StromClient> {
+        lock(&self.0).as_ref().map(|h| h.client().clone())
     }
 
     /// Whether the Strom held is the one `settings` name.
@@ -669,6 +676,8 @@ pub struct GoLive {
     sending: Arc<AtomicUsize>,
     /// The Strom the app holds, handed to the next session.
     held: HeldStrom,
+    /// The preview, which hands the cameras over at Go live (section 4.1).
+    preview: Arc<PreviewController>,
 }
 
 impl GoLive {
@@ -677,6 +686,12 @@ impl GoLive {
         keychain: Arc<dyn SecretStore>,
         host: Arc<dyn Host>,
     ) -> Self {
+        let held = HeldStrom::default();
+        let preview = Arc::new(PreviewController::new(
+            settings_file.clone(),
+            held.clone(),
+            host.clone(),
+        ));
         GoLive {
             settings_file,
             keychain,
@@ -688,8 +703,28 @@ impl GoLive {
                 idle: Arc::new(Notify::new()),
             })),
             sending: Arc::default(),
-            held: HeldStrom::default(),
+            held,
+            preview,
         }
+    }
+
+    /// With the preview `make` builds over this Go live's hold and host: one with
+    /// shorter waits, in tests.
+    pub fn with_preview(
+        mut self,
+        make: impl FnOnce(PathBuf, HeldStrom, Arc<dyn Host>) -> PreviewController,
+    ) -> Self {
+        self.preview = Arc::new(make(
+            self.settings_file.clone(),
+            self.held.clone(),
+            self.host.clone(),
+        ));
+        self
+    }
+
+    /// The preview controller: step 2's pictures and levels, and step 3's while live.
+    pub fn preview(&self) -> Arc<PreviewController> {
+        self.preview.clone()
     }
 
     /// The Strom the app holds: what the What to send step takes and the next Go live
@@ -750,7 +785,17 @@ impl GoLive {
         let sending = self.sending.clone();
         sending.store(0, Ordering::SeqCst);
         let held = self.held.clone();
+        let preview = self.preview.clone();
         let task = async move {
+            // The handover, step 1 (section 4.1): no preview flow holds a camera
+            // when the checks run and the session starts.
+            preview.hand_over().await;
+            // Back to step 2 when this Go live ends without a newer one under way.
+            let back_to_step_2 = |state: &Arc<Mutex<State>>| {
+                if lock(state).session == session {
+                    preview.live_ended();
+                }
+            };
             // A Strom held since the What to send step that is not the one the
             // settings name now is given up; one that is skips the reclaim, which ran
             // when it was taken: the Strom in `strom.pid` is the app's own (section
@@ -771,12 +816,14 @@ impl GoLive {
                 Ok(Ok(checked)) => checked,
                 Ok(Err(message)) => {
                     tracing::info!("go live refused: {}", message.message);
+                    back_to_step_2(&state);
                     lock(&state).end(session);
                     deliver(Reply::failure(id, &message).script());
                     return;
                 }
                 Err(err) => {
                     tracing::warn!("the checks before going live failed: {err}");
+                    back_to_step_2(&state);
                     lock(&state).end(session);
                     deliver(Reply::failure(id, &Failure::Unmatched.message()).script());
                     return;
@@ -789,6 +836,7 @@ impl GoLive {
                 if guard.session != session || guard.phase != Phase::Checking {
                     let superseded = guard.session != session;
                     drop(guard);
+                    back_to_step_2(&state);
                     deliver(Reply::ok(id, Value::Null).script());
                     // The page's `stopped` is the newer session's to send.
                     if !superseded {
@@ -809,10 +857,17 @@ impl GoLive {
                 // The held Strom, when it is the one these settings name (a hold
                 // taken during the checks counts too: its taking reclaimed), is the
                 // session's from here: it stops it at its end (section 4.1).
-                let launch = Launch {
-                    strom: held.take_serving(&settings),
-                    ..Launch::default()
+                // The uplinks carry the taps only on a Strom known to have the
+                // blocks (section 5.2, "Older Strom"): going live never depends on
+                // the preview.
+                let strom = held.take_serving(&settings);
+                let taps = if strom.is_some() && preview.capable() {
+                    Taps::On
+                } else {
+                    Taps::Off
                 };
+                tracing::info!(?taps, "the uplinks' preview taps");
+                let launch = Launch { strom, taps };
                 let (handle, events) = if settings.open_live.register {
                     Session::launch_armed(
                         launch,
@@ -848,6 +903,7 @@ impl GoLive {
                 .map(|poller| tokio::spawn(poll_status(poller, targets.clone(), incoming_tx)));
 
             let mut rows = Rows::new(ctx);
+            let mut returned = false;
             while let Some(incoming) = incoming.recv().await {
                 let event = match incoming {
                     Incoming::Session(event) => event,
@@ -860,6 +916,7 @@ impl GoLive {
                     Incoming::Ended => break,
                 };
                 if let gateway::Event::Stats { inputs } = &event {
+                    preview.session_stats(inputs);
                     *lock(&targets) = inputs
                         .iter()
                         .map(|s| Target {
@@ -878,6 +935,12 @@ impl GoLive {
                     gateway::Event::Stopped | gateway::Event::Failed { .. }
                 );
                 if last {
+                    // Back to step 2 before the page hears it stopped, so a
+                    // `preview {on}` it sends then is not undone.
+                    if !returned {
+                        returned = true;
+                        back_to_step_2(&state);
+                    }
                     // Idle before the page hears it stopped, so Go live works at once.
                     lock(&state).end(session);
                     // Nothing to show status for once the page hears it stopped.
@@ -893,6 +956,9 @@ impl GoLive {
             }
             if let Some(polling) = polling {
                 polling.abort();
+            }
+            if !returned {
+                back_to_step_2(&state);
             }
             lock(&state).end(session);
         };

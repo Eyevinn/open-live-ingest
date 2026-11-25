@@ -11,7 +11,6 @@ use crate::ipc::InputArgs;
 use open_live_ingest::api::Devices;
 use open_live_ingest::config::{self, Config, InputSettings, TEST_PATTERN_DEVICE};
 use open_live_ingest::devices::name_prefix;
-use open_live_ingest::gateway::Events;
 use open_live_ingest::run::DeviceReport;
 use serde::Serialize;
 use std::future::Future;
@@ -31,17 +30,6 @@ pub type DeviceList<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Devices>> +
 /// wait for it.
 pub trait DeviceSource: Send + Sync {
     fn devices<'a>(&'a self, settings: &'a Config) -> DeviceList<'a>;
-}
-
-/// The devices the local Strom reports, through the library's `devices`: a managed
-/// Strom is started to ask, if nothing is listening, and stopped again.
-#[derive(Debug, Default)]
-pub struct Strom;
-
-impl DeviceSource for Strom {
-    fn devices<'a>(&'a self, settings: &'a Config) -> DeviceList<'a> {
-        Box::pin(async move { open_live_ingest::api::devices(settings, &Events::discard()).await })
-    }
 }
 
 /// What the page shows in the What to send step.

@@ -192,6 +192,28 @@ pub enum Failure {
     GatewayTokenRefused,
     /// The settings file has a problem.
     SettingsInvalid { problem: String },
+    /// Preview: `camera`'s preview flow did not reach running (#172).
+    PreviewCameraNotOpened { camera: String },
+    /// Preview: no fresh picture from `camera` for 5 s while its flow runs.
+    PreviewNoPicture { camera: String },
+    /// Preview or live: `microphone` gives no sound for 5 s (`no_sound`).
+    NoSound { microphone: String },
+    /// Preview or live: Strom opened `opened` instead of `camera` (`wrong_camera`,
+    /// strom#1278). `live`: it is the uplink, so the way out is Stop and Go live.
+    WrongCamera {
+        opened: String,
+        camera: String,
+        live: bool,
+    },
+    /// Preview: the local Strom has no thumbnail or meter block
+    /// (`preview_unavailable`). A banner, once.
+    PreviewUnavailable,
+    /// Preview: another gateway is live on this computer
+    /// (`preview_off_other_gateway`). A banner.
+    PreviewOffOtherGateway,
+    /// Preview: macOS refuses the app access to the camera or the microphone, asked
+    /// before the first preview flow.
+    PreviewAccessDenied { media: Media },
     /// The Windows installer finds no WebView2. Shown by the installer (OL-59h), kept
     /// here so the wording lives with the rest.
     WebView2Missing,
@@ -386,6 +408,50 @@ impl Failure {
             Failure::SettingsInvalid { problem } => Message::new(
                 format!("The settings file has a problem: {problem}."),
                 Some(ShowFile),
+            ),
+            Failure::PreviewCameraNotOpened { camera } => Message::new(
+                format!("{camera} could not be opened. Close other apps that use it, then untick and tick it again."),
+                Some(Retry),
+            ),
+            Failure::PreviewNoPicture { camera } => {
+                Message::new(format!("No picture from {camera}."), None)
+            }
+            Failure::NoSound { microphone } => Message::new(
+                format!("No sound from {microphone}. Check that it is on and not muted."),
+                None,
+            ),
+            Failure::WrongCamera {
+                opened,
+                camera,
+                live,
+            } => Message::new(
+                format!(
+                    "Strom opened \"{opened}\" instead of \"{camera}\". {}",
+                    if *live {
+                        "Stop, then Go live."
+                    } else {
+                        "Untick and tick it again."
+                    }
+                ),
+                Some(ShowLogs),
+            ),
+            Failure::PreviewUnavailable => Message::new(
+                "This video engine has no preview. Pictures and sound levels need Strom 0.8.4 or later; going live is not affected.",
+                None,
+            ),
+            Failure::PreviewOffOtherGateway => Message::new(
+                "The preview is off while another gateway is live on this computer.",
+                Some(StopIt),
+            ),
+            Failure::PreviewAccessDenied { media } => Message::new(
+                format!(
+                    "Open Live Ingest is not allowed to use the {}. Allow it in System Settings → Privacy & Security, then tick the camera again.",
+                    media.noun()
+                ),
+                Some(match media {
+                    Media::Camera => OpenSettings,
+                    Media::Microphone => OpenMicrophoneSettings,
+                }),
             ),
             Failure::WebView2Missing => Message::new(WEBVIEW2_MISSING, None),
             Failure::Unmatched => Message::new(
@@ -1375,5 +1441,97 @@ mod tests {
         );
         assert_eq!(quoted(r#"a "b" d "e""#, 1).as_deref(), Some("e"));
         assert_eq!(quoted(r#"a "b" d"#, 1), None);
+    }
+    #[test]
+    fn preview_camera_could_not_be_opened() {
+        assert_message(
+            Failure::PreviewCameraNotOpened {
+                camera: "FaceTime HD Camera".to_string(),
+            }
+            .message(),
+            "FaceTime HD Camera could not be opened. Close other apps that use it, then untick and tick it again.",
+            Some(Action::Retry),
+        );
+    }
+
+    #[test]
+    fn preview_no_picture() {
+        assert_message(
+            Failure::PreviewNoPicture {
+                camera: "FaceTime HD Camera".to_string(),
+            }
+            .message(),
+            "No picture from FaceTime HD Camera.",
+            None,
+        );
+    }
+
+    #[test]
+    fn no_sound_from_the_microphone() {
+        assert_message(
+            Failure::NoSound {
+                microphone: "MacBook Pro Microphone".to_string(),
+            }
+            .message(),
+            "No sound from MacBook Pro Microphone. Check that it is on and not muted.",
+            None,
+        );
+    }
+
+    #[test]
+    fn strom_opened_another_camera_in_the_preview_and_while_live() {
+        let failure = |live| Failure::WrongCamera {
+            opened: "OBS Virtual Camera".to_string(),
+            camera: "FaceTime HD Camera".to_string(),
+            live,
+        };
+        assert_message(
+            failure(false).message(),
+            "Strom opened \"OBS Virtual Camera\" instead of \"FaceTime HD Camera\". Untick and tick it again.",
+            Some(Action::ShowLogs),
+        );
+        assert_message(
+            failure(true).message(),
+            "Strom opened \"OBS Virtual Camera\" instead of \"FaceTime HD Camera\". Stop, then Go live.",
+            Some(Action::ShowLogs),
+        );
+    }
+
+    #[test]
+    fn preview_unavailable_on_an_older_strom() {
+        assert_message(
+            Failure::PreviewUnavailable.message(),
+            "This video engine has no preview. Pictures and sound levels need Strom 0.8.4 or later; going live is not affected.",
+            None,
+        );
+    }
+
+    #[test]
+    fn preview_off_while_another_gateway_is_live() {
+        assert_message(
+            Failure::PreviewOffOtherGateway.message(),
+            "The preview is off while another gateway is live on this computer.",
+            Some(Action::StopIt),
+        );
+    }
+
+    #[test]
+    fn preview_access_denied_for_camera_or_microphone() {
+        assert_message(
+            Failure::PreviewAccessDenied {
+                media: Media::Camera,
+            }
+            .message(),
+            "Open Live Ingest is not allowed to use the camera. Allow it in System Settings → Privacy & Security, then tick the camera again.",
+            Some(Action::OpenSettings),
+        );
+        assert_message(
+            Failure::PreviewAccessDenied {
+                media: Media::Microphone,
+            }
+            .message(),
+            "Open Live Ingest is not allowed to use the microphone. Allow it in System Settings → Privacy & Security, then tick the camera again.",
+            Some(Action::OpenMicrophoneSettings),
+        );
     }
 }

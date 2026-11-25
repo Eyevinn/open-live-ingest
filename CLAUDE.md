@@ -33,7 +33,9 @@ Strom: its own Swift code does the media there, behind the `Media` seam (`src/me
 - `app/`: the desktop app. `app/src/main.rs` and `window.rs` are the window (tao), the system
   webview (wry) and the macOS menu bar (muda); `app/src/lib.rs` is its window-free core: the `oli`
   custom protocol and its CSP, the navigation filter, the IPC dispatcher, and the model of each
-  step of the window (`where_to_send.rs`), tested against fake servers in `testing.rs`, and the
+  step of the window (`where_to_send.rs`), the preview (`preview.rs`: step 2's preview flows on the
+  held Strom, pictures, levels and the silence detector, and the camera handover at Go live),
+  tested against fake servers in `testing.rs`, and the
   quit guard (`quit.rs`, with the macOS `applicationShouldTerminate:` and the Windows
   `WM_QUERYENDSESSION` subclass and single-instance mutex under `quit/`). `app/ui/` holds the
   three static page files, compiled in. No npm, no Node, no bundler.
