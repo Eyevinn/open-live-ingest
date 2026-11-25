@@ -25,6 +25,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var bitrateKbps: Int?
     @Published private(set) var stopping: StoppingProgress?
     @Published private(set) var notices: [Notice] = []
+    /// The picture being sent and its level while the uplink runs (step 3, section 5).
+    let liveMonitor = MonitorDisplay()
     // Advanced
     @Published private(set) var advancedProblems: [Problem] = []
     @Published private(set) var advancedWarnings: [Problem] = []
@@ -58,7 +60,8 @@ final class AppModel: ObservableObject {
         self.core = core
         self.logFile = logFile
         self.media = MediaController(
-            report: { [weak channel] report in channel?.send(.mediaReport(report)) }, factory: media)
+            report: { [weak channel] report in channel?.send(.mediaReport(report)) }, factory: media,
+            monitor: MediaMonitor(display: liveMonitor, pictures: true))
         phone = Phone(
             system: system ?? NoPhoneSystem(),
             send: { [weak channel] report in channel?.send(.phone(report)) },

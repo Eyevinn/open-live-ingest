@@ -9,7 +9,9 @@ import XCTest
 /// for the cloud Strom on 127.0.0.1. The simulator has no camera, so the test pattern is sent.
 ///
 /// Personal access token paste, instance pick, then Go live: Armed, the fake production goes
-/// active, Live with the status lines, Stop, and the source is kept on the fake Open Live.
+/// active, Live with the status lines, the picture being sent and a steady level of the test
+/// pattern's tone with no no-sound warning (#173), Stop, and the source is kept on the fake Open
+/// Live.
 final class ScreensUITests: XCTestCase {
     /// `testing::ACCESS`, which the fake Open Source Cloud takes as a personal access token.
     static let token = "h.eyJ0ZW5hbnRJZCI6InZlbnVlLXdzIn0.s"
@@ -48,11 +50,48 @@ final class ScreensUITests: XCTestCase {
         return met
     }
 
+    /// The level bar's peak in dBFS, the first number of its accessibility value
+    /// ("-20.0 dBFS peak, -23.0 dBFS RMS"); nil while it shows no level.
+    private func levelPeak(_ app: XCUIApplication) -> Double? {
+        let bar = app.descendants(matching: .any).matching(identifier: "levelBar").firstMatch
+        guard bar.exists, let value = bar.value as? String else { return nil }
+        return value.split(separator: " ").first.flatMap { Double($0) }
+    }
+
+    /// Step 3 live with the test pattern (#173 AC2, AC4): the picture being sent shows, and the
+    /// level bar reads the 1 kHz tone at -20 dBFS steadily, with no no-sound warning. A failure
+    /// in words; nil when it all holds.
+    private func liveMonitorProblem(_ app: XCUIApplication) -> String? {
+        let picture = app.descendants(matching: .any).matching(identifier: "livePreview").firstMatch
+        guard picture.waitForExistence(timeout: 20) else { return "no live picture (livePreview) on the Go live screen" }
+        let showing = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", "showing"), object: picture)
+        guard XCTWaiter().wait(for: [showing], timeout: 15) == .completed else {
+            return "the live picture never showed a frame (it says \(picture.value as? String ?? "nothing"))"
+        }
+        var peaks: [Double] = []
+        for _ in 0..<10 {
+            Thread.sleep(forTimeInterval: 0.5)
+            if let peak = levelPeak(app) { peaks.append(peak) }
+        }
+        let warning = app.descendants(matching: .any).matching(identifier: "noSoundWarning").firstMatch
+        if warning.exists { return "the no-sound warning shows: \(warning.label)" }
+        guard peaks.count >= 8 else { return "the level bar read a level only \(peaks.count) of 10 times: \(peaks)" }
+        guard peaks.allSatisfy({ (-23.0)...(-17.0) ~= $0 }) else {
+            return "the level is not the steady -20 dBFS tone: \(peaks)"
+        }
+        return nil
+    }
+
     func testPasteTokenPickInstanceGoLiveAndStopKeepingTheSource() throws {
         continueAfterFailure = false
         let control = try FakeControl(base: try environment("OLI_FAKE_CONTROL_URL"))
         let app = XCUIApplication()
         let sourceID = try goLiveUntilActive(app, control)
+
+        // The picture being sent and a steady, non-silent level, no warning (#173).
+        let problem = liveMonitorProblem(app)
+        shot("5b live picture and level")
+        XCTAssertNil(problem, problem ?? "")
 
         // Stop: the source is kept, marked inactive, for the next Go live.
         let go = app.buttons["goLive"]

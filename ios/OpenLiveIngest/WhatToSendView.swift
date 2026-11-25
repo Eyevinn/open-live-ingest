@@ -1,9 +1,11 @@
 import AVFoundation
 import SwiftUI
 
-/// Step 2, "What to send" (docs/specs/ios-app.md, section 5): the lens, the microphone and the
-/// label, over a live preview of the lens. The Studio name is `<gateway.name> — <label>`; only the
-/// label is editable here (the venue name is under Advanced). Saved with `set_input`.
+/// Step 2, "What to send" (docs/specs/ios-app.md, section 5): the lens, the microphone with its
+/// level bar, and the label, over a live preview of the lens. The preview and the level run only
+/// while this screen is shown and the app is in the foreground. The Studio name is
+/// `<gateway.name> — <label>`; only the label is editable here (the venue name is under Advanced).
+/// Saved with `set_input`.
 struct WhatToSendView: View {
     @ObservedObject var model: AppModel
     let next: () -> Void
@@ -14,6 +16,8 @@ struct WhatToSendView: View {
     @State private var microphoneID = ""
     @State private var label = ""
     @State private var preview = PreviewSession()
+    @State private var onScreen = false
+    @Environment(\.scenePhase) private var scenePhase
 
     private var lens: Lens? { lenses.first { $0.id == lensID } }
 
@@ -34,6 +38,7 @@ struct WhatToSendView: View {
                     }
                     .pickerStyle(.menu)
                     .accessibilityIdentifier("microphonePicker")
+                    PreviewLevel(display: preview.display)
 
                     TextField("Label", text: $label)
                         .textInputAutocapitalization(.words)
@@ -68,9 +73,25 @@ struct WhatToSendView: View {
         }
         .navigationTitle("What to send")
         .disabled(model.live)
-        .onAppear(perform: load)
-        .onDisappear { preview.stop() }
+        .onAppear {
+            onScreen = true
+            load()
+        }
+        .onDisappear {
+            onScreen = false
+            preview.stop()
+        }
         .onChange(of: lensID) { _, _ in showPreview() }
+        .onChange(of: microphoneID) { _, _ in showPreview() }
+        .onChange(of: scenePhase) { _, phase in
+            // Nothing runs in the background: the camera and the level stop, and come back with
+            // the app if this screen is still the one shown.
+            if phase == .background {
+                preview.stop()
+            } else if phase == .active, onScreen {
+                showPreview()
+            }
+        }
     }
 
     private var studioName: String {
@@ -96,20 +117,37 @@ struct WhatToSendView: View {
     }
 
     private func showPreview() {
-        guard let lens, lens.id != Devices.testPatternID else {
-            preview.show(nil)
+        guard onScreen, let lens, lens.id != Devices.testPatternID else {
+            preview.show(nil, microphone: nil, sound: false)
             return
         }
         let preview = self.preview
+        let microphone = microphoneID.isEmpty ? nil : microphoneID
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            preview.show(lens)
+            PreviewSession.microphoneAllowed { sound in preview.show(lens, microphone: microphone, sound: sound) }
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { granted in
-                DispatchQueue.main.async { if granted { preview.show(lens) } }
+                DispatchQueue.main.async {
+                    guard granted else { return }
+                    PreviewSession.microphoneAllowed { sound in
+                        preview.show(lens, microphone: microphone, sound: sound)
+                    }
+                }
             }
         default:
             model.problem = "Open Live Ingest may not use the camera. Allow it in Settings, Privacy & Security, Camera."
+        }
+    }
+}
+
+/// Step 2's level bar for the picked microphone, while the preview measures it.
+private struct PreviewLevel: View {
+    @ObservedObject var display: MonitorDisplay
+
+    var body: some View {
+        if display.running {
+            LevelBar(display: display)
         }
     }
 }
