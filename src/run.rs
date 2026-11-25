@@ -13,6 +13,7 @@
 //! [`Event`]s, reports come back as values, and `up` is told when to stop by a future
 //! its caller resolves: the CLI on Ctrl-C or SIGTERM, an app on its Stop button.
 
+use crate::api::StromHold;
 use crate::config::{self, format_ports, mask_passphrase, Config, UplinkMode, Video};
 use crate::credential::OscCredential;
 use crate::devices;
@@ -392,6 +393,11 @@ fn choose_ports(
 pub async fn devices(cfg: &Config, events: &Events) -> Result<Vec<DeviceReport>> {
     // Started only to ask, if started at all; dropped again on the way out.
     let (_local, strom) = connect_strom(cfg, events).await?;
+    devices_on(&strom).await
+}
+
+/// [`devices`], asking a Strom that is already running and is left as it is.
+pub(crate) async fn devices_on(strom: &StromClient) -> Result<Vec<DeviceReport>> {
     let video = strom
         .video_devices()
         .await
@@ -660,9 +666,12 @@ fn relay_passphrase(cfg: &Config, events: &Events) -> Result<String> {
 /// [`up`] with the media done by the local Strom ([`StromMedia`]), as the CLI and the
 /// desktop app run it. The arguments are checked first, so a rejected one never
 /// starts Strom; then a second live gateway is refused ([`AlreadyRunning`]) and this
-/// one recorded in the pidfile, and Strom is adopted or started. Only a Strom started
-/// here is stopped on the way out, then the pidfile is removed.
+/// one recorded in the pidfile, and Strom is adopted or started, or `held` is used:
+/// the Strom the app took in step 2, owned by this run from here on. Only a Strom
+/// started here, or a Managed one handed over in `held`, is stopped on the way out,
+/// then the pidfile is removed.
 pub async fn up_on_strom(
+    held: Option<StromHold>,
     cfg: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
@@ -670,8 +679,14 @@ pub async fn up_on_strom(
     events: &Events,
     stop: impl Future<Output = Stop>,
 ) -> Result<()> {
-    check_arguments(&cfg, &inputs, sending)?;
-    let media = StromMedia::start(&cfg, events).await?;
+    if let Err(err) = check_arguments(&cfg, &inputs, sending) {
+        // Released, not dropped: nothing started on it.
+        if let Some(held) = held {
+            held.release().await;
+        }
+        return Err(err);
+    }
+    let media = StromMedia::start_on(&cfg, held, events).await?;
     let outcome = up(
         &media,
         cfg,

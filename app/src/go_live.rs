@@ -5,10 +5,12 @@
 //! lists, each failure one line from `messages` (section 10): the settings file, at
 //! least one input ticked, no other gateway live on this machine (`gateway.pid`, a CLI
 //! `up` or another app), camera and microphone access (macOS), and a Strom left behind
-//! by a crash reclaimed rather than adopted. Then it starts [`Session`], armed
+//! by a crash reclaimed rather than adopted, unless the app holds a Strom ([`HeldStrom`],
+//! section 4.1), whose taking ran that reclaim already. Then it starts [`Session`], armed
 //! ([`Session::start_armed`]: each uplink runs only while a production holding its
-//! source is live), and turns its events into the page's: one row per input with its
-//! state and bitrate, banners for session-wide notices, and teardown progress. Stop runs the session's own teardown
+//! source is live), over the held Strom when there is one, and turns its events into
+//! the page's: one row per input with its state and bitrate, banners for session-wide
+//! notices, and teardown progress. Stop runs the session's own teardown
 //! ([`SessionHandle::request_stop`]) and the rows show it.
 //!
 //! [`Rows`] is the mapping from library events to page events, pure apart from the
@@ -18,13 +20,13 @@ use crate::ipc::{Deliver, Event, Reply};
 use crate::media_access::{self, Needs};
 use crate::messages::{self, Context, Failure, Media, Message, WarningKind};
 use crate::status::{self, Poller, Target};
-use open_live_ingest::api::{self, OscCredential};
+use open_live_ingest::api::{self, OscCredential, Released, StromHold};
 use open_live_ingest::config::{self, Config};
 use open_live_ingest::gateway::{self, Events, InputState};
 use open_live_ingest::keychain::SecretStore;
 use open_live_ingest::local_strom;
 use open_live_ingest::run::{self, Sources, Stop};
-use open_live_ingest::session::{Inputs, Session, SessionHandle};
+use open_live_ingest::session::{Inputs, Launch, Session, SessionHandle};
 use open_live_ingest::strom::StromClient;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -545,6 +547,82 @@ pub struct System;
 
 impl Host for System {}
 
+/// The Strom the app holds from the What to send step until Go live
+/// (docs/specs/desktop-app.md, section 4.1): taken for the device list and the
+/// preview, and handed to the session at Go live, which owns it from then on. Shared
+/// by the steps; cheap to clone.
+#[derive(Clone, Default)]
+pub struct HeldStrom(Arc<Mutex<Option<StromHold>>>);
+
+impl HeldStrom {
+    /// Holds the local Strom `settings` name, unless the one held already is it. A
+    /// hold for other `[strom]` settings is released first. Taking a hold runs section
+    /// 4's reclaim first: with no other gateway live, a Strom a crash left behind in
+    /// `strom.pid` is stopped (the reclaim checks `gateway.pid` once more itself), so
+    /// the Strom held is one the app starts and stops, never a leftover it would
+    /// adopt. Go live then skips the reclaim. Blocks while a Strom starts or stops.
+    pub async fn ensure(&self, settings: &Config, host: Arc<dyn Host>) -> anyhow::Result<()> {
+        let stale = {
+            let mut held = lock(&self.0);
+            if held.as_ref().is_some_and(|h| h.serves(settings)) {
+                return Ok(());
+            }
+            held.take()
+        };
+        if let Some(stale) = stale {
+            log_release(stale.release().await);
+        }
+        tokio::task::spawn_blocking(move || {
+            if host.other_gateway().is_none() {
+                host.reclaim_strom();
+            }
+        })
+        .await?;
+        let events = Events::new(|e| tracing::info!(event = ?e, "holding Strom"));
+        let hold = api::hold_strom(settings, &events).await?;
+        // Another take finished first: one hold is enough.
+        let extra = lock(&self.0).replace(hold);
+        if let Some(extra) = extra {
+            log_release(extra.release().await);
+        }
+        Ok(())
+    }
+
+    /// Whether a Strom is held.
+    pub fn is_held(&self) -> bool {
+        lock(&self.0).is_some()
+    }
+
+    /// Whether the Strom held is the one `settings` name.
+    fn serves(&self, settings: &Config) -> bool {
+        lock(&self.0).as_ref().is_some_and(|h| h.serves(settings))
+    }
+
+    /// Gives the hold up ([`StromHold::release`]): at quit, or when the settings
+    /// name another Strom. Nothing held is not an error.
+    pub async fn release(&self) {
+        let held = lock(&self.0).take();
+        if let Some(hold) = held {
+            log_release(hold.release().await);
+        }
+    }
+
+    /// The hold, when it is the Strom `settings` name, for Go live to hand to the
+    /// session.
+    fn take_serving(&self, settings: &Config) -> Option<StromHold> {
+        let mut held = lock(&self.0);
+        if held.as_ref().is_some_and(|h| h.serves(settings)) {
+            held.take()
+        } else {
+            None
+        }
+    }
+}
+
+fn log_release(released: Released) {
+    tracing::info!(?released, "released the held Strom");
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
@@ -589,6 +667,8 @@ pub struct GoLive {
     state: Arc<Mutex<State>>,
     /// The inputs the current session is sending, for the quit question.
     sending: Arc<AtomicUsize>,
+    /// The Strom the app holds, handed to the next session.
+    held: HeldStrom,
 }
 
 impl GoLive {
@@ -608,7 +688,14 @@ impl GoLive {
                 idle: Arc::new(Notify::new()),
             })),
             sending: Arc::default(),
+            held: HeldStrom::default(),
         }
+    }
+
+    /// The Strom the app holds: what the What to send step takes and the next Go live
+    /// hands to its session.
+    pub fn held(&self) -> HeldStrom {
+        self.held.clone()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -662,9 +749,24 @@ impl GoLive {
         let state = self.state.clone();
         let sending = self.sending.clone();
         sending.store(0, Ordering::SeqCst);
+        let held = self.held.clone();
         let task = async move {
+            // A Strom held since the What to send step that is not the one the
+            // settings name now is given up; one that is skips the reclaim, which ran
+            // when it was taken: the Strom in `strom.pid` is the app's own (section
+            // 4.1). It stays held until the session starts, so a Go live that starts
+            // none leaves it as it was.
+            let holding = match load(&settings_file) {
+                Ok(settings) if held.serves(&settings) => true,
+                Ok(_) if held.is_held() => {
+                    held.release().await;
+                    false
+                }
+                _ => false,
+            };
             let checked =
-                tokio::task::spawn_blocking(move || checks(&settings_file, host.as_ref())).await;
+                tokio::task::spawn_blocking(move || checks(&settings_file, host.as_ref(), holding))
+                    .await;
             let (settings, ctx) = match checked {
                 Ok(Ok(checked)) => checked,
                 Ok(Err(message)) => {
@@ -704,10 +806,23 @@ impl GoLive {
                 // holding one keeps working (#115). Go live arms: each uplink runs only
                 // while a production holding its source is live (#130). Without Open
                 // Live there are no productions to wait for, so it sends at once.
+                // The held Strom, when it is the one these settings name (a hold
+                // taken during the checks counts too: its taking reclaimed), is the
+                // session's from here: it stops it at its end (section 4.1).
+                let launch = Launch {
+                    strom: held.take_serving(&settings),
+                    ..Launch::default()
+                };
                 let (handle, events) = if settings.open_live.register {
-                    Session::start_armed(settings, Inputs::default(), credential, Sources::Keep)
+                    Session::launch_armed(
+                        launch,
+                        settings,
+                        Inputs::default(),
+                        credential,
+                        Sources::Keep,
+                    )
                 } else {
-                    Session::start_keeping_sources(settings, Inputs::default(), credential)
+                    Session::launch_keeping_sources(launch, settings, Inputs::default(), credential)
                 };
                 // Under the same lock as the phase, so a Stop from now on reaches it.
                 guard.phase = Phase::Live;
@@ -901,7 +1016,14 @@ fn load(settings_file: &std::path::Path) -> Result<Config, Message> {
 
 /// The checks before Go live (section 4), in order; the first that fails is the
 /// reply. Blocks: reclaiming a Strom waits for it, and macOS may show its prompt.
-fn checks(settings_file: &std::path::Path, host: &dyn Host) -> Result<(Config, Context), Message> {
+/// `holding`: the app holds a Strom for these settings, taken after its own reclaim
+/// (section 4.1), so there is nothing left behind to reclaim, and reclaiming would
+/// stop the app's own Strom.
+fn checks(
+    settings_file: &std::path::Path,
+    host: &dyn Host,
+    holding: bool,
+) -> Result<(Config, Context), Message> {
     let settings = load(settings_file)?;
     if let Some(problem) = config::problems(&settings).first() {
         return Err(messages::for_problem(problem));
@@ -927,7 +1049,9 @@ fn checks(settings_file: &std::path::Path, host: &dyn Host) -> Result<(Config, C
         tracing::info!(pid, "another gateway started during the checks");
         return Err(Failure::AlreadyLive.message());
     }
-    host.reclaim_strom();
+    if !holding {
+        host.reclaim_strom();
+    }
     let ctx = Context::of(&settings);
     Ok((settings, ctx))
 }
@@ -1869,7 +1993,7 @@ port_range = "47110-47112"
             starts_during_check: Some(4343),
             ..FakeHost::default()
         };
-        let err = checks(&settings_file(&scratch, CAMERA_WITH_MIC), &host).unwrap_err();
+        let err = checks(&settings_file(&scratch, CAMERA_WITH_MIC), &host, false).unwrap_err();
         assert_eq!(
             err.message,
             "Open Live Ingest is already live from another window or a terminal."
@@ -1914,7 +2038,7 @@ port_range = "47110-47112"
         let scratch = testing::Scratch::new("golive-test");
         let host = Arc::new(FakeHost::default());
         let path = settings_file(&scratch, "\n[[input]]\ndevice = \"test\"\n");
-        let (settings, _) = checks(&path, host.as_ref()).unwrap();
+        let (settings, _) = checks(&path, host.as_ref(), false).unwrap();
         assert_eq!(settings.inputs.len(), 1);
         assert_eq!(*host.asked.lock().unwrap(), Some(Needs::default()));
         assert!(
@@ -1927,7 +2051,7 @@ port_range = "47110-47112"
     fn a_broken_settings_file_says_so_with_show_file() {
         let scratch = testing::Scratch::new("golive-broken");
         std::fs::write(scratch.settings(), "[gateway\n").unwrap();
-        let err = checks(&scratch.settings(), &FakeHost::default()).unwrap_err();
+        let err = checks(&scratch.settings(), &FakeHost::default(), false).unwrap_err();
         assert!(
             err.message.starts_with("The settings file has a problem: "),
             "{}",
@@ -2096,5 +2220,145 @@ port_range = "47110-47112"
         let go = go_live(scratch.settings(), Arc::new(FakeHost::default()));
         go.stop();
         assert!(!go.is_live());
+    }
+
+    // -----------------------------------------------------------------------
+    // The held Strom (section 4.1)
+    // -----------------------------------------------------------------------
+
+    /// A Strom that is running: it lists no device and runs no flow.
+    fn fake_strom() -> String {
+        testing::serve(Arc::new(|req: &testing::Request| {
+            if req.path.starts_with("/api/discovery/devices") {
+                (200, json!([]))
+            } else if req.path == "/api/flows" {
+                (200, json!({ "flows": [] }))
+            } else {
+                (404, Value::Null)
+            }
+        }))
+    }
+
+    /// [`settings_file`], with Strom at `url`.
+    fn settings_file_at(scratch: &testing::Scratch, inputs: &str, url: &str) -> PathBuf {
+        let path = settings_file(scratch, inputs);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("http://127.0.0.1:9", url)).unwrap();
+        path
+    }
+
+    /// Taking the hold runs the reclaim first, then holds the Strom; a second take for
+    /// the same settings reuses it, reclaiming nothing.
+    #[test]
+    fn taking_the_hold_reclaims_first_and_only_once() {
+        let scratch = testing::Scratch::new("hold-reclaim");
+        let path = settings_file_at(&scratch, CAMERA_WITH_MIC, &fake_strom());
+        let settings = api::load_from(&path).unwrap();
+        let host = Arc::new(FakeHost::default());
+        let held = HeldStrom::default();
+        let rt = runtime();
+        rt.block_on(held.ensure(&settings, host.clone())).unwrap();
+        assert!(host.reclaimed.load(Ordering::SeqCst));
+        assert!(held.is_held());
+
+        host.reclaimed.store(false, Ordering::SeqCst);
+        rt.block_on(held.ensure(&settings, host.clone())).unwrap();
+        assert!(!host.reclaimed.load(Ordering::SeqCst), "reclaimed again");
+        rt.block_on(held.release());
+        assert!(!held.is_held());
+    }
+
+    /// With another gateway live its Strom is in use, not left behind: nothing is
+    /// reclaimed, and the hold adopts it.
+    #[test]
+    fn taking_the_hold_with_another_gateway_live_reclaims_nothing() {
+        let scratch = testing::Scratch::new("hold-other");
+        let path = settings_file_at(&scratch, CAMERA_WITH_MIC, &fake_strom());
+        let settings = api::load_from(&path).unwrap();
+        let host = Arc::new(FakeHost {
+            other: Some(4242),
+            ..FakeHost::default()
+        });
+        let held = HeldStrom::default();
+        let rt = runtime();
+        rt.block_on(held.ensure(&settings, host.clone())).unwrap();
+        assert!(!host.reclaimed.load(Ordering::SeqCst));
+        assert!(held.is_held());
+    }
+
+    /// Go live with a hold does not reclaim (that would stop the app's own Strom):
+    /// it hands the hold to the session, which starts on it.
+    #[test]
+    fn go_live_with_a_hold_does_not_reclaim_and_hands_it_over() {
+        let scratch = testing::Scratch::new("golive-held");
+        let path = settings_file_at(&scratch, CAMERA_WITH_MIC, &fake_strom());
+        let settings = api::load_from(&path).unwrap();
+        let host = Arc::new(FakeHost::default());
+        let go = go_live(path, host.clone());
+        let rt = runtime();
+        rt.block_on(go.held().ensure(&settings, host.clone()))
+            .unwrap();
+        host.reclaimed.store(false, Ordering::SeqCst);
+
+        let (deliver, rx) = deliverer();
+        go.start(6, deliver, rt.handle());
+        assert_eq!(next(&rx), json!({"id": 6, "ok": null}));
+        assert!(
+            !host.reclaimed.load(Ordering::SeqCst),
+            "reclaimed at Go live"
+        );
+        assert!(!go.held().is_held(), "the hold was not handed over");
+        // The session ran on the held Strom: it got as far as its device list, which
+        // has none of the saved devices.
+        let stopped = loop {
+            let message = next(&rx);
+            if message["event"] == "stopped" {
+                break message;
+            }
+        };
+        assert!(stopped["data"]["error"].is_object(), "{stopped}");
+    }
+
+    /// A hold for another Strom (the settings changed since it was taken) is not
+    /// handed over: it is released, and Go live reclaims as without one.
+    #[test]
+    fn go_live_with_a_hold_for_other_settings_reclaims() {
+        let scratch = testing::Scratch::new("golive-stale");
+        let path = settings_file_at(&scratch, CAMERA_WITH_MIC, &fake_strom());
+        let mut settings = api::load_from(&path).unwrap();
+        settings.strom.url = fake_strom();
+        let host = Arc::new(FakeHost::default());
+        let go = go_live(path, host.clone());
+        let rt = runtime();
+        rt.block_on(go.held().ensure(&settings, host.clone()))
+            .unwrap();
+        host.reclaimed.store(false, Ordering::SeqCst);
+
+        let (deliver, rx) = deliverer();
+        go.start(7, deliver, rt.handle());
+        assert_eq!(next(&rx), json!({"id": 7, "ok": null}));
+        assert!(host.reclaimed.load(Ordering::SeqCst));
+        assert!(!go.held().is_held());
+    }
+
+    /// A Go live refused by its checks keeps the hold for the next one.
+    #[test]
+    fn a_refused_go_live_keeps_the_hold() {
+        let scratch = testing::Scratch::new("golive-held-refused");
+        let path = settings_file_at(&scratch, CAMERA_WITH_MIC, &fake_strom());
+        let settings = api::load_from(&path).unwrap();
+        let host = Arc::new(FakeHost {
+            denied: Some(Media::Camera),
+            ..FakeHost::default()
+        });
+        let go = go_live(path, host.clone());
+        let rt = runtime();
+        rt.block_on(go.held().ensure(&settings, host.clone()))
+            .unwrap();
+
+        let (deliver, rx) = deliverer();
+        go.start(8, deliver, rt.handle());
+        assert!(next(&rx)["error"].is_object());
+        assert!(go.held().is_held());
     }
 }
