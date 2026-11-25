@@ -99,6 +99,8 @@ function renderWhere(where) {
   what.classList.toggle("disabled", !where.ready);
   what.setAttribute("aria-disabled", String(!where.ready));
   setGoEnabled(where.ready);
+  whereReady = where.ready;
+  syncPreview();
 }
 
 function clearProblem() {
@@ -214,7 +216,7 @@ function audioPicker(row, audio) {
 
 function inputRow(row, model) {
   const draft = row.ticked ? undefined : drafts.get(row.device);
-  const tr = element("tr");
+  const tr = element("tr", { className: "input-row" });
   tr.dataset.device = row.device;
 
   const tick = element("input", { type: "checkbox", className: "tick", checked: row.ticked });
@@ -260,7 +262,20 @@ function renderWhat(model) {
   notice.textContent = model.notice === null ? "" : model.notice;
   notice.hidden = model.notice === null;
   const body = document.querySelector("#inputs tbody");
-  body.replaceChildren(...model.video.map((row) => inputRow(row, model)));
+  body.replaceChildren(...model.video.flatMap((row) => inputRows(row, model)));
+}
+
+// A row, and under a ticked one its picture and level bars (spec, section 5.2).
+function inputRows(row, model) {
+  const tr = inputRow(row, model);
+  if (!row.picture) {
+    return [tr];
+  }
+  const preview = element("tr", { className: "preview-row" });
+  const cell = element("td", { colSpan: 3 });
+  cell.append(previewBox(row, false));
+  preview.append(element("td"), cell);
+  return [tr, preview];
 }
 
 function rowValues(tr) {
@@ -280,7 +295,7 @@ async function changed(tr) {
     drafts.delete(values.device);
   }
   const inputs = [];
-  for (const row of document.querySelectorAll("#inputs tbody tr")) {
+  for (const row of document.querySelectorAll("#inputs tbody tr.input-row")) {
     const v = rowValues(row);
     if (v.ticked) {
       inputs.push({ device: v.device, audio: v.audio === "" ? null : v.audio, label: v.label });
@@ -301,6 +316,218 @@ async function changed(tr) {
 async function listDevices(showAll) {
   renderWhat(await call("devices", { show_all: showAll }));
   clearProblem();
+}
+
+// ---------------------------------------------------------------------------
+// The preview: picture and sound, in steps 2 and 3 (spec, section 5.2)
+// ---------------------------------------------------------------------------
+
+// The core runs a preview flow per ticked row while the page asks for it: while step
+// 2 is shown (step 1 done, not live) and the window is visible. It sends a `preview`
+// event per row at each change of its picture, keyed by the row's `device`, one
+// `level` event for all rows four times a second, and the rows' notices. The page
+// keeps the latest of each and draws them; it sends nothing but `preview {on}`.
+
+// The row's picture: {state, image, message, action}, by device.
+const pictures = new Map();
+// The row's latest levels: {peak_db: [], rms_db: []}, one value per channel, by device.
+let levels = new Map();
+// The row's notices (no_sound, wrong_camera): kind to notice, by device.
+const rowNotices = new Map();
+// Window notices about the preview as a whole: shown in step 2.
+const PREVIEW_NOTICES = new Set(["preview_unavailable", "preview_off_other_gateway"]);
+const previewNotices = new Map();
+// The bars run from -60 to 0 dBFS.
+const LEVEL_FLOOR_DB = -60;
+
+let whereReady = false;
+let devicesListed = false;
+let previewOn = false;
+
+function previewText() {
+  return (whatToSend && whatToSend.preview_text) || {
+    no_microphone: "",
+    camera_off: "",
+    camera_off_states: [],
+  };
+}
+
+// Step 2 is shown: step 1 is done, nothing is live, and the window can be seen.
+function previewWanted() {
+  return devicesListed && whereReady && !live && document.visibilityState === "visible";
+}
+
+// Tells the core when that changes. Not when going live: Go live hands the cameras
+// over itself, and the core turns the preview off at the end of the session.
+function syncPreview() {
+  const on = previewWanted();
+  if (on === previewOn) {
+    return;
+  }
+  previewOn = on;
+  call("preview", { on }).catch((error) => {
+    previewOn = false;
+    showProblem(error);
+  });
+}
+
+// The picture and level bars of one row. `cameraOff`: a step 3 row that is Armed or
+// Waiting for production, whose camera is off.
+function previewBox(row, cameraOff) {
+  const box = element("div", { className: "preview" });
+  box.dataset.preview = row.device;
+  box.dataset.sound = String(row.sound);
+  box.dataset.cameraOff = String(cameraOff);
+  const picture = element("div", { className: "picture" });
+  picture.append(element("img", { alt: "", hidden: true }));
+  picture.append(element("div", { className: "picture-caption" }));
+  const side = element("div", { className: "preview-side" });
+  side.append(element("div", { className: "meters" }));
+  side.append(element("div", { className: "row-notices" }));
+  box.append(picture, side);
+  drawPicture(box);
+  drawLevels(box);
+  drawRowNotices(box);
+  return box;
+}
+
+// Every box that shows `device`'s row: in step 2, and in step 3 while live.
+function previewBoxes(device) {
+  return [...document.querySelectorAll(".preview")].filter(
+    (box) => box.dataset.preview === device,
+  );
+}
+
+const PICTURE_CAPTION = { starting: "Starting…" };
+
+function drawPicture(box) {
+  const picture = box.querySelector(".picture");
+  const image = picture.querySelector("img");
+  const caption = picture.querySelector(".picture-caption");
+  caption.replaceChildren();
+  if (box.dataset.cameraOff === "true") {
+    image.hidden = true;
+    picture.classList.remove("dim");
+    caption.textContent = previewText().camera_off;
+    return;
+  }
+  const shown = pictures.get(box.dataset.preview) || { state: null, image: null };
+  // No picture: the last one, dimmed, with the line saying so.
+  const withImage =
+    shown.image !== null && (shown.state === "showing" || shown.state === "no_picture");
+  if (withImage && image.getAttribute("src") !== shown.image) {
+    image.src = shown.image;
+  }
+  image.hidden = !withImage;
+  picture.classList.toggle("dim", shown.state === "no_picture");
+  caption.textContent = shown.message || PICTURE_CAPTION[shown.state] || "";
+  // A camera that could not be opened is ticked again by hand, as its line says;
+  // `retry` is Go live's action, so it gets no button here.
+  const button = shown.action === "retry" ? null : actionButton(shown.action);
+  if (button) {
+    caption.append(button);
+  }
+}
+
+// The share of the bar a level fills, -60 dBFS (empty) to 0 dBFS (full).
+function levelPercent(db) {
+  if (typeof db !== "number") {
+    return 0;
+  }
+  return Math.max(0, Math.min(100, ((db - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB) * 100));
+}
+
+function drawLevels(box) {
+  const meters = box.querySelector(".meters");
+  if (box.dataset.cameraOff === "true") {
+    meters.replaceChildren();
+    return;
+  }
+  if (box.dataset.sound !== "true") {
+    if (!meters.querySelector(".no-microphone")) {
+      meters.replaceChildren(
+        element("span", { className: "no-microphone", textContent: previewText().no_microphone }),
+      );
+    }
+    return;
+  }
+  const level = levels.get(box.dataset.preview);
+  const peaks = level ? level.peak_db : [];
+  const channels = Math.max(1, peaks.length);
+  if (meters.children.length !== channels) {
+    const bars = [];
+    for (let i = 0; i < channels; i++) {
+      const bar = element("div", { className: "meter" });
+      bar.append(element("div", { className: "peak" }), element("div", { className: "rms" }));
+      bars.push(bar);
+    }
+    meters.replaceChildren(...bars);
+  }
+  [...meters.children].forEach((bar, i) => {
+    bar.querySelector(".peak").style.width = levelPercent(peaks[i]) + "%";
+    bar.querySelector(".rms").style.width = levelPercent(level ? level.rms_db[i] : null) + "%";
+  });
+}
+
+function drawRowNotices(box) {
+  const lines = box.querySelector(".row-notices");
+  lines.replaceChildren();
+  const forRow = rowNotices.get(box.dataset.preview);
+  if (!forRow) {
+    return;
+  }
+  for (const notice of forRow.values()) {
+    const line = element("p", { className: "row-notice", textContent: notice.message });
+    const button = actionButton(notice.action);
+    if (button) {
+      line.append(" ", button);
+    }
+    lines.append(line);
+  }
+}
+
+// A notice for one row (it names a `device`) is drawn on that row.
+function rowNotice(notice) {
+  const forRow = rowNotices.get(notice.device) || new Map();
+  if (notice.clear) {
+    forRow.delete(notice.clear);
+  } else {
+    forRow.set(notice.kind, notice);
+  }
+  rowNotices.set(notice.device, forRow);
+  for (const box of previewBoxes(notice.device)) {
+    drawRowNotices(box);
+  }
+}
+
+function wirePreview() {
+  document.addEventListener("oli:preview", (event) => {
+    const data = event.detail;
+    const old = pictures.get(data.device);
+    // `image` is null when the picture did not change: keep the last one. A row
+    // that stopped, or whose camera went off, starts again without it.
+    const keep = data.state === "showing" || data.state === "no_picture";
+    const image = data.image !== null ? data.image : keep && old ? old.image : null;
+    pictures.set(data.device, {
+      state: data.state,
+      image,
+      message: data.message || null,
+      action: data.action || null,
+    });
+    for (const box of previewBoxes(data.device)) {
+      drawPicture(box);
+    }
+  });
+  document.addEventListener("oli:level", (event) => {
+    levels = new Map(event.detail.levels.map((level) => [level.device, level]));
+    for (const box of document.querySelectorAll(".preview")) {
+      drawLevels(box);
+    }
+  });
+  // Minimised or hidden: the preview stops, and starts again when seen.
+  document.addEventListener("visibilitychange", () => {
+    syncPreview();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +563,12 @@ function setLive(on) {
   live = on;
   document.body.classList.toggle("live", on);
   byId("go-button").textContent = on ? "Stop" : "Go live";
+  if (on) {
+    // Go live hands the cameras over itself; the core asks for nothing after it.
+    previewOn = false;
+  } else {
+    syncPreview();
+  }
 }
 
 // What each action does (spec, section 10). Actions with no command yet show no button.
@@ -480,14 +713,40 @@ function renderRows() {
       item.append(statusLine(productionLine(row.status.productions)));
       item.append(statusLine(linkLine(row.status.link)));
     }
+    const preview = livePreview(row);
+    if (preview) {
+      item.append(preview);
+    }
     list.append(item);
   }
 }
 
+// The step 3 row's picture and level bars, while live: from the uplink once it runs
+// (Connecting, Live); "Camera off until a production goes live" while Armed or
+// Waiting for production. The row is found by its Studio name.
+function livePreview(row) {
+  if (!live || whatToSend === null) {
+    return null;
+  }
+  const page = whatToSend.video.find((r) => r.ticked && r.input === row.input);
+  if (!page) {
+    return null;
+  }
+  const cameraOff = previewText().camera_off_states.includes(row.state);
+  if (!cameraOff && row.state !== "connecting" && row.state !== "live") {
+    return null;
+  }
+  return previewBox(page, cameraOff);
+}
+
 function renderNotices() {
-  const box = byId("go-notices");
+  renderNoticeBox(byId("go-notices"), notices);
+  renderNoticeBox(byId("what-notices"), previewNotices);
+}
+
+function renderNoticeBox(box, shown) {
   box.replaceChildren();
-  for (const notice of notices.values()) {
+  for (const notice of shown.values()) {
     const line = document.createElement("p");
     line.className = "notice";
     line.textContent = notice.message;
@@ -593,10 +852,17 @@ function wireGoLive() {
     renderRows();
   });
   document.addEventListener("oli:notice", (event) => {
-    if (event.detail.clear) {
-      notices.delete(event.detail.clear);
+    const notice = event.detail;
+    if (typeof notice.device === "string") {
+      rowNotice(notice);
+      return;
+    }
+    const kind = notice.clear || notice.kind;
+    const shown = PREVIEW_NOTICES.has(kind) ? previewNotices : notices;
+    if (notice.clear) {
+      shown.delete(notice.clear);
     } else {
-      notices.set(event.detail.kind, event.detail);
+      shown.set(notice.kind, notice);
     }
     renderNotices();
   });
@@ -803,6 +1069,7 @@ function wireUpdate() {
 
 async function start() {
   wireWhere();
+  wirePreview();
   wireGoLive();
   wireQuit();
   wireLogs();
@@ -819,7 +1086,13 @@ async function start() {
   byId("show-all").addEventListener("change", (event) => {
     listDevices(event.target.checked).catch(showProblem);
   });
-  await listDevices(false);
+  try {
+    await listDevices(false);
+  } finally {
+    // The first device list holds the local Strom; the preview runs on it.
+    devicesListed = true;
+    syncPreview();
+  }
 }
 
 start().catch(showProblem);

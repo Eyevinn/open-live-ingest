@@ -226,6 +226,66 @@ mod tests {
         );
     }
 
+    /// OL-70d: the pictures and levels arrive through the IPC like everything else;
+    /// the page opens no connection of its own (the CSP's `connect-src 'none'` would
+    /// refuse one, and a picture is a `data:` URL the core made).
+    #[test]
+    fn the_script_talks_only_through_the_ipc() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for api in [
+            "fetch",
+            "WebSocket",
+            "XMLHttpRequest",
+            "EventSource",
+            "sendBeacon",
+        ] {
+            assert!(!js.contains(api), "app.js mentions {api}");
+        }
+        assert!(js.contains("window.ipc.postMessage("));
+    }
+
+    /// The preview runs while step 2 is shown: the page says so when step 1 is done or
+    /// the session ends, and when the window is hidden or seen again; never when going
+    /// live, which hands the cameras over itself (spec, sections 4.1 and 5.2).
+    #[test]
+    fn the_preview_follows_step_2_and_the_windows_visibility() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let visibility = handler(js, "visibilitychange");
+        assert!(visibility.contains("syncPreview()"), "{visibility}");
+        let wanted = function(js, "previewWanted");
+        for condition in [
+            "whereReady",
+            "!live",
+            "document.visibilityState === \"visible\"",
+        ] {
+            assert!(wanted.contains(condition), "{wanted}");
+        }
+        let sync = function(js, "syncPreview");
+        assert!(sync.contains("call(\"preview\", { on })"), "{sync}");
+        assert!(function(js, "renderWhere").contains("syncPreview()"));
+        let set_live = function(js, "setLive");
+        assert!(set_live.contains("syncPreview()"), "{set_live}");
+        assert!(set_live.contains("previewOn = false"), "{set_live}");
+    }
+
+    /// A `preview` event whose picture did not change carries no image: the page keeps
+    /// the last one. Levels and row notices are drawn by the row's `device`.
+    #[test]
+    fn the_page_keeps_the_last_picture_and_draws_by_device() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let preview = handler(js, "oli:preview");
+        assert!(preview.contains("old.image"), "{preview}");
+        assert!(preview.contains("previewBoxes(data.device)"), "{preview}");
+        let level = handler(js, "oli:level");
+        assert!(level.contains("level.device"), "{level}");
+        let notice = handler(js, "oli:notice");
+        assert!(notice.contains("rowNotice(notice)"), "{notice}");
+        // The words come from the core's model.
+        assert!(js.contains("previewText().no_microphone"));
+        assert!(js.contains("previewText().camera_off"));
+        assert!(js.contains("previewText().camera_off_states.includes(row.state)"));
+    }
+
     /// Advanced asks Open Live for the relays again whenever it opens, by its own
     /// summary or by the Advanced action of a failure (an unknown relay): the list
     /// from when the window opened may be gone.

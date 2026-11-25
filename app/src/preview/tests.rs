@@ -799,6 +799,63 @@ fn targets_follow_the_saved_selection() {
     assert_eq!(flow.name, "Venue — Cam (preview)");
 }
 
+/// OL-70d: the page finds a row's `preview`, `level` and row notices by the row's
+/// `device`, and a step 3 row by its Studio name. The What to send rows and the
+/// preview's rows agree on both, and on the microphone ("No sound from ..."); the
+/// `preview` event carries the picture state the page draws.
+#[test]
+fn the_page_rows_and_the_preview_rows_agree() {
+    let text = settings_text(
+        "http://127.0.0.1:9",
+        &format!("{CAMERA_WITH_MIC}{TEST_PATTERN}"),
+    );
+    let settings: Config = toml::from_str(&text).unwrap();
+    let listed = devices();
+    let page = crate::what_to_send::model(Some(&listed), &settings, false);
+    let targets = targets(&settings, Some(&listed));
+    for target in &targets {
+        let row = page
+            .video
+            .iter()
+            .find(|r| r.device == target.device)
+            .unwrap_or_else(|| panic!("no page row for {}", target.device));
+        assert!(row.picture, "{}", row.device);
+        assert_eq!(row.input, target.name);
+        assert_eq!(row.microphone, target.microphone);
+        assert_eq!(row.sound, target.has_sound());
+    }
+
+    let t = Instant::now();
+    let (mut preview, generations) = running(targets, t);
+    let gen = generations["dev-cam"];
+    let shown = json_of(&preview.pictured("dev-cam", gen, Ok(Thumbnail::Jpeg(jpeg(1))), t));
+    let data = &shown[0]["data"];
+    assert_eq!(shown[0]["event"], "preview");
+    assert_eq!(data["device"], "dev-cam");
+    assert_eq!(data["state"], "showing");
+    assert!(data["image"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/jpeg;base64,"));
+    // Go live: every step 2 picture says its camera is off.
+    let (removals, events) = preview.hand_over();
+    let mut states: Vec<Value> = json_of(&events)
+        .iter()
+        .map(|e| e["data"]["state"].clone())
+        .collect();
+    for removal in &removals {
+        states.extend(
+            json_of(&preview.removed(removal))
+                .iter()
+                .map(|e| e["data"]["state"].clone()),
+        );
+    }
+    assert!(!states.is_empty());
+    for state in states {
+        assert_eq!(state, "camera_off");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The controller against a fake Strom
 // ---------------------------------------------------------------------------
