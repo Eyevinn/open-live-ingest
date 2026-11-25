@@ -226,6 +226,122 @@ mod tests {
         );
     }
 
+    /// OL-70d: the pictures and levels arrive through the IPC like everything else;
+    /// the page opens no connection of its own (the CSP's `connect-src 'none'` would
+    /// refuse one, and a picture is a `data:` URL the core made).
+    #[test]
+    fn the_script_talks_only_through_the_ipc() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        for api in [
+            "fetch",
+            "WebSocket",
+            "XMLHttpRequest",
+            "EventSource",
+            "sendBeacon",
+        ] {
+            assert!(!js.contains(api), "app.js mentions {api}");
+        }
+        assert!(js.contains("window.ipc.postMessage("));
+    }
+
+    /// The preview runs while step 2 is shown: the page says so when step 1 is done or
+    /// the session ends, and when the window is hidden or seen again; never when going
+    /// live, which hands the cameras over itself (spec, sections 4.1 and 5.2).
+    #[test]
+    fn the_preview_follows_step_2_and_the_windows_visibility() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let visibility = handler(js, "visibilitychange");
+        assert!(visibility.contains("syncPreview()"), "{visibility}");
+        let wanted = function(js, "previewWanted");
+        for condition in [
+            "whereReady",
+            "!live",
+            "document.visibilityState === \"visible\"",
+        ] {
+            assert!(wanted.contains(condition), "{wanted}");
+        }
+        let sync = function(js, "syncPreview");
+        assert!(sync.contains("call(\"preview\", { on })"), "{sync}");
+        assert!(function(js, "renderWhere").contains("syncPreview()"));
+        let set_live = function(js, "setLive");
+        assert!(set_live.contains("syncPreview()"), "{set_live}");
+        assert!(set_live.contains("previewOn = false"), "{set_live}");
+    }
+
+    /// A `preview` event whose picture did not change carries no image: the page keeps
+    /// the last one. Levels and row notices are drawn by the row's `device`.
+    #[test]
+    fn the_page_keeps_the_last_picture_and_draws_by_device() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let preview = handler(js, "oli:preview");
+        assert!(preview.contains("old.image"), "{preview}");
+        assert!(preview.contains("previewBoxes(data.device)"), "{preview}");
+        let level = handler(js, "oli:level");
+        assert!(level.contains("level.device"), "{level}");
+        let notice = handler(js, "oli:notice");
+        assert!(notice.contains("rowNotice(notice)"), "{notice}");
+        // The words come from the core's model.
+        assert!(js.contains("previewText().no_microphone"));
+        assert!(js.contains("previewText().camera_off"));
+        assert!(js.contains("previewText().camera_off_states.includes(row.state)"));
+    }
+
+    /// Step 2's banner "Stop it" (the preview is off while another gateway is live)
+    /// only stops that gateway: unlike Go live's own refusal, it must not go live. The
+    /// preview's buttons take their actions from `PREVIEW_ACTIONS`, which has no
+    /// `retry` (Go live's action) and its own `stop_it`.
+    #[test]
+    fn the_preview_banners_stop_it_does_not_go_live() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let render = function(js, "renderNotices");
+        assert!(
+            render.contains("byId(\"what-notices\"), previewNotices, PREVIEW_ACTIONS"),
+            "{render}"
+        );
+        let start = js
+            .find("const PREVIEW_ACTIONS = {")
+            .expect("app.js has PREVIEW_ACTIONS");
+        let end = start + js[start..].find("\n};\n").expect("PREVIEW_ACTIONS ends");
+        let actions = &js[start..end];
+        assert!(
+            actions.contains("stop_it: { label: \"Stop it\", run: () => stopOtherForPreview() }"),
+            "{actions}"
+        );
+        assert!(actions.contains("retry: null"), "{actions}");
+        assert!(!actions.contains("goLive"), "{actions}");
+        let stop = function(js, "stopOtherForPreview");
+        assert!(stop.contains("call(\"stop_other\")"), "{stop}");
+        assert!(stop.contains("syncPreview()"), "{stop}");
+        assert!(!stop.contains("goLive"), "{stop}");
+        assert!(!stop.contains("stopOther()"), "{stop}");
+        for name in ["drawPicture", "drawRowNotices"] {
+            let body = function(js, name);
+            assert!(body.contains("PREVIEW_ACTIONS"), "{body}");
+        }
+    }
+
+    /// A row's bars go empty when its picture stops, its camera goes off or it fails,
+    /// and when no `level` event has come for a while: never frozen on a last level.
+    #[test]
+    fn the_level_bars_do_not_keep_a_stale_level() {
+        let js = std::str::from_utf8(APP_JS).unwrap();
+        let start = js
+            .find("const NO_LEVEL_STATES")
+            .expect("app.js has NO_LEVEL_STATES");
+        let states = &js[start..start + js[start..].find('\n').unwrap()];
+        for state in ["\"stopped\"", "\"camera_off\"", "\"failed\""] {
+            assert!(states.contains(state), "{states}");
+        }
+        let preview = handler(js, "oli:preview");
+        assert!(
+            preview.contains("NO_LEVEL_STATES.has(data.state) && levels.delete(data.device)"),
+            "{preview}"
+        );
+        let level = handler(js, "oli:level");
+        assert!(level.contains("levelsAt = Date.now()"), "{level}");
+        assert!(js.contains("Date.now() - levelsAt > LEVEL_STALE_MS"));
+    }
+
     /// Advanced asks Open Live for the relays again whenever it opens, by its own
     /// summary or by the Advanced action of a failure (an unknown relay): the list
     /// from when the window opened may be gone.

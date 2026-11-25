@@ -850,7 +850,7 @@ row can be added.
 | The source was put in a production while that production was live (`SlotAddedWhileLive`, #128) | Row Connecting, with: Production "`<name>`" got this source while live, so Open Live has no receiver for it yet. The director has to deactivate and reactivate the production in Studio; until then it cannot show this input. | Open Studio |
 | Gateway token refused on the heartbeat | Banner: Studio can't see this venue's status (gateway token refused). Your cameras are still sending. | Advanced |
 | Settings file invalid (hand-edited) | The settings file has a problem: `<first problem>`. | Show file |
-| Preview: the camera could not be opened (preview flow does not reach running, #172) | Row picture: `<camera>` could not be opened. Close other apps that use it, then untick and tick it again. | Retry |
+| Preview: the camera could not be opened (preview flow does not reach running, #172) | Row picture: `<camera>` could not be opened. Close other apps that use it, then untick and tick it again. | — (untick and tick the row again; `retry` is Go live's action) |
 | Preview: no fresh frame for 5 s while the flow runs (§5.2) | Row picture, dimmed: No picture from `<camera>`. | — |
 | Preview or live: the microphone gives no sound for 5 s (`no_sound`, §5.2) | Row: No sound from `<microphone>`. Check that it is on and not muted. | — (clears itself) |
 | Preview or live: Strom opened another camera than the one picked (`wrong_camera`, strom#1278) | Row: Strom opened "`<opened>`" instead of "`<camera>`". Untick and tick it again (while live: Stop, then Go live). | Show logs |

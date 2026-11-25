@@ -7,6 +7,7 @@
 //! device list and the settings, [`entries`] turns what the page sends back into
 //! `[[input]]` entries, and [`check`] refuses a selection before it is saved.
 
+use crate::go_live::RowState;
 use crate::ipc::InputArgs;
 use open_live_ingest::api::Devices;
 use open_live_ingest::config::{self, Config, InputSettings, TEST_PATTERN_DEVICE};
@@ -21,6 +22,13 @@ pub const TEST_PATTERN_NAME: &str = "Test pattern";
 
 /// Shown when Strom reports no video device at all (spec, section 10).
 pub const NO_CAMERAS: &str = "No cameras found. Connect one, or tick Test pattern.";
+
+/// Shown instead of a level bar on a row whose audio is "None" (spec, section 5.2).
+pub const NO_MICROPHONE: &str = "No microphone";
+
+/// Shown in the picture area of a step 3 row that is Armed or Waiting for production:
+/// no production is live, so its uplink, and its camera, are off (spec, section 5.2).
+pub const CAMERA_OFF_UNTIL_LIVE: &str = "Camera off until a production goes live";
 
 /// A device list on its way.
 pub type DeviceList<'a> = Pin<Box<dyn Future<Output = anyhow::Result<Devices>> + Send + 'a>>;
@@ -47,7 +55,28 @@ pub struct WhatToSend {
     pub audio: Vec<AudioChoice>,
     /// One line about the list as a whole, such as no cameras at all.
     pub notice: Option<&'static str>,
+    /// The preview's fixed words, from the core like every other line the rows show.
+    pub preview_text: PreviewText,
 }
+
+/// The preview's fixed words (spec, section 5.2). The `preview` and `notice` events
+/// carry everything else the rows show.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PreviewText {
+    /// Instead of a level bar, on a row with no microphone.
+    pub no_microphone: &'static str,
+    /// In the picture area of a step 3 row that is Armed or Waiting for production.
+    pub camera_off: &'static str,
+    /// The step 3 input states whose camera is off: no flow, so no picture and no bar.
+    pub camera_off_states: [RowState; 2],
+}
+
+/// The preview's words, as the page gets them.
+pub const PREVIEW_TEXT: PreviewText = PreviewText {
+    no_microphone: NO_MICROPHONE,
+    camera_off: CAMERA_OFF_UNTIL_LIVE,
+    camera_off_states: [RowState::Armed, RowState::WaitingForProduction],
+};
 
 /// One input the person can tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -67,6 +96,17 @@ pub struct Row {
     pub audio: Option<String>,
     /// The editable part of the Studio name, prefilled with the device's name.
     pub label: String,
+    /// The whole Studio name, `<name_prefix><label>`: what the step 3 `input` events
+    /// name the row by, so the page finds the row's `preview` and `level` (by `device`).
+    pub input: String,
+    /// Whether the row shows a picture: ticked and connected. The `preview` events
+    /// carry its state (`starting`, `showing`, `no_picture`, ...).
+    pub picture: bool,
+    /// The paired microphone's name; None with audio "None" and for the test pattern.
+    pub microphone: Option<String>,
+    /// Whether the row shows a level bar: a microphone, or the test pattern's tone.
+    /// Without one, a ticked row says [`NO_MICROPHONE`].
+    pub sound: bool,
 }
 
 /// One entry of the audio picker.
@@ -117,7 +157,19 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
             .to_string()
     };
 
+    let prefix = name_prefix(&settings.gateway.name);
+    // The paired microphone's name, as the preview names it in "No sound from ...".
+    let microphone_of = |audio_id: Option<&String>| {
+        audio_id.map(|id| {
+            audio
+                .iter()
+                .find(|d| &d.id == id)
+                .map_or_else(|| id.clone(), |d| d.name.clone())
+        })
+    };
+
     let test = saved.iter().find(|e| e.is_test_pattern());
+    let label = label_or(test, TEST_PATTERN_NAME);
     let mut rows = vec![Row {
         device: TEST_PATTERN_DEVICE.to_string(),
         name: TEST_PATTERN_NAME.to_string(),
@@ -126,7 +178,11 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
         connected: true,
         ticked: test.is_some(),
         audio: None,
-        label: label_or(test, TEST_PATTERN_NAME),
+        input: format!("{prefix}{label}"),
+        label,
+        picture: test.is_some(),
+        microphone: None,
+        sound: true,
     }];
     let mut matched = vec![false; saved.len()];
     for device in video {
@@ -141,6 +197,9 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
         if device.virtual_ && !show_all && entry.is_none() {
             continue;
         }
+        let paired = entry.and_then(audio_of);
+        let microphone = microphone_of(paired.as_ref());
+        let label = label_or(entry, &device.name);
         rows.push(Row {
             device: device.id.clone(),
             name: device.name.clone(),
@@ -148,8 +207,12 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
             virtual_: device.virtual_,
             connected: true,
             ticked: entry.is_some(),
-            audio: entry.and_then(audio_of),
-            label: label_or(entry, &device.name),
+            audio: paired,
+            input: format!("{prefix}{label}"),
+            label,
+            picture: entry.is_some(),
+            sound: microphone.is_some(),
+            microphone,
         });
     }
     // Saved inputs Strom does not report: listed only once there is a list to miss
@@ -161,6 +224,10 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
             .filter(|(e, matched)| !**matched && !e.is_test_pattern())
         {
             let device = entry.device.trim();
+            let paired = audio_of(entry);
+            let microphone = microphone_of(paired.as_ref());
+            let label = label_or(Some(entry), device);
+            // Not connected: no preview flow, so no picture.
             rows.push(Row {
                 device: device.to_string(),
                 name: device.to_string(),
@@ -168,8 +235,12 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
                 virtual_: false,
                 connected: false,
                 ticked: true,
-                audio: audio_of(entry),
-                label: label_or(Some(entry), device),
+                audio: paired,
+                input: format!("{prefix}{label}"),
+                label,
+                picture: false,
+                sound: microphone.is_some(),
+                microphone,
             });
         }
     }
@@ -186,13 +257,14 @@ pub fn model(devices: Option<&Devices>, settings: &Config, show_all: bool) -> Wh
         })
         .collect();
     WhatToSend {
-        name_prefix: name_prefix(&settings.gateway.name),
+        name_prefix: prefix,
         show_all,
         video: rows,
         audio,
         notice: devices
             .is_some_and(|d| d.video.is_empty())
             .then_some(NO_CAMERAS),
+        preview_text: PREVIEW_TEXT,
     }
 }
 
@@ -573,6 +645,88 @@ pub(crate) mod tests {
             err,
             "Test pattern already goes to the Studio as \"Test pattern\". Pick another name."
         );
+    }
+
+    /// OL-70d: each row carries what the page draws for it in steps 2 and 3: whether
+    /// it has a picture, the microphone's name or none ("No microphone"), and the
+    /// Studio name the step 3 `input` events use. The words are the core's.
+    #[test]
+    fn the_rows_carry_what_the_page_renders() {
+        let saved = settings(
+            "[[input]]\ndevice = \"dev-cam\"\naudio = \"dev-mic\"\nlabel = \"Wide\"\n\n\
+             [[input]]\ndevice = \"test\"\n\n[[input]]\ndevice = \"dev-gone\"\naudio = \"dev-away\"\n",
+        );
+        let model = model(Some(&devices()), &saved, true);
+        let rows: Vec<(&str, &str, bool, Option<&str>, bool)> = model
+            .video
+            .iter()
+            .map(|r| {
+                (
+                    r.device.as_str(),
+                    r.input.as_str(),
+                    r.picture,
+                    r.microphone.as_deref(),
+                    r.sound,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                // The test pattern: a picture and the tone's bar, no microphone.
+                ("test", "Venue — Test pattern", true, None, true),
+                // A camera with a microphone: its name, for the bar and "No sound from".
+                (
+                    "dev-cam",
+                    "Venue — Wide",
+                    true,
+                    Some("USB Microphone"),
+                    true
+                ),
+                // Not ticked: nothing to show.
+                ("dev-obs", "Venue — OBS Virtual Camera", false, None, false),
+                // Not connected: no preview flow, so no picture; a microphone that is not
+                // listed is named by its id.
+                (
+                    "dev-gone",
+                    "Venue — dev-gone",
+                    false,
+                    Some("dev-away"),
+                    true
+                ),
+            ]
+        );
+        // A ticked camera with audio "None": no bar, and the page says so.
+        let none = model_of_one("[[input]]\ndevice = \"dev-cam\"\n");
+        assert_eq!(
+            (none.picture, none.microphone.as_deref(), none.sound),
+            (true, None, false)
+        );
+
+        let json = serde_json::to_value(&model).unwrap();
+        assert_eq!(json["preview_text"]["no_microphone"], "No microphone");
+        assert_eq!(
+            json["preview_text"]["camera_off"],
+            "Camera off until a production goes live"
+        );
+        // The armed wording goes with the states the `input` event names them by.
+        assert_eq!(
+            json["preview_text"]["camera_off_states"],
+            serde_json::json!(["armed", "waiting_for_production"])
+        );
+        let row = &json["video"][1];
+        for field in ["device", "input", "picture", "microphone", "sound"] {
+            assert!(row.get(field).is_some(), "row has no {field}: {row}");
+        }
+    }
+
+    fn model_of_one(inputs: &str) -> Row {
+        let model = model(Some(&devices()), &settings(inputs), false);
+        model
+            .video
+            .into_iter()
+            .find(|r| r.device == "dev-cam")
+            .unwrap()
     }
 
     /// What the app saves, `up` reads the same way: the model of a saved selection is

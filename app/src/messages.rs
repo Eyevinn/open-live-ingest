@@ -411,7 +411,9 @@ impl Failure {
             ),
             Failure::PreviewCameraNotOpened { camera } => Message::new(
                 format!("{camera} could not be opened. Close other apps that use it, then untick and tick it again."),
-                Some(Retry),
+                // Ticking the row again is the way out (spec, section 10): `retry`
+                // is Go live's action, which this row must not start.
+                None,
             ),
             Failure::PreviewNoPicture { camera } => {
                 Message::new(format!("No picture from {camera}."), None)
@@ -1450,7 +1452,7 @@ mod tests {
             }
             .message(),
             "FaceTime HD Camera could not be opened. Close other apps that use it, then untick and tick it again.",
-            Some(Action::Retry),
+            None,
         );
     }
 
