@@ -12,6 +12,7 @@
 //! [`MediaRequest`] and answers from what it reports. Either way the library owns no
 //! media. Flow ids and every other Strom concept stay inside [`StromMedia`].
 
+use crate::api::StromHold;
 use crate::config::{Config, Video};
 use crate::devices;
 use crate::flow::{self, Input};
@@ -130,9 +131,22 @@ impl StromMedia {
     /// this one in the pidfile, then adopts the local Strom or starts one, and reads
     /// its version.
     pub async fn start(cfg: &Config, events: &Events) -> Result<Self> {
+        Self::start_on(cfg, None, events).await
+    }
+
+    /// [`start`](Self::start), over `held` when given: the Strom an app took before
+    /// going live ([`crate::api::hold_strom`]) is used instead of adopting or starting
+    /// one, and is owned from here on, so dropping this stops it if it was started
+    /// for the hold, exactly as for a Strom started here. Refused like `start` when
+    /// another gateway is live, and the hold is then released
+    /// ([`StromHold::release`]), never just dropped: that gateway may use it.
+    pub async fn start_on(cfg: &Config, held: Option<StromHold>, events: &Events) -> Result<Self> {
         // One live session per settings file: a second loop over the same flows and
         // sources would fight the first for them.
         if let Some(pid) = run::running_gateway() {
+            if let Some(held) = held {
+                held.release().await;
+            }
             return Err(AlreadyRunning { pid }.into());
         }
         // Recorded at once, not once the inputs are live: a gateway that is still
@@ -141,10 +155,25 @@ impl StromMedia {
         // never takes its Strom for one left behind (#95). Removed again when this
         // drops, however the session ends.
         let pidfile = Pidfile::write(events);
-        let (local, strom) = run::connect_strom(cfg, events).await?;
-        // Asked once, here, whether or not the heartbeat is on; the heartbeat reuses it.
-        // An older Strom without the route is warned about, never refused.
-        let version = strom.version().await.ok();
+        let (local, strom, version) = match held {
+            Some(held) => {
+                if !held.serves(cfg) {
+                    bail!("the Strom held for this session is not the one the settings name ([strom] url, api_key or manage changed since it was taken)");
+                }
+                let (mut local, strom, version) = held.into_parts();
+                // Its stop is the session's to report now.
+                local.report_to(events.clone());
+                (local, strom, version)
+            }
+            None => {
+                let (local, strom) = run::connect_strom(cfg, events).await?;
+                // Asked once, here, whether or not the heartbeat is on; the heartbeat
+                // reuses it.
+                let version = strom.version().await.ok();
+                (local, strom, version)
+            }
+        };
+        // An older Strom without the version route is warned about, never refused.
         if let Some(warning) =
             strom_api::version_warning(strom_api::PINNED_VERSION, version.as_deref())
         {

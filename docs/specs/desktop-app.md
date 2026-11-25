@@ -282,7 +282,8 @@ from step 2 and hands that same Strom to the session at Go live.
      (new) every preview flow of this gateway (§5.2), before any uplink is created.
   2. §4's checks (`gateway.pid`, camera and microphone authorisation), then the session is started
      with the hold: `Session::start_armed` and `Session::start_keeping_sources` gain siblings that
-     take a `Launch { strom: Option<StromHold>, taps: Taps }` (names final in OL-70b).
+     take a `Launch { strom: Option<StromHold>, taps: Taps }`: `Session::launch_armed` and
+     `Session::launch_keeping_sources` (OL-70b).
      `StromMedia::start` writes `gateway.pid` as today and then uses the held Strom instead of
      calling `connect_strom`. From here the session owns it: when the session ends, its drop stops a
      Managed Strom after the teardown, exactly as for a Strom it started itself (§15 Q14).

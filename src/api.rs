@@ -30,7 +30,7 @@ use crate::credential::{self, StoredCredential};
 use crate::gateway::Events;
 use crate::heartbeat;
 use crate::keychain::SecretStore;
-use crate::local_strom;
+use crate::local_strom::{self, LocalStrom};
 use crate::openlive::{OpenLiveClient, ServerInfo};
 use crate::osc;
 use crate::run::{self, DeviceKind, DeviceReport};
@@ -58,11 +58,181 @@ pub struct Devices {
 /// as `devices --json` lists them. A managed Strom is started to ask, if nothing is
 /// listening, and stopped again before this returns; `events` hears about both.
 pub async fn devices(settings: &Config, events: &Events) -> Result<Devices> {
-    let (video, audio) = run::devices(settings, events)
-        .await?
+    Ok(split(run::devices(settings, events).await?))
+}
+
+/// [`devices`], asking the Strom `hold` keeps running: nothing is started or stopped.
+pub async fn devices_with(hold: &StromHold) -> Result<Devices> {
+    Ok(split(run::devices_on(&hold.client).await?))
+}
+
+fn split(devices: Vec<DeviceReport>) -> Devices {
+    let (video, audio) = devices
         .into_iter()
         .partition(|d| d.kind == DeviceKind::Video);
-    Ok(Devices { video, audio })
+    Devices { video, audio }
+}
+
+/// The local Strom, held by an app between sessions: the desktop app holds it from
+/// its What to send step until Go live, so the step can list devices and preview
+/// cameras on the same Strom the session then sends with (docs/specs/desktop-app.md,
+/// section 4.1). Taken with [`hold_strom`], used with [`devices_with`], and either
+/// handed to a session ([`crate::session::Launch`]), which owns it from then on and
+/// stops a Strom it holds that was started here when it ends, as it does a Strom it
+/// started itself; or given up with [`StromHold::release`].
+///
+/// Dropping a hold stops a Strom it started, as `devices` does on its way out, with
+/// no check for anyone else using it: release it instead, unless the process is
+/// going away anyway.
+pub struct StromHold {
+    local: LocalStrom,
+    client: StromClient,
+    version: Option<String>,
+    /// The `[strom]` settings it was taken with, for [`StromHold::serves`].
+    url: String,
+    api_key: Option<String>,
+    manage: bool,
+}
+
+impl fmt::Debug for StromHold {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // No key: it is a credential.
+        f.debug_struct("StromHold")
+            .field("url", &self.url)
+            .field("managed", &self.local.is_managed())
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What [`StromHold::release`] did with the Strom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Released {
+    /// It was running before the hold was taken, and is left as it was.
+    Adopted,
+    /// It was started for the hold, and is stopped now.
+    Stopped,
+    /// It was started for the hold but is left running, still recorded in
+    /// `strom.pid`, so `down` (or the next reclaim) stops it.
+    LeftRunning(LeftRunning),
+}
+
+/// Why a Strom started for a hold is left running at its release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeftRunning {
+    /// `gateway.pid` names another gateway, which may have adopted it.
+    OtherGateway { pid: u32 },
+    /// It runs flows: someone else's (a CLI `up` that adopted it, Strom's own UI).
+    Flows { count: usize },
+    /// Its flows could not be listed, so whether anyone uses it is not known.
+    FlowsUnknown,
+}
+
+impl StromHold {
+    /// A client for it.
+    pub fn client(&self) -> &StromClient {
+        &self.client
+    }
+
+    /// Its version, as it reported it when the hold was taken.
+    pub fn version(&self) -> Option<&str> {
+        self.version.as_deref()
+    }
+
+    /// Whether it was started for the hold (Managed) rather than adopted.
+    pub fn is_managed(&self) -> bool {
+        self.local.is_managed()
+    }
+
+    /// Whether it is the Strom `settings` name: the same `strom.url`, `strom.api_key`
+    /// and `strom.manage` as when it was taken. A change of any of them calls for a
+    /// new hold.
+    pub fn serves(&self, settings: &Config) -> bool {
+        self.url == settings.strom.url
+            && self.api_key == settings.strom.api_key
+            && self.manage == settings.strom.manage
+    }
+
+    /// Gives the hold up. A Strom that was adopted is left as it is. One started for
+    /// the hold is stopped, and `strom.pid` removed, only when it runs no flow and
+    /// `gateway.pid` names no other gateway; otherwise another gateway (a CLI `up`
+    /// that adopted it) or someone else uses it, and it is left running, still
+    /// recorded in `strom.pid`, which is logged. Remove your own flows first: every
+    /// flow counts. Blocks while a Strom stops (at most 10 s).
+    pub async fn release(self) -> Released {
+        let other = run::running_gateway();
+        self.release_unless(other).await
+    }
+
+    async fn release_unless(mut self, other_gateway: Option<u32>) -> Released {
+        if !self.local.is_managed() {
+            return Released::Adopted;
+        }
+        let left = match other_gateway {
+            // Gone already: nobody uses it, and its record goes with it.
+            _ if self.local.has_exited() => None,
+            Some(pid) => Some(LeftRunning::OtherGateway { pid }),
+            None => match self.client.list_flows().await {
+                Ok(flows) if flows.is_empty() => None,
+                Ok(flows) => Some(LeftRunning::Flows { count: flows.len() }),
+                Err(err) => {
+                    tracing::warn!(err = %format_args!("{err:#}"), "could not list the held Strom's flows");
+                    Some(LeftRunning::FlowsUnknown)
+                }
+            },
+        };
+        match left {
+            None => {
+                drop(self.local);
+                Released::Stopped
+            }
+            Some(why) => {
+                tracing::info!(
+                    ?why,
+                    "releasing the held Strom: left running, still recorded in strom.pid"
+                );
+                self.local.leave_running();
+                Released::LeftRunning(why)
+            }
+        }
+    }
+
+    /// The parts a session runs on.
+    pub(crate) fn into_parts(self) -> (LocalStrom, StromClient, Option<String>) {
+        (self.local, self.client, self.version)
+    }
+
+    /// A hold over `local`, reached at `url`, for tests.
+    #[cfg(test)]
+    pub(crate) fn for_test(local: LocalStrom, url: &str) -> Self {
+        StromHold {
+            local,
+            client: StromClient::new(url, None).unwrap(),
+            version: None,
+            url: url.to_string(),
+            api_key: None,
+            manage: true,
+        }
+    }
+}
+
+/// Holds the local Strom for an app: adopts the one answering at `strom.url`, or
+/// starts one headless when `strom.manage` allows (recorded in `strom.pid`), as `up`
+/// does, and reads its version. `events` hears Strom starting and ready, and, unless
+/// it is handed to a session, its stop. A Strom left behind by a crash should be
+/// reclaimed first ([`local_strom::reclaim_recorded`]): adopted, it would never be
+/// stopped. No `gateway.pid` is written: holding a Strom is not going live.
+pub async fn hold_strom(settings: &Config, events: &Events) -> Result<StromHold> {
+    let (local, client) = run::connect_strom(settings, events).await?;
+    let version = client.version().await.ok();
+    Ok(StromHold {
+        local,
+        client,
+        version,
+        url: settings.strom.url.clone(),
+        api_key: settings.strom.api_key.clone(),
+        manage: settings.strom.manage,
+    })
 }
 
 /// An Open Source Cloud workspace as a credential sees it: every credential is bound
@@ -590,6 +760,73 @@ pub async fn probe_strom(settings: &Config) -> Reachability {
     }
 }
 
+/// A fake local Strom for the library's tests: plain HTTP/1.1 on std threads, one
+/// request per connection, each answered by `handler` from its method and path.
+#[cfg(test)]
+pub(crate) mod fake_strom {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    pub(crate) type Handler = Arc<dyn Fn(&str, &str) -> (u16, serde_json::Value) + Send + Sync>;
+
+    /// Serves `handler` on a free port of 127.0.0.1; returns `http://127.0.0.1:<port>`.
+    pub(crate) fn serve(handler: Handler) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let handler = handler.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut first = String::new();
+                    if reader.read_line(&mut first).is_err() {
+                        return;
+                    }
+                    // The headers, up to the blank line; the routes used have no body.
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                        line.clear();
+                    }
+                    let mut words = first.split_whitespace();
+                    let method = words.next().unwrap_or_default().to_string();
+                    let path = words.next().unwrap_or_default().to_string();
+                    let (status, body) = handler(&method, &path);
+                    let body = body.to_string();
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A Strom that sees no devices and runs `flows`.
+    pub(crate) fn running(flows: Vec<strom_types::Flow>) -> String {
+        serve(Arc::new(move |_, path| {
+            if path.starts_with("/api/discovery/devices") {
+                (200, serde_json::json!([]))
+            } else if path == "/api/flows" {
+                (200, serde_json::json!({ "flows": flows }))
+            } else if path == "/api/version" {
+                (
+                    200,
+                    serde_json::json!({
+                        "version": "0.8.4", "git_hash": "0", "git_tag": "v0.8.4",
+                        "git_branch": "main", "git_dirty": false, "build_timestamp": ""
+                    }),
+                )
+            } else {
+                (404, serde_json::Value::Null)
+            }
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,5 +1020,175 @@ mod tests {
             Problem::new(None, "two"),
         ]);
         assert_eq!(err.to_string(), "the settings were not saved: one; two");
+    }
+
+    // -----------------------------------------------------------------------
+    // The Strom an app holds (docs/specs/desktop-app.md, section 4.1)
+    // -----------------------------------------------------------------------
+
+    /// A Strom answering at the settings' address is adopted for the hold, listed
+    /// through it, and given up untouched.
+    #[tokio::test]
+    async fn a_running_strom_is_held_adopted_and_released_untouched() {
+        let url = fake_strom::running(Vec::new());
+        let mut settings = Config::default();
+        settings.strom.url = url.clone();
+        settings.strom.manage = false;
+        let hold = hold_strom(&settings, &Events::discard()).await.unwrap();
+        assert!(!hold.is_managed());
+        assert_eq!(hold.version(), Some("0.8.4"));
+        assert!(hold.serves(&settings));
+        let devices = devices_with(&hold).await.unwrap();
+        assert!(devices.video.is_empty() && devices.audio.is_empty());
+
+        let mut moved = settings.clone();
+        moved.strom.url = "http://127.0.0.1:9".to_string();
+        assert!(!hold.serves(&moved), "another address");
+        let mut keyed = settings.clone();
+        keyed.strom.api_key = Some("k".to_string());
+        assert!(!hold.serves(&keyed), "another key");
+        let mut managed = settings.clone();
+        managed.strom.manage = true;
+        assert!(!hold.serves(&managed), "manage changed");
+
+        assert_eq!(hold.release().await, Released::Adopted);
+    }
+
+    /// A process standing in for a Strom started for the hold, recorded in a scratch
+    /// `strom.pid`, with its events kept.
+    #[cfg(unix)]
+    struct Started {
+        dir: std::path::PathBuf,
+        pid: u32,
+        pidfile: std::path::PathBuf,
+        seen: Arc<std::sync::Mutex<Vec<crate::gateway::Event>>>,
+    }
+
+    #[cfg(unix)]
+    impl Started {
+        fn hold(name: &str, url: &str) -> (Self, StromHold) {
+            let dir = std::env::temp_dir().join(format!("oli-hold-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let child = std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            let pidfile = dir.join("strom.pid");
+            std::fs::write(&pidfile, pid.to_string()).unwrap();
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let events = {
+                let seen = seen.clone();
+                Events::new(move |e| seen.lock().unwrap().push(e))
+            };
+            let local = LocalStrom::managed_for_test(child, pidfile.clone(), events);
+            let hold = StromHold::for_test(local, url);
+            (
+                Started {
+                    dir,
+                    pid,
+                    pidfile,
+                    seen,
+                },
+                hold,
+            )
+        }
+
+        fn alive(&self) -> bool {
+            // Signal 0 checks the pid exists; a stopped child is reaped, so it is gone.
+            unsafe { libc::kill(self.pid as libc::pid_t, 0) == 0 }
+        }
+
+        fn stopped_events(&self) -> usize {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, crate::gateway::Event::StromStopped))
+                .count()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Started {
+        fn drop(&mut self) {
+            if self.alive() {
+                unsafe {
+                    libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A Strom started for the hold that runs a flow that is not ours (a CLI `up`
+    /// adopted it meanwhile) is left running at the release, still in `strom.pid`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_leaves_a_strom_with_a_foreign_flow_running_and_keeps_strom_pid() {
+        let url = fake_strom::running(vec![strom_types::Flow::new("Someone else's")]);
+        let (started, hold) = Started::hold("foreign", &url);
+        assert!(hold.is_managed());
+
+        let released = hold.release_unless(None).await;
+
+        assert_eq!(
+            released,
+            Released::LeftRunning(LeftRunning::Flows { count: 1 })
+        );
+        assert!(started.alive(), "the Strom was stopped");
+        assert_eq!(
+            std::fs::read_to_string(&started.pidfile).unwrap(),
+            started.pid.to_string(),
+            "strom.pid still names it"
+        );
+        assert_eq!(started.stopped_events(), 0);
+    }
+
+    /// Another gateway live on this machine may use it: left running, unasked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_leaves_the_strom_running_while_another_gateway_is_live() {
+        let url = fake_strom::running(Vec::new());
+        let (started, hold) = Started::hold("other", &url);
+
+        let released = hold.release_unless(Some(4242)).await;
+
+        assert_eq!(
+            released,
+            Released::LeftRunning(LeftRunning::OtherGateway { pid: 4242 })
+        );
+        assert!(started.alive());
+        assert!(started.pidfile.exists());
+    }
+
+    /// Flows that cannot be listed may be anyone's: left running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_leaves_the_strom_running_when_its_flows_are_not_known() {
+        let url = fake_strom::serve(Arc::new(|_, _| (500, serde_json::Value::Null)));
+        let (started, hold) = Started::hold("unknown", &url);
+
+        let released = hold.release_unless(None).await;
+
+        assert_eq!(released, Released::LeftRunning(LeftRunning::FlowsUnknown));
+        assert!(started.alive());
+        assert!(started.pidfile.exists());
+    }
+
+    /// With no flow and no other gateway, the Strom started for the hold is stopped
+    /// and its record removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_stops_an_idle_strom_started_for_the_hold() {
+        let url = fake_strom::running(Vec::new());
+        let (started, hold) = Started::hold("idle", &url);
+
+        let released = hold.release_unless(None).await;
+
+        assert_eq!(released, Released::Stopped);
+        assert!(!started.alive(), "the Strom still runs");
+        assert!(!started.pidfile.exists(), "strom.pid kept");
+        assert_eq!(started.stopped_events(), 1);
     }
 }

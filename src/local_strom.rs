@@ -30,17 +30,81 @@ pub enum LocalStrom {
         child: Child,
         log_path: PathBuf,
         events: Events,
+        /// Where its pid is recorded ([`config::strom_pidfile`]), removed once it has
+        /// stopped.
+        pidfile: PathBuf,
+        /// Left running when dropped, its pid still recorded: see
+        /// [`LocalStrom::leave_running`].
+        keep_running: bool,
     },
+}
+
+impl LocalStrom {
+    /// Whether this process started it, and so stops it when this is dropped.
+    pub fn is_managed(&self) -> bool {
+        matches!(self, LocalStrom::Managed { .. })
+    }
+
+    /// Whether a Strom started here has exited already. Never for an adopted one.
+    pub(crate) fn has_exited(&mut self) -> bool {
+        match self {
+            LocalStrom::Managed { child, .. } => matches!(child.try_wait(), Ok(Some(_))),
+            LocalStrom::Adopted => false,
+        }
+    }
+
+    /// From now on, its stop is told to `events` rather than to whoever started it:
+    /// the session a held Strom is handed to reports `StromStopped` itself.
+    pub(crate) fn report_to(&mut self, to: Events) {
+        if let LocalStrom::Managed { events, .. } = self {
+            *events = to;
+        }
+    }
+
+    /// Gives it up without stopping it: a Managed Strom keeps running and stays
+    /// recorded in `strom.pid`, so `down` (or the next reclaim) stops it as it stops
+    /// any recorded Strom. For a Strom another gateway has started using meanwhile.
+    pub(crate) fn leave_running(mut self) {
+        if let LocalStrom::Managed { keep_running, .. } = &mut self {
+            *keep_running = true;
+        }
+    }
+}
+
+#[cfg(test)]
+impl LocalStrom {
+    /// A Managed Strom over `child`, recorded at `pidfile`, for tests that stand a
+    /// process in for Strom without touching the user's own `strom.pid`.
+    pub(crate) fn managed_for_test(child: Child, pidfile: PathBuf, events: Events) -> Self {
+        LocalStrom::Managed {
+            child,
+            log_path: pidfile.with_file_name("strom.log"),
+            events,
+            pidfile,
+            keep_running: false,
+        }
+    }
 }
 
 impl Drop for LocalStrom {
     fn drop(&mut self) {
-        let LocalStrom::Managed { child, events, .. } = self else {
+        let LocalStrom::Managed {
+            child,
+            events,
+            pidfile,
+            keep_running,
+            ..
+        } = self
+        else {
             return;
         };
+        if *keep_running {
+            info!(pid = child.id(), "leaving the Strom we started running");
+            return;
+        }
         // Already exited and reaped: its pid may belong to another process by now.
         if let Ok(Some(_)) = child.try_wait() {
-            std::fs::remove_file(config::strom_pidfile()).ok();
+            std::fs::remove_file(&*pidfile).ok();
             return;
         }
         let pid = child.id();
@@ -72,7 +136,7 @@ impl Drop for LocalStrom {
                 }
             }
         }
-        std::fs::remove_file(config::strom_pidfile()).ok();
+        std::fs::remove_file(&*pidfile).ok();
         events.emit(Event::StromStopped);
     }
 }
@@ -190,6 +254,8 @@ pub async fn ensure_running(cfg: &Config, events: &Events) -> Result<LocalStrom>
         child,
         log_path,
         events: events.clone(),
+        pidfile,
+        keep_running: false,
     };
     wait_until_ready(&client, &mut managed, events).await?;
     Ok(managed)
@@ -985,12 +1051,13 @@ mod tests {
             .unwrap()
             .port();
         let client = StromClient::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
-        // Not dropped: `Drop` would remove the user's real Strom pidfile.
-        let mut managed = std::mem::ManuallyDrop::new(LocalStrom::Managed {
+        let mut managed = LocalStrom::Managed {
             child,
             log_path,
             events: Events::discard(),
-        });
+            pidfile: scratch.0.join("strom.pid"),
+            keep_running: false,
+        };
 
         let started = Instant::now();
         let err = wait_until_ready(&client, &mut managed, &Events::discard())

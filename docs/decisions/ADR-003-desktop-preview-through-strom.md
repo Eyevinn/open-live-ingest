@@ -1,7 +1,7 @@
 # ADR-003: Desktop preview of picture and sound through Strom's thumbnail and meter blocks
 
 **Date**: 2026-11-25
-**Status**: Proposed
+**Status**: Accepted
 
 Spec: [`docs/specs/desktop-app.md`](../specs/desktop-app.md) §4.1, §5.2, §12. Issue: #172 (OL-70).
 Builds on [ADR-001](ADR-001-desktop-app-toolkit.md).

@@ -29,6 +29,12 @@
 //! with the source kept. `SlotAddedWhileLive` names the live productions that were
 //! given the source while live, which have no receiver for it until reactivated.
 //!
+//! [`Session::launch_armed`] and [`Session::launch_keeping_sources`] are
+//! `start_armed` and `start_keeping_sources` with a [`Launch`]: the desktop app hands
+//! over the Strom it held before going live ([`crate::api::StromHold`]), and the
+//! session owns it from then on, stopping it at its end if it was started for the
+//! hold (docs/specs/desktop-app.md, section 4.1).
+//!
 //! Every start but [`Session::start_armed_with`] does the media through the local
 //! Strom ([`StromMedia`]), built inside the session task. `start_armed_with` takes the
 //! media backend instead: on a phone an [`ExternalMedia`](crate::media::ExternalMedia)
@@ -54,6 +60,7 @@
 //!   per tick (every 10 s) for as long as the session runs. Drop the receiver
 //!   instead: events for nobody are discarded.
 
+use crate::api::StromHold;
 use crate::config::{self, Config};
 use crate::credential::OscCredential;
 use crate::devices::AudioPairing;
@@ -97,6 +104,33 @@ impl Inputs {
     }
 }
 
+/// How a session that sends through the local Strom is launched: what the desktop app
+/// hands over at Go live (docs/specs/desktop-app.md, section 4.1). The default is how
+/// every other start launches: no held Strom, no taps.
+#[derive(Debug, Default)]
+pub struct Launch {
+    /// The Strom the app held before going live ([`crate::api::hold_strom`]), used
+    /// instead of adopting or starting one. The session owns it from here on: it
+    /// stops it when it ends if it was started for the hold, after its teardown, as it
+    /// stops a Strom it started itself, and its `StromStopped` comes on the session's
+    /// events. A session that ends before it starts on it (settings refused, another
+    /// gateway live) releases it ([`StromHold::release`]) instead. `None` adopts or
+    /// starts one, as `up` does.
+    pub strom: Option<StromHold>,
+    /// Whether the uplink flows carry the preview taps.
+    pub taps: Taps,
+}
+
+/// Whether a session's uplink flows carry the picture and sound taps the desktop app
+/// reads while live (docs/specs/desktop-app.md, section 12). Only `Off` for now, the
+/// flow every caller builds today; `On` comes with the taps in the flow builder.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Taps {
+    /// Today's flow, byte for byte.
+    #[default]
+    Off,
+}
+
 /// Starts sessions. See the module documentation.
 #[derive(Debug)]
 pub struct Session {
@@ -115,6 +149,7 @@ impl Session {
     /// the module documentation's caveats).
     pub fn start(settings: Config, inputs: Inputs) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
+            None,
             None,
             settings,
             None,
@@ -135,6 +170,7 @@ impl Session {
     ) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
             None,
+            None,
             settings,
             Some(credential),
             inputs,
@@ -154,6 +190,7 @@ impl Session {
         credential: Option<OscCredential>,
     ) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
+            None,
             None,
             settings,
             credential,
@@ -181,6 +218,7 @@ impl Session {
     ) -> (SessionHandle, Receiver) {
         Self::start_inner::<StromMedia>(
             None,
+            None,
             settings,
             credential,
             inputs,
@@ -203,6 +241,7 @@ impl Session {
     ) -> (SessionHandle, Receiver) {
         Self::start_inner(
             Some(media),
+            None,
             settings,
             credential,
             inputs,
@@ -210,10 +249,58 @@ impl Session {
         )
     }
 
+    /// [`start_armed`](Self::start_armed), launched as `launch` says: over the Strom
+    /// the app holds, when it holds one, which the session owns from here on. See
+    /// [`Launch`].
+    pub fn launch_armed(
+        launch: Launch,
+        settings: Config,
+        inputs: Inputs,
+        credential: Option<OscCredential>,
+        sources: Sources,
+    ) -> (SessionHandle, Receiver) {
+        let Launch {
+            strom,
+            taps: Taps::Off,
+        } = launch;
+        Self::start_inner::<StromMedia>(
+            None,
+            strom,
+            settings,
+            credential,
+            inputs,
+            (sources, Sending::WhileLive),
+        )
+    }
+
+    /// [`start_keeping_sources`](Self::start_keeping_sources), launched as `launch`
+    /// says. See [`Launch`].
+    pub fn launch_keeping_sources(
+        launch: Launch,
+        settings: Config,
+        inputs: Inputs,
+        credential: Option<OscCredential>,
+    ) -> (SessionHandle, Receiver) {
+        let Launch {
+            strom,
+            taps: Taps::Off,
+        } = launch;
+        Self::start_inner::<StromMedia>(
+            None,
+            strom,
+            settings,
+            credential,
+            inputs,
+            (Sources::Keep, Sending::Always),
+        )
+    }
+
     /// Runs the session on a task of its own: through `media` when one is given,
-    /// otherwise through a [`StromMedia`] built inside the task.
+    /// otherwise through a [`StromMedia`] built inside the task, over `held` when
+    /// given.
     fn start_inner<M: Media + 'static>(
         media: Option<M>,
+        held: Option<StromHold>,
         settings: Config,
         credential: Option<OscCredential>,
         inputs: Inputs,
@@ -230,7 +317,10 @@ impl Session {
             // A dropped handle is a stop too: the session must not outlive its owner
             // with flows and sources nobody can remove.
             let stop = async move { stop_rx.await.unwrap_or(Stop::Interrupt) };
-            let outcome = run(media, settings, credential, inputs, sources, &events, stop).await;
+            let outcome = run(
+                media, held, settings, credential, inputs, sources, &events, stop,
+            )
+            .await;
             events.emit(match &outcome {
                 Ok(()) => Event::Stopped,
                 Err(err) => Event::Failed {
@@ -263,8 +353,10 @@ impl Session {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run<M: Media>(
     media: Option<M>,
+    held: Option<StromHold>,
     settings: Config,
     credential: Option<OscCredential>,
     inputs: Inputs,
@@ -272,14 +364,21 @@ async fn run<M: Media>(
     events: &Events,
     stop: impl std::future::Future<Output = Stop> + Send,
 ) -> Result<()> {
-    match credential {
+    let valid = match credential {
         // The app's credential stands in for one in the settings or a CLI login.
-        Some(_) => config::validate_with(&settings, true)?,
-        None => config::validate(&settings)?,
+        Some(_) => config::validate_with(&settings, true),
+        None => config::validate(&settings),
+    };
+    if let Err(err) = valid {
+        // Released, not dropped: the session never started on it.
+        if let Some(held) = held {
+            held.release().await;
+        }
+        return Err(err);
     }
     match media {
         Some(media) => run::up(&media, settings, credential, inputs, sources, events, stop).await,
-        None => run::up_on_strom(settings, credential, inputs, sources, events, stop).await,
+        None => run::up_on_strom(held, settings, credential, inputs, sources, events, stop).await,
     }
 }
 
@@ -409,5 +508,94 @@ mod tests {
             reason.starts_with("--audio pairs an audio source"),
             "{reason}"
         );
+    }
+
+    /// The desktop app's handover (docs/specs/desktop-app.md, section 4.1): a Strom
+    /// started for the app's hold and handed to a session keeps running while the
+    /// session runs, and the session stops it when it ends, telling its own events,
+    /// not the app's.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_strom_is_stopped_by_the_sessions_end_not_by_the_app() {
+        use crate::api::{fake_strom, StromHold};
+        use crate::local_strom::LocalStrom;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let dir = std::env::temp_dir().join(format!("oli-handover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let alive = move || unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+        let pidfile = dir.join("strom.pid");
+        std::fs::write(&pidfile, pid.to_string()).unwrap();
+        let app_seen = Arc::new(Mutex::new(Vec::new()));
+        let app_events = {
+            let seen = app_seen.clone();
+            Events::new(move |e| seen.lock().unwrap().push(e))
+        };
+
+        // The session's first call on Strom is listing its flows (`prepare`): then
+        // the held Strom must still run. Refused, so the session ends there.
+        let ran_when_asked = Arc::new(AtomicBool::new(false));
+        let url = {
+            let ran = ran_when_asked.clone();
+            fake_strom::serve(Arc::new(move |_, path| {
+                if path == "/api/flows" {
+                    ran.store(alive(), Ordering::SeqCst);
+                }
+                (500, serde_json::Value::Null)
+            }))
+        };
+        let hold = StromHold::for_test(
+            LocalStrom::managed_for_test(child, pidfile.clone(), app_events),
+            &url,
+        );
+        let mut settings = Config::default();
+        settings.gateway.id = Some("gw-handover".to_string());
+        settings.strom.url = url;
+        settings.strom.manage = true;
+        settings.open_live.register = false;
+        settings.uplink.host = Some("cloud.example.com".to_string());
+        settings.uplink.port_range = Some("47110-47112".to_string());
+
+        let (handle, mut events) = Session::launch_keeping_sources(
+            Launch {
+                strom: Some(hold),
+                ..Launch::default()
+            },
+            settings,
+            Inputs::test_pattern(),
+            None,
+        );
+        let mut seen = Vec::new();
+        while let Some(event) = events.recv().await {
+            seen.push(event);
+        }
+        let outcome = handle.wait().await;
+
+        assert!(outcome.is_err(), "{seen:?}");
+        assert!(
+            ran_when_asked.load(Ordering::SeqCst),
+            "the held Strom was stopped before the session used it: {seen:?}"
+        );
+        assert!(!alive(), "the held Strom outlived the session");
+        assert!(!pidfile.exists(), "strom.pid kept");
+        assert!(
+            seen.iter().any(|e| matches!(e, Event::StromStopped)),
+            "{seen:?}"
+        );
+        assert!(
+            app_seen.lock().unwrap().is_empty(),
+            "{:?}",
+            app_seen.lock().unwrap()
+        );
+        // `StromStopped` comes after the teardown, before the last event.
+        let stopped = seen.iter().position(|e| matches!(e, Event::StromStopped));
+        assert!(stopped < Some(seen.len() - 1), "{seen:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
