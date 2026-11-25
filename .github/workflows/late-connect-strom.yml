@@ -10,16 +10,18 @@ name: Late connect (Strom receiver)
 #   3. nosync:  late as in 1, sinks `sync: false`
 #   4. late+restart: late as in 1, with `--restart-on-late-connect`: the ingest-side
 #      workaround #111's triage proposed (restart the uplink once at a late first
-#      connect, so it connects again into the running receiver). It does not avoid
-#      the stall (PR #170, run 45480983729), so it is kept as a recorded negative
-#      result, and `up` has no such restart
+#      connect, so it connects again into the running receiver). On Strom v0.8.2 it
+#      did not avoid the stall (PR #170, run 45490377672), so it is kept as a recorded
+#      negative result, and `up` has no such restart
 #
-# Until a Strom release carries the strom#1277 fix, the expected pattern is
-# FAIL / PASS / PASS / FAIL, and the job succeeds only on that pattern: it shows the
-# reproduction still catches the stall, that its controls stay clean, and that an
-# immediate restart does not get around it. After the fix is released and pinned
-# (.github/scripts/bump-strom-pin.sh), runs 1 and 4 must PASS and the expected
-# pattern here becomes PASS / PASS / PASS / PASS.
+# On Strom v0.8.4 (PR #171, run 45500947777) a late first connect is clean: run 1
+# PASSes, on both the drop gate and the PTS gates. A reconnect right after the first
+# connect still stalls the receiver: run 4 FAILs (drops from about +20 to +40 s, sinks
+# empty until +40 s). strom#1277 is therefore not fixed, only narrowed to a reconnect
+# soon after the first connect. The expected pattern is PASS / PASS / PASS / FAIL, and
+# the job succeeds only on that pattern. When a Strom release fixes the reconnect case
+# too and is pinned (.github/scripts/bump-strom-pin.sh), run 4 must PASS and the
+# expected pattern becomes PASS / PASS / PASS / PASS.
 #
 # The Strom setup is ci.yml's real-strom job: GStreamer from apt, the
 # strom-<tag>-linux-x86_64 release asset at the strom-types pin in Cargo.toml,
@@ -190,7 +192,12 @@ jobs:
           out="$RUNNER_TEMP/late-connect"
           results="$out/results.tsv"
           summary="$out/summary.md"
-          declare -A expected=([late]=FAIL [first]=PASS [nosync]=PASS [late+restart]=FAIL)
+          # The expectations on Strom v0.8.4, see the header. The messages below are
+          # built from this array, so they follow it.
+          order=(late first nosync late+restart)
+          declare -A expected=([late]=PASS [first]=PASS [nosync]=PASS [late+restart]=FAIL)
+          pattern=""
+          for name in "${order[@]}"; do pattern+="${pattern:+ / }${expected[$name]}"; done
           ok=true
           {
             echo "## Late connect (Strom receiver), #111 / strom#1277"
@@ -199,7 +206,7 @@ jobs:
             echo
             echo "| run | arguments | expected | result |"
             echo "|---|---|---|---|"
-            for name in late first nosync late+restart; do
+            for name in "${order[@]}"; do
               # An exact match on the name column: `late+restart` is not a regex.
               line="$(awk -F'\t' -v n="$name" '$1 == n' "$results" 2>/dev/null || true)"
               if [[ -n "$line" ]]; then
@@ -212,12 +219,12 @@ jobs:
             done
             echo
             if $ok; then
-              echo "Pattern FAIL / PASS / PASS / FAIL as expected: the late receiver with clock-synced sinks still stalls the uplink (strom#1277 not fixed in this Strom), both controls are clean, and an immediate restart on a late connect does not avoid the stall."
+              echo "Pattern $pattern as expected: a late first connect into a receiver with clock-synced sinks is clean, both controls are clean, and a reconnect right after the first connect (\`late+restart\`) still stalls the receiver, so strom#1277 is not fixed in this Strom."
             else
-              echo "**Pattern differs from the expected FAIL / PASS / PASS / FAIL.** If runs \`late\` and \`late+restart\` passed with the others, this Strom may carry the strom#1277 fix: check, then flip both expectations here."
+              echo "**Pattern differs from the expected $pattern.** If \`late\` FAILed, the late first connect stalls again (a regression in this Strom, or in the reproduction). If \`late+restart\` PASSed with the others, this Strom may fix the reconnect case of strom#1277 too: check, then flip its expectation here."
             fi
             echo
-            for name in late first nosync late+restart; do
+            for name in "${order[@]}"; do
               [[ -f "$out/$name.log" ]] || continue
               echo "<details><summary>$name: samples and verdict</summary>"
               echo
@@ -230,7 +237,7 @@ jobs:
           } > "$summary"
           cat "$summary" >> "$GITHUB_STEP_SUMMARY"
           cat "$summary"
-          $ok || { echo "::error title=late-connect::the pattern is not FAIL / PASS / PASS / FAIL, see the job summary"; exit 1; }
+          $ok || { echo "::error title=late-connect::the pattern is not the expected $pattern, see the job summary"; exit 1; }
 
       - name: Stop Strom, logs (tail)
         if: always()

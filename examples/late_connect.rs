@@ -28,10 +28,14 @@
 //!   connect like the drop counters: both sinks must have had a buffer by the first
 //!   sample (+10 s), and each sink's last PTS, read there and again at the end of the
 //!   window, must have advanced by the wall time between those two reads, less 5 s.
-//!   A receiver that freezes without making the sender drop (its sinks stop getting
-//!   buffers while SRT still acknowledges) fails on that, instead of passing on a
-//!   buffer it got early on; so does one that only starts decoding later in the
-//!   window, instead of passing on a short stretch of wall time at the end.
+//!   Both sinks are also read at every later sample, and each step from one reading to
+//!   the next (the last step ends at the end-of-window read) must advance by the wall
+//!   time between them, less the same 5 s. A receiver that freezes without making the
+//!   sender drop (its sinks stop getting buffers while SRT still acknowledges) fails on
+//!   that, instead of passing on a buffer it got early on, and so does one that freezes
+//!   mid-window and then catches up, which the first-to-last comparison alone would
+//!   pass; so does one that only starts decoding later in the window, instead of
+//!   passing on a short stretch of wall time at the end.
 //!
 //! It reads the uplink's `/api/flows/<id>/srt-stats` the moment the peer appears and
 //! then every 10 s to the end of the window. The caller's SRT counters start at 0 for
@@ -83,7 +87,7 @@
 //! `LATE_CONNECT_AFTER` (5 s) after the flow started, it stops and starts the flow
 //! once, so the caller connects again into the receiver that is now running. The
 //! window and its counters then start at that second connect. Measured with the
-//! Strom receiver (PR #170, late-connect run 45480983729, Strom 0.8.2 on both ends),
+//! Strom receiver (PR #170, late-connect run 45490377672, Strom 0.8.2 on both ends),
 //! and expected until a Strom release fixes strom#1277:
 //!
 //! | run | expected |
@@ -96,9 +100,20 @@
 //! covers the later window.
 //!
 //! With the default `srt-live-transmit` receiver both the late run and the control
-//! pass (0 dropped, #120 and the Mac run on #111). With a Strom carrying the
-//! strom#1277 fix, the first row must PASS: that is the after-fix half of AC1, run
-//! after the pin bump (`.github/scripts/bump-strom-pin.sh`).
+//! pass (0 dropped, #120 and the Mac run on #111).
+//!
+//! On Strom v0.8.4 on both ends (PR #171, late-connect run 45500947777) the late first
+//! connect is clean: `--listener-delay 35` with `sync: true` PASSes (0 of 38,295
+//! dropped, PTS advanced 50.0 s in 50.0 s). The restart still stalls the receiver
+//! (0 dropped at +10 and +20 s, about 25 % at +30 s, sinks empty until +40 s), so a
+//! reconnect right after the first connect still hits strom#1277, which stays open:
+//!
+//! | run | expected on v0.8.4 |
+//! |---|---|
+//! | `--listener-delay 35`, `sync: true` | PASS |
+//! | `--listener-delay 0`, `sync: true` | PASS |
+//! | `--listener-delay 35 --receiver-sync false` | PASS |
+//! | `--listener-delay 35 --restart-on-late-connect`, `sync: true` | FAIL |
 //!
 //! Options: `--strom <url>` (default `http://127.0.0.1:8080`, or `OLI_STROM_URL`),
 //! `--port <n>` (default 47199), `--receiver-port <n>` (default `--port`; set it
@@ -377,10 +392,10 @@ async fn main() -> Result<ExitCode> {
         let mut reconnects = 0;
         let mut previous_sent = totals(&first).0;
         let mut next = SAMPLE_INTERVAL;
-        // The Strom receiver's first PTS reading, taken at the first sample at which
-        // both sinks have had a buffer; `pts_reached_end` fails it unless that is the
-        // +10 s sample.
-        let mut first_pts: Option<PtsReading> = None;
+        // The Strom receiver's PTS readings, from the first sample at which both sinks
+        // have had a buffer (`pts_reached_end` fails it unless that is the +10 s
+        // sample) and then at every sample (`pts_kept_pace` checks each step).
+        let mut pts_readings: Vec<PtsReading> = Vec::new();
         while next <= o.window {
             tokio::time::sleep(next.saturating_sub(connected.elapsed())).await;
             let label = format!("+{} s", next.as_secs());
@@ -401,14 +416,23 @@ async fn main() -> Result<ExitCode> {
                     println!("{label:>10}: no peer: the caller is reconnecting");
                 }
             }
-            if let (None, Some((client, rx_id))) = (&first_pts, &rx_strom) {
-                first_pts = pts_reading(client, rx_id).await?;
-                if let Some(first) = &first_pts {
-                    println!(
-                        "{label:>10}: receiver PTS video {} audio {}",
-                        show_pts(first.video),
-                        show_pts(first.audio)
-                    );
+            if let Some((client, rx_id)) = &rx_strom {
+                match pts_reading(client, rx_id).await? {
+                    Some(reading) => {
+                        println!(
+                            "{label:>10}: receiver PTS video {} audio {}",
+                            show_pts(reading.video),
+                            show_pts(reading.audio)
+                        );
+                        pts_readings.push(reading);
+                    }
+                    // A sink whose last message was an event, not a buffer: no PTS to
+                    // compare, so the next step spans two intervals. A frozen sink
+                    // keeps its last buffer's message, so this does not hide a stall.
+                    None if !pts_readings.is_empty() => {
+                        println!("{label:>10}: receiver PTS not readable from both sinks, skipped");
+                    }
+                    None => {}
                 }
             }
             next += SAMPLE_INTERVAL;
@@ -418,7 +442,7 @@ async fn main() -> Result<ExitCode> {
             Some((client, rx_id)) => Some(strom_receiver_media(client, rx_id).await?),
             None => None,
         };
-        Ok((samples, reconnects, strom_media, first_pts, connected))
+        Ok((samples, reconnects, strom_media, pts_readings, connected))
     }
     .await;
 
@@ -434,7 +458,7 @@ async fn main() -> Result<ExitCode> {
             let _ = client.delete_flow(rx_id).await;
         }
     }
-    let (samples, reconnects, strom_media, first_pts, connected) = outcome?;
+    let (samples, reconnects, strom_media, pts_readings, connected) = outcome?;
 
     let mut drops_ok = true;
     for (label, (sent, dropped)) in &samples {
@@ -464,7 +488,10 @@ async fn main() -> Result<ExitCode> {
             let got_media = media.packets_received > 0
                 && media.video_pts.is_some()
                 && media.audio_pts.is_some();
-            got_media && pts_reached_end(connected, first_pts.as_ref(), &media)
+            // Both run, so the log shows both gates' lines.
+            let reached_end = pts_reached_end(connected, pts_readings.first(), &media);
+            let kept_pace = pts_kept_pace(&pts_readings, &media);
+            got_media && reached_end && kept_pace
         }
         None => {
             let (video_frames, audio_frames) = count_frames(&o.out)?;
@@ -681,6 +708,56 @@ fn pts_reached_end(connected: Instant, first: Option<&PtsReading>, media: &Strom
         ok &= reached;
     }
     started_on_time && ok
+}
+
+/// Each step between two consecutive PTS readings (every sample from the first
+/// reading on, then the end-of-window read) advanced each sink's PTS by the wall time
+/// between those reads, less `PTS_SLACK`. `pts_reached_end` compares only the first
+/// and the last reading, so a receiver that froze mid-window and then caught up (its
+/// PTS jumping forward after the freeze) would pass it; this fails it at the step
+/// where it froze. A PTS that went backwards (a reset) counts as no advance. With no
+/// readings there is nothing to step through, and `pts_reached_end` fails that.
+fn pts_kept_pace(readings: &[PtsReading], media: &StromMedia) -> bool {
+    let end = match (
+        media.video_pts.as_deref().and_then(parse_pts),
+        media.audio_pts.as_deref().and_then(parse_pts),
+    ) {
+        (Some(video), Some(audio)) => Some(PtsReading {
+            video,
+            audio,
+            read_at: media.read_at,
+        }),
+        _ => None,
+    };
+    let steps: Vec<&PtsReading> = readings.iter().chain(end.as_ref()).collect();
+    let mut ok = true;
+    for pair in steps.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let wall = to.read_at.saturating_duration_since(from.read_at);
+        for (kind, a, b) in [
+            ("video", from.video, to.video),
+            ("audio", from.audio, to.audio),
+        ] {
+            let advanced = b.saturating_sub(a);
+            if advanced + PTS_SLACK < wall {
+                println!(
+                    "receiver {kind} PTS stalled mid-window: {} to {}, advanced {:.1} s in {:.1} s of wall time",
+                    show_pts(a),
+                    show_pts(b),
+                    advanced.as_secs_f64(),
+                    wall.as_secs_f64(),
+                );
+                ok = false;
+            }
+        }
+    }
+    if ok && steps.len() >= 2 {
+        println!(
+            "receiver PTS: kept pace at each of {} steps between readings",
+            steps.len() - 1
+        );
+    }
+    ok
 }
 
 /// A GStreamer clock time as printed in `last-message`, `H:MM:SS.NNNNNNNNN`; `None`
@@ -913,6 +990,66 @@ mod tests {
             connected,
             None,
             &media("0:00:59.000000000", "0:00:59.000000000", end)
+        ));
+    }
+
+    #[test]
+    fn pts_step_gate_catches_a_mid_window_stall() {
+        let connected = Instant::now();
+        // Readings at +10 .. +60 s, then the end-of-window read just after +60 s.
+        let readings = |pts: [u64; 6]| -> Vec<PtsReading> {
+            pts.iter()
+                .zip(1..)
+                .map(|(&p, i)| PtsReading {
+                    video: Duration::from_secs(p),
+                    audio: Duration::from_secs(p),
+                    read_at: connected + SAMPLE_INTERVAL * i,
+                })
+                .collect()
+        };
+        let end = connected + Duration::from_secs(60) + Duration::from_millis(200);
+        // Kept up at every step (a non-zero PTS base, as in the `nosync` run).
+        let steady = readings([47, 57, 67, 77, 87, 97]);
+        let at_end = media("0:01:37.100000000", "0:01:37.100000000", end);
+        assert!(pts_kept_pace(&steady, &at_end));
+        // Froze from +20 to +40 s, then caught up: first-to-last advanced 50 s in 50 s,
+        // so `pts_reached_end` passes it, and the step gate must not.
+        let caught_up = readings([10, 20, 21, 22, 50, 60]);
+        let caught_up_end = media("0:01:00.100000000", "0:01:00.100000000", end);
+        assert!(pts_reached_end(
+            connected,
+            caught_up.first(),
+            &caught_up_end
+        ));
+        assert!(!pts_kept_pace(&caught_up, &caught_up_end));
+        // Only audio froze for one step.
+        let mut audio_froze = readings([10, 20, 30, 40, 50, 60]);
+        audio_froze[3].audio = Duration::from_secs(31);
+        assert!(!pts_kept_pace(
+            &audio_froze,
+            &media("0:01:00.100000000", "0:01:00.100000000", end)
+        ));
+        // Froze in the last 10 s step, from +50 to +60 s.
+        assert!(!pts_kept_pace(
+            &readings([10, 20, 30, 40, 50, 51]),
+            &media("0:00:51.000000000", "0:00:51.000000000", end)
+        ));
+        // A skipped sample: the step spans 20 s and advanced 20 s.
+        let mut skipped = readings([10, 20, 30, 40, 50, 60]);
+        skipped.remove(2);
+        assert!(pts_kept_pace(
+            &skipped,
+            &media("0:01:00.100000000", "0:01:00.100000000", end)
+        ));
+        // A PTS that went backwards (a reset) is no advance.
+        assert!(!pts_kept_pace(
+            &readings([10, 20, 30, 2, 12, 22]),
+            &media("0:00:22.100000000", "0:00:22.100000000", end)
+        ));
+        // Slow reads, within the slack: 6 s of media in a 10 s step.
+        assert!(pts_kept_pace(
+            &readings([10, 20, 26, 36, 46, 56]),
+            &media("0:00:56.100000000", "0:00:56.100000000", end)
         ));
     }
 
