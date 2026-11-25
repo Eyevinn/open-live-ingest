@@ -308,7 +308,7 @@ agent, each with install steps in its header.
 ## Requirements
 
 - Linux, macOS or Windows (x86_64), with a Strom instance on the same machine that can see the
-  capture hardware. `install.sh` and `install.ps1` install Strom v0.8.2 when none is found. If Strom's installer stops on an
+  capture hardware. `install.sh` and `install.ps1` install Strom v0.8.4 when none is found. If Strom's installer stops on an
   unaccepted Xcode license on a Mac that already has GStreamer, rerun with
   `SKIP_GSTREAMER=true`, which it passes through to Strom's installer
 - Node.js, only to sign in to Open Source Cloud with `npx @osaas/cli login`. A pasted token needs none

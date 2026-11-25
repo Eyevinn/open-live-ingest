@@ -2744,8 +2744,8 @@ dependencies = [
 
 [[package]]
 name = "strom-types"
-version = "0.8.2"
-source = "git+https://github.com/Eyevinn/strom.git?tag=v0.8.2#2bdf4a0d645067414629837e409f034df26891cc"
+version = "0.8.4"
+source = "git+https://github.com/Eyevinn/strom.git?tag=v0.8.4#0df2e4bbfe3905840a0f452636a71040fa82eec7"
 dependencies = [
  "base64 0.22.1",
  "serde",

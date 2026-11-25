@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # libsrt, at the version the cloud Strom's GStreamer links: Strom (Eyevinn/strom, its Dockerfile
-# at v0.8.2, the strom-types tag pinned in Cargo.toml) runs on ubuntu:26.04 with the distro's
+# at v0.8.4, the strom-types tag pinned in Cargo.toml) runs on ubuntu:26.04 with the distro's
 # gstreamer1.0-plugins-bad 1.28.2, whose srt plugin links libsrt1.5-gnutls 1.5.4-3
 # (https://packages.ubuntu.com/resolute/libsrt1.5-gnutls). Move it with that image, on purpose.
 SRT_VERSION=1.5.4

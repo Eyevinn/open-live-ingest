@@ -10,29 +10,37 @@ name: Late connect (Strom receiver)
 #   3. nosync:  late as in 1, sinks `sync: false`
 #   4. late+restart: late as in 1, with `--restart-on-late-connect`: the ingest-side
 #      workaround #111's triage proposed (restart the uplink once at a late first
-#      connect, so it connects again into the running receiver). It does not avoid
-#      the stall (PR #170, run 45480983729), so it is kept as a recorded negative
-#      result, and `up` has no such restart
+#      connect, so it connects again into the running receiver). On Strom v0.8.2 it
+#      did not avoid the stall (PR #170, run 45490377672), so it is kept as a recorded
+#      negative result, and `up` has no such restart
 #
-# Until a Strom release carries the strom#1277 fix, the expected pattern is
-# FAIL / PASS / PASS / FAIL, and the job succeeds only on that pattern: it shows the
-# reproduction still catches the stall, that its controls stay clean, and that an
-# immediate restart does not get around it. After the fix is released and pinned
-# (.github/scripts/bump-strom-pin.sh), runs 1 and 4 must PASS and the expected
-# pattern here becomes PASS / PASS / PASS / PASS.
+# On Strom v0.8.4 (PR #171, runs 45500947777, 45517536044, 45518995136) both late
+# rows are intermittent: run 1 (late) went PASS / PASS / FAIL, and in its FAIL the
+# receiver stalled with the strom#1277 signature (drops from about +20 to +40 s, sinks
+# empty until +40 s); run 4 (late+restart) went FAIL / PASS / PASS. strom#1277 is
+# therefore not fixed in v0.8.4, only less frequent. Runs 2-3 (the controls) must
+# PASS. Runs 1 and 4 are recorded, not gated: PASS or FAIL both count, and the summary
+# says which it was. A run with no verdict still fails the job: an ERROR, a missing
+# run, or run 4 without its restart line. No retries or voting: a vote over an
+# intermittent stall still gives no fixed expectation. Runs 1 and 4 go back to a hard
+# PASS only after a Strom release with a strom#1277 fix is pinned
+# (.github/scripts/bump-strom-pin.sh) and shows both clean across several
+# consecutive runs, not one.
 #
 # The Strom setup is ci.yml's real-strom job: GStreamer from apt, the
 # strom-<tag>-linux-x86_64 release asset at the strom-types pin in Cargo.toml,
 # checked against GitHub's SHA-256 digest. No secrets.
 #
 # Not part of every CI run (about 7 minutes of live media): by hand, or on a pull
-# request that changes this workflow or the example.
+# request that changes this workflow, the example or Cargo.toml (where the Strom pin
+# lives, so a pin bump runs the reproduction against the new Strom on both ends).
 on:
   workflow_dispatch:
   pull_request:
     paths:
       - .github/workflows/late-connect-strom.yml
       - examples/late_connect.rs
+      - Cargo.toml
 
 permissions:
   contents: read
@@ -167,6 +175,14 @@ jobs:
             else
               verdict=ERROR
             fi
+            # late+restart tests the restart: without its restart line in the log
+            # (the first peer came in time, so nothing restarted) the run did not
+            # test it, and its verdict, FAIL or PASS, must not count.
+            if [[ "$name" == late+restart && "$verdict" != ERROR ]] \
+                && ! grep -q '^late connect: first peer .*restarting the uplink once' "$out/$name.log"; then
+              echo "run $name: no restart line in its log, so it did not exercise the restart"
+              verdict=ERROR
+            fi
             echo "run $name: $verdict (exit status $status)"
             printf '%s\t%s\t%s\t%s\n' "$name" "$extra" "$verdict" "$status" >> "$out/results.tsv"
           done
@@ -180,7 +196,14 @@ jobs:
           out="$RUNNER_TEMP/late-connect"
           results="$out/results.tsv"
           summary="$out/summary.md"
-          declare -A expected=([late]=FAIL [first]=PASS [nosync]=PASS [late+restart]=FAIL)
+          # The expectations on Strom v0.8.4, see the header. `PASS or FAIL` takes
+          # either verdict, but not ERROR or NOT RUN. The messages below are built from
+          # this array, so they follow it.
+          order=(late first nosync late+restart)
+          declare -A expected=([late]="PASS or FAIL" [first]=PASS [nosync]=PASS [late+restart]="PASS or FAIL")
+          pattern=""
+          for name in "${order[@]}"; do pattern+="${pattern:+ / }${expected[$name]}"; done
+          declare -A got=()
           ok=true
           {
             echo "## Late connect (Strom receiver), #111 / strom#1277"
@@ -189,7 +212,7 @@ jobs:
             echo
             echo "| run | arguments | expected | result |"
             echo "|---|---|---|---|"
-            for name in late first nosync late+restart; do
+            for name in "${order[@]}"; do
               # An exact match on the name column: `late+restart` is not a regex.
               line="$(awk -F'\t' -v n="$name" '$1 == n' "$results" 2>/dev/null || true)"
               if [[ -n "$line" ]]; then
@@ -197,17 +220,31 @@ jobs:
               else
                 extra="-"; verdict="NOT RUN"; status="-"
               fi
-              [[ "$verdict" == "${expected[$name]}" ]] || ok=false
+              got[$name]="$verdict"
+              case "${expected[$name]}" in
+                "PASS or FAIL") [[ "$verdict" == PASS || "$verdict" == FAIL ]] || ok=false ;;
+                *) [[ "$verdict" == "${expected[$name]}" ]] || ok=false ;;
+              esac
               echo "| $name | \`--receiver strom $extra\` | ${expected[$name]} | $verdict (exit $status) |"
             done
             echo
             if $ok; then
-              echo "Pattern FAIL / PASS / PASS / FAIL as expected: the late receiver with clock-synced sinks still stalls the uplink (strom#1277 not fixed in this Strom), both controls are clean, and an immediate restart on a late connect does not avoid the stall."
+              echo "Pattern $pattern as expected: both controls (\`first\`, \`nosync\`) are clean, and every run gave a verdict."
+              echo
+              # The v0.8.4 run where each recorded row FAILed (see the header).
+              declare -A failed_in=([late]=45518995136 [late+restart]=45500947777)
+              for name in late late+restart; do
+                if [[ "${got[$name]}" == FAIL ]]; then
+                  echo "- \`$name\`: FAIL, stalled this time, strom#1277 not fixed in this Strom."
+                else
+                  echo "- \`$name\`: PASS, clean this time; intermittent on v0.8.4 (it FAILed in run ${failed_in[$name]}), not counted as fixed."
+                fi
+              done
             else
-              echo "**Pattern differs from the expected FAIL / PASS / PASS / FAIL.** If runs \`late\` and \`late+restart\` passed with the others, this Strom may carry the strom#1277 fix: check, then flip both expectations here."
+              echo "**Pattern differs from the expected $pattern.** Only a \`first\` or \`nosync\` FAIL is a regression (a control stalls: in this Strom, or in the reproduction). An ERROR or NOT RUN means a run gave no verdict: see its log."
             fi
             echo
-            for name in late first nosync late+restart; do
+            for name in "${order[@]}"; do
               [[ -f "$out/$name.log" ]] || continue
               echo "<details><summary>$name: samples and verdict</summary>"
               echo
@@ -220,7 +257,7 @@ jobs:
           } > "$summary"
           cat "$summary" >> "$GITHUB_STEP_SUMMARY"
           cat "$summary"
-          $ok || { echo "::error title=late-connect::the pattern is not FAIL / PASS / PASS / FAIL, see the job summary"; exit 1; }
+          $ok || { echo "::error title=late-connect::the pattern is not the expected $pattern, see the job summary"; exit 1; }
 
       - name: Stop Strom, logs (tail)
         if: always()
