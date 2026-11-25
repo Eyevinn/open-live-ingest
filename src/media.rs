@@ -158,6 +158,9 @@ impl StromMedia {
         let (local, strom, version) = match held {
             Some(held) => {
                 if !held.serves(cfg) {
+                    // Released, never just dropped: dropping would stop a Managed
+                    // Strom without checking for flows or another gateway.
+                    held.release().await;
                     bail!("the Strom held for this session is not the one the settings name ([strom] url, api_key or manage changed since it was taken)");
                 }
                 let (mut local, strom, version) = held.into_parts();

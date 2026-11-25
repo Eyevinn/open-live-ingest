@@ -202,8 +202,9 @@ impl StromHold {
         (self.local, self.client, self.version)
     }
 
-    /// A hold over `local`, reached at `url`, for tests.
-    #[cfg(test)]
+    /// A hold over `local`, reached at `url`, for tests. Unix only, as are the
+    /// tests that stand a process in for Strom.
+    #[cfg(all(test, unix))]
     pub(crate) fn for_test(local: LocalStrom, url: &str) -> Self {
         StromHold {
             local,

@@ -71,7 +71,7 @@ impl LocalStrom {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl LocalStrom {
     /// A Managed Strom over `child`, recorded at `pidfile`, for tests that stand a
     /// process in for Strom without touching the user's own `strom.pid`.

@@ -8,8 +8,9 @@
 //! by a crash reclaimed rather than adopted, unless the app holds a Strom ([`HeldStrom`],
 //! section 4.1), whose taking ran that reclaim already. Then it starts [`Session`], armed
 //! ([`Session::start_armed`]: each uplink runs only while a production holding its
-//! source is live), over the held Strom when there is one, and turns its events into the page's: one row per input with its
-//! state and bitrate, banners for session-wide notices, and teardown progress. Stop runs the session's own teardown
+//! source is live), over the held Strom when there is one, and turns its events into
+//! the page's: one row per input with its state and bitrate, banners for session-wide
+//! notices, and teardown progress. Stop runs the session's own teardown
 //! ([`SessionHandle::request_stop`]) and the rows show it.
 //!
 //! [`Rows`] is the mapping from library events to page events, pure apart from the
