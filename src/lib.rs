@@ -29,4 +29,5 @@ pub mod osc;
 pub mod run;
 pub mod session;
 pub mod strom;
+pub mod strom_events;
 pub mod update;

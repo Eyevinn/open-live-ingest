@@ -292,7 +292,7 @@ async fn main() -> Result<ExitCode> {
         rate_control: "cbr".to_string(),
         ..Video::default()
     };
-    let flow = flow::build(GATEWAY_ID, &input, &video);
+    let flow = flow::build(GATEWAY_ID, &input, &video, flow::Taps::Off);
     let id = flow.id;
     println!("uplink: {}", input.endpoint.venue_uri());
 

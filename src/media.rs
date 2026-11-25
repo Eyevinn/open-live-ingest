@@ -293,9 +293,10 @@ impl Media for StromMedia {
         })
     }
 
-    /// Removes our own leftovers from a run that ended without cleanup, and any other
-    /// flow already holding one of the cameras about to be opened. Two pipelines on one
-    /// device contend for frames, which presents as stutter rather than as an error.
+    /// Removes our own leftovers from a run that ended without cleanup, the desktop
+    /// app's preview flows of this gateway, and any other flow already holding one of
+    /// the cameras about to be opened. Two pipelines on one device contend for frames,
+    /// which presents as stutter rather than as an error.
     async fn prepare(&self, inputs: &[Input], events: &Events) -> Result<()> {
         let devices: Vec<&str> = inputs
             .iter()
@@ -310,7 +311,8 @@ impl Media for StromMedia {
             .await
             .context("listing Strom's flows")?
         {
-            let ours = flow::is_ours(&existing, &self.gateway_id);
+            let ours = flow::is_ours(&existing, &self.gateway_id)
+                || flow::is_preview_of_ours(&existing, &self.gateway_id);
             let holds_device =
                 flow::capture_device_of(&existing).is_some_and(|d| devices.contains(&d));
             if !(ours || holds_device) {
@@ -329,7 +331,7 @@ impl Media for StromMedia {
     /// removed again.
     async fn start(&self, input: &Input, video: &Video) -> Result<()> {
         let flow_id = self.flow_id(input);
-        let desired = flow::build(&self.gateway_id, input, video);
+        let desired = flow::build(&self.gateway_id, input, video, flow::Taps::Off);
         self.strom.create_flow(&desired).await?;
         match self.strom.start_flow(&flow_id).await {
             Ok(true) => Ok(()),
@@ -585,5 +587,164 @@ impl Media for ExternalMedia {
 
     async fn hold_changed(&self) {
         self.hold_changed.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Uplink;
+    use crate::flow::{Source, Taps};
+    use serde_json::{json, Value};
+
+    /// A stand-in for Strom's flow routes: `GET /api/flows` lists `flows`, `POST
+    /// .../stop` answers, `DELETE /api/flows/{id}` removes one. Every call recorded.
+    async fn fake_strom(flows: Vec<Value>) -> (String, Arc<Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let log = calls.clone();
+        let flows = Arc::new(Mutex::new(flows));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let mut words = head.split_whitespace();
+                let (method, path) = (words.next().unwrap_or(""), words.next().unwrap_or(""));
+                log.lock().unwrap().push(format!("{method} {path}"));
+                let id = path
+                    .strip_prefix("/api/flows/")
+                    .map(|r| r.split('/').next().unwrap());
+                let (status, body) = {
+                    let mut flows = flows.lock().unwrap();
+                    match (method, id) {
+                        ("GET", None) => ("200 OK", json!({ "flows": *flows })),
+                        ("POST", Some(id)) => {
+                            let flow = flows.iter().find(|f| f["id"] == id).cloned();
+                            ("200 OK", json!({ "flow": flow }))
+                        }
+                        ("DELETE", Some(id)) => {
+                            flows.retain(|f| f["id"] != id);
+                            ("204 No Content", Value::Null)
+                        }
+                        _ => ("404 Not Found", json!({ "error": "no route" })),
+                    }
+                };
+                let body = if body.is_null() {
+                    String::new()
+                } else {
+                    body.to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), calls)
+    }
+
+    fn test_pattern() -> Source {
+        Source::Test {
+            resolution: "1920x1080".to_string(),
+            framerate: "25/1".to_string(),
+        }
+    }
+
+    fn camera(id: &str) -> Source {
+        Source::Device {
+            device_id: id.to_string(),
+            audio_device: None,
+            resolution: None,
+            framerate: None,
+        }
+    }
+
+    fn input(source: Source) -> Input {
+        Input {
+            id: flow::input_id_for(&source),
+            name: "Venue — Input".to_string(),
+            source,
+            endpoint: Uplink::default().endpoint("cloud.example.com", 9000),
+        }
+    }
+
+    fn json_of(flow: strom_types::Flow) -> Value {
+        serde_json::to_value(flow).unwrap()
+    }
+
+    /// The app's preview flows of this gateway go before any uplink is created,
+    /// including a test pattern's, which holds no camera; another gateway's preview
+    /// and a hand-built flow on another camera are left alone.
+    #[tokio::test]
+    async fn prepare_removes_this_gateways_preview_flows() {
+        let ours_test = flow::preview("gw", "Venue — Test pattern", &test_pattern());
+        let ours_other_camera = flow::preview("gw", "Venue — Cam 2", &camera("dev-2"));
+        let theirs = flow::preview("gw-other", "Other — Test pattern", &test_pattern());
+        let mut hand_built = flow::build(
+            "someone",
+            &input(camera("dev-3")),
+            &Video::default(),
+            Taps::Off,
+        );
+        hand_built.name = "By hand".to_string();
+        let (url, calls) = fake_strom(vec![
+            json_of(ours_test.clone()),
+            json_of(ours_other_camera.clone()),
+            json_of(theirs.clone()),
+            json_of(hand_built.clone()),
+        ])
+        .await;
+        let strom = StromClient::new(&url, None).unwrap();
+        let removed = Arc::new(Mutex::new(Vec::new()));
+        let events = {
+            let removed = removed.clone();
+            Events::new(move |e| {
+                if let Event::ConflictingFlowRemoved { name, ours } = e {
+                    removed.lock().unwrap().push((name, ours));
+                }
+            })
+        };
+
+        StromMedia::over(&strom, "gw")
+            .prepare(&[input(test_pattern())], &events)
+            .await
+            .unwrap();
+
+        let mut removed = removed.lock().unwrap().clone();
+        removed.sort();
+        assert_eq!(
+            removed,
+            [
+                ("Venue — Cam 2 (preview)".to_string(), true),
+                ("Venue — Test pattern (preview)".to_string(), true),
+            ]
+        );
+        let calls = calls.lock().unwrap().clone();
+        for kept in [theirs.id, hand_built.id] {
+            assert!(
+                !calls.contains(&format!("DELETE /api/flows/{kept}")),
+                "{calls:?}"
+            );
+        }
+        for gone in [ours_test.id, ours_other_camera.id] {
+            assert!(
+                calls.contains(&format!("DELETE /api/flows/{gone}")),
+                "{calls:?}"
+            );
+        }
     }
 }

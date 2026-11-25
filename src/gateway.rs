@@ -53,8 +53,9 @@ pub enum Event {
     /// An Open Live source of this gateway, left by an earlier run, held a port one of
     /// the inputs needs and was removed.
     LeftoverSourceRemoved { name: String, port: u16 },
-    /// A Strom flow was removed before starting: one of ours left by an earlier run,
-    /// or someone else's holding one of the cameras.
+    /// A Strom flow was removed before starting: one of ours left by an earlier run
+    /// (an uplink, or the desktop app's preview of an input), or someone else's
+    /// holding one of the cameras.
     ConflictingFlowRemoved { name: String, ours: bool },
     /// An input's source is being created in Open Live, or given a new port there.
     Registering { input: String },

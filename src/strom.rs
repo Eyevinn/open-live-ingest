@@ -5,6 +5,7 @@
 //! carry the SRT passphrase.
 
 use anyhow::{bail, Context, Result};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
 use strom_types::api::{
@@ -33,6 +34,20 @@ pub enum Reachability {
     /// send an operator to completely different places.
     NeedsCredential,
     Unreachable(String),
+}
+
+/// What [`StromClient::thumbnail`] got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Thumbnail {
+    /// The tap's latest frame, as Strom serves it (`image/jpeg`, 320x180 by
+    /// default). Not checked: the caller checks the JPEG marker and the size.
+    Jpeg(Vec<u8>),
+    /// No fresh frame: the branch was just attached, or the source sends nothing
+    /// (504). `capture_failed` when Strom says the capture itself failed (500), which
+    /// a caller treats the same way, and may log.
+    NoFrame { capture_failed: bool },
+    /// The flow does not run, or has no such block (404).
+    Gone,
 }
 
 #[derive(Clone)]
@@ -232,6 +247,54 @@ impl StromClient {
         Ok(Some(body.properties))
     }
 
+    /// The latest picture from a block's thumbnail tap (`builtin.thumbnail`):
+    /// `GET /api/flows/{id}/blocks/{block_id}/thumbnail`. The first request attaches
+    /// the tap's branch; Strom detaches it again after 10 s without one. Err only when
+    /// Strom does not answer, or answers something else than these.
+    pub async fn thumbnail(&self, id: &FlowId, block_id: &str) -> Result<Thumbnail> {
+        let res = self
+            .get(&format!("/api/flows/{id}/blocks/{block_id}/thumbnail"))
+            .send()
+            .await
+            .context("GET thumbnail")?;
+        match res.status() {
+            reqwest::StatusCode::NOT_FOUND => Ok(Thumbnail::Gone),
+            reqwest::StatusCode::GATEWAY_TIMEOUT => Ok(Thumbnail::NoFrame {
+                capture_failed: false,
+            }),
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR => Ok(Thumbnail::NoFrame {
+                capture_failed: true,
+            }),
+            _ => Ok(Thumbnail::Jpeg(
+                ok(res, "GET thumbnail")?
+                    .bytes()
+                    .await
+                    .context("reading thumbnail")?
+                    .to_vec(),
+            )),
+        }
+    }
+
+    /// The ids of the blocks this Strom can build (`GET /api/blocks`), such as
+    /// `builtin.thumbnail`. Only the ids are read, so a block definition another
+    /// Strom version shapes differently does not fail the list.
+    pub async fn block_ids(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Blocks {
+            blocks: Vec<Block>,
+        }
+        #[derive(Deserialize)]
+        struct Block {
+            id: String,
+        }
+        let res = self.get("/api/blocks").send().await.context("GET blocks")?;
+        let body: Blocks = ok(res, "GET blocks")?
+            .json()
+            .await
+            .context("decoding blocks")?;
+        Ok(body.blocks.into_iter().map(|b| b.id).collect())
+    }
+
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
         self.auth(self.http.get(format!("{}{path}", self.base_url)))
     }
@@ -401,5 +464,192 @@ mod tests {
             audio[0].category,
             strom_types::discovery::DeviceCategory::AudioSource
         );
+    }
+
+    /// A stand-in for Strom on a local port: answers each request with what `route`
+    /// gives for its path (status, content type, body), and records the path and the
+    /// `Authorization` header.
+    async fn fake_strom(
+        route: fn(&str) -> (u16, &'static str, Vec<u8>),
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let auth = head
+                    .lines()
+                    .find_map(|l| {
+                        let (name, value) = l.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                log.lock().unwrap().push(format!("{path} {auth}"));
+                let (status, content_type, body) = route(&path);
+                let mut response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                response.extend_from_slice(&body);
+                let _ = socket.write_all(&response).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+
+    fn error(status: u16, message: &str) -> (u16, &'static str, Vec<u8>) {
+        (
+            status,
+            "application/json",
+            json!({ "error": message }).to_string().into_bytes(),
+        )
+    }
+
+    /// Strom v0.8.4's `get_block_thumbnail`: 200 with the JPEG, 504 while there is no
+    /// fresh frame, 404 for a flow that does not run, 500 for a capture that failed.
+    #[tokio::test]
+    async fn thumbnail_statuses_map_to_what_the_preview_shows() {
+        let (url, seen) = fake_strom(|path| {
+            let flow = path
+                .strip_prefix("/api/flows/")
+                .and_then(|r| r.strip_suffix("/blocks/picture/thumbnail"));
+            match flow {
+                Some("00000000-0000-0000-0000-000000000001") => (200, "image/jpeg", JPEG.to_vec()),
+                Some("00000000-0000-0000-0000-000000000002") => {
+                    error(504, "Frame capture timed out")
+                }
+                Some("00000000-0000-0000-0000-000000000003") => {
+                    error(404, "Flow not running or block not found")
+                }
+                Some("00000000-0000-0000-0000-000000000004") => {
+                    error(500, "Thumbnail capture failed")
+                }
+                Some("00000000-0000-0000-0000-000000000005") => error(401, "unauthorized"),
+                _ => error(404, "no route"),
+            }
+        })
+        .await;
+        let strom = StromClient::new(&url, Some("k3y")).unwrap();
+        let id = |n: u128| uuid::Uuid::from_u128(n);
+
+        assert_eq!(
+            strom.thumbnail(&id(1), "picture").await.unwrap(),
+            Thumbnail::Jpeg(JPEG.to_vec())
+        );
+        assert_eq!(
+            strom.thumbnail(&id(2), "picture").await.unwrap(),
+            Thumbnail::NoFrame {
+                capture_failed: false
+            }
+        );
+        assert_eq!(
+            strom.thumbnail(&id(3), "picture").await.unwrap(),
+            Thumbnail::Gone
+        );
+        assert_eq!(
+            strom.thumbnail(&id(4), "picture").await.unwrap(),
+            Thumbnail::NoFrame {
+                capture_failed: true
+            }
+        );
+        let err = strom.thumbnail(&id(5), "picture").await.unwrap_err();
+        assert!(format!("{err:#}").contains("401"), "{err:#}");
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.ends_with(" Bearer k3y")));
+    }
+
+    /// No answer at all is an error: Strom is gone, which is not a row's state.
+    #[tokio::test]
+    async fn a_thumbnail_from_a_strom_that_is_gone_is_an_error() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let strom = StromClient::new(&format!("http://127.0.0.1:{port}"), None).unwrap();
+        assert!(strom
+            .thumbnail(&uuid::Uuid::from_u128(1), "picture")
+            .await
+            .is_err());
+    }
+
+    /// Only the ids are read, so a definition shaped by another Strom version does
+    /// not fail the list; the pinned Strom's own definitions decode too.
+    #[tokio::test]
+    async fn block_ids_read_the_ids_of_get_api_blocks() {
+        let (url, seen) = fake_strom(|path| match path {
+            "/api/blocks" => (
+                200,
+                "application/json",
+                json!({ "blocks": [
+                    { "id": "builtin.local_input", "name": "Local Input", "category": "Inputs" },
+                    { "id": "builtin.thumbnail", "something_new": [1, 2] },
+                    { "id": "builtin.meter" }
+                ]})
+                .to_string()
+                .into_bytes(),
+            ),
+            _ => error(404, "no route"),
+        })
+        .await;
+        let strom = StromClient::new(&url, None).unwrap();
+        let ids = strom.block_ids().await.unwrap();
+        assert_eq!(
+            ids,
+            ["builtin.local_input", "builtin.thumbnail", "builtin.meter"]
+        );
+        assert!(crate::flow::has_preview_blocks(&ids));
+        assert_eq!(seen.lock().unwrap().as_slice(), ["/api/blocks "]);
+    }
+
+    /// An older Strom without the blocks: listed, but not both.
+    #[tokio::test]
+    async fn an_older_strom_lists_no_preview_blocks() {
+        let (url, _) = fake_strom(|path| match path {
+            "/api/blocks" => (
+                200,
+                "application/json",
+                json!({ "blocks": [{ "id": "builtin.local_input" }, { "id": "builtin.meter" }] })
+                    .to_string()
+                    .into_bytes(),
+            ),
+            _ => error(404, "no route"),
+        })
+        .await;
+        let ids = StromClient::new(&url, None)
+            .unwrap()
+            .block_ids()
+            .await
+            .unwrap();
+        assert!(!crate::flow::has_preview_blocks(&ids));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_block_list_is_an_error() {
+        let (url, _) = fake_strom(|_| error(500, "boom")).await;
+        let strom = StromClient::new(&url, None).unwrap();
+        assert!(strom.block_ids().await.is_err());
     }
 }
