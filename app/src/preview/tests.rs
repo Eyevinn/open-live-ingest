@@ -398,7 +398,7 @@ fn a_camera_that_cannot_be_opened_waits_to_be_ticked_again() {
         vec![json!({"event": "preview", "data": {
             "device": "dev-cam", "state": "failed", "image": null,
             "message": "Cam could not be opened. Close other apps that use it, then untick and tick it again.",
-            "action": "retry",
+            "action": null,
         }})]
     );
     let (plan, _) = preview.plan("gw", vec![cam(false)], t + RECONCILE_EVERY);

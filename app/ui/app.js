@@ -332,6 +332,12 @@ async function listDevices(showAll) {
 const pictures = new Map();
 // The row's latest levels: {peak_db: [], rms_db: []}, one value per channel, by device.
 let levels = new Map();
+// When the last `level` event came. The core sends none while no row has readings, so
+// levels older than LEVEL_STALE_MS are dropped rather than left frozen on the bars.
+let levelsAt = 0;
+const LEVEL_STALE_MS = 1000;
+// A picture in these states has no sound to show: its bars go empty.
+const NO_LEVEL_STATES = new Set(["stopped", "camera_off", "failed"]);
 // The row's notices (no_sound, wrong_camera): kind to notice, by device.
 const rowNotices = new Map();
 // Window notices about the preview as a whole: shown in step 2.
@@ -383,6 +389,9 @@ function previewBox(row, cameraOff) {
   picture.append(element("div", { className: "picture-caption" }));
   const side = element("div", { className: "preview-side" });
   side.append(element("div", { className: "meters" }));
+  // The picture's own line (a camera that could not be opened, no picture): beside
+  // the picture, not over it, where a long line and its button would be cut off.
+  side.append(element("div", { className: "picture-problem" }));
   side.append(element("div", { className: "row-notices" }));
   box.append(picture, side);
   drawPicture(box);
@@ -398,13 +407,19 @@ function previewBoxes(device) {
   );
 }
 
-const PICTURE_CAPTION = { starting: "Starting…" };
+// The short word over the picture; the picture's line, if any, is beside it.
+const PICTURE_CAPTION = {
+  starting: "Starting…",
+  no_picture: "No picture",
+  failed: "Not opened",
+};
 
 function drawPicture(box) {
   const picture = box.querySelector(".picture");
   const image = picture.querySelector("img");
   const caption = picture.querySelector(".picture-caption");
-  caption.replaceChildren();
+  const problem = box.querySelector(".picture-problem");
+  problem.replaceChildren();
   if (box.dataset.cameraOff === "true") {
     image.hidden = true;
     picture.classList.remove("dim");
@@ -420,12 +435,14 @@ function drawPicture(box) {
   }
   image.hidden = !withImage;
   picture.classList.toggle("dim", shown.state === "no_picture");
-  caption.textContent = shown.message || PICTURE_CAPTION[shown.state] || "";
-  // A camera that could not be opened is ticked again by hand, as its line says;
-  // `retry` is Go live's action, so it gets no button here.
-  const button = shown.action === "retry" ? null : actionButton(shown.action);
-  if (button) {
-    caption.append(button);
+  caption.textContent = PICTURE_CAPTION[shown.state] || "";
+  if (shown.message) {
+    const line = element("p", { className: "row-notice", textContent: shown.message });
+    const button = actionButton(shown.action, PREVIEW_ACTIONS);
+    if (button) {
+      line.append(" ", button);
+    }
+    problem.append(line);
   }
 }
 
@@ -469,6 +486,12 @@ function drawLevels(box) {
   });
 }
 
+function drawAllLevels() {
+  for (const box of document.querySelectorAll(".preview")) {
+    drawLevels(box);
+  }
+}
+
 function drawRowNotices(box) {
   const lines = box.querySelector(".row-notices");
   lines.replaceChildren();
@@ -478,7 +501,7 @@ function drawRowNotices(box) {
   }
   for (const notice of forRow.values()) {
     const line = element("p", { className: "row-notice", textContent: notice.message });
-    const button = actionButton(notice.action);
+    const button = actionButton(notice.action, PREVIEW_ACTIONS);
     if (button) {
       line.append(" ", button);
     }
@@ -514,16 +537,28 @@ function wirePreview() {
       message: data.message || null,
       action: data.action || null,
     });
+    // Stopped, camera off or failed: no sound comes, so the bars go empty now
+    // rather than keep the last level.
+    const quiet = NO_LEVEL_STATES.has(data.state) && levels.delete(data.device);
     for (const box of previewBoxes(data.device)) {
       drawPicture(box);
+      if (quiet) {
+        drawLevels(box);
+      }
     }
   });
   document.addEventListener("oli:level", (event) => {
     levels = new Map(event.detail.levels.map((level) => [level.device, level]));
-    for (const box of document.querySelectorAll(".preview")) {
-      drawLevels(box);
-    }
+    levelsAt = Date.now();
+    drawAllLevels();
   });
+  // No `level` event for a while (no row has readings): empty the bars.
+  setInterval(() => {
+    if (levels.size > 0 && Date.now() - levelsAt > LEVEL_STALE_MS) {
+      levels = new Map();
+      drawAllLevels();
+    }
+  }, LEVEL_STALE_MS / 2);
   // Minimised or hidden: the preview stops, and starts again when seen.
   document.addEventListener("visibilitychange", () => {
     syncPreview();
@@ -589,8 +624,18 @@ const ACTIONS = {
   show_strom_log: { label: "Show logs", run: () => call("show_logs", { which: "strom" }) },
 };
 
-function actionButton(action) {
-  const known = action && ACTIONS[action];
+// The same actions where the preview draws them (step 2's banner, the rows' pictures
+// and notices). There "Stop it" only stops the other gateway so the preview can come
+// back; it does not go live, as Go live's own refusal does. `retry` is Go live's
+// action, so it has no button here.
+const PREVIEW_ACTIONS = {
+  ...ACTIONS,
+  stop_it: { label: "Stop it", run: () => stopOtherForPreview() },
+  retry: null,
+};
+
+function actionButton(action, actions = ACTIONS) {
+  const known = action && actions[action];
   if (!known) {
     return null;
   }
@@ -740,17 +785,17 @@ function livePreview(row) {
 }
 
 function renderNotices() {
-  renderNoticeBox(byId("go-notices"), notices);
-  renderNoticeBox(byId("what-notices"), previewNotices);
+  renderNoticeBox(byId("go-notices"), notices, ACTIONS);
+  renderNoticeBox(byId("what-notices"), previewNotices, PREVIEW_ACTIONS);
 }
 
-function renderNoticeBox(box, shown) {
+function renderNoticeBox(box, shown, actions) {
   box.replaceChildren();
   for (const notice of shown.values()) {
     const line = document.createElement("p");
     line.className = "notice";
     line.textContent = notice.message;
-    const button = actionButton(notice.action);
+    const button = actionButton(notice.action, actions);
     if (button) {
       line.append(" ", button);
     }
@@ -778,10 +823,20 @@ async function goLive() {
   }
 }
 
+// Go live's "Stop it" (already live from another window or a terminal): stop that
+// gateway, then go live as was asked.
 async function stopOther() {
   clearGoProblem();
   await call("stop_other");
   await goLive();
+}
+
+// Step 2's "Stop it" (the preview is off while another gateway is live): only stop
+// that gateway. The core looks for it again at its next reconcile and turns the
+// preview back on; nothing goes live.
+async function stopOtherForPreview() {
+  await call("stop_other");
+  syncPreview();
 }
 
 function wireGoLive() {
