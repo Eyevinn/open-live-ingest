@@ -2368,7 +2368,10 @@ pub async fn down(cfg: &Config, events: &Events) -> Result<()> {
     let strom = StromClient::new(&cfg.strom.url, cfg.strom.api_key.as_deref())?;
     match strom.list_flows().await {
         Ok(flows) => {
-            for f in flows.iter().filter(|f| flow::is_ours(f, &gateway_id)) {
+            // The desktop app's preview flows go too: `down` leaves no camera open.
+            for f in flows.iter().filter(|f| {
+                flow::is_ours(f, &gateway_id) || flow::is_preview_of_ours(f, &gateway_id)
+            }) {
                 match remove_flow(&strom, &f.id).await {
                     Ok(()) => {
                         events.emit(Event::FlowRemoved {
@@ -3908,7 +3911,8 @@ mod tests {
         let mut l = live("A", initial, None, None);
         let video = Video::default();
         let state = Arc::new(Mutex::new(FakeStrom {
-            flow: serde_json::to_value(flow::build("gw", &l.input, &video)).unwrap(),
+            flow: serde_json::to_value(flow::build("gw", &l.input, &video, flow::Taps::Off))
+                .unwrap(),
             running: true,
             stats: samples.iter().copied().collect(),
             calls: Vec::new(),
@@ -4111,7 +4115,8 @@ mod tests {
         l.last_counters = Some(counters(0, 0));
         let video = Video::default();
         let state = Arc::new(Mutex::new(FakeStrom {
-            flow: serde_json::to_value(flow::build("gw", &l.input, &video)).unwrap(),
+            flow: serde_json::to_value(flow::build("gw", &l.input, &video, flow::Taps::Off))
+                .unwrap(),
             running: true,
             stats: [clean(1)].into_iter().collect(),
             calls: Vec::new(),

@@ -1,0 +1,79 @@
+{
+  "blocks": [
+    {
+      "block_definition_id": "builtin.local_input",
+      "id": "capture",
+      "name": "Capture",
+      "position": {
+        "x": 0.0,
+        "y": 0.0
+      },
+      "properties": {
+        "audio_device": "dev-mic",
+        "stream_mode": "audio_video",
+        "video_device": "dev-abc",
+        "video_framerate": "25/1",
+        "video_resolution": "1280x720"
+      }
+    },
+    {
+      "block_definition_id": "builtin.videoenc",
+      "id": "encoder",
+      "name": "Encoder",
+      "position": {
+        "x": 250.0,
+        "y": 0.0
+      },
+      "properties": {
+        "bitrate": 6000,
+        "codec": "h264",
+        "encoder_preference": "auto",
+        "keyframe_interval": 25,
+        "quality_preset": "ultrafast",
+        "rate_control": "cbr",
+        "tune": "zerolatency"
+      }
+    },
+    {
+      "block_definition_id": "builtin.mpegtssrt_output",
+      "id": "uplink",
+      "name": "SRT Uplink",
+      "position": {
+        "x": 500.0,
+        "y": 0.0
+      },
+      "properties": {
+        "latency": 200,
+        "num_audio_tracks": 1,
+        "num_video_tracks": 1,
+        "srt_uri": "srt://strom.example.com:9000?mode=caller&latency=200"
+      }
+    }
+  ],
+  "elements": [],
+  "gst_state": null,
+  "id": "12cb89c7-d5b8-5cc5-a9f5-3115686e3679",
+  "links": [
+    {
+      "from": "capture:video_out",
+      "to": "encoder:video_in"
+    },
+    {
+      "from": "capture:audio_out",
+      "to": "uplink:audio_in_0"
+    },
+    {
+      "from": "encoder:encoded_out",
+      "to": "uplink:video_in"
+    }
+  ],
+  "name": "Venue A — Cam",
+  "properties": {
+    "auto_restart": false,
+    "clock_type": "monotonic",
+    "cpu_affinity": "off",
+    "ephemeral": false,
+    "thread_priority": "high"
+  },
+  "running": false
+}
