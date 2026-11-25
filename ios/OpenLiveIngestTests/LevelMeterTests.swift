@@ -164,21 +164,30 @@ final class LevelMeterTests: XCTestCase {
         let monitor = MediaMonitor(display: display, pictures: true)
         monitor.start(microphone: "Test pattern")
         var frame = 0
-        var peaks: [Float] = []
-        let end = Date().addingTimeInterval(2)
-        while Date() < end {
+        func feedOneFrame() {
             let first = source.audioSamples(beforeFrame: frame)
             let next = source.audioSamples(beforeFrame: frame + 1)
             if let sound = source.audioBuffer(startSample: first, frameCount: Int(next - first)) { monitor.audio(sound) }
             if let picture = source.pixelBuffer(frame: frame) { monitor.video(picture) }
             frame += 1
             RunLoop.main.run(until: Date().addingTimeInterval(1 / source.video.fps))
+        }
+        var peaks: [Float] = []
+        let end = Date().addingTimeInterval(2)
+        while Date() < end {
+            feedOneFrame()
             if let peak = display.level?.peak { peaks.append(peak) }
         }
+        // A level must reach the display within 2 s: it never waits behind a picture.
         XCTAssertTrue(display.running)
         XCTAssertFalse(display.silent)
         XCTAssertFalse(peaks.isEmpty, "no level reached the display")
         for peak in peaks { XCTAssertEqual(peak, -20, accuracy: 0.5) }
+
+        // The first picture render is slow on the simulator (software CoreImage warming up, at
+        // `.utility`): keep feeding for up to 10 s until one arrives.
+        let pictured = Date().addingTimeInterval(10)
+        while display.picture == nil, Date() < pictured { feedOneFrame() }
         XCTAssertNotNil(display.picture, "no picture reached the display")
         XCTAssertEqual(Double(display.picture?.width ?? 0), Double(MediaMonitor.pictureWidth), accuracy: 1)
 

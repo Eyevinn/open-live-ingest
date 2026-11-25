@@ -24,9 +24,11 @@ final class MonitorDisplay: ObservableObject {
 /// step 3 shows what goes out.
 ///
 /// The taps never block or copy: `video` and `audio` check a flag under a lock and hand the
-/// buffer (retained, read only) to the monitor's own queue, where the level is measured and the
-/// picture scaled; a picture is skipped while the last one is still being made. Runs between
-/// `start` and `stop` only, so it stops with its source (the background pause stops both).
+/// buffer (retained, read only) on. The level is measured, and the 250 ms window closed, on the
+/// monitor's `queue` (default QoS: cheap, and never behind a picture); the picture is scaled on
+/// its own `renderQueue` at `.utility`, below the encode path, and is skipped while the last one
+/// is still being made. Runs between `start` and `stop` only, so it stops with its source (the
+/// background pause stops both).
 final class MediaMonitor {
     /// The level window and the rate of the level bar (the desktop's 4 Hz).
     static let window: TimeInterval = 0.25
@@ -35,8 +37,13 @@ final class MediaMonitor {
 
     private let display: MonitorDisplay
     private let pictures: Bool
-    private let queue = DispatchQueue(label: "com.eyevinn.open-live-ingest.monitor", qos: .utility)
-    private lazy var context = CIContext(options: [.cacheIntermediates: false])
+    /// Levels and the 250 ms window: cheap, so default QoS; never waits behind a picture.
+    private let queue = DispatchQueue(label: "com.eyevinn.open-live-ingest.monitor")
+    /// Picture scaling only: below the encode path, so it cannot starve the encoder or sender
+    /// (AC5; e2e-ios 45584652341 vs 45594413753).
+    private let renderQueue = DispatchQueue(label: "com.eyevinn.open-live-ingest.monitor.picture", qos: .utility)
+    /// Used on `renderQueue` only.
+    private let context = CIContext(options: [.cacheIntermediates: false])
 
     // Under `lock`: what the taps look at.
     private let lock = NSLock()
@@ -97,7 +104,7 @@ final class MediaMonitor {
     }
 
     /// Stops and clears the display: at once when called on main, else in main's next turn, not
-    /// behind a picture still being scaled on the monitor's queue. A level or picture already on
+    /// behind a picture still being scaled on `renderQueue`. A level or picture already on
     /// its way to main is dropped there (`isCurrent`).
     func stop() {
         lock.lock()
@@ -146,7 +153,7 @@ final class MediaMonitor {
     }
 
     /// A picture as it goes to the encoder: every `pictureInterval`, unless the last one is still
-    /// being scaled, on the monitor's queue.
+    /// being scaled, on `renderQueue` (not the level's `queue`, so the level bar never waits).
     func video(_ pixelBuffer: CVPixelBuffer) {
         guard pictures else { return }
         let now = DispatchTime.now().uptimeNanoseconds
@@ -159,7 +166,7 @@ final class MediaMonitor {
         let generation = self.generation
         lock.unlock()
         guard take else { return }
-        queue.async { [weak self] in
+        renderQueue.async { [weak self] in
             guard let self else { return }
             let image = self.scaled(pixelBuffer)
             self.lock.lock()
@@ -192,6 +199,7 @@ final class MediaMonitor {
         }
     }
 
+    /// On `renderQueue`.
     private func scaled(_ pixelBuffer: CVPixelBuffer) -> CGImage? {
         let image = CIImage(cvPixelBuffer: pixelBuffer)
         let width = image.extent.width
