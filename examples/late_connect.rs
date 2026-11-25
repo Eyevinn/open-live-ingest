@@ -102,18 +102,20 @@
 //! With the default `srt-live-transmit` receiver both the late run and the control
 //! pass (0 dropped, #120 and the Mac run on #111).
 //!
-//! On Strom v0.8.4 on both ends (PR #171, late-connect run 45500947777) the late first
-//! connect is clean: `--listener-delay 35` with `sync: true` PASSes (0 of 38,295
-//! dropped, PTS advanced 50.0 s in 50.0 s). The restart still stalls the receiver
-//! (0 dropped at +10 and +20 s, about 25 % at +30 s, sinks empty until +40 s), so a
-//! reconnect right after the first connect still hits strom#1277, which stays open:
+//! On Strom v0.8.4 on both ends (PR #171, late-connect runs 45500947777 and
+//! 45517536044) the late first connect is clean: `--listener-delay 35` with
+//! `sync: true` PASSed both times (0 dropped, PTS advanced 50.0 s in 50.0 s). The
+//! restart is intermittent: it stalled the receiver in the first run (0 dropped at +10
+//! and +20 s, about 25 % at +30 s, sinks empty until +40 s) and was clean in the
+//! second. So a reconnect right after the first connect can still hit strom#1277,
+//! which stays open:
 //!
 //! | run | expected on v0.8.4 |
 //! |---|---|
 //! | `--listener-delay 35`, `sync: true` | PASS |
 //! | `--listener-delay 0`, `sync: true` | PASS |
 //! | `--listener-delay 35 --receiver-sync false` | PASS |
-//! | `--listener-delay 35 --restart-on-late-connect`, `sync: true` | FAIL |
+//! | `--listener-delay 35 --restart-on-late-connect`, `sync: true` | PASS or FAIL (intermittent) |
 //!
 //! Options: `--strom <url>` (default `http://127.0.0.1:8080`, or `OLI_STROM_URL`),
 //! `--port <n>` (default 47199), `--receiver-port <n>` (default `--port`; set it
