@@ -767,6 +767,48 @@ fn up_status_and_down_print_as_before() {
     assert_golden(&scratch.stdout(&["down"]), DOWN_AGAIN);
 }
 
+const DOWN_PREVIEWS: &str = concat!(
+    "  Venue — Test pattern (preview) — flow stopped and removed\n",
+    "  Venue — FaceTime HD Camera (preview) — flow stopped and removed\n",
+);
+
+/// The desktop app's preview flows of this gateway (#172), left by an app that
+/// ended without cleanup: `down` removes them like its own uplinks, so no camera
+/// stays open. Another gateway's preview stays.
+#[test]
+fn down_removes_the_apps_preview_flows() {
+    use open_live_ingest::flow::{self, Source};
+    let preview = |gateway: &str, name: &str, source: Source| {
+        serde_json::to_value(flow::preview(gateway, name, &source)).unwrap()
+    };
+    let test_pattern = Source::Test {
+        resolution: "1920x1080".to_string(),
+        framerate: "25/1".to_string(),
+    };
+    let camera = Source::Device {
+        device_id: "dev-cam".to_string(),
+        audio_device: Some("dev-mic".to_string()),
+        resolution: None,
+        framerate: None,
+    };
+    let theirs = preview("gw-other", "Other — Test pattern", test_pattern.clone());
+    let strom_state = Arc::new(Mutex::new(StromState {
+        flows: vec![
+            preview("gw-golden", "Venue — Test pattern", test_pattern),
+            theirs.clone(),
+            preview("gw-golden", "Venue — FaceTime HD Camera", camera),
+        ],
+        ..StromState::default()
+    }));
+    let strom = fake_strom(strom_state.clone());
+    let open_live = fake_open_live(Arc::new(Mutex::new(OpenLiveState::default())));
+    let scratch = Scratch::new("down-previews", &strom, &open_live);
+
+    assert_golden(&scratch.stdout(&["down"]), DOWN_PREVIEWS);
+    assert_eq!(strom_state.lock().unwrap().flows, [theirs]);
+    assert_golden(&scratch.stdout(&["down"]), DOWN_AGAIN);
+}
+
 #[cfg(unix)]
 const UP_THEN_STOP: &str = "\
 Bringing up 1 input(s) to cloud.example.com, SRT ports 47110-47112 from Open Live, about 6 Mbps in total.
