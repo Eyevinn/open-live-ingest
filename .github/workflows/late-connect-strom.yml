@@ -14,16 +14,18 @@ name: Late connect (Strom receiver)
 #      did not avoid the stall (PR #170, run 45490377672), so it is kept as a recorded
 #      negative result, and `up` has no such restart
 #
-# On Strom v0.8.4 a late first connect is clean: run 1 PASSed, on both the drop gate
-# and the PTS gates, in both runs on PR #171 (45500947777, 45517536044). A reconnect
-# right after the first connect is intermittent: run 4 stalled the receiver in
-# 45500947777 (drops from about +20 to +40 s, sinks empty until +40 s) and was clean in
-# 45517536044. strom#1277 is therefore not fixed, only narrowed to a reconnect soon
-# after the first connect, which sometimes still stalls. Runs 1-3 must PASS. Run 4 is
-# recorded, not gated: PASS or FAIL both count, and the summary says which it was; an
-# ERROR or a missing run still fails the job. When a Strom release fixes the reconnect
-# case and is pinned (.github/scripts/bump-strom-pin.sh), run 4 must PASS every time,
-# and its expectation becomes PASS.
+# On Strom v0.8.4 (PR #171, runs 45500947777, 45517536044, 45518995136) both late
+# rows are intermittent: run 1 (late) went PASS / PASS / FAIL, and in its FAIL the
+# receiver stalled with the strom#1277 signature (drops from about +20 to +40 s, sinks
+# empty until +40 s); run 4 (late+restart) went FAIL / PASS / PASS. strom#1277 is
+# therefore not fixed in v0.8.4, only less frequent. Runs 2-3 (the controls) must
+# PASS. Runs 1 and 4 are recorded, not gated: PASS or FAIL both count, and the summary
+# says which it was. A run with no verdict still fails the job: an ERROR, a missing
+# run, or run 4 without its restart line. No retries or voting: a vote over an
+# intermittent stall still gives no fixed expectation. Runs 1 and 4 go back to a hard
+# PASS only after a Strom release with a strom#1277 fix is pinned
+# (.github/scripts/bump-strom-pin.sh) and shows both clean across several
+# consecutive runs, not one.
 #
 # The Strom setup is ci.yml's real-strom job: GStreamer from apt, the
 # strom-<tag>-linux-x86_64 release asset at the strom-types pin in Cargo.toml,
@@ -198,7 +200,7 @@ jobs:
           # either verdict, but not ERROR or NOT RUN. The messages below are built from
           # this array, so they follow it.
           order=(late first nosync late+restart)
-          declare -A expected=([late]=PASS [first]=PASS [nosync]=PASS [late+restart]="PASS or FAIL")
+          declare -A expected=([late]="PASS or FAIL" [first]=PASS [nosync]=PASS [late+restart]="PASS or FAIL")
           pattern=""
           for name in "${order[@]}"; do pattern+="${pattern:+ / }${expected[$name]}"; done
           declare -A got=()
@@ -227,14 +229,19 @@ jobs:
             done
             echo
             if $ok; then
-              echo "Pattern $pattern as expected: a late first connect into a receiver with clock-synced sinks is clean, and both controls are clean."
-              if [[ "${got[late+restart]}" == FAIL ]]; then
-                echo "\`late+restart\` FAILed: a reconnect right after the first connect stalled the receiver this time, so strom#1277 is not fixed in this Strom."
-              else
-                echo "\`late+restart\` PASSed this time. It is intermittent on this Strom (it stalled in run 45500947777), so strom#1277 is not counted as fixed from one clean run."
-              fi
+              echo "Pattern $pattern as expected: both controls (\`first\`, \`nosync\`) are clean, and every run gave a verdict."
+              echo
+              # The v0.8.4 run where each recorded row FAILed (see the header).
+              declare -A failed_in=([late]=45518995136 [late+restart]=45500947777)
+              for name in late late+restart; do
+                if [[ "${got[$name]}" == FAIL ]]; then
+                  echo "- \`$name\`: FAIL, stalled this time, strom#1277 not fixed in this Strom."
+                else
+                  echo "- \`$name\`: PASS, clean this time; intermittent on v0.8.4 (it FAILed in run ${failed_in[$name]}), not counted as fixed."
+                fi
+              done
             else
-              echo "**Pattern differs from the expected $pattern.** If \`late\`, \`first\` or \`nosync\` FAILed, the late first connect or a control stalls (a regression in this Strom, or in the reproduction). An ERROR or NOT RUN means a run did not produce a verdict: see its log."
+              echo "**Pattern differs from the expected $pattern.** Only a \`first\` or \`nosync\` FAIL is a regression (a control stalls: in this Strom, or in the reproduction). An ERROR or NOT RUN means a run gave no verdict: see its log."
             fi
             echo
             for name in "${order[@]}"; do

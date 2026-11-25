@@ -102,17 +102,18 @@
 //! With the default `srt-live-transmit` receiver both the late run and the control
 //! pass (0 dropped, #120 and the Mac run on #111).
 //!
-//! On Strom v0.8.4 on both ends (PR #171, late-connect runs 45500947777 and
-//! 45517536044) the late first connect is clean: `--listener-delay 35` with
-//! `sync: true` PASSed both times (0 dropped, PTS advanced 50.0 s in 50.0 s). The
-//! restart is intermittent: it stalled the receiver in the first run (0 dropped at +10
-//! and +20 s, about 25 % at +30 s, sinks empty until +40 s) and was clean in the
-//! second. So a reconnect right after the first connect can still hit strom#1277,
-//! which stays open:
+//! On Strom v0.8.4 on both ends (PR #171, late-connect runs 45500947777,
+//! 45517536044 and 45518995136) both late runs are intermittent. The late first
+//! connect (`--listener-delay 35`, `sync: true`) PASSed, PASSed, then FAILed: in the
+//! third run 0 dropped at +10 and +20 s, about 21 % at +30 and +40 s, and no buffer on
+//! either sink until +40 s. The restart went FAIL, PASS, PASS: in the first run 0
+//! dropped at +10 and +20 s, about 25 % at +30 s, sinks empty until +40 s. Both
+//! controls PASSed all three times. So v0.8.4 makes the stall less frequent but does
+//! not fix it, and strom#1277 stays open:
 //!
 //! | run | expected on v0.8.4 |
 //! |---|---|
-//! | `--listener-delay 35`, `sync: true` | PASS |
+//! | `--listener-delay 35`, `sync: true` | PASS or FAIL (intermittent) |
 //! | `--listener-delay 0`, `sync: true` | PASS |
 //! | `--listener-delay 35 --receiver-sync false` | PASS |
 //! | `--listener-delay 35 --restart-on-late-connect`, `sync: true` | PASS or FAIL (intermittent) |
