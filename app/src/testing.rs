@@ -537,13 +537,16 @@ struct StromState {
     lingering: std::collections::BTreeMap<String, usize>,
     /// Every request, as `METHOD /path`.
     calls: Vec<String>,
+    /// Pictures of a flow it has are 404 too, as Strom answers for a flow it has just
+    /// started (#189).
+    pictures_404: bool,
 }
 
 /// A fake local Strom: a camera (`dev-cam`, "Cam") and a microphone (`dev-mic`,
 /// "Mic") in its device list, the preview blocks when `blocks` says so, and the flow
 /// routes, keeping what is posted. A removed flow is still answered for `linger`
 /// more `GET`s before Strom says 404, as a flow takes a moment to go. Pictures are
-/// 504: no fresh frame. The capture's `device-name` is `opened`.
+/// 504: no fresh frame (404 after [`FakeStrom::pictures_404`]). The capture's `device-name` is `opened`.
 pub struct FakeStrom {
     pub url: String,
     state: Arc<Mutex<StromState>>,
@@ -629,7 +632,7 @@ impl FakeStrom {
                     }
                 }
                 ("GET", _, Some((id, rest))) if rest == "blocks/picture/thumbnail" => {
-                    if state.flows.contains_key(&id) {
+                    if state.flows.contains_key(&id) && !state.pictures_404 {
                         (504, Value::Null)
                     } else {
                         (404, Value::Null)
@@ -649,6 +652,11 @@ impl FakeStrom {
             }
         }));
         FakeStrom { url, state }
+    }
+
+    /// From now on, pictures of the flows it has are 404, not 504.
+    pub fn pictures_404(&self) {
+        self.state.lock().unwrap().pictures_404 = true;
     }
 
     /// Every request so far, as `METHOD /path`.
