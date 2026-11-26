@@ -21,7 +21,7 @@
 # BUNDLE_PLUGIN_SCANNER and BUNDLE_GIO_MODULE_DIR, relative to Contents):
 #
 #   Open Live Ingest.app/Contents/
-#     Info.plist                       CFBundleExecutable open-live-ingest-app
+#     Info.plist                       CFBundleExecutable open-live-ingest-app, LSUIElement
 #     MacOS/open-live-ingest-app       the desktop app, what Finder opens
 #     MacOS/open-live-ingest           the CLI, for SSH and a PATH symlink
 #     MacOS/strom
@@ -34,6 +34,12 @@
 #
 # The app and the CLI both find the bundled Strom as "a strom next to the running
 # executable", so either one runs the same gateway with the same GStreamer.
+#
+# Every executable in MacOS/ shares the bundle's Info.plist, so Strom (and the CLI)
+# would each register with the window server as a second "Open Live Ingest" in the
+# Dock (#188). LSUIElement keeps them out of the Dock; the app itself still gets its
+# Dock icon and menu bar because it sets NSApplicationActivationPolicyRegular when
+# it finishes launching (app/src/window.rs). The --check below requires the key.
 #
 # Each kind of code sits where Apple's bundle layout puts it, because codesign only
 # accepts nested code in those places. Frameworks, PlugIns, Helpers and MacOS are
@@ -171,7 +177,7 @@ rpaths_of() {
 # a bundle without its executables or plugins is an error, never a pass.
 check_bundle() {
     local app="${1%/}" f d tool req key bad=0 checked=0 list load_cmds rpaths hits dotted sig ents adhoc
-    local plist main_exec icon
+    local plist main_exec icon ui_element
     [[ -d "$app/Contents" ]] || die "$app is not an app bundle"
     for tool in file otool find awk sed grep codesign plutil; do
         command -v "$tool" >/dev/null 2>&1 || die "$tool not found (the check needs it)"
@@ -200,6 +206,13 @@ check_bundle() {
     [[ -s "$app/Contents/Resources/${icon%.icns}.icns" ]] \
         || die "CFBundleIconFile names $icon, but Contents/Resources has no ${icon%.icns}.icns"
     say "OK: CFBundleExecutable is $APP_EXEC, the CLI and strom are next to it, the icon is there"
+    # Strom inherits this Info.plist; without LSUIElement it gets a Dock icon of its
+    # own (#188). The app turns itself back into a regular app at launch.
+    ui_element="$(plutil -extract LSUIElement raw -o - "$plist")" \
+        || die "cannot read LSUIElement from Contents/Info.plist (Strom would get a second Dock icon)"
+    [[ "$ui_element" == "true" ]] \
+        || die "LSUIElement is '$ui_element', not true (Strom would get a second Dock icon)"
+    say "OK: LSUIElement is true, so only the app shows in the Dock"
     [[ -d "$app/Contents/$GIO_MODULE_DIR_REL" ]] || die "Contents/$GIO_MODULE_DIR_REL is missing"
     grep -qF "$app/Contents/$PLUGIN_DIR_REL/" <<<"$list" || die "Contents/$PLUGIN_DIR_REL holds no plugins"
     while IFS= read -r f; do
@@ -416,6 +429,9 @@ install -m 0755 "$ingest_bin" "$contents/MacOS/$CLI_EXEC"
 install -m 0755 "$strom_bin" "$contents/MacOS/strom"
 install -m 0644 "$icon_src" "$contents/Resources/$ICON_NAME.icns"
 
+# LSUIElement: strom and the CLI run from MacOS/ under this same Info.plist and must
+# not show up in the Dock as a second "Open Live Ingest" (#188); the app sets its own
+# activation policy to regular at launch, so it keeps its Dock icon and menu bar.
 min_version="${MACOS_MIN_VERSION:-$(sw_vers -productVersion | cut -d. -f1).0}"
 cat >"$contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -445,6 +461,8 @@ cat >"$contents/Info.plist" <<EOF
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.video</string>
     <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>LSUIElement</key>
     <true/>
     <key>NSCameraUsageDescription</key>
     <string>Open Live Ingest sends the cameras you choose to Open Live.</string>
