@@ -1389,6 +1389,27 @@ mod tests {
         );
     }
 
+    /// The bundled Strom runs from `Contents/MacOS` under the app's Info.plist, so without
+    /// `LSUIElement` it shows in the Dock as a second "Open Live Ingest" (#188). The
+    /// script writes the key and its `--check` refuses a bundle without it.
+    #[test]
+    fn the_bundled_strom_gets_no_dock_icon_of_its_own() {
+        let script = include_str!("../.github/scripts/build-macos-app.sh");
+        let lines: Vec<&str> = script.lines().map(str::trim).collect();
+        assert!(
+            lines
+                .windows(2)
+                .any(|w| w[0] == "<key>LSUIElement</key>" && w[1] == "<true/>"),
+            "the Info.plist in build-macos-app.sh must set LSUIElement to true"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| !l.starts_with('#') && l.contains("plutil -extract LSUIElement raw")),
+            "build-macos-app.sh --check must read LSUIElement from the Info.plist"
+        );
+    }
+
     /// `codesign` accepts nested code only in a bundle's code locations, and takes a
     /// directory there whose name has a dot (such as `gstreamer-1.0`) for a nested
     /// bundle, which rejects the whole app.

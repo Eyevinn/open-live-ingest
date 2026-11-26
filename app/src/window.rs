@@ -50,7 +50,16 @@ pub fn run() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    // The bundle's Info.plist sets LSUIElement so the Strom started from Contents/MacOS
+    // gets no Dock icon of its own (#188). The app is the one regular app: Dock icon,
+    // menu bar, Cmd-Tab. tao's default is the same; this keeps it from depending on that.
+    #[cfg(target_os = "macos")]
+    {
+        use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+        event_loop.set_activation_policy(ActivationPolicy::Regular);
+    }
 
     let builder = WindowBuilder::new()
         .with_title(TITLE)

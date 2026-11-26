@@ -154,6 +154,13 @@ packaging/windows/    open-live-ingest.nsi
   window of its own, so when the app starts Strom the library adds `CREATE_NO_WINDOW` to the
   creation flags. This is a launch option the app sets; the CLI keeps today's flags and console
   behaviour (`DESIGN.md` §6).
+- **macOS: no Dock icon for Strom.** The bundled Strom runs from `Contents/MacOS/strom`, so it
+  shares the bundle's Info.plist and bundle identifier, and once GStreamer touches the window
+  server it would register as a second foreground "Open Live Ingest" with a Dock icon of its own
+  (#188). Info.plist therefore sets `LSUIElement` = true, which keeps Strom (and the CLI) out of
+  the Dock, and the app sets `NSApplicationActivationPolicyRegular` before its event loop runs
+  (tao's `EventLoopExtMacOS::set_activation_policy`), so the app alone has the Dock icon, the menu
+  bar and a Cmd-Tab entry. `build-macos-app.sh --check` fails a bundle without the key.
 - **macOS: the camera prompt names the app.** Launched from Finder, the app is the responsible
   process for the Strom it starts, so TCC asks on behalf of "Open Live Ingest" (Info.plist already
   carries `NSCameraUsageDescription` and `NSMicrophoneUsageDescription`). Before Go live the app
@@ -870,15 +877,16 @@ Changes to `.github/scripts/build-macos-app.sh` (after #67, which edits the same
   `Contents/MacOS/open-live-ingest` for SSH and the PATH symlink, so `local_strom`'s "a `strom`
   next to the running executable" and the bundle detection work for both.
 - Info.plist adds `CFBundleIconFile` (`AppIcon`, from a committed `app/icons/AppIcon.icns`),
-  `NSHighResolutionCapable` = true and `LSApplicationCategoryType` =
-  `public.app-category.video`. `CFBundleIdentifier` stays `com.eyevinn.open-live-ingest`, so camera
+  `NSHighResolutionCapable` = true, `LSApplicationCategoryType` =
+  `public.app-category.video` and `LSUIElement` = true (no Dock icon for Strom, §4; added for
+  #188). `CFBundleIdentifier` stays `com.eyevinn.open-live-ingest`, so camera
   and microphone permissions already granted carry over.
 - Signing order: libraries and plugins, `gst-plugin-scanner`, `strom` (entitlements), then the CLI
   `open-live-ingest` as a nested executable (entitlements: it opens no device itself, but over SSH
   it is the process TCC sees), then the bundle with the entitlements, which signs the app binary.
   No new entitlement: WKWebView's JIT runs in Apple's WebContent process. Whatever #67 grants the
   ad hoc build applies to the app binary in the same way.
-- `--check` requires all three executables and the entitlements on each.
+- `--check` requires all three executables, the entitlements on each and `LSUIElement` = true.
 
 Changes to `.github/workflows/release.yml`:
 
