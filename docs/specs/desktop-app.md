@@ -492,10 +492,11 @@ these (`preview`, `set_inputs`, `go_live`, `stop`) and every 2 s:
 | Change | Preview flow |
 |---|---|
 | Row ticked | created and started |
-| Row unticked, or preview off | removed; the row is `stopped` when Strom answers 404 (camera off) |
+| Row unticked, or preview off | removed; the row is `stopped` when Strom answers 404 (camera off). This holds for a row that is `failed` because its flow went away too (Strom may still run it, #190); a row whose flow did not come up has none left (it was removed then) and is `stopped` at once |
 | Audio pick changed, or capture resolution / frame rate changed | removed, then created |
 | Label changed | nothing (the flow id does not depend on it) |
-| Flow gone (404) while the controller thinks it runs | `failed`, created again at the next reconcile unless another gateway runs |
+| Flow gone while the controller thinks it runs: a thumbnail 404, and `GET /api/flows/{id}` 404 too | `failed`, created again at the next reconcile unless another gateway runs |
+| Thumbnail 404 while Strom still lists the flow | nothing: no fresh frame, as a 504 (below). The flow is not removed or created again |
 
 While live, the controller polls the taps of every running uplink flow (flow id from the session's
 `stats`, `gateway::InputStats`, as §5.1 does) while the window is visible, regardless of the page's
@@ -521,7 +522,7 @@ out.
 |---|---|---|
 | 200 `image/jpeg` | the latest frame, 320×180, quality 75 (`ThumbnailTapConfig` defaults: one new frame per 1 s, served from cache, stale after 3 s) | `showing`; the event carries the image if its bytes changed |
 | 504 | no fresh frame: the branch was just attached, or the source sends nothing | `starting` until the first picture; `no_picture` after 5 s of 504s once a picture was shown, or 5 s after start without one |
-| 404 | the flow does not run, or has no such block | `failed` (preview), or nothing (uplink: the session's own states say why) |
+| 404 | the flow does not run, or has no such block. Strom also answers it for a flow it has just started, and at times for one `GET /api/flows/{id}` reports Playing (#189) | preview: confirmed with `StromClient::get_flow`. Flow listed: as a 504 (`starting`, then `no_picture` after 5 s), never a restart. Flow not listed (404): `failed`, created again at the next reconcile. No answer: as below. Uplink: nothing (the session's own states say why) |
 | no answer | Strom is gone | nothing per row: the `strom` event and §10 handle it |
 
 The first request attaches the tap's branch; it is polled every 250 ms until the first picture
