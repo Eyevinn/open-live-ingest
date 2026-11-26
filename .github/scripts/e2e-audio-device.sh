@@ -181,7 +181,29 @@ sudo chmod 0666 "$camera_dev"
 gst-launch-1.0 -q videotestsrc is-live=true pattern=smpte \
     ! video/x-raw,format=YUY2,width=1280,height=720,framerate=25/1 \
     ! v4l2sink device="$camera_dev" > "$work/camera.log" 2>&1 &
-pids+=("$!")
+camera_pid="$!"
+pids+=("$camera_pid")
+# With exclusive_caps=1 the device reports itself as a capture device only once the
+# writer above streams into it; until then it is output-only. Strom's DeviceMonitor
+# probes the devices once at start-up (it only hears of later add/remove events), so
+# a camera that is still output-only then is never listed (run 45828031144). Wait for
+# the capture capability before Strom starts.
+camera_is_capture() {
+    v4l2-ctl -d "$camera_dev" --info 2>/dev/null | awk '
+        /Device Caps/ { caps = 1; next }
+        caps && /^\t\t/ { if ($0 ~ /\tVideo Capture$/) found = 1; next }
+        { caps = 0 }
+        END { exit !found }'
+}
+for _ in $(seq 60); do
+    camera_is_capture && break
+    kill -0 "$camera_pid" 2>/dev/null || break
+    sleep 0.5
+done
+if ! camera_is_capture; then
+    cat "$work/camera.log" >&2
+    fail "the test pattern does not reach $camera_dev: it does not report Video Capture, so Strom would not list it"
+fi
 pass "virtual camera '$camera_name' at $camera_dev (v4l2loopback, kernel $kernel), fed a test pattern"
 
 # --- 2. virtual microphone -------------------------------------------------------------
