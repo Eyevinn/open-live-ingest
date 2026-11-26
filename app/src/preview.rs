@@ -330,7 +330,8 @@ enum PictureState {
     /// No fresh picture for [`NO_PICTURE_AFTER`].
     NoPicture,
     /// The flow did not come up, or went away. `retry`: created again at the next
-    /// reconcile (it went away); otherwise only when the row is ticked again.
+    /// reconcile (it went away, and Strom may still list it: unticked, it is removed);
+    /// otherwise only when the row is ticked again (`run_flow` removed it already).
     Failed { retry: bool },
 }
 
@@ -592,7 +593,8 @@ impl Preview {
     /// [`runs`](Self::runs), else nothing. Rows to remove leave the model at once;
     /// rows to create enter it as `starting`. A changed audio pick or capture mode is
     /// a removal and a start; a changed label is nothing. A row whose flow went away
-    /// is created again; one that did not come up waits to be ticked again.
+    /// is created again, and removed like a running one when unticked; one that did
+    /// not come up waits to be ticked again.
     pub fn plan(
         &mut self,
         gateway_id: &str,
@@ -632,15 +634,21 @@ impl Preview {
             }
             let row = self.rows.remove(&device).expect("listed above");
             events.extend(row.clear_notices());
-            let failed = matches!(row.picture, PictureState::Failed { .. });
-            if !failed {
-                plan.remove.push(Removal {
+            match (&row.picture, &desired) {
+                // `run_flow` removed the flow that did not come up.
+                (PictureState::Failed { retry: false }, None) => {
+                    events.push(row.event("stopped", None, None));
+                }
+                (PictureState::Failed { retry: false }, Some(_)) => {}
+                // Gone, and created again: `run_flow` removes a flow left with its id.
+                (PictureState::Failed { retry: true }, Some(_)) => {}
+                // Unticked after it went away, or running: removed, `stopped` at 404,
+                // so a flow Strom still runs does not keep the camera on (#190).
+                _ => plan.remove.push(Removal {
                     device: device.clone(),
                     flow: row.flow,
                     announce: desired.is_none().then_some("stopped"),
-                });
-            } else if desired.is_none() {
-                events.push(row.event("stopped", None, None));
+                }),
             }
         }
         for (device, target) in wanted {
@@ -743,6 +751,13 @@ impl Preview {
         }
     }
 
+    /// Whether `device` is a preview row (not an uplink).
+    fn is_preview(&self, device: &str) -> bool {
+        self.rows
+            .get(device)
+            .is_some_and(|r| r.kind == Kind::Preview)
+    }
+
     /// The rows whose picture is due now, each marked as being asked for: the
     /// preview rows while the preview runs, the uplinks while live, and only while
     /// the window is visible.
@@ -767,7 +782,8 @@ impl Preview {
     }
 
     /// What Strom answered for a row's picture (section 5.2's table). Strom not
-    /// answering changes nothing per row.
+    /// answering changes nothing per row. For a preview row, `Gone` is a 404 that
+    /// `GET /api/flows/{id}` confirmed ([`picture_of`]).
     pub fn pictured(
         &mut self,
         device: &str,
@@ -996,7 +1012,7 @@ impl Preview {
         for device in previews {
             let row = self.rows.remove(&device).expect("listed above");
             events.extend(row.clear_notices());
-            if matches!(row.picture, PictureState::Failed { .. }) {
+            if matches!(row.picture, PictureState::Failed { retry: false }) {
                 events.push(row.event(announce, None, None));
             } else {
                 removals.push(Removal {
@@ -1117,6 +1133,32 @@ async fn run_flow(strom: &StromClient, flow: &Flow) -> anyhow::Result<bool> {
             strom.delete_flow(&flow.id).await.ok();
             Err(err)
         }
+    }
+}
+
+/// A preview row's picture. Strom answers 404 for the thumbnail of a flow it has just
+/// started, and at times of one it reports as Playing (#189), so a 404 is confirmed
+/// with `GET /api/flows/{id}`: see [`confirm_gone`]. An uplink's 404 is passed on
+/// as is (`confirm` false). Err when Strom does not answer either request.
+async fn picture_of(strom: &StromClient, id: &FlowId, confirm: bool) -> anyhow::Result<Thumbnail> {
+    let answer = strom.thumbnail(id, flow::BLOCK_PICTURE).await?;
+    if !confirm || answer != Thumbnail::Gone {
+        return Ok(answer);
+    }
+    Ok(confirm_gone(strom.get_flow(id).await?.is_some()))
+}
+
+/// What a thumbnail 404 means once Strom has said whether it still has the flow: gone
+/// when it does not; while it does, no fresh frame (as a 504), so a flow that never
+/// gives a picture ends in `no_picture` after [`NO_PICTURE_AFTER`] and is not
+/// created again.
+fn confirm_gone(listed: bool) -> Thumbnail {
+    if listed {
+        Thumbnail::NoFrame {
+            capture_failed: false,
+        }
+    } else {
+        Thumbnail::Gone
     }
 }
 
@@ -1460,15 +1502,24 @@ impl PreviewController {
 
     /// Asks for each picture due now, each on a task of its own.
     fn poll_pictures(self: &Arc<Self>) {
-        let due = self.model().due(Instant::now());
+        let due: Vec<_> = {
+            let mut model = self.model();
+            let due = model.due(Instant::now());
+            due.into_iter()
+                .map(|(device, flow, generation)| {
+                    let preview = model.is_preview(&device);
+                    (device, flow, generation, preview)
+                })
+                .collect()
+        };
         if due.is_empty() {
             return;
         }
         let Some(strom) = self.strom() else { return };
-        for (device, flow, generation) in due {
+        for (device, flow, generation, preview) in due {
             let (this, strom) = (Arc::downgrade(self), strom.clone());
             let task = async move {
-                let answer = strom.thumbnail(&flow, flow::BLOCK_PICTURE).await;
+                let answer = picture_of(&strom, &flow, preview).await;
                 let Some(this) = this.upgrade() else { return };
                 let events = this
                     .model()

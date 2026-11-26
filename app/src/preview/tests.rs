@@ -368,18 +368,88 @@ fn no_answer_or_a_late_answer_changes_nothing() {
     assert!(none.is_empty());
 }
 
-/// A preview flow gone (404) while it should run is `failed`, and created again at
-/// the next reconcile.
+/// A preview flow gone (a thumbnail 404, and Strom does not list the flow either)
+/// while it should run is `failed`, and created again at the next reconcile.
 #[test]
 fn a_preview_flow_gone_is_failed_and_created_again_at_the_next_reconcile() {
     let t = Instant::now();
     let (mut preview, g) = running(vec![cam(false)], t);
-    let events = json_of(&preview.pictured("dev-cam", g["dev-cam"], Ok(Thumbnail::Gone), t));
+    let gone = confirm_gone(false);
+    assert_eq!(gone, Thumbnail::Gone);
+    let events = json_of(&preview.pictured("dev-cam", g["dev-cam"], Ok(gone), t));
     assert_eq!(events[0]["data"]["state"], "failed");
     let (plan, events) = preview.plan("gw", vec![cam(false)], t + RECONCILE_EVERY);
     assert!(plan.remove.is_empty(), "nothing to remove: it is gone");
     assert_eq!(plan.start.len(), 1);
     assert_eq!(json_of(&events)[0]["data"]["state"], "starting");
+}
+
+/// #190: a thumbnail 404 for a flow Strom still lists is no fresh frame, not gone:
+/// no `failed`, nothing removed or created again, and `no_picture` once 5 s pass
+/// without a picture, as for 504s.
+#[test]
+fn a_thumbnail_404_for_a_flow_strom_still_has_is_no_picture_not_a_restart() {
+    let t = Instant::now();
+    let (mut preview, g) = running(vec![cam(false)], t);
+    let gen = g["dev-cam"];
+    let mut at = t;
+    while at < t + NO_PICTURE_AFTER {
+        assert_eq!(preview.due(at).len(), 1, "polled at {:?}", at - t);
+        let events = preview.pictured("dev-cam", gen, Ok(confirm_gone(true)), at);
+        assert!(events.is_empty(), "{:?}", json_of(&events));
+        if (at - t)
+            .as_millis()
+            .is_multiple_of(RECONCILE_EVERY.as_millis())
+        {
+            let (plan, events) = preview.plan("gw", vec![cam(false)], at);
+            assert!(plan.remove.is_empty() && plan.start.is_empty(), "restarted");
+            assert!(events.is_empty());
+        }
+        at += FIRST_PICTURE_EVERY;
+    }
+    preview.due(at);
+    let events = json_of(&preview.pictured("dev-cam", gen, Ok(confirm_gone(true)), at));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["data"]["state"], "no_picture");
+    assert_eq!(events[0]["data"]["message"], "No picture from Cam.");
+    // Still not created again, and further 404s say nothing more.
+    let (plan, _) = preview.plan("gw", vec![cam(false)], at + RECONCILE_EVERY);
+    assert!(plan.remove.is_empty() && plan.start.is_empty());
+    preview.due(at + Duration::from_secs(1));
+    assert!(preview
+        .pictured(
+            "dev-cam",
+            gen,
+            Ok(confirm_gone(true)),
+            at + Duration::from_secs(1)
+        )
+        .is_empty());
+}
+
+/// #190: a row whose flow went away and is then unticked has its flow removed (Strom
+/// may still run it), and is `stopped` once Strom answers 404. Go live hands such a
+/// flow over the same way.
+#[test]
+fn unticking_a_row_whose_flow_went_away_removes_its_flow() {
+    let t = Instant::now();
+    let (mut preview, g) = running(vec![cam(false)], t);
+    preview.pictured("dev-cam", g["dev-cam"], Ok(confirm_gone(false)), t);
+    let (plan, events) = preview.plan("gw", vec![], t + RECONCILE_EVERY);
+    assert!(events.is_empty(), "stopped before the flow is gone");
+    assert!(plan.start.is_empty());
+    assert_eq!(plan.remove.len(), 1);
+    let removal = &plan.remove[0];
+    assert_eq!(removal.flow, preview_id("dev-cam"));
+    assert_eq!(removal.announce, Some("stopped"));
+    let events = json_of(&preview.removed(removal));
+    assert_eq!(events[0]["data"]["state"], "stopped");
+
+    let (mut preview, g) = running(vec![cam(false)], t);
+    preview.pictured("dev-cam", g["dev-cam"], Ok(confirm_gone(false)), t);
+    let (removals, events) = preview.hand_over();
+    assert!(events.is_empty());
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0].announce, Some("camera_off"));
 }
 
 /// A flow that does not reach running: the camera's line, and no new flow until the
@@ -637,6 +707,10 @@ fn while_live_the_uplinks_taps_are_read() {
     let (events, checks) = preview.uplinks(vec![(cam(true), uplink)], t);
     assert!(events.is_empty() && checks.is_empty());
     assert_eq!(preview.due(t), vec![("dev-cam".to_string(), uplink, gen)]);
+    assert!(
+        !preview.is_preview("dev-cam"),
+        "an uplink's 404 is not confirmed"
+    );
     assert!(preview
         .pictured("dev-cam", gen, Ok(Thumbnail::Gone), t)
         .is_empty());
@@ -1028,6 +1102,76 @@ fn tick_creates_the_flow_and_untick_removes_it_after_404() {
     assert!(gets >= 3, "did not wait for 404: {calls:?}");
     let stopped = wait_for(&rx, "stopped", |m| m["data"]["state"] == "stopped");
     assert_eq!(stopped["data"]["device"], "dev-cam");
+}
+
+/// #190: Strom answers 404 for the picture of a flow it runs. The controller asks
+/// Strom for the flow, finds it, and neither removes nor creates it again.
+#[test]
+fn a_picture_404_for_a_running_flow_does_not_restart_it() {
+    let setup = Setup::new("preview-404", true, "Cam", CAMERA_WITH_MIC);
+    let go = setup.go_live();
+    let (preview, _rx) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+    preview.set_wanted(true);
+    setup.rt.block_on(preview.reconcile());
+    let id = preview_of("dev-cam");
+    setup.strom.pictures_404();
+
+    let strom = StromClient::new(&setup.strom.url, None).unwrap();
+    let (listed, unknown, unconfirmed) = setup.rt.block_on(async {
+        (
+            picture_of(&strom, &id, true).await.unwrap(),
+            picture_of(&strom, &preview_of("dev-other"), true)
+                .await
+                .unwrap(),
+            picture_of(&strom, &id, false).await.unwrap(),
+        )
+    });
+    assert_eq!(
+        listed,
+        Thumbnail::NoFrame {
+            capture_failed: false
+        }
+    );
+    assert_eq!(unknown, Thumbnail::Gone);
+    assert_eq!(unconfirmed, Thumbnail::Gone);
+
+    let asked = setup
+        .calls_for(id)
+        .iter()
+        .filter(|c| **c == format!("GET /api/flows/{id}"))
+        .count();
+    setup.rt.block_on(async { preview.poll_pictures() });
+    setup
+        .strom
+        .wait_for("the flow asked for after the 404", |calls| {
+            calls
+                .iter()
+                .filter(|c| **c == format!("GET /api/flows/{id}"))
+                .count()
+                > asked
+        });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while preview.model().rows["dev-cam"].polling {
+        assert!(Instant::now() < deadline, "the picture never came back");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(preview.model().rows["dev-cam"].picture.polled(), "failed");
+    setup.rt.block_on(preview.reconcile());
+    let calls = setup.calls_for(id);
+    assert!(
+        !calls.iter().any(|c| c.starts_with("DELETE")),
+        "removed: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| **c == format!("POST /api/flows/{id}/start"))
+            .count(),
+        1,
+        "started again: {calls:?}"
+    );
+    assert_eq!(setup.strom.flow_ids(), [id.to_string()]);
 }
 
 /// Strom opened another camera: the row's `wrong_camera` notice.
