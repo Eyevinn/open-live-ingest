@@ -176,8 +176,33 @@ if ! load_loopback 2>/dev/null; then
 fi
 for _ in $(seq 20); do [[ -e "$camera_dev" ]] && break; sleep 0.5; done
 [[ -e "$camera_dev" ]] || fail "v4l2loopback loaded but $camera_dev did not appear"
-# The runner user is not in the video group.
-sudo chmod 0666 "$camera_dev"
+# The runner user is not in the video group, so it needs explicit access to the node.
+# udev applies its rule (root:video 0660) asynchronously once the node exists; a chmod
+# made before that is undone, and the writer below then fails with "Permission denied"
+# (run 45838214921). Let udev finish first, then grant access (mode and an ACL for this
+# user), and check it holds before starting the writer.
+camera_user="$(id -un)"
+grant_camera_access() {
+    sudo udevadm settle --timeout=30 || true
+    sudo chmod 0666 "$camera_dev"
+    if command -v setfacl >/dev/null 2>&1; then
+        sudo setfacl -m "u:$camera_user:rw" "$camera_dev" || true
+    fi
+}
+camera_accessible() { [[ -r "$camera_dev" && -w "$camera_dev" ]]; }
+camera_access_ok=0
+for _ in $(seq 10); do
+    grant_camera_access
+    sleep 0.5
+    sudo udevadm settle --timeout=30 || true
+    if camera_accessible; then camera_access_ok=1; break; fi
+done
+if [[ $camera_access_ok -ne 1 ]]; then
+    ls -l "$camera_dev" >&2 || true
+    if command -v getfacl >/dev/null 2>&1; then sudo getfacl "$camera_dev" >&2 || true; fi
+    id >&2
+    fail "$camera_dev is not readable and writable by $camera_user after udevadm settle and chmod 0666, so neither the test-pattern writer nor Strom can open it"
+fi
 gst-launch-1.0 -q videotestsrc is-live=true pattern=smpte \
     ! video/x-raw,format=YUY2,width=1280,height=720,framerate=25/1 \
     ! v4l2sink device="$camera_dev" > "$work/camera.log" 2>&1 &
@@ -202,6 +227,8 @@ for _ in $(seq 60); do
 done
 if ! camera_is_capture; then
     cat "$work/camera.log" >&2
+    ls -l "$camera_dev" >&2 || true
+    if command -v getfacl >/dev/null 2>&1; then sudo getfacl "$camera_dev" >&2 || true; fi
     fail "the test pattern does not reach $camera_dev: it does not report Video Capture, so Strom would not list it"
 fi
 pass "virtual camera '$camera_name' at $camera_dev (v4l2loopback, kernel $kernel), fed a test pattern"
