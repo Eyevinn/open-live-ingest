@@ -19,20 +19,22 @@
 use crate::ipc::{Deliver, Event, Reply};
 use crate::media_access::{self, Needs};
 use crate::messages::{self, Context, Failure, Media, Message, WarningKind};
-use crate::preview::PreviewController;
+use crate::preview::{PreviewController, Recover};
 use crate::status::{self, Poller, Target};
-use open_live_ingest::api::{self, OscCredential, Released, StromHold};
+use open_live_ingest::api::{self, LeftRunning, OscCredential, Released, StromHold};
 use open_live_ingest::config::{self, Config};
 use open_live_ingest::gateway::{self, Events, InputState};
 use open_live_ingest::keychain::SecretStore;
 use open_live_ingest::local_strom;
 use open_live_ingest::run::{self, Sources, Stop};
-use open_live_ingest::session::{Inputs, Launch, Session, SessionHandle, Taps};
+use open_live_ingest::session::{self, Inputs, Launch, Session, SessionHandle, Taps};
 use open_live_ingest::strom::StromClient;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -525,6 +527,9 @@ impl Rows {
     }
 }
 
+/// A future a [`Host`] hands back: the steps of holding a Strom.
+pub type HostFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
 /// What Go live needs from the machine, apart from the settings: a fake in tests.
 pub trait Host: Send + Sync {
     /// The pid of another gateway live on this machine.
@@ -541,6 +546,23 @@ pub trait Host: Send + Sync {
     fn media_access(&self, needs: Needs) -> Result<(), Media> {
         media_access::check(needs)
     }
+    /// Holds the local Strom `settings` name ([`api::hold_strom`]): adopts the one
+    /// listening, or starts one when `strom.manage` allows.
+    fn hold_strom(&self, settings: Config) -> HostFuture<anyhow::Result<StromHold>> {
+        Box::pin(async move {
+            let events = Events::new(|e| tracing::info!(event = ?e, "holding Strom"));
+            api::hold_strom(&settings, &events).await
+        })
+    }
+    /// Whether the app may stop `hold`'s Strom and start a fresh one in its place
+    /// (strom#1278, section 5.2): only a Strom it started itself, never one it adopted.
+    fn restartable(&self, hold: &StromHold) -> bool {
+        hold.is_managed()
+    }
+    /// Gives `hold` up ([`StromHold::release`]).
+    fn release_strom(&self, hold: StromHold) -> HostFuture<Released> {
+        Box::pin(hold.release())
+    }
 }
 
 /// This machine.
@@ -548,12 +570,31 @@ pub struct System;
 
 impl Host for System {}
 
+/// What [`HeldStrom::refresh`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refreshed {
+    /// The held Strom was stopped and a fresh one is held in its place.
+    Fresh,
+    /// No Strom the app started is held for these settings (an adopted one, or
+    /// `strom.manage` off): left as it is.
+    NotManaged,
+    /// The held Strom could not be stopped (it runs flows that are not ours, another
+    /// gateway is live, or its flows are not known): held again as it is.
+    LeftRunning(LeftRunning),
+    /// No fresh Strom could be held: nothing is held now.
+    Failed(String),
+}
+
 /// The Strom the app holds from the What to send step until Go live
 /// (docs/specs/desktop-app.md, section 4.1): taken for the device list and the
 /// preview, and handed to the session at Go live, which owns it from then on. Shared
 /// by the steps; cheap to clone.
 #[derive(Clone, Default)]
-pub struct HeldStrom(Arc<Mutex<Option<StromHold>>>);
+pub struct HeldStrom {
+    hold: Arc<Mutex<Option<StromHold>>>,
+    /// One take or refresh at a time.
+    taking: Arc<tokio::sync::Mutex<()>>,
+}
 
 impl HeldStrom {
     /// Holds the local Strom `settings` name, unless the one held already is it. A
@@ -564,8 +605,9 @@ impl HeldStrom {
     /// adopt. Go live then skips the reclaim. Blocks while a Strom starts or stops.
     /// True when a hold was taken now, false when the one held already serves.
     pub async fn ensure(&self, settings: &Config, host: Arc<dyn Host>) -> anyhow::Result<bool> {
+        let _one = self.taking.lock().await;
         let stale = {
-            let mut held = lock(&self.0);
+            let mut held = lock(&self.hold);
             if held.as_ref().is_some_and(|h| h.serves(settings)) {
                 return Ok(false);
             }
@@ -574,41 +616,96 @@ impl HeldStrom {
         if let Some(stale) = stale {
             log_release(stale.release().await);
         }
-        tokio::task::spawn_blocking(move || {
-            if host.other_gateway().is_none() {
-                host.reclaim_strom();
-            }
-        })
-        .await?;
-        let events = Events::new(|e| tracing::info!(event = ?e, "holding Strom"));
-        let hold = api::hold_strom(settings, &events).await?;
+        self.take(settings, host, true).await?;
+        Ok(true)
+    }
+
+    /// Takes a hold, after the reclaim when `reclaim` says so.
+    async fn take(
+        &self,
+        settings: &Config,
+        host: Arc<dyn Host>,
+        reclaim: bool,
+    ) -> anyhow::Result<()> {
+        if reclaim {
+            let host = host.clone();
+            tokio::task::spawn_blocking(move || {
+                if host.other_gateway().is_none() {
+                    host.reclaim_strom();
+                }
+            })
+            .await?;
+        }
+        let hold = host.hold_strom(settings.clone()).await?;
         // Another take finished first: one hold is enough.
-        let extra = lock(&self.0).replace(hold);
+        let extra = lock(&self.hold).replace(hold);
         if let Some(extra) = extra {
             log_release(extra.release().await);
         }
-        Ok(true)
+        Ok(())
+    }
+
+    /// Replaces the held Strom with a fresh one (strom#1278, section 5.2): a camera
+    /// started first in a fresh Strom opens the device picked. Only for a Strom the
+    /// app started for these settings ([`Host::restartable`]); remove the app's own
+    /// flows first, since one that runs any flow is not stopped. Such a Strom is held
+    /// again as it is, without the reclaim, which would stop it under its other user.
+    pub async fn refresh(&self, settings: &Config, host: Arc<dyn Host>) -> Refreshed {
+        let _one = self.taking.lock().await;
+        let old = {
+            let mut held = lock(&self.hold);
+            match held.as_ref() {
+                Some(h) if h.serves(settings) && host.restartable(h) => held.take(),
+                _ => None,
+            }
+        };
+        let Some(old) = old else {
+            return Refreshed::NotManaged;
+        };
+        let released = host.release_strom(old).await;
+        log_release(released.clone());
+        let left = match released {
+            Released::LeftRunning(why) => Some(why),
+            Released::Stopped | Released::Adopted => None,
+        };
+        match (self.take(settings, host, left.is_none()).await, left) {
+            (Err(err), _) => Refreshed::Failed(format!("{err:#}")),
+            (Ok(()), Some(why)) => Refreshed::LeftRunning(why),
+            (Ok(()), None) => Refreshed::Fresh,
+        }
     }
 
     /// Whether a Strom is held.
     pub fn is_held(&self) -> bool {
-        lock(&self.0).is_some()
+        lock(&self.hold).is_some()
+    }
+
+    /// Whether the Strom held may be replaced with a fresh one ([`Host::restartable`]).
+    pub fn restartable(&self, host: &dyn Host) -> bool {
+        lock(&self.hold)
+            .as_ref()
+            .is_some_and(|h| host.restartable(h))
     }
 
     /// A client of the Strom held, if one is.
     pub fn client(&self) -> Option<StromClient> {
-        lock(&self.0).as_ref().map(|h| h.client().clone())
+        lock(&self.hold).as_ref().map(|h| h.client().clone())
     }
 
     /// Whether the Strom held is the one `settings` name.
     fn serves(&self, settings: &Config) -> bool {
-        lock(&self.0).as_ref().is_some_and(|h| h.serves(settings))
+        lock(&self.hold)
+            .as_ref()
+            .is_some_and(|h| h.serves(settings))
     }
 
     /// Gives the hold up ([`StromHold::release`]): at quit, or when the settings
     /// name another Strom. Nothing held is not an error.
+    /// Waits for a take or refresh under way (a fresh Strom Go live is starting), so
+    /// the Strom it holds is released too, not left running.
     pub async fn release(&self) {
-        let held = lock(&self.0).take();
+        let _one = self.taking.lock().await;
+        let held = lock(&self.hold).take();
         if let Some(hold) = held {
             log_release(hold.release().await);
         }
@@ -617,7 +714,7 @@ impl HeldStrom {
     /// The hold, when it is the Strom `settings` name, for Go live to hand to the
     /// session.
     fn take_serving(&self, settings: &Config) -> Option<StromHold> {
-        let mut held = lock(&self.0);
+        let mut held = lock(&self.hold);
         if held.as_ref().is_some_and(|h| h.serves(settings)) {
             held.take()
         } else {
@@ -767,6 +864,11 @@ impl GoLive {
     /// checks have passed and the session has started (`ok: null`), or with the
     /// failure's one line and action. Progress follows as events. Asked again while
     /// a session runs, it replies at once and starts nothing.
+    ///
+    /// On a Strom the app started, the session gets a fresh one rather than the one
+    /// that ran the previews, and a camera Strom opened wrong (strom#1278) before any
+    /// input is on air has the session started again on a fresh Strom, at most
+    /// [`MAX_RECOVERIES`](crate::preview::MAX_RECOVERIES) times (section 5.2).
     pub fn start(&self, id: u32, deliver: Deliver, runtime: &tokio::runtime::Handle) {
         let session = {
             let mut state = self.lock();
@@ -809,9 +911,11 @@ impl GoLive {
                 }
                 _ => false,
             };
-            let checked =
-                tokio::task::spawn_blocking(move || checks(&settings_file, host.as_ref(), holding))
-                    .await;
+            let checking = host.clone();
+            let checked = tokio::task::spawn_blocking(move || {
+                checks(&settings_file, checking.as_ref(), holding)
+            })
+            .await;
             let (settings, ctx) = match checked {
                 Ok(Ok(checked)) => checked,
                 Ok(Err(message)) => {
@@ -829,7 +933,67 @@ impl GoLive {
                     return;
                 }
             };
-            let (mut events, poller) = {
+            // The uplinks start first in a Strom of their own (strom#1278: a camera
+            // started first in a fresh Strom opens the device picked): the one that
+            // ran the previews is stopped and a fresh one held, when the app started
+            // it. Not for a Go live stopped during its checks.
+            let current = || {
+                let guard = lock(&state);
+                guard.session == session && guard.phase == Phase::Checking
+            };
+            if holding && current() {
+                let refreshed = held.refresh(&settings, host.clone()).await;
+                tracing::info!(result = ?refreshed, "Go live: the uplinks start on a fresh Strom (strom#1278)");
+            }
+            // Stop (and quitting while live) leaves the sources in Open Live, so the
+            // next Go live adopts them with the same id and a production slot holding
+            // one keeps working (#115). Go live arms: each uplink runs only while a
+            // production holding its source is live (#130). Without Open Live there
+            // are no productions to wait for, so it sends at once.
+            let launch = |settings: Config, strom: Option<StromHold>, taps: Taps| {
+                let credential = settings
+                    .open_live
+                    .uses_keychain()
+                    .then(|| OscCredential::Keychain(keychain.clone()));
+                let launch = Launch { strom, taps };
+                if settings.open_live.register {
+                    Session::launch_armed(
+                        launch,
+                        settings,
+                        Inputs::default(),
+                        credential,
+                        Sources::Keep,
+                    )
+                } else {
+                    Session::launch_keeping_sources(launch, settings, Inputs::default(), credential)
+                }
+            };
+            // The session's events and the status polls, in one queue. A session
+            // started again after a wrong camera is a new run: what an earlier run
+            // still says is dropped.
+            let (incoming_tx, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+            let forward = |run: u64, mut events: session::Receiver| {
+                let forward = incoming_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = events.recv().await {
+                        if forward.send(Incoming::Session(run, event)).is_err() {
+                            return;
+                        }
+                    }
+                    let _ = forward.send(Incoming::Ended(run));
+                });
+            };
+            // A wrong camera before any input is on air, on a Strom the app started:
+            // the preview asks for the session to be started again.
+            let recover = |restartable: bool| {
+                let to = incoming_tx.clone();
+                preview.recover_live_with(restartable.then(|| -> Recover {
+                    Arc::new(move |attempt| {
+                        let _ = to.send(Incoming::Recover(attempt));
+                    })
+                }));
+            };
+            let (taps, poller) = {
                 let mut guard = lock(&state);
                 // Stop pressed while the checks ran, and maybe Go live again since:
                 // nothing has started for this one.
@@ -847,13 +1011,8 @@ impl GoLive {
                 let credential = settings
                     .open_live
                     .uses_keychain()
-                    .then(|| OscCredential::Keychain(keychain));
+                    .then(|| OscCredential::Keychain(keychain.clone()));
                 let poller = status_poller(&settings, credential.as_ref());
-                // Stop (and quitting while live) leaves the sources in Open Live, so
-                // the next Go live adopts them with the same id and a production slot
-                // holding one keeps working (#115). Go live arms: each uplink runs only
-                // while a production holding its source is live (#130). Without Open
-                // Live there are no productions to wait for, so it sends at once.
                 // The held Strom, when it is the one these settings name (a hold
                 // taken during the checks counts too: its taking reclaimed), is the
                 // session's from here: it stops it at its end (section 4.1).
@@ -861,60 +1020,151 @@ impl GoLive {
                 // blocks (section 5.2, "Older Strom"): going live never depends on
                 // the preview.
                 let strom = held.take_serving(&settings);
+                let restartable = strom.as_ref().is_some_and(|h| host.restartable(h));
                 let taps = if strom.is_some() && preview.capable() {
                     Taps::On
                 } else {
                     Taps::Off
                 };
                 tracing::info!(?taps, "the uplinks' preview taps");
-                let launch = Launch { strom, taps };
-                let (handle, events) = if settings.open_live.register {
-                    Session::launch_armed(
-                        launch,
-                        settings,
-                        Inputs::default(),
-                        credential,
-                        Sources::Keep,
-                    )
-                } else {
-                    Session::launch_keeping_sources(launch, settings, Inputs::default(), credential)
-                };
+                let (handle, events) = launch(settings.clone(), strom, taps);
+                forward(0, events);
+                recover(restartable);
                 // Under the same lock as the phase, so a Stop from now on reaches it.
                 guard.phase = Phase::Live;
                 guard.handle = Some(handle);
-                (events, poller)
+                (taps, poller)
             };
             tracing::info!("going live");
             deliver(Reply::ok(id, Value::Null).script());
 
-            // The session's events and the status polls, in one queue.
-            let (incoming_tx, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-            let forward = incoming_tx.clone();
-            tokio::spawn(async move {
-                while let Some(event) = events.recv().await {
-                    if forward.send(Incoming::Session(event)).is_err() {
-                        return;
-                    }
-                }
-                let _ = forward.send(Incoming::Ended);
-            });
             let targets: Arc<Mutex<Vec<Target>>> = Arc::default();
-            let mut polling = poller
-                .map(|poller| tokio::spawn(poll_status(poller, targets.clone(), incoming_tx)));
+            let mut polling = poller.map(|poller| {
+                tokio::spawn(poll_status(poller, targets.clone(), incoming_tx.clone()))
+            });
 
-            let mut rows = Rows::new(ctx);
+            let mut rows = Rows::new(ctx.clone());
             let mut returned = false;
+            // The current run, and the recovery under way: the attempt whose run is
+            // being stopped.
+            let mut run = 0;
+            let mut restarting: Option<u32> = None;
             while let Some(incoming) = incoming.recv().await {
+                // Stop pressed during a recovery: the run's teardown is the page's
+                // again, and the run ends as Stop says.
+                if restarting.is_some()
+                    && matches!(incoming, Incoming::Session(from, _) if from == run)
+                    && lock(&state).phase != Phase::Live
+                {
+                    restarting = None;
+                }
                 let event = match incoming {
-                    Incoming::Session(event) => event,
+                    Incoming::Session(from, _) | Incoming::Ended(from) if from != run => continue,
+                    Incoming::Session(_, event) => event,
                     Incoming::Status(statuses) => {
                         for out in rows.on_status(&statuses) {
                             deliver(out.script());
                         }
                         continue;
                     }
-                    Incoming::Ended => break,
+                    Incoming::Recover(attempt) => {
+                        // An input went on air after the wrong camera was seen and
+                        // before this was handled: the session is not stopped, and
+                        // the uplinks are read again, so the wrong camera shows the
+                        // notice.
+                        if preview.is_on_air() {
+                            tracing::info!(
+                                attempt,
+                                result = "on air meanwhile",
+                                "wrong camera: Go live again on a fresh Strom (strom#1278)"
+                            );
+                            preview.relaunched();
+                            continue;
+                        }
+                        let mut guard = lock(&state);
+                        if guard.session == session
+                            && guard.phase == Phase::Live
+                            && restarting.is_none()
+                        {
+                            restarting = Some(attempt);
+                            if let Some(handle) = guard.handle.as_mut() {
+                                handle.request_stop(Stop::Interrupt);
+                            }
+                        }
+                        continue;
+                    }
+                    Incoming::Ended(_) => {
+                        let Some(attempt) = restarting.take() else {
+                            break;
+                        };
+                        // The run has ended, its teardown done and a Strom the app
+                        // started stopped: Go live again on a fresh one.
+                        let live = || {
+                            let guard = lock(&state);
+                            guard.session == session && guard.phase == Phase::Live
+                        };
+                        let fresh = if live() {
+                            Some(held.ensure(&settings, host.clone()).await)
+                        } else {
+                            None
+                        };
+                        let mut guard = lock(&state);
+                        let still_live = guard.session == session && guard.phase == Phase::Live;
+                        let error = match fresh.filter(|_| still_live) {
+                            None => {
+                                tracing::info!(
+                                    attempt,
+                                    result = "stopped meanwhile",
+                                    "wrong camera: Go live again on a fresh Strom (strom#1278)"
+                                );
+                                None
+                            }
+                            Some(Err(err)) => {
+                                tracing::info!(attempt, result = %format_args!("no fresh Strom: {err:#}"), "wrong camera: Go live again on a fresh Strom (strom#1278)");
+                                Some(messages::for_error(&format!("{err:#}"), &ctx))
+                            }
+                            Some(Ok(_)) => {
+                                tracing::info!(
+                                    attempt,
+                                    result = "started again",
+                                    "wrong camera: Go live again on a fresh Strom (strom#1278)"
+                                );
+                                let strom = held.take_serving(&settings);
+                                let restartable =
+                                    strom.as_ref().is_some_and(|h| host.restartable(h));
+                                let (handle, events) = launch(settings.clone(), strom, taps);
+                                run += 1;
+                                forward(run, events);
+                                preview.relaunched();
+                                recover(restartable);
+                                guard.handle = Some(handle);
+                                continue;
+                            }
+                        };
+                        drop(guard);
+                        returned = true;
+                        back_to_step_2(&state);
+                        lock(&state).end(session);
+                        if let Some(polling) = polling.take() {
+                            polling.abort();
+                        }
+                        deliver(rows.stopped(error).script());
+                        break;
+                    }
                 };
+                // The run being stopped for a recovery: its teardown is not the
+                // page's; the next run's states replace its rows.
+                if restarting.is_some() {
+                    tracing::info!(?event, "session event (stopping for a fresh Strom)");
+                    continue;
+                }
+                if let gateway::Event::Input {
+                    state: InputState::OnAir,
+                    ..
+                } = &event
+                {
+                    preview.on_air();
+                }
                 if let gateway::Event::Stats { inputs } = &event {
                     preview.session_stats(inputs);
                     *lock(&targets) = inputs
@@ -1026,10 +1276,14 @@ fn lock<T>(state: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// What the loop of one session hears: the session's events and the status polls.
 enum Incoming {
-    Session(gateway::Event),
+    /// An event of the session's run with this number.
+    Session(u64, gateway::Event),
     Status(Vec<status::InputStatus>),
-    /// The session's events have ended.
-    Ended,
+    /// The events of the session's run with this number have ended.
+    Ended(u64),
+    /// Strom opened another camera before any input was on air (strom#1278): stop
+    /// the run and Go live again on a fresh Strom. The attempt number.
+    Recover(u32),
 }
 
 /// The poller for the status lines, with clients as the session builds them. None,

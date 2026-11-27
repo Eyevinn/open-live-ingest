@@ -540,20 +540,38 @@ struct StromState {
     /// Pictures of a flow it has are 404 too, as Strom answers for a flow it has just
     /// started (#189).
     pictures_404: bool,
+    /// Flow starts so far, over every Strom it stood in for.
+    starts: usize,
+    /// Per flow it runs, which start it was.
+    started_as: std::collections::BTreeMap<String, usize>,
 }
 
 /// A fake local Strom: a camera (`dev-cam`, "Cam") and a microphone (`dev-mic`,
 /// "Mic") in its device list, the preview blocks when `blocks` says so, and the flow
 /// routes, keeping what is posted. A removed flow is still answered for `linger`
 /// more `GET`s before Strom says 404, as a flow takes a moment to go. Pictures are
-/// 504: no fresh frame (404 after [`FakeStrom::pictures_404`]). The capture's `device-name` is `opened`.
+/// 504: no fresh frame (404 after [`FakeStrom::pictures_404`]). The capture's
+/// `device-name` is `opened`.
+#[derive(Clone)]
 pub struct FakeStrom {
     pub url: String,
     state: Arc<Mutex<StromState>>,
 }
 
+/// What [`FakeStrom::restart`] adds to the requests it has seen.
+pub const STROM_RESTARTED: &str = "STROM restarted";
+
 impl FakeStrom {
     pub fn start(blocks: bool, linger: usize, opened: &'static str) -> Self {
+        Self::start_opening(blocks, linger, &[opened])
+    }
+
+    /// [`start`](Self::start), the capture's `device-name` of the `n`th flow started
+    /// (from 0, over every flow) being `opened[n]`, or the last of them after that:
+    /// strom#1278 on the second and later starts (#196).
+    pub fn start_opening(blocks: bool, linger: usize, opened: &[&'static str]) -> Self {
+        let opened = opened.to_vec();
+        assert!(!opened.is_empty());
         let state: Arc<Mutex<StromState>> = Arc::default();
         let shared = state.clone();
         let url = serve(Arc::new(move |req: &Request| {
@@ -605,9 +623,13 @@ impl FakeStrom {
                     (200, json!({ "flow": flow }))
                 }
                 ("POST", _, Some((id, action))) if action == "start" => {
+                    let start = state.starts;
                     match state.flows.get_mut(&id) {
                         Some(flow) => {
                             flow["running"] = json!(true);
+                            let flow = flow.clone();
+                            state.starts += 1;
+                            state.started_as.insert(id, start);
                             (200, json!({ "flow": flow }))
                         }
                         None => (404, Value::Null),
@@ -640,9 +662,11 @@ impl FakeStrom {
                 }
                 ("GET", _, Some((id, rest))) if rest == "elements/capture:videosrc/properties" => {
                     if state.flows.contains_key(&id) {
+                        let start = state.started_as.get(&id).copied().unwrap_or(0);
+                        let name = opened[start.min(opened.len() - 1)];
                         (
                             200,
-                            json!({ "element_id": "capture:videosrc", "properties": { "device-name": opened } }),
+                            json!({ "element_id": "capture:videosrc", "properties": { "device-name": name } }),
                         )
                     } else {
                         (404, Value::Null)
@@ -652,6 +676,15 @@ impl FakeStrom {
             }
         }));
         FakeStrom { url, state }
+    }
+
+    /// Stands in for a fresh Strom: every flow is gone, and [`STROM_RESTARTED`] is
+    /// added to the requests seen.
+    pub fn restart(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.flows.clear();
+        state.lingering.clear();
+        state.calls.push(STROM_RESTARTED.to_string());
     }
 
     /// From now on, pictures of the flows it has are 404, not 504.

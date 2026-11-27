@@ -287,8 +287,9 @@ from step 2 and hands that same Strom to the session at Go live.
      parallel. Each row's picture goes to `camera_off`. A flow still present after 5 s is logged
      and left to the session's `prepare`, which removes every flow holding one of its cameras, and
      (new) every preview flow of this gateway (§5.2), before any uplink is created.
-  2. §4's checks (`gateway.pid`, camera and microphone authorisation), then the session is started
-     with the hold: `Session::start_armed` and `Session::start_keeping_sources` gain siblings that
+  2. §4's checks (`gateway.pid`, camera and microphone authorisation). When the app started the
+     held Strom, it is then released and a fresh one held (#196, §5.2 "Wrong camera"), so the
+     uplinks are the first camera starts in their Strom. Then the session is started with the hold: `Session::start_armed` and `Session::start_keeping_sources` gain siblings that
      take a `Launch { strom: Option<StromHold>, taps: Taps }`: `Session::launch_armed` and
      `Session::launch_keeping_sources` (OL-70b).
      `StromMedia::start` writes `gateway.pid` as today and then uses the held Strom instead of
@@ -568,9 +569,37 @@ test pattern never warns.
 runs, the app core reads `GET /api/flows/{id}/elements/capture:videosrc/properties`
 (`StromClient::element_properties`, already in the library; one retry after 1 s on 404) and compares
 `device-name` (both `avfvideosrc` and `mfvideosrc` have it) with the device's name in Strom's device
-list. A mismatch is logged at `warn` naming both and raises the row's `wrong_camera` notice, with no
-automatic action (question 22). A missing property is logged at `debug` and ignored. For the uplink
-the app does the check after the session reports the flow starting; the CLI is unchanged.
+list. A mismatch is logged at `warn` naming both, every time. What follows depends on the Strom (question
+22, #196):
+
+- **A Strom the app started** (`StromHold::is_managed`, behind `Host::restartable` so the model
+  tests can stand a fake in for one): the app recovers with a fresh Strom, since a camera started
+  first in a fresh Strom opened the device picked in every case logged (#191).
+  - *Preview:* every preview flow is removed (and polled until 404, as at the handover), the held
+    Strom is released and a fresh one held (`HeldStrom::refresh`), and the next reconcile starts the
+    flows again. At most 2 recoveries per tick of the row (unticking or the preview going off
+    resets it).
+  - *Go live, before any input is on air:* the session is stopped with its sources kept, as Stop
+    does (#115), which stops its Strom; a fresh one is held and the session launched again on it.
+    All inputs restart together, since a fresh Strom runs none of the old flows. The page does not
+    see that teardown; the rows follow the new session's states. At most 2 recoveries per Go live.
+  - One `info` line per recovery, with the attempt number and the result.
+  - Still wrong after 2 recoveries: the row's `wrong_camera` notice, as below.
+- **Once an input is on air:** no restart (that is the director's picture in Studio); the notice
+  ("while live: Stop, then Go live").
+- **An adopted Strom, or `strom.manage` off:** the app never stops it; the notice only.
+- **A Strom that cannot be stopped** (`release()` returns `LeftRunning`: it runs flows that are not
+  ours, or they cannot be listed) is held again as it is, without the reclaim. That is not counted
+  as a recovery: it is logged, and the row's next wrong camera is the notice.
+
+The notice is the row's `wrong_camera` (§10). A missing property is logged at `debug` and ignored.
+For the uplink the app does the check after the session reports the flow starting; the CLI is
+unchanged.
+
+Go live also hands the session a fresh Strom rather than the one that ran the previews, when the app
+started it (§4.1): released after the preview flows are gone, a new one held, then the session
+started on it. So each uplink is the first camera start in its Strom. Going live takes one Strom
+start longer (0.4 s to a few seconds in the 2026-11-27 log).
 
 **Older Strom.** Taking the hold reads `GET /api/blocks` once (`StromClient::block_ids`). Both
 `builtin.thumbnail` and `builtin.meter` must be listed (Strom v0.8.4, the pin, has both). If either
@@ -1173,10 +1202,19 @@ off; Go live with a production active in Studio and see the same picture and lev
     (`gateway.pid` names another process): the app removes its preview flows and creates none until
     that gateway is gone, and quitting leaves a Strom that runs flows not ours running (§4.1).
 22. **What does the app do when Strom opened another camera (strom#1278)?** It logs both names at
-    `warn` and shows the row notice; it does not stop or restart the flow. Stopping an uplink is the
-    director's call in Studio, and a restart can hit the same bug; the person sees the wrong picture
-    in the row anyway and can Stop. Revisit when strom#1278's AC2 (Strom fails the flow itself)
-    ships.
+    `warn`, every time. On a Strom the app started it then recovers by itself with a fresh Strom
+    (#196, §5.2): the preview flows, or before any input is on air the whole session, start again on
+    a newly started Strom, at most twice per tick or Go live, each recovery one `info` line; Go live
+    also always starts the uplinks on a fresh Strom. Still wrong after that, once an input is on
+    air, or on an adopted Strom (or `strom.manage` off), it shows the row notice and does nothing
+    more: stopping an uplink on air is the director's call in Studio.
+    Why: the first decision (notice only, "a restart can hit the same bug") did not hold up in the
+    field. With v0.7.1 on a Mac with a built-in and a USB camera (#191, `app.log` of 2026-11-27),
+    the first camera start after each Strom start never opened the wrong camera (8 of 8), while
+    the second and later starts in the same Strom did 7 of 9 times, including 4 of 5 Go lives (two
+    of those went on air with it). Stop and Go live again did not help (3 of 3 wrong), because
+    after Stop the preview ran first, so the uplink was again a second start. A restart of the
+    *flow* hits the bug; a restart of *Strom* does not. Revisit when strom#1278 is fixed (#191).
 23. **Pictures over the IPC as `data:` URLs, or a dynamic route on the app's `oli` protocol?**
     `data:` over the IPC. The CSP already allows it, the protocol handler stays three compiled-in
     files (§9.4), and the overhead (one 10–20 KB string a second per row) is negligible.
@@ -1216,10 +1254,17 @@ off; Go live with a production active in Studio and see the same picture and lev
 - **A GUI app on Windows does not get console control events.** All stop paths are the ones in §8;
   `DESIGN.md` §6's console-close handling stays the CLI's.
 - **Audio drift (#64 AC3).** The audio picker ships after #64's measurement, as #64 requires.
-- **strom#1278: the wrong camera on a stop and start (#172).** The preview adds a stop and start of
-  a camera (preview flow, then uplink flow) to every Go live. Mitigation: the `capture:videosrc`
-  check after every start (§5.2), a warning on the row and in the log. Detection: OL-70e on a
-  two-camera runner is not available, so the log line is what a field report carries.
+- **strom#1278: the wrong camera on a stop and start (#172, #196).** The preview adds a stop and
+  start of a camera (preview flow, then uplink flow) to every Go live. In the field (#191, v0.7.1,
+  a Mac with a built-in and a USB camera) the second and later camera starts in one Strom opened
+  the wrong camera 7 of 9 times, the first start after a Strom start 0 of 8. Mitigation: Go live
+  starts the uplinks on a fresh Strom, and the `capture:videosrc` check after every start (§5.2)
+  recovers with a fresh Strom, at most twice per tick or Go live, before any input is on air, on a
+  Strom the app started; otherwise a warning on the row. Residual risk: an adopted Strom, an input
+  already on air, and two cameras started in the same fresh Strom (the second may still be wrong)
+  keep today's notice. Detection: the `warn` line for every wrong camera and the `info` line for
+  every recovery in `app.log`; OL-70e on a two-camera runner is not available, so the log is what a
+  field report carries.
 - **Camera not released in time at the handover.** AVFoundation or Media Foundation may release a
   device shortly after Strom reports the flow gone. With registration on the uplink starts only
   when a production goes active, normally seconds later; with registration off (Go live sends at

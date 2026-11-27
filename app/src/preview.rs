@@ -17,7 +17,7 @@
 //!
 //! Images and levels are IPC payloads only: nothing here logs one.
 
-use crate::go_live::{HeldStrom, Host};
+use crate::go_live::{HeldStrom, Host, Refreshed};
 use crate::ipc::{Deliver, Event};
 use crate::media_access::Needs;
 use crate::messages::{Failure, Media, Message};
@@ -62,6 +62,9 @@ pub const MAX_PICTURE: usize = 256 * 1024;
 /// How long quitting waits for the preview flows to go and the hold to be released:
 /// the CLI's bound (section 8).
 pub const SHUT_DOWN_WITHIN: Duration = Duration::from_secs(4);
+/// How often a wrong camera (strom#1278) is recovered from with a fresh Strom: per
+/// tick of a row, and per Go live. Still wrong after that: the `wrong_camera` notice.
+pub const MAX_RECOVERIES: u32 = 2;
 /// The lowest level the page is sent.
 const FLOOR_DB: f64 = -90.0;
 /// The capture's video source in a flow, whose `device-name` says which camera Strom
@@ -341,6 +344,20 @@ impl PictureState {
     }
 }
 
+/// Asks the Go live under way to stop its session and start it again on a fresh
+/// Strom (strom#1278); called with the attempt number.
+pub type Recover = Arc<dyn Fn(u32) + Send + Sync>;
+
+/// A wrong camera to recover from with a fresh Strom (strom#1278, section 5.2),
+/// instead of the notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recovery {
+    /// Remove the preview flows, hold a fresh Strom, start them again.
+    Preview { attempt: u32 },
+    /// Stop the session and Go live again on a fresh Strom: every uplink restarts.
+    Live { attempt: u32 },
+}
+
 /// What the camera check found (strom#1278).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CameraCheck {
@@ -503,6 +520,15 @@ pub struct Preview {
     unavailable_shown: bool,
     rows: BTreeMap<String, Row>,
     generations: u64,
+    /// Per ticked row, the fresh Stroms its wrong camera has had (strom#1278).
+    recoveries: BTreeMap<String, u32>,
+    /// The fresh Stroms this Go live has had for a wrong camera.
+    live_recoveries: u32,
+    /// The session is being started again on a fresh Strom: its uplinks are not read
+    /// until it is ([`relaunched`](Self::relaunched)).
+    live_restarting: bool,
+    /// An input of this Go live has been on air: no more restarts.
+    on_air: bool,
 }
 
 impl Default for Preview {
@@ -516,6 +542,10 @@ impl Default for Preview {
             unavailable_shown: false,
             rows: BTreeMap::new(),
             generations: 0,
+            recoveries: BTreeMap::new(),
+            live_recoveries: 0,
+            live_restarting: false,
+            on_air: false,
         }
     }
 }
@@ -608,6 +638,9 @@ impl Preview {
         } else {
             BTreeMap::new()
         };
+        // Unticked (or the preview off): the next tick may recover again.
+        self.recoveries
+            .retain(|device, _| wanted.contains_key(device));
         let previews: Vec<String> = self
             .rows
             .iter()
@@ -937,61 +970,141 @@ impl Preview {
         events
     }
 
-    /// What Strom opened for a row's camera (strom#1278): another device than the
-    /// one picked raises `wrong_camera`, with no other action (question 22).
-    pub fn camera_checked(&mut self, device: &str, generation: u64, opened: Opened) -> Vec<Event> {
+    /// What Strom opened for a row's camera (strom#1278). Another device than the one
+    /// picked is logged at `warn`, always. On a Strom the app may restart
+    /// (`restartable`) it is then recovered from with a fresh Strom, at most
+    /// [`MAX_RECOVERIES`] times per tick of a preview row, and per Go live while no
+    /// input is on air yet (the uplinks' rows go until the session runs again);
+    /// otherwise, or once those are used, the row's `wrong_camera` notice
+    /// (question 22).
+    pub fn camera_checked(
+        &mut self,
+        device: &str,
+        generation: u64,
+        opened: Opened,
+        restartable: bool,
+    ) -> (Vec<Event>, Option<Recovery>) {
         let Some(row) = self
             .rows
             .get_mut(device)
             .filter(|r| r.generation == generation)
         else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
         let Some(expected) = row.target.camera_device.clone() else {
-            return Vec::new();
+            return (Vec::new(), None);
         };
-        match opened {
+        let name = match opened {
             Opened::Device(name) if name.trim() == expected.trim() => {
                 row.camera = CameraCheck::Same;
-                Vec::new()
+                return (Vec::new(), None);
             }
-            Opened::Device(name) => {
-                tracing::warn!(device = %device, picked = %expected, opened = %name, "Strom opened another camera than the one picked (strom#1278)");
-                row.camera = CameraCheck::Other;
-                let message = Failure::WrongCamera {
-                    opened: name,
-                    camera: expected,
-                    live: row.kind == Kind::Uplink,
-                }
-                .message();
-                vec![row_notice(WRONG_CAMERA, device, &message)]
-            }
+            Opened::Device(name) => name,
             Opened::Unknown => {
                 tracing::debug!(device = %device, "the camera's element has no device-name; not checked");
                 row.camera = CameraCheck::Unknown;
-                Vec::new()
+                return (Vec::new(), None);
             }
-            Opened::NotRunning => Vec::new(),
+            Opened::NotRunning => return (Vec::new(), None),
+        };
+        tracing::warn!(device = %device, picked = %expected, opened = %name, "Strom opened another camera than the one picked (strom#1278)");
+        let kind = row.kind;
+        match kind {
+            Kind::Preview => {
+                let used = self.recoveries.get(device).copied().unwrap_or(0);
+                if restartable && used < MAX_RECOVERIES {
+                    self.recoveries.insert(device.to_string(), used + 1);
+                    return (Vec::new(), Some(Recovery::Preview { attempt: used + 1 }));
+                }
+            }
+            Kind::Uplink => {
+                if restartable
+                    && !self.on_air
+                    && !self.live_restarting
+                    && self.live_recoveries < MAX_RECOVERIES
+                {
+                    self.live_recoveries += 1;
+                    self.live_restarting = true;
+                    let events = self.drop_uplinks(|_| false);
+                    let attempt = self.live_recoveries;
+                    return (events, Some(Recovery::Live { attempt }));
+                }
+            }
         }
+        let Some(row) = self.rows.get_mut(device) else {
+            return (Vec::new(), None);
+        };
+        row.camera = CameraCheck::Other;
+        let message = Failure::WrongCamera {
+            opened: name,
+            camera: expected,
+            live: kind == Kind::Uplink,
+        }
+        .message();
+        (vec![row_notice(WRONG_CAMERA, device, &message)], None)
+    }
+
+    /// Whether the preview recovery for `device`'s start `generation` is still to be
+    /// made: not live, and the row not started again meanwhile (another row's
+    /// recovery restarted it). One that is not gives its attempt back.
+    pub fn recovery_due(&mut self, device: &str, generation: u64) -> bool {
+        let due = !self.live
+            && self
+                .rows
+                .get(device)
+                .is_some_and(|r| r.kind == Kind::Preview && r.generation == generation);
+        if !due {
+            if let Some(used) = self.recoveries.get_mut(device) {
+                *used = used.saturating_sub(1);
+            }
+        }
+        due
+    }
+
+    /// The Strom could not be replaced (left running, adopted, or none started): no
+    /// more recoveries for `device` until it is ticked again, so its next wrong
+    /// camera shows the notice.
+    pub fn no_more_recoveries(&mut self, device: &str) {
+        self.recoveries.insert(device.to_string(), MAX_RECOVERIES);
+    }
+
+    /// A preview recovery: every preview row leaves the model, saying nothing, and its
+    /// flow is returned, to be removed before the Strom is replaced. The next
+    /// reconcile starts them again.
+    pub fn restart_previews(&mut self) -> (Vec<Removal>, Vec<Event>) {
+        self.take_previews(None)
+    }
+
+    /// An input of the session is on air: a wrong camera from now on is the notice.
+    pub fn set_on_air(&mut self) {
+        self.on_air = true;
+    }
+
+    /// The session runs again on a fresh Strom: its uplinks are read again.
+    pub fn relaunched(&mut self) {
+        self.live_restarting = false;
     }
 
     /// Go live: from here the session owns the Strom. Every preview row leaves the
     /// model; their flows are returned, to be removed before the session starts.
     pub fn hand_over(&mut self) -> (Vec<Removal>, Vec<Event>) {
         self.live = true;
-        self.take_previews("camera_off")
+        self.live_recoveries = 0;
+        self.live_restarting = false;
+        self.on_air = false;
+        self.take_previews(Some("camera_off"))
     }
 
     /// Quitting: the preview is off, and every preview flow is returned, to be
     /// removed before the hold is released.
     pub fn shut_down(&mut self) -> (Vec<Removal>, Vec<Event>) {
         self.wanted = false;
-        self.take_previews("stopped")
+        self.take_previews(Some("stopped"))
     }
 
     /// The preview rows of a Strom no longer held: gone with it.
     fn forget_previews(&mut self) -> Vec<Event> {
-        let (removals, mut events) = self.take_previews("stopped");
+        let (removals, mut events) = self.take_previews(Some("stopped"));
         events.extend(
             removals
                 .iter()
@@ -1000,7 +1113,9 @@ impl Preview {
         events
     }
 
-    fn take_previews(&mut self, announce: &'static str) -> (Vec<Removal>, Vec<Event>) {
+    /// Every preview row leaves the model; the flows of those that have one are
+    /// returned. `announce`: what each row says once its flow is gone.
+    fn take_previews(&mut self, announce: Option<&'static str>) -> (Vec<Removal>, Vec<Event>) {
         let mut removals = Vec::new();
         let mut events = Vec::new();
         let previews: Vec<String> = self
@@ -1013,12 +1128,12 @@ impl Preview {
             let row = self.rows.remove(&device).expect("listed above");
             events.extend(row.clear_notices());
             if matches!(row.picture, PictureState::Failed { retry: false }) {
-                events.push(row.event(announce, None, None));
+                events.extend(announce.map(|state| row.event(state, None, None)));
             } else {
                 removals.push(Removal {
                     device,
                     flow: row.flow,
-                    announce: Some(announce),
+                    announce,
                 });
             }
         }
@@ -1031,6 +1146,7 @@ impl Preview {
     pub fn live_ended(&mut self) -> Vec<Event> {
         self.live = false;
         self.wanted = false;
+        self.live_restarting = false;
         self.drop_uplinks(|_| false)
     }
 
@@ -1058,7 +1174,7 @@ impl Preview {
         running: Vec<(Target, FlowId)>,
         now: Instant,
     ) -> (Vec<Event>, Vec<(String, FlowId, u64)>) {
-        if !self.live || self.capable != Some(true) {
+        if !self.live || self.capable != Some(true) || self.live_restarting {
             return (Vec::new(), Vec::new());
         }
         let flows: Vec<FlowId> = running.iter().map(|(_, f)| *f).collect();
@@ -1220,6 +1336,9 @@ pub struct PreviewController {
     reconciling: tokio::sync::Mutex<()>,
     wake: Arc<Notify>,
     meter: Mutex<Option<JoinHandle<()>>>,
+    /// While live on a Strom the app started: how to have the session started again
+    /// on a fresh one (strom#1278). None: a wrong camera is the notice only.
+    live_recovery: Mutex<Option<Recover>>,
 }
 
 impl PreviewController {
@@ -1236,6 +1355,7 @@ impl PreviewController {
             reconciling: tokio::sync::Mutex::new(()),
             wake: Arc::new(Notify::new()),
             meter: Mutex::default(),
+            live_recovery: Mutex::default(),
         }
     }
 
@@ -1342,36 +1462,43 @@ impl PreviewController {
             .client()
             .ok_or_else(|| anyhow::anyhow!("the Strom hold was handed over meanwhile"))?;
         if taken || self.strom().is_none() {
-            let capable = match client.block_ids().await {
-                Ok(ids) => flow::has_preview_blocks(&ids),
-                Err(err) => {
-                    tracing::warn!(err = %format_args!("{err:#}"), "could not read the local Strom's blocks: no preview");
-                    false
-                }
-            };
-            let events = {
-                let mut model = self.model();
-                // Rows of an earlier hold were on the Strom it released.
-                let mut events = model.forget_previews();
-                events.extend(model.set_capable(Some(capable)));
-                events
-            };
-            *lock(&self.strom) = Some(client.clone());
-            self.stop_meter();
-            if capable {
-                match strom_events::meter_readings(
-                    &settings.strom.url,
-                    settings.strom.api_key.as_deref(),
-                ) {
-                    Ok(readings) => self.read_meter(readings),
-                    Err(err) => {
-                        tracing::warn!(err = %format_args!("{err:#}"), "no sound levels: the local Strom's events");
-                    }
-                }
-            }
-            self.deliver(events);
+            self.took(settings, &client).await;
         }
         Ok(client)
+    }
+
+    /// A new hold, reached through `client`: asked once whether it has the preview
+    /// blocks, and with them the meter WebSocket is opened. The preview rows of an
+    /// earlier hold are forgotten.
+    async fn took(self: &Arc<Self>, settings: &Config, client: &StromClient) {
+        let capable = match client.block_ids().await {
+            Ok(ids) => flow::has_preview_blocks(&ids),
+            Err(err) => {
+                tracing::warn!(err = %format_args!("{err:#}"), "could not read the local Strom's blocks: no preview");
+                false
+            }
+        };
+        let events = {
+            let mut model = self.model();
+            // Rows of an earlier hold were on the Strom it released.
+            let mut events = model.forget_previews();
+            events.extend(model.set_capable(Some(capable)));
+            events
+        };
+        *lock(&self.strom) = Some(client.clone());
+        self.stop_meter();
+        if capable {
+            match strom_events::meter_readings(
+                &settings.strom.url,
+                settings.strom.api_key.as_deref(),
+            ) {
+                Ok(readings) => self.read_meter(readings),
+                Err(err) => {
+                    tracing::warn!(err = %format_args!("{err:#}"), "no sound levels: the local Strom's events");
+                }
+            }
+        }
+        self.deliver(events);
     }
 
     fn read_meter(self: &Arc<Self>, mut readings: strom_events::MeterReadings) {
@@ -1470,7 +1597,8 @@ impl PreviewController {
     }
 
     /// Reads which camera Strom opened for a running flow (one retry after a second
-    /// when it does not run yet) and hands it to the model.
+    /// when it does not run yet) and hands it to the model, which may ask for a
+    /// recovery with a fresh Strom (strom#1278).
     fn check_camera(
         self: &Arc<Self>,
         strom: StromClient,
@@ -1494,10 +1622,76 @@ impl PreviewController {
                 }
             };
             let Some(this) = this.upgrade() else { return };
-            let events = this.model().camera_checked(&device, generation, opened);
+            let restartable = this.restartable(&device);
+            let (events, recovery) =
+                this.model()
+                    .camera_checked(&device, generation, opened, restartable);
             this.deliver(events);
+            match recovery {
+                Some(Recovery::Preview { attempt }) => {
+                    this.recover_preview(device, generation, attempt).await;
+                }
+                Some(Recovery::Live { attempt }) => {
+                    let recover = lock(&this.live_recovery).clone();
+                    if let Some(recover) = recover {
+                        recover(attempt);
+                    }
+                }
+                None => {}
+            }
         };
         tokio::spawn(task.with_current_subscriber());
+    }
+
+    /// Whether a wrong camera on `device`'s row may be recovered from with a fresh
+    /// Strom: a preview row's on a held Strom the app started, an uplink's when the
+    /// session runs on one.
+    fn restartable(&self, device: &str) -> bool {
+        if self.model().is_preview(device) {
+            self.held.restartable(self.host.as_ref())
+        } else {
+            lock(&self.live_recovery).is_some()
+        }
+    }
+
+    /// A preview recovery (strom#1278, section 5.2): every preview flow is removed,
+    /// the held Strom replaced with a fresh one ([`HeldStrom::refresh`]), and the
+    /// flows started again. One `info` line says the attempt and the result. A Strom
+    /// that could not be replaced counts as no recovery: the row's next wrong camera
+    /// is the notice.
+    async fn recover_preview(self: &Arc<Self>, device: String, generation: u64, attempt: u32) {
+        {
+            let _one = self.reconciling.lock().await;
+            if !self.model().recovery_due(&device, generation) {
+                return;
+            }
+            let settings = match api::load_from(&self.settings_file) {
+                Ok(settings) => settings,
+                Err(err) => {
+                    tracing::info!(device = %device, attempt, result = %format_args!("no settings: {err:#}"), "wrong camera: the preview starts again on a fresh Strom (strom#1278)");
+                    self.model().no_more_recoveries(&device);
+                    return;
+                }
+            };
+            let (removals, events) = self.model().restart_previews();
+            self.deliver(events);
+            self.remove_all(removals).await;
+            let refreshed = self.held.refresh(&settings, self.host.clone()).await;
+            tracing::info!(device = %device, attempt, result = ?refreshed, "wrong camera: the preview starts again on a fresh Strom (strom#1278)");
+            if refreshed != Refreshed::Fresh {
+                self.model().no_more_recoveries(&device);
+            }
+            match self.held.client() {
+                Some(client) => self.took(&settings, &client).await,
+                None => {
+                    *lock(&self.strom) = None;
+                    self.stop_meter();
+                    let events = self.model().set_capable(None);
+                    self.deliver(events);
+                }
+            }
+        }
+        self.reconcile().await;
     }
 
     /// Asks for each picture due now, each on a task of its own.
@@ -1569,6 +1763,9 @@ impl PreviewController {
     /// While live: the session's stats name the inputs whose uplink runs; their taps
     /// are read from now on.
     pub fn session_stats(self: &Arc<Self>, inputs: &[InputStats]) {
+        if inputs.iter().any(|s| s.state == InputState::OnAir) {
+            self.on_air();
+        }
         let Ok(settings) = api::load_from(&self.settings_file) else {
             return;
         };
@@ -1598,10 +1795,33 @@ impl PreviewController {
         }
     }
 
+    /// While live: an input is on air, so a wrong camera from now on is the notice,
+    /// never a restart.
+    pub fn on_air(&self) {
+        self.model().set_on_air();
+    }
+
+    /// While live: whether an input of the session is on air.
+    pub fn is_on_air(&self) -> bool {
+        self.model().on_air
+    }
+
+    /// While live: how to have the session started again on a fresh Strom after a
+    /// wrong camera; None when its Strom is not one the app started.
+    pub fn recover_live_with(&self, recover: Option<Recover>) {
+        *lock(&self.live_recovery) = recover;
+    }
+
+    /// The session runs again on a fresh Strom: its uplinks are read again.
+    pub fn relaunched(&self) {
+        self.model().relaunched();
+    }
+
     /// The session has ended, or Go live was refused: back to step 2, with the preview
     /// off until the page asks again. A session that ran owned the Strom and stopped
     /// it; without a hold left there is nothing to preview on until the next one.
     pub fn live_ended(&self) {
+        *lock(&self.live_recovery) = None;
         let events = self.model().live_ended();
         if !self.held.is_held() {
             *lock(&self.strom) = None;
