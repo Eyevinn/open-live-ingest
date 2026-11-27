@@ -701,7 +701,10 @@ impl HeldStrom {
 
     /// Gives the hold up ([`StromHold::release`]): at quit, or when the settings
     /// name another Strom. Nothing held is not an error.
+    /// Waits for a take or refresh under way (a fresh Strom Go live is starting), so
+    /// the Strom it holds is released too, not left running.
     pub async fn release(&self) {
+        let _one = self.taking.lock().await;
         let held = lock(&self.hold).take();
         if let Some(hold) = held {
             log_release(hold.release().await);
@@ -1065,6 +1068,19 @@ impl GoLive {
                         continue;
                     }
                     Incoming::Recover(attempt) => {
+                        // An input went on air after the wrong camera was seen and
+                        // before this was handled: the session is not stopped, and
+                        // the uplinks are read again, so the wrong camera shows the
+                        // notice.
+                        if preview.is_on_air() {
+                            tracing::info!(
+                                attempt,
+                                result = "on air meanwhile",
+                                "wrong camera: Go live again on a fresh Strom (strom#1278)"
+                            );
+                            preview.relaunched();
+                            continue;
+                        }
                         let mut guard = lock(&state);
                         if guard.session == session
                             && guard.phase == Phase::Live

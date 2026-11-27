@@ -1067,6 +1067,8 @@ struct FakeHost {
     holds: AtomicUsize,
     /// Holds released to replace the Strom.
     releases: AtomicUsize,
+    /// Taking a hold fails once this many have been taken.
+    holds_fail_after: Option<usize>,
 }
 
 impl Host for FakeHost {
@@ -1082,7 +1084,10 @@ impl Host for FakeHost {
         }
     }
     fn hold_strom(&self, settings: Config) -> HostFuture<anyhow::Result<StromHold>> {
-        self.holds.fetch_add(1, Ordering::SeqCst);
+        let taken = self.holds.fetch_add(1, Ordering::SeqCst);
+        if self.holds_fail_after.is_some_and(|n| taken >= n) {
+            return Box::pin(async { Err(anyhow::anyhow!("Strom did not start")) });
+        }
         Box::pin(async move { api::hold_strom(&settings, &Events::new(|_| {})).await })
     }
     fn restartable(&self, _hold: &StromHold) -> bool {
@@ -1700,6 +1705,142 @@ fn a_wrong_camera_before_on_air_goes_live_again_on_a_fresh_strom() {
     let seen = drain(&rx, Duration::from_millis(300));
     assert!(wrong_camera_notices(&seen).is_empty(), "{seen:?}");
     assert!(!seen.iter().any(|m| m["event"] == "stopped"), "{seen:?}");
+
+    go.stop();
+    setup.rt.block_on(go.until_idle());
+}
+
+/// Go live, the uplink started and checked on a fresh Strom (camera right), so the
+/// session's recovery hook is installed: for the tests that queue a `Recover` by hand.
+fn live_on_a_fresh_strom(setup: &Setup, go: &GoLive, id: u32) -> Receiver<Value> {
+    let (deliver, rx) = deliverer();
+    go.start(id, deliver, setup.rt.handle());
+    wait_for(&rx, "the reply", |m| m["id"] == id);
+    setup.wait_for_checked_start(flow::flow_id("gw-app", "dev-cam"), 1);
+    rx
+}
+
+/// The `Recover` the preview would queue after a wrong camera on an uplink.
+fn queued_recover(preview: &PreviewController) -> Recover {
+    lock(&preview.live_recovery)
+        .clone()
+        .expect("no recovery hook on a Strom the app started")
+}
+
+/// An input goes on air (the loop handles its `Input OnAir`) after a wrong camera
+/// queued a `Recover` and before the loop handles it: the session keeps running on
+/// its Strom, and the uplinks are read again so the wrong camera shows the notice.
+#[test]
+fn an_input_on_air_before_a_queued_recover_keeps_the_session() {
+    let setup = Setup::managed("golive-onair-recover", &["Cam"], false);
+    let go = setup.go_live();
+    let (preview, _events) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+    let rx = live_on_a_fresh_strom(&setup, &go, 7);
+    let uplink = flow::flow_id("gw-app", "dev-cam");
+
+    // As `camera_checked` leaves the model when it asks for a live recovery.
+    preview.model().live_restarting = true;
+    preview.on_air();
+    queued_recover(&preview)(1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while preview.model().live_restarting {
+        assert!(Instant::now() < deadline, "the Recover was never handled");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(go.is_live());
+    let seen = drain(&rx, Duration::from_millis(300));
+    assert!(!seen.iter().any(|m| m["event"] == "stopped"), "{seen:?}");
+    // The hold and the fresh Strom at Go live; none after.
+    assert_eq!(setup.host.holds.load(Ordering::SeqCst), 2);
+    assert_eq!(setup.restarts().len(), 1);
+    assert_eq!(setup.starts_of(uplink).len(), 1);
+    assert!(setup.strom.flow_ids().contains(&uplink.to_string()));
+
+    go.stop();
+    setup.rt.block_on(go.until_idle());
+}
+
+/// Stop pressed while the session is being stopped for a fresh Strom: it ends as
+/// Stop says, once, and goes idle without being started again.
+#[test]
+fn stop_during_a_live_recovery_ends_the_session() {
+    let setup = Setup::managed("golive-stop-recover", &["Cam"], false);
+    let go = setup.go_live();
+    let (preview, _events) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+    let rx = live_on_a_fresh_strom(&setup, &go, 8);
+    let uplink = flow::flow_id("gw-app", "dev-cam");
+
+    queued_recover(&preview)(1);
+    // The run's teardown has begun: the recovery is under way.
+    setup.strom.wait_for("the run's teardown", |calls| {
+        calls.contains(&format!("DELETE /api/flows/{uplink}"))
+    });
+    go.stop();
+    setup.rt.block_on(go.until_idle());
+
+    assert!(!go.is_live());
+    let stopped = wait_for(&rx, "stopped", |m| m["event"] == "stopped");
+    assert!(stopped["data"]["error"].is_null(), "{stopped}");
+    let seen = drain(&rx, Duration::from_millis(300));
+    assert!(!seen.iter().any(|m| m["event"] == "stopped"), "{seen:?}");
+}
+
+/// No fresh Strom after a wrong camera while live (taking the hold fails): the
+/// session ends, and the page hears `stopped` with the error.
+#[test]
+fn no_fresh_strom_after_a_live_recovery_stops_with_the_error() {
+    let setup = Setup::with(
+        "golive-recover-fails",
+        true,
+        &["Other"],
+        CAMERA_WITH_MIC,
+        |strom| {
+            FakeHost {
+                managed: true,
+                strom: Some(strom),
+                // The hold, and the fresh Strom at Go live; the recovery's fails.
+                holds_fail_after: Some(2),
+                ..FakeHost::default()
+            }
+        },
+    );
+    let go = setup.go_live();
+    let (preview, _events) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+
+    let (deliver, rx) = deliverer();
+    go.start(10, deliver, setup.rt.handle());
+    wait_for(&rx, "the reply", |m| m["id"] == 10);
+    let stopped = wait_for(&rx, "stopped", |m| m["event"] == "stopped");
+    assert!(stopped["data"]["error"].is_object(), "{stopped}");
+    setup.rt.block_on(go.until_idle());
+    assert!(!go.is_live());
+    assert_eq!(setup.host.holds.load(Ordering::SeqCst), 3);
+    assert_eq!(setup.starts_of(flow::flow_id("gw-app", "dev-cam")).len(), 1);
+}
+
+/// #196: Go live on an adopted Strom keeps it: no fresh one, the uplinks start on
+/// the Strom that ran the previews.
+#[test]
+fn go_live_on_an_adopted_strom_keeps_it() {
+    let setup = Setup::new("golive-adopted", true, "Cam", CAMERA_WITH_MIC);
+    let go = setup.go_live();
+    let (preview, _events) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+
+    let (deliver, rx) = deliverer();
+    go.start(11, deliver, setup.rt.handle());
+    wait_for(&rx, "the reply", |m| m["id"] == 11);
+    let uplink = flow::flow_id("gw-app", "dev-cam");
+    setup.strom.wait_for("the uplink", |calls| {
+        calls.contains(&format!("POST /api/flows/{uplink}/start"))
+    });
+    assert_eq!(setup.host.releases.load(Ordering::SeqCst), 0);
+    assert_eq!(setup.host.holds.load(Ordering::SeqCst), 1);
+    assert!(setup.restarts().is_empty());
 
     go.stop();
     setup.rt.block_on(go.until_idle());

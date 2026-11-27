@@ -1801,6 +1801,11 @@ impl PreviewController {
         self.model().set_on_air();
     }
 
+    /// While live: whether an input of the session is on air.
+    pub fn is_on_air(&self) -> bool {
+        self.model().on_air
+    }
+
     /// While live: how to have the session started again on a fresh Strom after a
     /// wrong camera; None when its Strom is not one the app started.
     pub fn recover_live_with(&self, recover: Option<Recover>) {
