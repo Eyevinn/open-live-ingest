@@ -21,6 +21,27 @@ final class SignInCheckUITests: XCTestCase {
         ) == .completed
     }
 
+    // Waits for sign-in until a deadline, polling about once a second. A single
+    // XCTNSPredicateExpectation is not enough on a slow runner: each label read can take
+    // 10+ s there, so a 60 s expectation checks the predicate only a few times and can
+    // time out with the event already in. `osc_signed_in` in the comma-separated `events`
+    // label counts as evidence too: SignInCheck.swift sets `events` and `signedIn = "yes"`
+    // in the same main-queue block. After the deadline it reads once more so a slow
+    // snapshot can't lose a result that is already there.
+    private func waitForSignIn(_ app: XCUIApplication, within seconds: TimeInterval) -> Bool {
+        let signedIn = app.staticTexts["signedIn"]
+        let events = app.staticTexts["events"]
+        func arrived() -> Bool {
+            signedIn.label == "yes" || events.label.split(separator: ",").contains("osc_signed_in")
+        }
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if arrived() { return true }
+            RunLoop.current.run(until: Date().addingTimeInterval(1))
+        }
+        return arrived()
+    }
+
     func testLoopbackSignInCompletesInWebAuthenticationSession() throws {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -32,7 +53,7 @@ final class SignInCheckUITests: XCTestCase {
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let signedIn = app.staticTexts["signedIn"]
         var allowed = false
-        let deadline = Date().addingTimeInterval(60)
+        let deadline = Date().addingTimeInterval(120)
         while Date() < deadline, !allowed, signedIn.label != "yes" {
             for button in [springboard.buttons["Continue"], app.alerts.buttons["Continue"]]
             where button.exists {
@@ -46,7 +67,7 @@ final class SignInCheckUITests: XCTestCase {
         print("sign-in-check: consent alert shown and allowed: \(allowed)")
         XCTAssertEqual(app.staticTexts["page"].label, "started", "the session did not start")
 
-        let arrived = wait(signedIn, label: "yes", within: 60)
+        let arrived = waitForSignIn(app, within: 180)
         shot("2 after osc_signed_in")
         print("sign-in-check: events: \(app.staticTexts["events"].label)")
         XCTAssertTrue(arrived, "osc_signed_in never arrived: the sheet did not reach the loopback listener")
@@ -75,7 +96,7 @@ final class SignInCheckUITests: XCTestCase {
         XCTAssertFalse(app.staticTexts.matching(errorText).firstMatch.exists, "an error is shown in the app")
         XCTAssertFalse(springboard.staticTexts.matching(errorText).firstMatch.exists, "an error is shown over the app")
 
-        let reply = wait(app.staticTexts["reply"], label: "ok", within: 30)
+        let reply = wait(app.staticTexts["reply"], label: "ok", within: 90)
         print("sign-in-check: osc_sign_in reply: \(app.staticTexts["reply"].label)")
         XCTAssertTrue(reply, "the osc_sign_in reply was not ok")
         print("sign-in-check: FINDING yes: the loopback redirect completes in ASWebAuthenticationSession")
