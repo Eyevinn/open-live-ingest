@@ -1,8 +1,10 @@
 //! The preview's model with a fake clock, and its controller against a fake Strom.
 
 use super::*;
-use crate::go_live::GoLive;
-use crate::testing::{self, Captured, FakeStrom};
+use crate::go_live::{GoLive, HostFuture};
+use crate::testing::{self, Captured, FakeStrom, STROM_RESTARTED};
+use open_live_ingest::api::{LeftRunning, Released, StromHold};
+use open_live_ingest::gateway::Events;
 use open_live_ingest::keychain::MemoryKeychain;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -492,20 +494,24 @@ fn wrong_camera_on_a_mismatched_device_name() {
     let t = Instant::now();
     let (mut preview, g) = running(vec![cam(false)], t);
     let gen = g["dev-cam"];
-    assert!(preview
-        .camera_checked("dev-cam", gen, Opened::Device("Cam".into()))
-        .is_empty());
-    assert!(preview
-        .camera_checked("dev-cam", gen, Opened::Unknown)
-        .is_empty());
-    assert!(preview
-        .camera_checked("dev-cam", gen, Opened::NotRunning)
-        .is_empty());
-    let events = json_of(&preview.camera_checked(
+    for opened in [
+        Opened::Device("Cam".into()),
+        Opened::Unknown,
+        Opened::NotRunning,
+    ] {
+        assert_eq!(
+            preview.camera_checked("dev-cam", gen, opened, false),
+            (Vec::new(), None)
+        );
+    }
+    let (events, recovery) = preview.camera_checked(
         "dev-cam",
         gen,
         Opened::Device("OBS Virtual Camera".into()),
-    ));
+        false,
+    );
+    assert_eq!(recovery, None, "not a Strom the app may restart");
+    let events = json_of(&events);
     assert_eq!(
         events,
         vec![json!({"event": "notice", "data": {
@@ -527,8 +533,113 @@ fn wrong_camera_on_a_mismatched_device_name() {
 fn the_test_pattern_has_no_camera_to_check() {
     let t = Instant::now();
     let (mut preview, g) = running(vec![test_pattern()], t);
-    let events = preview.camera_checked("test", g["test"], Opened::Device("Cam".into()));
-    assert!(events.is_empty());
+    let checked = preview.camera_checked("test", g["test"], Opened::Device("Cam".into()), true);
+    assert_eq!(checked, (Vec::new(), None));
+}
+
+/// #196: on a Strom the app may restart, a preview row's wrong camera asks for a
+/// fresh Strom instead of the notice, twice per tick; the third shows the notice.
+/// Unticked and ticked again, it may recover again.
+#[test]
+fn a_preview_row_recovers_twice_per_tick_then_shows_the_notice() {
+    let t = Instant::now();
+    let mut preview = Preview::default();
+    preview.set_wanted(true);
+    preview.set_capable(Some(true));
+    let other = || Opened::Device("FaceTime HD Camera".into());
+    let start = |preview: &mut Preview| {
+        let (plan, _) = preview.plan("gw", vec![cam(false)], t);
+        let start = &plan.start[0];
+        preview.started(&start.device, start.generation, &Ok(true), t);
+        start.generation
+    };
+    for attempt in 1..=MAX_RECOVERIES {
+        let gen = start(&mut preview);
+        let (events, recovery) = preview.camera_checked("dev-cam", gen, other(), true);
+        assert!(events.is_empty(), "{:?}", json_of(&events));
+        assert_eq!(recovery, Some(Recovery::Preview { attempt }));
+        assert!(preview.recovery_due("dev-cam", gen));
+        // The recovery takes the rows out, saying nothing, and starts them again.
+        let (removals, events) = preview.restart_previews();
+        assert!(events.is_empty());
+        assert_eq!(removals[0].announce, None);
+        assert!(preview.removed(&removals[0]).is_empty());
+    }
+    let gen = start(&mut preview);
+    let (events, recovery) = preview.camera_checked("dev-cam", gen, other(), true);
+    assert_eq!(recovery, None);
+    assert_eq!(json_of(&events)[0]["data"]["kind"], "wrong_camera");
+
+    // Unticked, then ticked again: a new tick may recover again.
+    preview.plan("gw", vec![], t);
+    let gen = start(&mut preview);
+    let (_, recovery) = preview.camera_checked("dev-cam", gen, other(), true);
+    assert_eq!(recovery, Some(Recovery::Preview { attempt: 1 }));
+}
+
+/// A recovery made stale by another row's (its row started again meanwhile) is not
+/// made and gives its attempt back; a Strom that could not be replaced leaves the
+/// row's next wrong camera to the notice.
+#[test]
+fn a_stale_recovery_is_given_back_and_a_strom_not_replaced_ends_them() {
+    let t = Instant::now();
+    let (mut preview, g) = running(vec![cam(false)], t);
+    let other = || Opened::Device("Other".into());
+    let (_, recovery) = preview.camera_checked("dev-cam", g["dev-cam"], other(), true);
+    assert_eq!(recovery, Some(Recovery::Preview { attempt: 1 }));
+    assert!(!preview.recovery_due("dev-cam", g["dev-cam"] + 1));
+    let (_, recovery) = preview.camera_checked("dev-cam", g["dev-cam"], other(), true);
+    assert_eq!(
+        recovery,
+        Some(Recovery::Preview { attempt: 1 }),
+        "the stale attempt was not given back"
+    );
+
+    preview.no_more_recoveries("dev-cam");
+    let (events, recovery) = preview.camera_checked("dev-cam", g["dev-cam"], other(), true);
+    assert_eq!(recovery, None);
+    assert_eq!(json_of(&events)[0]["data"]["kind"], "wrong_camera");
+}
+
+/// #196: while live, before any input is on air, an uplink's wrong camera asks for
+/// the session to be started again (the uplinks' rows go, and are not read until it
+/// runs again), at most twice per Go live; then the notice. Once an input is on air
+/// it is the notice at once, never a restart.
+#[test]
+fn while_live_a_wrong_camera_restarts_only_before_on_air() {
+    let t = Instant::now();
+    let other = || Opened::Device("Other".into());
+    let uplink = flow::flow_id("gw", "dev-cam");
+    let (mut preview, _) = running(vec![], t);
+    preview.hand_over();
+    for attempt in 1..=MAX_RECOVERIES {
+        let (_, checks) = preview.uplinks(vec![(cam(true), uplink)], t);
+        let (events, recovery) = preview.camera_checked("dev-cam", checks[0].2, other(), true);
+        assert_eq!(recovery, Some(Recovery::Live { attempt }));
+        let events = json_of(&events);
+        assert_eq!(events.last().unwrap()["data"]["state"], "camera_off");
+        assert!(!events.iter().any(|e| e["data"]["kind"] == "wrong_camera"));
+        // The run being stopped still reports its uplinks: not read.
+        let (events, checks) = preview.uplinks(vec![(cam(true), uplink)], t);
+        assert!(events.is_empty() && checks.is_empty());
+        preview.relaunched();
+    }
+    let (_, checks) = preview.uplinks(vec![(cam(true), uplink)], t);
+    let (events, recovery) = preview.camera_checked("dev-cam", checks[0].2, other(), true);
+    assert_eq!(recovery, None);
+    assert_eq!(
+        json_of(&events)[0]["data"]["message"],
+        "Strom opened \"Other\" instead of \"Cam\". Stop, then Go live."
+    );
+
+    // The next Go live may recover again, until an input is on air.
+    preview.live_ended();
+    preview.hand_over();
+    let (_, checks) = preview.uplinks(vec![(cam(true), uplink)], t);
+    preview.set_on_air();
+    let (events, recovery) = preview.camera_checked("dev-cam", checks[0].2, other(), true);
+    assert_eq!(recovery, None, "restarted after on air");
+    assert_eq!(json_of(&events)[0]["data"]["kind"], "wrong_camera");
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +825,11 @@ fn while_live_the_uplinks_taps_are_read() {
     assert!(preview
         .pictured("dev-cam", gen, Ok(Thumbnail::Gone), t)
         .is_empty());
-    let wrong = json_of(&preview.camera_checked("dev-cam", gen, Opened::Device("Other".into())));
+    let wrong = json_of(
+        &preview
+            .camera_checked("dev-cam", gen, Opened::Device("Other".into()), false)
+            .0,
+    );
     assert_eq!(
         wrong[0]["data"]["message"],
         "Strom opened \"Other\" instead of \"Cam\". Stop, then Go live."
@@ -773,7 +888,11 @@ fn no_event_or_log_line_carries_an_image() {
             }),
             t + Duration::from_secs(6),
         ));
-        events.extend(preview.camera_checked("dev-cam", gen, Opened::Device("Other".into())));
+        events.extend(
+            preview
+                .camera_checked("dev-cam", gen, Opened::Device("Other".into()), false)
+                .0,
+        );
         for k in 1..=24 {
             preview.reading(&reading(preview_id("dev-cam"), &[Some(-80.0)]));
             events.extend(preview.window(t + LEVEL_WINDOW * k));
@@ -935,10 +1054,19 @@ fn the_page_rows_and_the_preview_rows_agree() {
 // ---------------------------------------------------------------------------
 
 /// A machine with no other gateway; macOS access granted unless `denied` says not.
+/// The fake Strom is adopted, never started; `managed` has it stand for one the app
+/// started, which a release stops ([`FakeStrom::restart`]) unless `left_running`.
 #[derive(Default)]
 struct FakeHost {
     denied: Mutex<Option<Media>>,
     asked: AtomicUsize,
+    managed: bool,
+    left_running: bool,
+    strom: Option<FakeStrom>,
+    /// Holds taken.
+    holds: AtomicUsize,
+    /// Holds released to replace the Strom.
+    releases: AtomicUsize,
 }
 
 impl Host for FakeHost {
@@ -952,6 +1080,24 @@ impl Host for FakeHost {
             Some(media) => Err(media),
             None => Ok(()),
         }
+    }
+    fn hold_strom(&self, settings: Config) -> HostFuture<anyhow::Result<StromHold>> {
+        self.holds.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { api::hold_strom(&settings, &Events::new(|_| {})).await })
+    }
+    fn restartable(&self, _hold: &StromHold) -> bool {
+        self.managed
+    }
+    fn release_strom(&self, hold: StromHold) -> HostFuture<Released> {
+        self.releases.fetch_add(1, Ordering::SeqCst);
+        drop(hold);
+        if self.left_running {
+            return Box::pin(async { Released::LeftRunning(LeftRunning::Flows { count: 1 }) });
+        }
+        if let Some(strom) = &self.strom {
+            strom.restart();
+        }
+        Box::pin(async { Released::Stopped })
     }
 }
 
@@ -1006,15 +1152,36 @@ struct Setup {
 
 impl Setup {
     fn new(name: &str, blocks: bool, opened: &'static str, inputs: &str) -> Self {
-        let strom = FakeStrom::start(blocks, 2, opened);
+        Self::with(name, blocks, &[opened], inputs, |_| FakeHost::default())
+    }
+
+    /// On a Strom standing for one the app started (strom#1278 recovery), whose
+    /// `n`th flow started opens `opened[n]` (the last after that).
+    fn managed(name: &str, opened: &[&'static str], left_running: bool) -> Self {
+        Self::with(name, true, opened, CAMERA_WITH_MIC, |strom| FakeHost {
+            managed: true,
+            left_running,
+            strom: Some(strom),
+            ..FakeHost::default()
+        })
+    }
+
+    fn with(
+        name: &str,
+        blocks: bool,
+        opened: &[&'static str],
+        inputs: &str,
+        host: impl FnOnce(FakeStrom) -> FakeHost,
+    ) -> Self {
+        let strom = FakeStrom::start_opening(blocks, 2, opened);
         let scratch = testing::Scratch::new(name);
         let path = scratch.settings();
         std::fs::write(&path, settings_text(&strom.url, inputs)).unwrap();
         Setup {
+            host: Arc::new(host(strom.clone())),
             strom,
             _scratch: scratch,
             path,
-            host: Arc::new(FakeHost::default()),
             rt: runtime(),
         }
     }
@@ -1040,6 +1207,46 @@ impl Setup {
         let (deliver, rx) = deliverer();
         preview.deliver_to(deliver, Some(devices()));
         (preview, rx)
+    }
+
+    /// Where in Strom's requests each start of `flow` is.
+    fn starts_of(&self, flow: FlowId) -> Vec<usize> {
+        let start = format!("POST /api/flows/{flow}/start");
+        self.strom
+            .calls()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == start)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Where in Strom's requests it was replaced with a fresh one.
+    fn restarts(&self) -> Vec<usize> {
+        self.strom
+            .calls()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| *c == STROM_RESTARTED)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Waits up to 10 s for `flow` to have been started `n` times, and its camera
+    /// read after the last.
+    fn wait_for_checked_start(&self, flow: FlowId, n: usize) {
+        let start = format!("POST /api/flows/{flow}/start");
+        let check = format!("GET /api/flows/{flow}/elements/capture:videosrc/properties");
+        self.strom
+            .wait_for(&format!("start {n} of {flow}, checked"), |calls| {
+                let starts: Vec<usize> = calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c == start)
+                    .map(|(i, _)| i)
+                    .collect();
+                starts.len() >= n && calls[starts[n - 1]..].contains(&check)
+            });
     }
 
     fn calls_for(&self, flow: FlowId) -> Vec<String> {
@@ -1189,6 +1396,120 @@ fn the_controller_raises_wrong_camera_from_strom_s_device_name() {
         notice["data"]["message"],
         "Strom opened \"OBS Virtual Camera\" instead of \"Cam\". Untick and tick it again."
     );
+    // #196: an adopted Strom is never replaced: the notice only.
+    assert_eq!(setup.host.releases.load(Ordering::SeqCst), 0);
+    assert_eq!(setup.host.holds.load(Ordering::SeqCst), 1);
+    assert_eq!(setup.starts_of(preview_of("dev-cam")).len(), 1);
+}
+
+/// Waits until `rx` has been quiet for `quiet`, and returns what it delivered.
+fn drain(rx: &Receiver<Value>, quiet: Duration) -> Vec<Value> {
+    let mut seen = Vec::new();
+    while let Ok(message) = rx.recv_timeout(quiet) {
+        seen.push(message);
+    }
+    seen
+}
+
+fn wrong_camera_notices(seen: &[Value]) -> Vec<&Value> {
+    seen.iter()
+        .filter(|m| m["data"]["kind"] == "wrong_camera")
+        .collect()
+}
+
+/// #196 item 2: on a Strom the app started, a wrong camera in the preview has the
+/// preview flow removed, the Strom replaced with a fresh one, and the flow started
+/// again; the second start opens the camera picked, so no notice is shown.
+#[test]
+fn a_wrong_camera_in_the_preview_is_recovered_with_a_fresh_strom() {
+    let setup = Setup::managed("preview-recover", &["Other", "Cam"], false);
+    let go = setup.go_live();
+    let (preview, rx) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+    preview.set_wanted(true);
+    setup.rt.block_on(preview.reconcile());
+    let id = preview_of("dev-cam");
+    setup.wait_for_checked_start(id, 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while preview
+        .model()
+        .rows
+        .get("dev-cam")
+        .map(|r| r.camera.clone())
+        != Some(CameraCheck::Same)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the second start was never checked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let starts = setup.starts_of(id);
+    let restarts = setup.restarts();
+    assert_eq!(starts.len(), 2);
+    assert_eq!(restarts.len(), 1);
+    assert!(
+        starts[0] < restarts[0] && restarts[0] < starts[1],
+        "{:?}",
+        setup.strom.calls()
+    );
+    let delete = setup
+        .strom
+        .calls()
+        .iter()
+        .position(|c| *c == format!("DELETE /api/flows/{id}"))
+        .unwrap();
+    assert!(
+        delete < restarts[0],
+        "the Strom was replaced before its flow went"
+    );
+    assert_eq!(setup.host.releases.load(Ordering::SeqCst), 1);
+    assert_eq!(setup.host.holds.load(Ordering::SeqCst), 2);
+    let seen = drain(&rx, Duration::from_millis(300));
+    assert!(wrong_camera_notices(&seen).is_empty(), "{seen:?}");
+    assert!(
+        !seen.iter().any(|m| m["data"]["state"] == "stopped"),
+        "{seen:?}"
+    );
+    assert_eq!(setup.strom.flow_ids(), [id.to_string()]);
+}
+
+/// #196 item 2: the camera still wrong after two fresh Stroms: the notice, and no
+/// third.
+#[test]
+fn a_camera_still_wrong_after_two_recoveries_shows_the_notice() {
+    let setup = Setup::managed("preview-recover-twice", &["Other"], false);
+    let go = setup.go_live();
+    let (preview, rx) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+    preview.set_wanted(true);
+    setup.rt.block_on(preview.reconcile());
+    let notice = wait_for(&rx, "wrong_camera", |m| m["data"]["kind"] == "wrong_camera");
+    assert_eq!(
+        notice["data"]["message"],
+        "Strom opened \"Other\" instead of \"Cam\". Untick and tick it again."
+    );
+    assert_eq!(setup.host.releases.load(Ordering::SeqCst), 2);
+    assert_eq!(setup.restarts().len(), 2);
+    assert_eq!(setup.starts_of(preview_of("dev-cam")).len(), 3);
+}
+
+/// A Strom that cannot be stopped (it runs a flow that is not ours) is held again as
+/// it is: no recovery counted, and the flow's next wrong camera is the notice.
+#[test]
+fn a_strom_left_running_is_no_recovery_and_the_notice_follows() {
+    let setup = Setup::managed("preview-left-running", &["Other"], true);
+    let go = setup.go_live();
+    let (preview, rx) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+    preview.set_wanted(true);
+    setup.rt.block_on(preview.reconcile());
+    wait_for(&rx, "wrong_camera", |m| m["data"]["kind"] == "wrong_camera");
+    assert_eq!(setup.host.releases.load(Ordering::SeqCst), 1);
+    assert!(setup.restarts().is_empty());
+    assert_eq!(setup.starts_of(preview_of("dev-cam")).len(), 2);
+    assert!(go.held().is_held());
 }
 
 /// The handover (section 4.1): Go live removes every preview flow and waits until
@@ -1301,6 +1622,85 @@ fn no_blocks_no_preview_flow_and_the_uplinks_carry_no_taps() {
         !text.contains("builtin.thumbnail") && !text.contains("builtin.meter"),
         "{text}"
     );
+    go.stop();
+    setup.rt.block_on(go.until_idle());
+}
+
+/// #196 item 1: on a Strom the app started, Go live replaces the Strom that ran the
+/// previews with a fresh one, after the preview flows are gone and before the
+/// uplinks start.
+#[test]
+fn go_live_starts_the_uplinks_on_a_fresh_strom() {
+    let setup = Setup::managed("golive-fresh", &["Cam"], false);
+    let go = setup.go_live();
+    let (preview, _events) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+    preview.set_wanted(true);
+    setup.rt.block_on(preview.reconcile());
+    let id = preview_of("dev-cam");
+    assert_eq!(setup.strom.flow_ids(), [id.to_string()]);
+
+    let (deliver, rx) = deliverer();
+    go.start(5, deliver, setup.rt.handle());
+    wait_for(&rx, "the reply", |m| m["id"] == 5);
+    let uplink = flow::flow_id("gw-app", "dev-cam");
+    setup.strom.wait_for("the uplink", |calls| {
+        calls.contains(&format!("POST /api/flows/{uplink}/start"))
+    });
+    let calls = setup.strom.calls();
+    let restarts = setup.restarts();
+    assert_eq!(restarts.len(), 1, "{calls:?}");
+    let removed = calls
+        .iter()
+        .position(|c| *c == format!("DELETE /api/flows/{id}"))
+        .unwrap();
+    let uplink_start = setup.starts_of(uplink)[0];
+    assert!(
+        removed < restarts[0] && restarts[0] < uplink_start,
+        "{calls:?}"
+    );
+    assert_eq!(setup.host.holds.load(Ordering::SeqCst), 2);
+
+    go.stop();
+    setup.rt.block_on(go.until_idle());
+}
+
+/// #196 item 2: while live, before any input is on air, a wrong camera on the
+/// uplink stops the session and goes live again on a fresh Strom; the second start
+/// opens the camera picked, so no notice, and the page never hears it stop.
+#[test]
+fn a_wrong_camera_before_on_air_goes_live_again_on_a_fresh_strom() {
+    let setup = Setup::managed("golive-recover", &["Other", "Cam"], false);
+    let go = setup.go_live();
+    let (preview, _events) = setup.preview(&go);
+    setup.rt.block_on(preview.hold(&setup.settings())).unwrap();
+
+    let (deliver, rx) = deliverer();
+    go.start(6, deliver, setup.rt.handle());
+    wait_for(&rx, "the reply", |m| m["id"] == 6);
+    let uplink = flow::flow_id("gw-app", "dev-cam");
+    setup.wait_for_checked_start(uplink, 2);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while preview
+        .model()
+        .rows
+        .get("dev-cam")
+        .map(|r| r.camera.clone())
+        != Some(CameraCheck::Same)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the second uplink was never checked"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(go.is_live());
+    // The hold, the fresh Strom at Go live, and the one after the wrong camera.
+    assert_eq!(setup.host.holds.load(Ordering::SeqCst), 3);
+    let seen = drain(&rx, Duration::from_millis(300));
+    assert!(wrong_camera_notices(&seen).is_empty(), "{seen:?}");
+    assert!(!seen.iter().any(|m| m["event"] == "stopped"), "{seen:?}");
+
     go.stop();
     setup.rt.block_on(go.until_idle());
 }
